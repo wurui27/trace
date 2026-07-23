@@ -28,6 +28,15 @@ test("server-renders the PerfPilot dashboard", async () => {
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
 
   const html = await response.text();
+  assert.match(html, /<title>PerfPilot · Android 性能诊断<\/title>/);
+  assert.match(
+    html,
+    /<meta[^>]+property="og:description"[^>]+content="问题优先、证据可追溯、优化可复测。"/,
+  );
+  assert.match(
+    html,
+    /<meta[^>]+property="og:image"[^>]+content="http:\/\/localhost\/og\.png"/,
+  );
   assert.match(html, /PerfPilot/);
   assert.match(html, /发现 3 个需要关注的问题/);
   assert.match(html, /启动体验/);

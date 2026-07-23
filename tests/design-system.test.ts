@@ -7,6 +7,11 @@ const css = readFileSync(
   new URL("../app/globals.css", import.meta.url),
   "utf8",
 );
+const executableCss = css.replace(/\/\*[\s\S]*?\*\//g, "");
+
+function escapePattern(value: string) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 describe("Focus Light design system", () => {
   it.each([
@@ -24,16 +29,24 @@ describe("Focus Light design system", () => {
   });
 
   it.each([
-    ".sidebar",
-    ".top-bar",
-    ".conclusion-hero",
-    ".core-overview-panel",
-    ".new-analysis-dialog",
-    ":focus-visible",
-    ".skip-link",
-  ])("styles the %s contract selector", (selector) => {
-    expect(css).toContain(selector);
-  });
+    [".sidebar", String.raw`position\s*:\s*fixed\s*;`],
+    [".top-bar", String.raw`position\s*:\s*sticky\s*;`],
+    [".conclusion-hero", String.raw`background\s*:\s*linear-gradient\(`],
+    [".core-overview-panel", String.raw`display\s*:\s*grid\s*;`],
+    [".new-analysis-dialog", String.raw`width\s*:\s*min\(\s*670px`],
+    [":focus-visible", String.raw`outline\s*:\s*2px\s+solid`],
+    [".skip-link", String.raw`position\s*:\s*fixed\s*;`],
+  ])(
+    "gives the %s contract selector a required declaration",
+    (selector, declaration) => {
+      expect(executableCss).toMatch(
+        new RegExp(
+          `${escapePattern(selector)}[^{}]*\\{[^}]*${declaration}`,
+          "i",
+        ),
+      );
+    },
+  );
 
   it("defines the two responsive layout breakpoints", () => {
     expect(css).toMatch(/@media\s*\(\s*max-width\s*:\s*1050px\s*\)/i);
