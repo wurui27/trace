@@ -31,7 +31,17 @@ describe("NewAnalysisDialog", () => {
     expect(
       screen.getByRole("button", { name: "真机自动测试" }),
     ).toHaveAttribute("aria-pressed", "true");
-    expect(screen.getByRole("button", { name: "关闭" })).toHaveFocus();
+    const closeButton = screen.getByRole("button", { name: "关闭" });
+    const cancelButton = screen.getByRole("button", { name: "取消" });
+    expect(closeButton).toHaveFocus();
+    expect(cancelButton).toBeEnabled();
+
+    await user.tab({ shift: true });
+    expect(cancelButton).toHaveFocus();
+
+    await user.tab();
+    expect(closeButton).toHaveFocus();
+
     expect(document.body).toHaveStyle({ overflow: "hidden" });
     expect(screen.getByText("选择 APK")).toBeInTheDocument();
     expect(screen.getByText("选择真机")).toBeInTheDocument();

@@ -17,6 +17,7 @@ export function NewAnalysisDialog() {
   const [mode, setMode] = useState<AnalysisMode>("agent");
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
+  const dialogRef = useRef<HTMLDivElement>(null);
   const previousBodyOverflowRef = useRef<string | null>(null);
 
   const titleId = useId();
@@ -46,6 +47,54 @@ export function NewAnalysisDialog() {
     const handleKeyDown = (event: KeyboardEvent) => {
       if (event.key === "Escape") {
         closeDialog();
+        return;
+      }
+
+      if (event.key !== "Tab") {
+        return;
+      }
+
+      const dialog = dialogRef.current;
+
+      if (!dialog) {
+        return;
+      }
+
+      const focusableElements = Array.from(
+        dialog.querySelectorAll<HTMLElement>(
+          "button:not([disabled]), input:not([disabled]), select:not([disabled]), a[href]",
+        ),
+      ).filter((element) => {
+        const style = window.getComputedStyle(element);
+
+        return (
+          !element.hidden &&
+          style.display !== "none" &&
+          style.visibility !== "hidden"
+        );
+      });
+      const firstFocusableElement = focusableElements[0];
+      const lastFocusableElement = focusableElements.at(-1);
+
+      if (!firstFocusableElement || !lastFocusableElement) {
+        return;
+      }
+
+      if (!dialog.contains(document.activeElement)) {
+        event.preventDefault();
+        firstFocusableElement.focus();
+        return;
+      }
+
+      if (event.shiftKey && document.activeElement === firstFocusableElement) {
+        event.preventDefault();
+        lastFocusableElement.focus();
+      } else if (
+        !event.shiftKey &&
+        document.activeElement === lastFocusableElement
+      ) {
+        event.preventDefault();
+        firstFocusableElement.focus();
       }
     };
 
@@ -91,6 +140,7 @@ export function NewAnalysisDialog() {
           onClick={handleOverlayClick}
         >
           <div
+            ref={dialogRef}
             className="new-analysis-dialog"
             role="dialog"
             aria-modal="true"
