@@ -28,6 +28,10 @@ describe("NewAnalysisDialog", () => {
     expect(
       screen.getByRole("dialog", { name: "新建性能分析" }),
     ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "真机自动测试" }),
+    ).toHaveAttribute("aria-pressed", "true");
+    expect(screen.getByRole("button", { name: "关闭" })).toHaveFocus();
     expect(document.body).toHaveStyle({ overflow: "hidden" });
     expect(screen.getByText("选择 APK")).toBeInTheDocument();
     expect(screen.getByText("选择真机")).toBeInTheDocument();
@@ -38,10 +42,12 @@ describe("NewAnalysisDialog", () => {
     );
 
     expect(screen.getByLabelText("Trace 文件")).toBeRequired();
-    expect(screen.getByLabelText("APK 文件（可选）")).toBeInTheDocument();
-    expect(screen.getByLabelText("源码压缩包（可选）")).toBeInTheDocument();
-    expect(screen.getByLabelText("Mapping 文件（可选）")).toBeInTheDocument();
-    expect(screen.getByLabelText("Native Symbols（可选）")).toBeInTheDocument();
+    expect(screen.getByLabelText("APK 文件（可选）")).not.toBeRequired();
+    expect(screen.getByLabelText("源码压缩包（可选）")).not.toBeRequired();
+    expect(screen.getByLabelText("Mapping 文件（可选）")).not.toBeRequired();
+    expect(
+      screen.getByLabelText("Native Symbols（可选）"),
+    ).not.toBeRequired();
 
     await user.click(screen.getByRole("button", { name: "关闭" }));
 
