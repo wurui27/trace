@@ -40,6 +40,7 @@ export interface PerformanceProblem {
   readonly currentValue: string;
   readonly targetValue: string;
   readonly delta: string;
+  readonly comparisonBasis: string;
   readonly sourceLocation: string;
   readonly acceptanceCriteria: string;
   readonly evidence: ReadonlyArray<EvidenceItem>;
@@ -163,6 +164,8 @@ const dashboardData = deepFreeze<DashboardData>({
       currentValue: "1.42 s",
       targetValue: "< 1.20 s",
       delta: "+217 ms",
+      comparisonBasis:
+        "未四舍五入的冷启动中位数 1,417 ms，目标 1,200 ms",
       sourceLocation:
         "未提供源码；当前定位到 Application 初始化中的包管理查询调用链",
       acceptanceCriteria:
@@ -218,6 +221,7 @@ const dashboardData = deepFreeze<DashboardData>({
       currentValue: "8.6%",
       targetValue: "< 5%",
       delta: "+3.6 pp",
+      comparisonBasis: "慢帧 157 / 1,824 帧，目标比例 < 5%",
       sourceLocation:
         "未提供源码；当前定位到相册网格的图片加载与布局阶段",
       acceptanceCriteria:
@@ -273,6 +277,7 @@ const dashboardData = deepFreeze<DashboardData>({
       currentValue: "286 ms",
       targetValue: "< 100 ms",
       delta: "+186 ms",
+      comparisonBasis: "最慢输入响应 286 ms，目标 < 100 ms",
       sourceLocation:
         "未提供源码；当前定位到详情页创建与首屏资源加载阶段",
       acceptanceCriteria:
