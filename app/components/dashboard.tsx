@@ -57,7 +57,7 @@ export function Dashboard({ data }: DashboardProps) {
               >
                 <span className="conclusion-problem-copy">
                   <strong>{problem.title}</strong>
-                  <span>{problem.impact}</span>
+                  <span>{problem.impactLabel}</span>
                 </span>
                 <ArrowRight aria-hidden="true" />
               </Link>

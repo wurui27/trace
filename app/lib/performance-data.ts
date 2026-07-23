@@ -30,6 +30,7 @@ export interface PerformanceProblem {
   readonly severity: Severity;
   readonly status: ProblemStatus;
   readonly impact: string;
+  readonly impactLabel: string;
   readonly summary: string;
   readonly conclusion: string;
   readonly suggestion: string;
@@ -158,6 +159,7 @@ const dashboardData = deepFreeze<DashboardData>({
       status: "已确认问题",
       severity: "critical",
       impact: "用户平均要多等待 217 ms 才看到首页",
+      impactLabel: "影响首屏 217 ms",
       summary: "主线程在首帧前同步等待 PackageManager 186 ms",
       conclusion:
         "首页启动的主要延迟来自 Application 初始化阶段的同步包管理查询；跨进程等待链已闭合。",
@@ -215,6 +217,7 @@ const dashboardData = deepFreeze<DashboardData>({
       status: "疑似问题",
       severity: "warning",
       impact: "相册网格连续滚动时，每 12 帧约有 1 帧明显迟到",
+      impactLabel: "慢帧率 8.6%",
       summary: "图片解码与网格重组在主线程重叠",
       conclusion:
         "卡顿与图片解码批次重叠，但缺少完整工作线程唤醒链，当前只标记为疑似问题。",
@@ -271,6 +274,7 @@ const dashboardData = deepFreeze<DashboardData>({
       status: "疑似问题",
       severity: "warning",
       impact: "打开详情页时，最慢一次触摸响应达到 286 ms",
+      impactLabel: "最慢响应 286 ms",
       summary: "主线程在页面创建阶段连续执行布局和资源读取",
       conclusion:
         "响应延迟与布局、资源读取重叠；没有内核阻塞栈，暂不能断言为磁盘 I/O 根因。",

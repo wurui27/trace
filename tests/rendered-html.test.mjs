@@ -1,13 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-async function render() {
+async function render(path = "/") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
 
   return worker.fetch(
-    new Request("http://localhost/", {
+    new Request(`http://localhost${path}`, {
       headers: { accept: "text/html" },
     }),
     {
@@ -32,4 +32,38 @@ test("server-renders the PerfPilot dashboard", async () => {
   assert.match(html, /发现 3 个需要关注的问题/);
   assert.match(html, /启动体验/);
   assert.match(html, /数据可信度/);
+});
+
+test("server-renders a performance problem evidence detail", async () => {
+  const response = await render("/problems/startup-main-thread");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  for (const text of [
+    "首页启动慢",
+    "用户平均要多等待 217 ms 才看到首页",
+    "影响首屏 217 ms",
+    "结论",
+    "5 个有效样本",
+    "复现 4 / 5 轮",
+    "CV 4.8%",
+    "证据链",
+    "确认症状",
+    "锁定场景窗口",
+    "确认线程状态",
+    "追踪依赖",
+    "排除系统条件",
+    "优化建议",
+    "源码位置",
+    "验收标准",
+    "同条件复测",
+  ]) {
+    assert.ok(html.includes(text), `expected HTML to contain "${text}"`);
+  }
+});
+
+test("returns 404 for an unknown performance problem", async () => {
+  const response = await render("/problems/not-a-real-problem");
+
+  assert.equal(response.status, 404);
 });
