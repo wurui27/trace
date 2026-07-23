@@ -9,7 +9,7 @@ export type ProblemStatus =
   | "数据不足"
   | "本次采集无效";
 
-type EvidenceStep =
+export type EvidenceStep =
   | "确认症状"
   | "锁定场景窗口"
   | "确认线程状态"
@@ -17,72 +17,83 @@ type EvidenceStep =
   | "排除系统条件";
 
 export interface EvidenceItem {
-  step: EvidenceStep;
-  interval: string;
-  value: string;
-  explanation: string;
+  readonly step: EvidenceStep;
+  readonly interval: string;
+  readonly value: string;
+  readonly explanation: string;
 }
 
 export interface PerformanceProblem {
-  id: string;
-  title: string;
-  area: string;
-  severity: Severity;
-  status: ProblemStatus;
-  impact: string;
-  summary: string;
-  conclusion: string;
-  suggestion: string;
-  confidence: number;
-  validSamples: number;
-  reproducedRuns: number;
-  variability: string;
-  currentValue: string;
-  targetValue: string;
-  delta: string;
-  sourceLocation: string;
-  acceptanceCriteria: string;
-  evidence: EvidenceItem[];
+  readonly id: string;
+  readonly title: string;
+  readonly area: string;
+  readonly severity: Severity;
+  readonly status: ProblemStatus;
+  readonly impact: string;
+  readonly summary: string;
+  readonly conclusion: string;
+  readonly suggestion: string;
+  readonly confidence: number;
+  readonly validSamples: number;
+  readonly reproducedRuns: number;
+  readonly variability: string;
+  readonly currentValue: string;
+  readonly targetValue: string;
+  readonly delta: string;
+  readonly sourceLocation: string;
+  readonly acceptanceCriteria: string;
+  readonly evidence: ReadonlyArray<EvidenceItem>;
 }
 
 export interface DashboardData {
-  app: {
-    name: string;
-    packageName: string;
-    version: string;
+  readonly app: {
+    readonly name: string;
+    readonly packageName: string;
+    readonly version: string;
   };
-  device: {
-    name: string;
-    os: string;
-    serial: string;
-    verified: boolean;
+  readonly device: {
+    readonly name: string;
+    readonly os: string;
+    readonly serial: string;
+    readonly verified: boolean;
   };
-  startup: {
-    value: string;
-    target: string;
-    state: MetricState;
-    context: string;
-    cold: string;
-    warm: string;
-    hot: string;
+  readonly startup: {
+    readonly value: string;
+    readonly target: string;
+    readonly state: MetricState;
+    readonly context: string;
+    readonly cold: string;
+    readonly warm: string;
+    readonly hot: string;
   };
-  secondaryMetrics: Array<{
-    label: string;
-    value: string;
-    unit: string;
-    state: MetricState;
-    context: string;
+  readonly secondaryMetrics: ReadonlyArray<{
+    readonly label: string;
+    readonly value: string;
+    readonly unit: string;
+    readonly state: MetricState;
+    readonly context: string;
   }>;
-  problems: PerformanceProblem[];
-  credibility: {
-    runs: number;
-    deviceConsistency: string;
-    thermalState: string;
-    failures: number;
+  readonly problems: ReadonlyArray<PerformanceProblem>;
+  readonly credibility: {
+    readonly runs: number;
+    readonly deviceConsistency: string;
+    readonly thermalState: string;
+    readonly failures: number;
   };
 }
 
-const dashboardData: DashboardData = {
+function deepFreeze<T>(value: T): T {
+  if (value !== null && typeof value === "object") {
+    for (const nestedValue of Object.values(value)) {
+      deepFreeze(nestedValue);
+    }
+    Object.freeze(value);
+  }
+
+  return value;
+}
+
+const dashboardData = deepFreeze<DashboardData>({
   app: {
     name: "Acme Gallery",
     packageName: "com.acme.gallery",
@@ -155,7 +166,7 @@ const dashboardData: DashboardData = {
       sourceLocation:
         "未提供源码；当前定位到 Application 初始化中的包管理查询调用链",
       acceptanceCriteria:
-        "Pixel 8、Android 15、相同构建与数据集下运行 5 轮；冷启动中位数 < 1.20 s，问题签名最多出现 1 轮.",
+        "Pixel 8、Android 15、相同构建与数据集下运行 5 轮；冷启动中位数 < 1.20 s，问题签名最多出现 1 轮。",
       evidence: [
         {
           step: "确认症状",
@@ -210,7 +221,7 @@ const dashboardData: DashboardData = {
       sourceLocation:
         "未提供源码；当前定位到相册网格的图片加载与布局阶段",
       acceptanceCriteria:
-        "相同设备与滚动脚本运行 5 轮；慢帧率 < 5%，P95 超时 < 8 ms，问题签名最多出现 1 轮.",
+        "相同设备与滚动脚本运行 5 轮；慢帧率 < 5%，P95 超时 < 8 ms，问题签名最多出现 1 轮。",
       evidence: [
         {
           step: "确认症状",
@@ -265,7 +276,7 @@ const dashboardData: DashboardData = {
       sourceLocation:
         "未提供源码；当前定位到详情页创建与首屏资源加载阶段",
       acceptanceCriteria:
-        "相同设备与点击脚本运行 5 轮；P95 输入响应 < 100 ms，且不再出现连续主线程长任务.",
+        "相同设备与点击脚本运行 5 轮；P95 输入响应 < 100 ms，且不再出现连续主线程长任务。",
       evidence: [
         {
           step: "确认症状",
@@ -306,7 +317,7 @@ const dashboardData: DashboardData = {
     thermalState: "温度正常",
     failures: 0,
   },
-};
+});
 
 export function getDashboardData(): DashboardData {
   return dashboardData;
