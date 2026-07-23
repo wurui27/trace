@@ -70,6 +70,9 @@ export function AppShell({
 
   return (
     <div className="app-shell">
+      <a className="skip-link" href="#main-content">
+        跳到主要内容
+      </a>
       <aside className="sidebar">
         <Link className="sidebar-brand" href="/" aria-label="PerfPilot 首页">
           <span className="brand-mark" aria-hidden="true">
