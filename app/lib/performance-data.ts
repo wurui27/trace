@@ -37,6 +37,7 @@ export interface PerformanceProblem {
   readonly confidence: number;
   readonly validSamples: number;
   readonly reproducedRuns: number;
+  readonly totalRuns: number;
   readonly variability: string;
   readonly currentValue: string;
   readonly targetValue: string;
@@ -167,6 +168,7 @@ const dashboardData = deepFreeze<DashboardData>({
       confidence: 92,
       validSamples: 5,
       reproducedRuns: 4,
+      totalRuns: 5,
       variability: "CV 4.8%",
       currentValue: "1.42 s",
       targetValue: "< 1.20 s",
@@ -225,6 +227,7 @@ const dashboardData = deepFreeze<DashboardData>({
       confidence: 84,
       validSamples: 5,
       reproducedRuns: 4,
+      totalRuns: 5,
       variability: "CV 7.2%",
       currentValue: "8.6%",
       targetValue: "< 5%",
@@ -282,6 +285,7 @@ const dashboardData = deepFreeze<DashboardData>({
       confidence: 78,
       validSamples: 4,
       reproducedRuns: 3,
+      totalRuns: 5,
       variability: "CV 9.1%",
       currentValue: "286 ms",
       targetValue: "< 100 ms",

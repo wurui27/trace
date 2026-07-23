@@ -3,22 +3,85 @@ import {
   ArrowLeft,
   CheckCircle2,
   CircleAlert,
+  CircleHelp,
+  CircleX,
   ExternalLink,
   MapPin,
   RotateCcw,
   ShieldCheck,
+  type LucideIcon,
 } from "lucide-react";
 
 import type {
   DashboardData,
   PerformanceProblem,
 } from "../lib/performance-data";
+import {
+  getProblemStatusTone,
+  type StatusTone,
+} from "../lib/problem-status";
 
 interface ProblemDetailProps {
   readonly problem: PerformanceProblem;
   readonly app: DashboardData["app"];
   readonly device: DashboardData["device"];
 }
+
+interface StatusPresentation {
+  readonly Icon: LucideIcon;
+  readonly containerClassName: string;
+  readonly iconClassName: string;
+  readonly impactClassName: string;
+  readonly deltaClassName: string;
+}
+
+const statusPresentationByTone: Record<StatusTone, StatusPresentation> = {
+  danger: {
+    Icon: CircleAlert,
+    containerClassName:
+      "inline-flex items-center gap-1.5 rounded-full bg-red-50 px-3 py-1 font-medium text-red-700",
+    iconClassName: "size-4 text-red-600",
+    impactClassName:
+      "inline-flex rounded-md border border-red-200 bg-red-50 px-2.5 py-1 text-sm font-semibold text-red-700",
+    deltaClassName: "text-2xl font-semibold text-red-700",
+  },
+  warning: {
+    Icon: CircleAlert,
+    containerClassName:
+      "inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 font-medium text-amber-700",
+    iconClassName: "size-4 text-amber-600",
+    impactClassName:
+      "inline-flex rounded-md border border-amber-200 bg-amber-50 px-2.5 py-1 text-sm font-semibold text-amber-700",
+    deltaClassName: "text-2xl font-semibold text-amber-700",
+  },
+  success: {
+    Icon: CheckCircle2,
+    containerClassName:
+      "inline-flex items-center gap-1.5 rounded-full bg-emerald-50 px-3 py-1 font-medium text-emerald-700",
+    iconClassName: "size-4 text-emerald-600",
+    impactClassName:
+      "inline-flex rounded-md border border-emerald-200 bg-emerald-50 px-2.5 py-1 text-sm font-semibold text-emerald-700",
+    deltaClassName: "text-2xl font-semibold text-emerald-700",
+  },
+  neutral: {
+    Icon: CircleHelp,
+    containerClassName:
+      "inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1 font-medium text-zinc-700",
+    iconClassName: "size-4 text-zinc-500",
+    impactClassName:
+      "inline-flex rounded-md border border-zinc-300 bg-zinc-100 px-2.5 py-1 text-sm font-semibold text-zinc-700",
+    deltaClassName: "text-2xl font-semibold text-zinc-700",
+  },
+  invalid: {
+    Icon: CircleX,
+    containerClassName:
+      "inline-flex items-center gap-1.5 rounded-full bg-zinc-100 px-3 py-1 font-medium text-zinc-700",
+    iconClassName: "size-4 text-red-600",
+    impactClassName:
+      "inline-flex rounded-md border border-zinc-300 bg-zinc-100 px-2.5 py-1 text-sm font-semibold text-zinc-700",
+    deltaClassName: "text-2xl font-semibold text-red-600",
+  },
+};
 
 function getConfidenceLevel(confidence: number): "高" | "中" | "低" {
   if (confidence >= 85) {
@@ -37,7 +100,9 @@ export function ProblemDetail({
   app,
   device,
 }: ProblemDetailProps) {
-  const isConfirmed = problem.status === "已确认问题";
+  const statusTone = getProblemStatusTone(problem.status);
+  const statusPresentation = statusPresentationByTone[statusTone];
+  const StatusIcon = statusPresentation.Icon;
   const confidenceLevel = getConfidenceLevel(problem.confidence);
   const scenarioWindow = problem.evidence.find(
     (item) => item.step === "锁定场景窗口",
@@ -71,18 +136,11 @@ export function ProblemDetail({
             {problem.title}
           </h1>
           <div className="flex flex-wrap items-center gap-2 text-sm">
-            <span
-              className={
-                isConfirmed
-                  ? "inline-flex items-center gap-1.5 rounded-full bg-red-50 px-3 py-1 font-medium text-red-700"
-                  : "inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-3 py-1 font-medium text-amber-700"
-              }
-            >
-              {isConfirmed ? (
-                <CheckCircle2 aria-hidden="true" className="size-4" />
-              ) : (
-                <CircleAlert aria-hidden="true" className="size-4" />
-              )}
+            <span className={statusPresentation.containerClassName}>
+              <StatusIcon
+                aria-hidden="true"
+                className={statusPresentation.iconClassName}
+              />
               {problem.status}
             </span>
             <span className="text-zinc-500">{problem.area}</span>
@@ -93,7 +151,7 @@ export function ProblemDetail({
           <p className="max-w-3xl text-lg leading-8 text-zinc-700">
             {problem.impact}
           </p>
-          <span className="inline-flex rounded-md border border-red-200 bg-red-50 px-2.5 py-1 text-sm font-semibold text-red-700">
+          <span className={statusPresentation.impactClassName}>
             {problem.impactLabel}
           </span>
         </div>
@@ -160,14 +218,17 @@ export function ProblemDetail({
             </div>
             <div className="space-y-1">
               <dt className="text-sm text-zinc-500">差距</dt>
-              <dd className="text-2xl font-semibold text-red-700">
+              <dd className={statusPresentation.deltaClassName}>
                 {problem.delta}
               </dd>
             </div>
             <div className="space-y-1">
               <dt className="text-sm text-zinc-500">可信度</dt>
               <dd className="inline-flex items-center gap-2 text-2xl font-semibold text-zinc-950">
-                <ShieldCheck aria-hidden="true" className="size-5 text-emerald-600" />
+                <ShieldCheck
+                  aria-hidden="true"
+                  className="size-5 text-indigo-500"
+                />
                 {confidenceLevel} · {problem.confidence}%
               </dd>
             </div>
@@ -176,7 +237,9 @@ export function ProblemDetail({
           <div className="mt-6 border-t border-zinc-200 pt-5">
             <ul className="flex flex-wrap gap-x-6 gap-y-2 text-sm font-medium text-zinc-700">
               <li>{`${problem.validSamples} 个有效样本`}</li>
-              <li>{`复现 ${problem.reproducedRuns} / 5 轮`}</li>
+              <li>
+                {`复现 ${problem.reproducedRuns} / ${problem.totalRuns} 轮`}
+              </li>
               <li>{problem.variability}</li>
             </ul>
             <p className="mt-3 text-sm leading-6 text-zinc-500">
