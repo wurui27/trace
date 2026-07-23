@@ -6,6 +6,7 @@ import type {
   MetricState,
   Severity,
 } from "../lib/performance-data";
+import { NewAnalysisDialog } from "./new-analysis-dialog";
 
 interface DashboardProps {
   readonly data: DashboardData;
@@ -39,17 +40,7 @@ export function Dashboard({ data }: DashboardProps) {
             快速了解当前版本的关键性能、用户影响与复现质量。
           </p>
         </div>
-        <button
-          type="button"
-          className="new-analysis-button"
-          disabled
-          aria-describedby="new-analysis-description"
-        >
-          新建分析
-        </button>
-        <span id="new-analysis-description" className="visually-hidden">
-          分析入口交互将在下一步接入
-        </span>
+        <NewAnalysisDialog />
       </header>
 
       <section className="conclusion-hero" aria-labelledby="conclusion-title">
