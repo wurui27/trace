@@ -68,6 +68,7 @@ export interface DashboardData {
     readonly hot: string;
   };
   readonly secondaryMetrics: ReadonlyArray<{
+    readonly id: string;
     readonly label: string;
     readonly value: string;
     readonly unit: string;
@@ -117,6 +118,7 @@ const dashboardData = deepFreeze<DashboardData>({
   },
   secondaryMetrics: [
     {
+      id: "smoothness",
       label: "页面流畅度",
       value: "8.6",
       unit: "%",
@@ -124,6 +126,7 @@ const dashboardData = deepFreeze<DashboardData>({
       context: "相册网格连续滚动 · 2 个异常页面",
     },
     {
+      id: "main-thread",
       label: "主线程响应",
       value: "186",
       unit: "ms",
@@ -131,6 +134,7 @@ const dashboardData = deepFreeze<DashboardData>({
       context: "启动场景 · 最长连续阻塞",
     },
     {
+      id: "memory",
       label: "内存稳定性",
       value: "+18",
       unit: "MB",
@@ -138,6 +142,7 @@ const dashboardData = deepFreeze<DashboardData>({
       context: "详情页进出 10 轮后未回落",
     },
     {
+      id: "cpu",
       label: "CPU 与调度",
       value: "72",
       unit: "%",

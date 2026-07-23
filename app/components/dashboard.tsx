@@ -25,6 +25,7 @@ const priorityLabels: Record<Severity, string> = {
 
 export function Dashboard({ data }: DashboardProps) {
   const focusProblems = data.problems.slice(0, 3);
+  const conclusionTitle = `发现 ${focusProblems.length} 个需要关注的问题`;
 
   return (
     <div className="dashboard">
@@ -38,15 +39,23 @@ export function Dashboard({ data }: DashboardProps) {
             快速了解当前版本的关键性能、用户影响与复现质量。
           </p>
         </div>
-        <button type="button" className="new-analysis-button">
+        <button
+          type="button"
+          className="new-analysis-button"
+          disabled
+          aria-describedby="new-analysis-description"
+        >
           新建分析
         </button>
+        <span id="new-analysis-description" className="visually-hidden">
+          分析入口交互将在下一步接入
+        </span>
       </header>
 
       <section className="conclusion-hero" aria-labelledby="conclusion-title">
         <div className="conclusion-heading">
           <p className="section-label">本次结论</p>
-          <h2 id="conclusion-title">发现 3 个需要关注的问题</h2>
+          <h2 id="conclusion-title">{conclusionTitle}</h2>
         </div>
         <ul className="conclusion-problem-list">
           {focusProblems.map((problem) => (
@@ -115,7 +124,7 @@ export function Dashboard({ data }: DashboardProps) {
 
           <div className="secondary-metrics" aria-label="其他核心指标">
             {data.secondaryMetrics.map((metric) => (
-              <article className="secondary-metric" key={metric.label}>
+              <article className="secondary-metric" key={metric.id}>
                 <header className="secondary-metric-heading">
                   <h3>{metric.label}</h3>
                   <span
@@ -159,6 +168,7 @@ export function Dashboard({ data }: DashboardProps) {
                 <Link
                   className="focus-card-link"
                   href={`/problems/${problem.id}`}
+                  aria-label={`查看${problem.title}详情`}
                 >
                   查看详情
                   <ArrowRight aria-hidden="true" />
