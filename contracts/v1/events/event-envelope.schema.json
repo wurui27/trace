@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/events/event-envelope.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "event_id", "event_type", "subject_type", "subject_id"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "event_id": {"type": "string", "format": "uuid"},
+    "event_type": {
+      "enum": ["analysis_queued", "sample_validation_requested", "analysis_requested"]
+    },
+    "subject_type": {"enum": ["analysis", "scenario_job", "sample_attempt"]},
+    "subject_id": {"type": "string", "format": "uuid"}
+  }
+}

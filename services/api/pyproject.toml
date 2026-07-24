@@ -1,0 +1,28 @@
+[project]
+name = "perfpilot-api"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+  "alembic>=1.18.5,<1.19",
+  "argon2-cffi>=25.1,<26",
+  "boto3>=1.43.51,<1.44",
+  "cryptography>=48.0.1,<49",
+  "fastapi[standard]>=0.139.2,<0.140",
+  "psycopg[binary]>=3.3.4,<3.4",
+  "pydantic>=2.13.4,<2.14",
+  "pydantic-settings>=2.12,<3",
+  "redis[hiredis]>=8.0.1,<8.1",
+  "sqlalchemy[asyncio]>=2.0.51,<2.1",
+]
+
+[project.scripts]
+perfpilot-api = "perfpilot_api.main:run"
+perfpilot-admin = "perfpilot_api.cli:main"
+perfpilot-provisioner = "perfpilot_api.workers.provisioner:main"
+perfpilot-dispatcher = "perfpilot_api.workers.dispatcher:main"
+perfpilot-scheduler = "perfpilot_api.workers.scheduler:main"
+perfpilot-reconciler = "perfpilot_api.workers.reconciler:main"
+
+[build-system]
+requires = ["uv_build>=0.11.25,<0.12"]
+build-backend = "uv_build"

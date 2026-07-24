@@ -1,0 +1,8 @@
+{
+  "schema_version": "1.0",
+  "error": {
+    "code": "example_failure",
+    "message": "用于验证缺少 request_id 的无效载荷",
+    "retryable": false
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0",
+  "event_id": "10000000-0000-4000-8000-000000000001",
+  "event_type": "analysis_queued",
+  "subject_type": "analysis",
+  "subject_id": "20000000-0000-4000-8000-000000000001"
+}
