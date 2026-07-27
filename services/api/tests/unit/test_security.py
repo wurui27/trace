@@ -1,0 +1,491 @@
+import base64
+import hashlib
+import re
+from http.cookies import SimpleCookie
+
+import pytest
+from starlette.responses import Response
+
+import perfpilot_api.security.csrf as csrf_security
+import perfpilot_api.security.proxy_signature as proxy_security
+import perfpilot_api.security.sessions as session_security
+from perfpilot_api.security.passwords import (
+    hash_password,
+    normalize_username,
+    verify_password,
+)
+
+_URLSAFE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
+
+
+def test_username_normalization_uses_nfkc_strip_and_casefold() -> None:
+    assert normalize_username("  ＲＡＹ_ＷＵ  ") == "ray_wu"
+    assert normalize_username("  Straße  ") == "strasse"
+
+
+def test_argon2_password_hashes_are_salted_and_verify() -> None:
+    password = "correct horse battery staple"
+
+    first_hash = hash_password(password)
+    second_hash = hash_password(password)
+
+    assert first_hash.startswith("$argon2id$")
+    assert first_hash != second_hash
+    assert password not in first_hash
+    assert verify_password(first_hash, password) is True
+    assert verify_password(first_hash, "wrong password") is False
+
+
+def test_password_verification_rejects_malformed_hash_without_leaking_secret() -> None:
+    secret = "password-value-that-must-not-leak"
+
+    assert verify_password("not-an-argon2-hash", secret) is False
+    assert secret not in repr(verify_password)
+
+
+@pytest.mark.parametrize(
+    ("generate", "digest", "verify"),
+    [
+        (
+            session_security.generate_session_token,
+            session_security.digest_session_token,
+            session_security.verify_session_token,
+        ),
+        (
+            csrf_security.generate_csrf_token,
+            csrf_security.digest_csrf_token,
+            csrf_security.verify_csrf_token,
+        ),
+    ],
+    ids=["session", "csrf"],
+)
+def test_session_and_csrf_tokens_are_32_random_urlsafe_bytes(
+    generate: object,
+    digest: object,
+    verify: object,
+) -> None:
+    first = generate()
+    second = generate()
+
+    assert first != second
+    assert _URLSAFE_TOKEN_PATTERN.fullmatch(first)
+    assert len(base64.urlsafe_b64decode(first + "=")) == 32
+    expected_digest = hashlib.sha256(first.encode("ascii")).hexdigest()
+    assert digest(first) == expected_digest
+    assert verify(first, expected_digest) is True
+    assert verify(second, expected_digest) is False
+
+
+def test_session_cookie_is_secure_host_only_and_can_be_cleared() -> None:
+    response = Response()
+    session_security.set_session_cookie(response, "session-token", max_age=3600)
+
+    cookie = SimpleCookie()
+    cookie.load(response.headers["set-cookie"])
+    session_cookie = cookie[session_security.COOKIE_NAME]
+    assert session_cookie.value == "session-token"
+    assert session_cookie["max-age"] == "3600"
+    assert session_cookie["path"] == "/"
+    assert session_cookie["secure"] is True
+    assert session_cookie["httponly"] is True
+    assert session_cookie["samesite"].casefold() == "lax"
+    assert session_cookie["domain"] == ""
+
+    clear_response = Response()
+    session_security.clear_session_cookie(clear_response)
+    cleared = SimpleCookie()
+    cleared.load(clear_response.headers["set-cookie"])
+    cleared_cookie = cleared[session_security.COOKIE_NAME]
+    assert cleared_cookie.value == ""
+    assert cleared_cookie["max-age"] == "0"
+    assert cleared_cookie["expires"]
+    assert cleared_cookie["path"] == "/"
+    assert cleared_cookie["secure"] is True
+    assert cleared_cookie["httponly"] is True
+    assert cleared_cookie["samesite"].casefold() == "lax"
+    assert cleared_cookie["domain"] == ""
+
+
+def test_origin_allowlist_uses_strict_canonical_origin_matching() -> None:
+    allowed_origins = ["https://app.example/", "http://127.0.0.1:3000"]
+
+    assert csrf_security.is_allowed_origin("https://app.example", allowed_origins)
+    assert csrf_security.is_allowed_origin("https://APP.EXAMPLE:443", allowed_origins)
+    assert csrf_security.is_allowed_origin("http://127.0.0.1:3000", allowed_origins)
+
+    for rejected_origin in (
+        None,
+        "null",
+        "https://app.example.evil",
+        "https://app.example/path",
+        "https://user@app.example",
+        "http://app.example",
+        "https://app.example, https://evil.example",
+    ):
+        assert not csrf_security.is_allowed_origin(rejected_origin, allowed_origins)
+
+
+def test_origin_error_does_not_echo_an_untrusted_origin() -> None:
+    untrusted_origin = "https://url-secret-marker.example"
+
+    with pytest.raises(csrf_security.OriginNotAllowedError) as exc_info:
+        csrf_security.require_allowed_origin(
+            untrusted_origin,
+            ["https://app.example"],
+        )
+
+    assert "url-secret-marker" not in str(exc_info.value)
+    assert "url-secret-marker" not in repr(exc_info.value)
+
+
+def test_proxy_signature_matches_the_exact_raw_request_contract() -> None:
+    secret = b"proxy-secret-value"
+    timestamp = 1_700_000_000
+    request_id = "req.proxy:1"
+    raw_path = b"/v1/teams/team%2Fid/analyses"
+    raw_query = b"b=two%20words&a=1"
+    body = b'{"mode":"device"}'
+    path_and_query = raw_path + b"?" + raw_query
+    body_sha256 = hashlib.sha256(body).hexdigest().encode("ascii")
+    canonical = b"\n".join(
+        (
+            str(timestamp).encode("ascii"),
+            request_id.encode("ascii"),
+            b"POST",
+            path_and_query,
+            body_sha256,
+        )
+    )
+    expected = base64.urlsafe_b64encode(
+        __import__("hmac").new(secret, canonical, hashlib.sha256).digest()
+    ).rstrip(b"=").decode("ascii")
+
+    signature = proxy_security.sign_proxy_request(
+        secret,
+        timestamp=timestamp,
+        request_id=request_id,
+        method="post",
+        raw_path=raw_path,
+        raw_query=raw_query,
+        body=body,
+    )
+
+    assert signature == expected
+    assert "=" not in signature
+    assert signature != proxy_security.sign_proxy_request(
+        secret,
+        timestamp=timestamp,
+        request_id=request_id,
+        method="post",
+        raw_path=raw_path,
+        raw_query=b"a=1&b=two%20words",
+        body=body,
+    )
+
+
+def test_proxy_client_identity_uses_separate_domain_bound_attestation() -> None:
+    secret = b"proxy-secret-value"
+    timestamp = 1_700_000_000
+    request_id = "req-client-identity"
+    canonical_ip = "2001:db8::1"
+    expected_client_id = base64.urlsafe_b64encode(
+        __import__("hmac").new(
+            secret,
+            f"perfpilot-client-id-v1\n{canonical_ip}".encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+    ).rstrip(b"=").decode("ascii")
+    expected_attestation = base64.urlsafe_b64encode(
+        __import__("hmac").new(
+            secret,
+            (
+                "perfpilot-client-attestation-v1\n"
+                f"{timestamp}\n{request_id}\n{expected_client_id}"
+            ).encode("ascii"),
+            hashlib.sha256,
+        ).digest()
+    ).rstrip(b"=").decode("ascii")
+
+    identity = proxy_security.sign_proxy_client_identity(
+        secret,
+        client_address="2001:0DB8:0:0:0:0:0:1",
+        timestamp=timestamp,
+        request_id=request_id,
+    )
+
+    assert identity == f"{expected_client_id}.{expected_attestation}"
+    assert proxy_security.verify_proxy_client_identity(
+        secret,
+        identity_header=identity,
+        timestamp_header=str(timestamp),
+        request_id_header=request_id,
+    ) == expected_client_id
+    assert proxy_security.sign_proxy_request(
+        secret,
+        timestamp=timestamp,
+        request_id=request_id,
+        method="GET",
+        raw_path=b"/v1/me",
+    ) == proxy_security.sign_proxy_request(
+        secret,
+        timestamp=timestamp,
+        request_id=request_id,
+        method="GET",
+        raw_path=b"/v1/me",
+    )
+
+
+@pytest.mark.parametrize(
+    ("timestamp_header", "request_id_header", "mutate_identity"),
+    [
+        ("1700000001", "req-client-identity", False),
+        ("1700000000", "req-client-identity-other", False),
+        ("1700000000", "req-client-identity", True),
+        (None, "req-client-identity", False),
+    ],
+)
+def test_proxy_client_identity_rejects_tampering_or_rebinding(
+    timestamp_header: str | None,
+    request_id_header: str,
+    mutate_identity: bool,
+) -> None:
+    secret = b"proxy-secret-value"
+    identity = proxy_security.sign_proxy_client_identity(
+        secret,
+        client_address="198.51.100.10",
+        timestamp=1_700_000_000,
+        request_id="req-client-identity",
+    )
+    if mutate_identity:
+        identity = f"{'a' if identity[0] != 'a' else 'b'}{identity[1:]}"
+
+    with pytest.raises(proxy_security.InvalidProxyClientIdentityError):
+        proxy_security.verify_proxy_client_identity(
+            secret,
+            identity_header=identity,
+            timestamp_header=timestamp_header,
+            request_id_header=request_id_header,
+        )
+
+
+@pytest.mark.parametrize(
+    "client_address",
+    ["198.51.100.1:443", " 198.51.100.1", "fe80::1%eth0", "not-an-ip"],
+)
+def test_proxy_client_identity_signer_requires_canonicalizable_ip(
+    client_address: str,
+) -> None:
+    with pytest.raises(ValueError, match="invalid client address"):
+        proxy_security.sign_proxy_client_identity(
+            b"proxy-secret-value",
+            client_address=client_address,
+            timestamp=1_700_000_000,
+            request_id="req-client-identity",
+        )
+
+
+@pytest.mark.asyncio
+async def test_proxy_verification_accepts_fresh_signature_once() -> None:
+    timestamp = 1_700_000_000
+    secret = b"proxy-secret-value"
+    replay_store = proxy_security.InMemoryReplayStore(clock=lambda: float(timestamp))
+    signature = proxy_security.sign_proxy_request(
+        secret,
+        timestamp=timestamp,
+        request_id="req-replay",
+        method="GET",
+        raw_path=b"/v1/me",
+        raw_query=b"",
+        body=b"",
+    )
+
+    result = await proxy_security.verify_proxy_request(
+        secret,
+        timestamp_header=str(timestamp),
+        request_id_header="req-replay",
+        signature_header=signature,
+        method="GET",
+        raw_path=b"/v1/me",
+        raw_query=b"",
+        body=b"",
+        replay_store=replay_store,
+        clock=lambda: float(timestamp),
+    )
+
+    assert result is None
+    with pytest.raises(proxy_security.ProxyReplayError):
+        await proxy_security.verify_proxy_request(
+            secret,
+            timestamp_header=str(timestamp),
+            request_id_header="req-replay",
+            signature_header=signature,
+            method="GET",
+            raw_path=b"/v1/me",
+            raw_query=b"",
+            body=b"",
+            replay_store=replay_store,
+            clock=lambda: float(timestamp),
+        )
+
+
+@pytest.mark.asyncio
+async def test_proxy_timestamp_accepts_60_seconds_and_rejects_61() -> None:
+    now = 1_700_000_000
+    secret = b"proxy-secret-value"
+
+    for timestamp in (now - 60, now + 60):
+        request_id = f"req-{timestamp}"
+        signature = proxy_security.sign_proxy_request(
+            secret,
+            timestamp=timestamp,
+            request_id=request_id,
+            method="GET",
+            raw_path=b"/v1/me",
+        )
+        await proxy_security.verify_proxy_request(
+            secret,
+            timestamp_header=str(timestamp),
+            request_id_header=request_id,
+            signature_header=signature,
+            method="GET",
+            raw_path=b"/v1/me",
+            replay_store=proxy_security.InMemoryReplayStore(clock=lambda: float(now)),
+            clock=lambda: float(now),
+        )
+
+    for timestamp in (now - 61, now + 61):
+        request_id = f"req-{timestamp}"
+        signature = proxy_security.sign_proxy_request(
+            secret,
+            timestamp=timestamp,
+            request_id=request_id,
+            method="GET",
+            raw_path=b"/v1/me",
+        )
+        with pytest.raises(proxy_security.StaleProxySignatureError):
+            await proxy_security.verify_proxy_request(
+                secret,
+                timestamp_header=str(timestamp),
+                request_id_header=request_id,
+                signature_header=signature,
+                method="GET",
+                raw_path=b"/v1/me",
+                replay_store=proxy_security.InMemoryReplayStore(
+                    clock=lambda: float(now)
+                ),
+                clock=lambda: float(now),
+            )
+
+
+@pytest.mark.parametrize(
+    ("header_name", "invalid_value"),
+    [
+        ("timestamp_header", None),
+        ("timestamp_header", " 1700000000"),
+        ("timestamp_header", "+1700000000"),
+        ("request_id_header", None),
+        ("request_id_header", "unsafe request id"),
+        ("request_id_header", "a" * 129),
+        ("signature_header", None),
+        ("signature_header", "not-base64="),
+    ],
+)
+@pytest.mark.asyncio
+async def test_proxy_verification_rejects_invalid_headers(
+    header_name: str,
+    invalid_value: str | None,
+) -> None:
+    timestamp = 1_700_000_000
+    secret = b"proxy-secret-value"
+    request_id = "req-valid"
+    signature = proxy_security.sign_proxy_request(
+        secret,
+        timestamp=timestamp,
+        request_id=request_id,
+        method="GET",
+        raw_path=b"/v1/me",
+    )
+    headers: dict[str, str | None] = {
+        "timestamp_header": str(timestamp),
+        "request_id_header": request_id,
+        "signature_header": signature,
+    }
+    headers[header_name] = invalid_value
+
+    with pytest.raises(proxy_security.InvalidProxySignatureError):
+        await proxy_security.verify_proxy_request(
+            secret,
+            timestamp_header=headers["timestamp_header"],
+            request_id_header=headers["request_id_header"],
+            signature_header=headers["signature_header"],
+            method="GET",
+            raw_path=b"/v1/me",
+            replay_store=proxy_security.InMemoryReplayStore(
+                clock=lambda: float(timestamp)
+            ),
+            clock=lambda: float(timestamp),
+        )
+
+
+@pytest.mark.asyncio
+async def test_invalid_proxy_signature_error_does_not_leak_request_material() -> None:
+    timestamp = 1_700_000_000
+    secret = b"proxy-secret-marker"
+    signature = "a" * 43
+
+    with pytest.raises(proxy_security.InvalidProxySignatureError) as exc_info:
+        await proxy_security.verify_proxy_request(
+            secret,
+            timestamp_header=str(timestamp),
+            request_id_header="req-secret-marker",
+            signature_header=signature,
+            method="POST",
+            raw_path=b"/url-secret-marker",
+            body=b"body-secret-marker",
+            replay_store=proxy_security.InMemoryReplayStore(
+                clock=lambda: float(timestamp)
+            ),
+            clock=lambda: float(timestamp),
+        )
+
+    rendered_error = f"{exc_info.value!s} {exc_info.value!r}"
+    assert "secret-marker" not in rendered_error
+    assert signature not in rendered_error
+
+
+@pytest.mark.asyncio
+async def test_in_memory_replay_store_uses_injected_clock_for_expiry() -> None:
+    current_time = [100.0]
+    store = proxy_security.InMemoryReplayStore(clock=lambda: current_time[0])
+
+    assert await store.reserve("req-id", ttl_seconds=10) is True
+    assert await store.reserve("req-id", ttl_seconds=10) is False
+    current_time[0] = 111.0
+    assert await store.reserve("req-id", ttl_seconds=10) is True
+
+
+@pytest.mark.asyncio
+async def test_redis_replay_store_uses_atomic_set_nx_ex_without_network() -> None:
+    class FakeRedis:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str, bool, int]] = []
+            self.result: bool | None = True
+
+        async def set(
+            self,
+            name: str,
+            value: str,
+            *,
+            nx: bool,
+            ex: int,
+        ) -> bool | None:
+            self.calls.append((name, value, nx, ex))
+            return self.result
+
+    redis = FakeRedis()
+    store = proxy_security.RedisReplayStore(redis, key_prefix="test:proxy:")
+
+    assert await store.reserve("req-id", ttl_seconds=121) is True
+    assert redis.calls == [("test:proxy:req-id", "1", True, 121)]
+    redis.result = None
+    assert await store.reserve("req-id", ttl_seconds=121) is False

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/auth/me-response.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "user", "memberships"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "user": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "username", "is_platform_admin"],
+      "properties": {
+        "id": {"type": "string", "format": "uuid"},
+        "username": {"type": "string", "minLength": 1, "maxLength": 128},
+        "is_platform_admin": {"type": "boolean"}
+      }
+    },
+    "memberships": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "team", "role"],
+        "properties": {
+          "id": {"type": "string", "format": "uuid"},
+          "team": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "name"],
+            "properties": {
+              "id": {"type": "string", "format": "uuid"},
+              "name": {"type": "string", "minLength": 1, "maxLength": 200}
+            }
+          },
+          "role": {
+            "enum": ["team_owner", "team_member", "team_viewer"]
+          }
+        }
+      }
+    }
+  }
+}
