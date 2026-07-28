@@ -450,6 +450,52 @@ def test_tenant_schema_enforces_required_uniqueness(
     )
 
 
+def test_tenant_artifact_upload_schema_enforces_immutable_slot_invariants(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("tenant", migration_databases.tenant_url)
+    tenant_inspector = inspect(migration_databases.tenant_engine)
+
+    artifact_columns = {
+        column["name"]: column for column in tenant_inspector.get_columns("artifacts")
+    }
+    assert artifact_columns["idempotency_key"]["nullable"] is True
+    assert artifact_columns["request_hash"]["nullable"] is True
+
+    artifact_checks = {
+        constraint["name"]: _normalize_postgresql_predicate(constraint["sqltext"])
+        for constraint in tenant_inspector.get_check_constraints("artifacts")
+    }
+    assert artifact_checks["ck_artifacts_idempotency_pair"] == (
+        "idempotency_keyisnullandrequest_hashisnullor"
+        "idempotency_keyisnotnullandrequest_hashisnotnull"
+    )
+    assert artifact_checks["ck_artifacts_request_hash"] == (
+        "request_hashisnullorrequest_hash~'^[0-9a-f]{64}$'"
+    )
+    assert artifact_checks["ck_artifacts_state_metadata"] == (
+        "state<>'pending'orversion_idisnullandfinalized_atisnulland"
+        "state<>'finalized'orversion_idisnotnullandfinalized_atisnotnull"
+    )
+
+    assert ("object_key",) in _unique_column_sets(tenant_inspector, "artifacts")
+
+    analysis_idempotency_index = next(
+        index
+        for index in tenant_inspector.get_indexes("artifacts")
+        if index["name"] == "uq_artifacts_analysis_idempotency"
+    )
+    assert analysis_idempotency_index["unique"] is True
+    assert analysis_idempotency_index["column_names"] == [
+        "analysis_id",
+        "idempotency_key",
+    ]
+    analysis_idempotency_where = analysis_idempotency_index["dialect_options"]["postgresql_where"]
+    assert _normalize_postgresql_predicate(analysis_idempotency_where) == (
+        "analysis_idisnotnullandidempotency_keyisnotnull"
+    )
+
+
 def test_partial_indexes_enforce_active_leases_and_ready_outbox_dispatch(
     migration_databases: MigrationDatabases,
 ) -> None:

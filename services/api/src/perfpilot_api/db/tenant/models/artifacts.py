@@ -9,6 +9,7 @@ from sqlalchemy import (
     Index,
     String,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -30,6 +31,7 @@ class Artifact(
     __tablename__ = "artifacts"
     __table_args__ = (
         UniqueConstraint("upload_id", name="uq_artifacts_upload_id"),
+        UniqueConstraint("object_key", name="uq_artifacts_object_key"),
         UniqueConstraint("object_key", "version_id", name="uq_artifacts_object_version"),
         CheckConstraint(
             "num_nonnulls(application_version_id, analysis_id, scenario_result_id, "
@@ -41,12 +43,33 @@ class Artifact(
             name="ck_artifacts_state",
         ),
         CheckConstraint("size_bytes >= 0", name="ck_artifacts_size_nonnegative"),
+        CheckConstraint(
+            "(idempotency_key IS NULL AND request_hash IS NULL) OR "
+            "(idempotency_key IS NOT NULL AND request_hash IS NOT NULL)",
+            name="ck_artifacts_idempotency_pair",
+        ),
+        CheckConstraint(
+            "request_hash IS NULL OR request_hash ~ '^[0-9a-f]{64}$'",
+            name="ck_artifacts_request_hash",
+        ),
+        CheckConstraint(
+            "(state <> 'pending' OR (version_id IS NULL AND finalized_at IS NULL)) AND "
+            "(state <> 'finalized' OR (version_id IS NOT NULL AND finalized_at IS NOT NULL))",
+            name="ck_artifacts_state_metadata",
+        ),
         CheckConstraint("version > 0", name="ck_artifacts_version_positive"),
         Index("ix_artifacts_application_version_id", "application_version_id"),
         Index("ix_artifacts_analysis_id", "analysis_id"),
         Index("ix_artifacts_scenario_result_id", "scenario_result_id"),
         Index("ix_artifacts_sample_attempt_id", "sample_attempt_id"),
         Index("ix_artifacts_state_expires", "state", "expires_at"),
+        Index(
+            "uq_artifacts_analysis_idempotency",
+            "analysis_id",
+            "idempotency_key",
+            unique=True,
+            postgresql_where=text("analysis_id IS NOT NULL AND idempotency_key IS NOT NULL"),
+        ),
     )
 
     application_version_id: Mapped[UUID | None] = mapped_column(
@@ -66,6 +89,8 @@ class Artifact(
         ForeignKey("sample_attempts.id", ondelete="CASCADE"),
     )
     upload_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    idempotency_key: Mapped[str | None] = mapped_column(String(255))
+    request_hash: Mapped[str | None] = mapped_column(String(64))
     artifact_kind: Mapped[str] = mapped_column(String(96), nullable=False)
     mime_type: Mapped[str] = mapped_column(String(255), nullable=False)
     size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)

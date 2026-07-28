@@ -1,3 +1,4 @@
+import asyncio
 import re
 import secrets
 import time
@@ -20,6 +21,7 @@ from perfpilot_api.api.admin_teams import router as admin_teams_router
 from perfpilot_api.api.health import router as health_router
 from perfpilot_api.api.me import router as me_router
 from perfpilot_api.api.members import router as members_router
+from perfpilot_api.api.uploads import router as uploads_router
 from perfpilot_api.config import Settings, get_settings
 from perfpilot_api.db.control.session import (
     create_control_engine,
@@ -37,15 +39,30 @@ from perfpilot_api.security.proxy_signature import (
     RedisReplayStore,
     ReplayStore,
 )
+from perfpilot_api.runtime.artifacts import ArtifactRuntime, build_artifact_runtime
 from perfpilot_api.services.auth import (
     AuthService,
     RedisLoginRateLimiter,
     RedisPreAuthSessionLimiter,
 )
 from perfpilot_api.services.provisioning import AdminTeamService
+from perfpilot_api.services.uploads import UploadService
 
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
+_CONTROL_FLOW_EXCEPTIONS = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+
+
+def _prefer_control_flow_error(
+    first_error: BaseException | None,
+    error: BaseException,
+) -> BaseException:
+    if first_error is None or (
+        isinstance(error, _CONTROL_FLOW_EXCEPTIONS)
+        and not isinstance(first_error, _CONTROL_FLOW_EXCEPTIONS)
+    ):
+        return error
+    return first_error
 
 
 def _transport_client_address(request: Request) -> str:
@@ -116,6 +133,7 @@ def create_app(
     settings_override: Settings | None = None,
     auth_service: AuthService | None = None,
     admin_team_service: AdminTeamService | None = None,
+    upload_service: UploadService | None = None,
     replay_store: ReplayStore | None = None,
     proxy_clock: Callable[[], float] = time.time,
     client_address_resolver: Callable[[Request], str] | None = None,
@@ -134,21 +152,31 @@ def create_app(
 
     owned_engine = None
     owned_redis = None
+    owned_artifact_runtime: ArtifactRuntime | None = None
+    control_session_factory = None
     resolved_auth_service = auth_service
     resolved_admin_team_service = admin_team_service
+    resolved_upload_service = upload_service
     resolved_replay_store = replay_store
+    artifact_runtime_required = (
+        not testing and settings.app_env == "production" and resolved_upload_service is None
+    )
     if not testing and (resolved_auth_service is None or resolved_replay_store is None):
         owned_redis = redis.from_url(settings.redis_url.get_secret_value())
         if resolved_replay_store is None:
             resolved_replay_store = RedisReplayStore(owned_redis)
-    if not testing and (resolved_auth_service is None or resolved_admin_team_service is None):
+    if not testing and (
+        resolved_auth_service is None
+        or resolved_admin_team_service is None
+        or artifact_runtime_required
+    ):
         owned_engine = create_control_engine(settings.control_database_url.get_secret_value())
-        session_factory = create_control_session_factory(owned_engine)
+        control_session_factory = create_control_session_factory(owned_engine)
         if resolved_auth_service is None:
             if owned_redis is None:
                 raise RuntimeError("Redis authentication dependencies are unavailable")
             resolved_auth_service = AuthService(
-                session_factory=session_factory,
+                session_factory=control_session_factory,
                 rate_limiter=RedisLoginRateLimiter(
                     owned_redis,
                     key_secret=settings.session_secret.get_secret_value().encode(),
@@ -162,24 +190,54 @@ def create_app(
             )
         if resolved_admin_team_service is None:
             resolved_admin_team_service = AdminTeamService(
-                session_factory=session_factory,
+                session_factory=control_session_factory,
             )
 
     @asynccontextmanager
-    async def lifespan(_: FastAPI) -> AsyncIterator[None]:
+    async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
+        nonlocal owned_artifact_runtime, resolved_upload_service
+        lifespan_error: BaseException | None = None
         try:
+            if artifact_runtime_required:
+                if control_session_factory is None:
+                    raise RuntimeError("Artifact runtime dependencies are unavailable")
+                owned_artifact_runtime = await build_artifact_runtime(
+                    settings=settings,
+                    control_session_factory=control_session_factory,
+                )
+                resolved_upload_service = owned_artifact_runtime.upload_service
+                lifespan_app.state.upload_service = resolved_upload_service
             yield
+        except BaseException as error:
+            lifespan_error = error
         finally:
-            if owned_redis is not None:
-                await owned_redis.aclose()
-            if owned_engine is not None:
-                await owned_engine.dispose()
+            cleanup_error: BaseException | None = None
+            cleanup_steps = (
+                owned_artifact_runtime.close if owned_artifact_runtime is not None else None,
+                owned_redis.aclose if owned_redis is not None else None,
+                owned_engine.dispose if owned_engine is not None else None,
+            )
+            for cleanup in cleanup_steps:
+                if cleanup is None:
+                    continue
+                try:
+                    await cleanup()
+                except BaseException as error:
+                    cleanup_error = _prefer_control_flow_error(cleanup_error, error)
+            failure = lifespan_error
+            if cleanup_error is not None:
+                failure = _prefer_control_flow_error(failure, cleanup_error)
+            if failure is not None:
+                if failure is lifespan_error or isinstance(failure, _CONTROL_FLOW_EXCEPTIONS):
+                    raise failure
+                raise RuntimeError("Application dependency cleanup failed") from None
 
     app = FastAPI(lifespan=lifespan)
     app.state.testing = testing
     app.state.settings = settings
     app.state.auth_service = resolved_auth_service
     app.state.admin_team_service = resolved_admin_team_service
+    app.state.upload_service = resolved_upload_service
     app.state.proxy_replay_store = resolved_replay_store or InMemoryReplayStore(clock=proxy_clock)
     app.state.proxy_clock = proxy_clock
     identity_required = (
@@ -204,6 +262,7 @@ def create_app(
     app.include_router(admin_teams_router)
     app.include_router(me_router)
     app.include_router(members_router)
+    app.include_router(uploads_router)
     return app
 
 

@@ -3,10 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import importlib
-import json
+import inspect
 import os
 import re
-import stat
+import threading
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, Protocol
@@ -24,6 +24,11 @@ from perfpilot_api.db.tenant.router import (
     SqlAlchemyTenantRouteRepository,
     TenantClusterEndpoint,
     TenantRouter,
+)
+from perfpilot_api.runtime.artifacts import create_s3_client
+from perfpilot_api.runtime.secrets import (
+    build_configured_secret_store,
+    read_owner_only_file,
 )
 from perfpilot_api.secrets.encrypted_file import EncryptedFileSecretStore
 from perfpilot_api.services.provisioning import (
@@ -56,6 +61,7 @@ _ALLOWED_TENANT_ADMIN_CONNINFO_KEYS = frozenset(
 )
 _REQUIRED_TENANT_ADMIN_CONNINFO_KEYS = frozenset({"dbname", "host", "sslmode", "user"})
 _INVALID_TENANT_ADMIN_CONNINFO = "tenant admin connection configuration is invalid"
+_CONTROL_FLOW_EXCEPTIONS = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
 
 
 class _Provisioner(Protocol):
@@ -64,6 +70,52 @@ class _Provisioner(Protocol):
         *,
         worker_id: str,
     ) -> TenantResourceRecord | None: ...
+
+
+def _prefer_control_flow_error(
+    first_error: BaseException | None,
+    error: BaseException,
+) -> BaseException:
+    if first_error is None or (
+        isinstance(error, _CONTROL_FLOW_EXCEPTIONS)
+        and not isinstance(first_error, _CONTROL_FLOW_EXCEPTIONS)
+    ):
+        return error
+    return first_error
+
+
+async def _close_callbacks(callbacks: tuple[Any, ...]) -> BaseException | None:
+    first_error: BaseException | None = None
+    for callback in reversed(callbacks):
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException as error:
+            first_error = _prefer_control_flow_error(first_error, error)
+    return first_error
+
+
+def _close_callbacks_blocking(callbacks: tuple[Any, ...]) -> BaseException | None:
+    if not callbacks:
+        return None
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(_close_callbacks(callbacks))
+
+    outcome: list[BaseException | None] = []
+
+    def close_in_thread() -> None:
+        try:
+            outcome.append(asyncio.run(_close_callbacks(callbacks)))
+        except BaseException as error:
+            outcome.append(error)
+
+    cleanup_thread = threading.Thread(target=close_in_thread)
+    cleanup_thread.start()
+    cleanup_thread.join()
+    return outcome[0] if outcome else RuntimeError("provisioner cleanup failed")
 
 
 class ProvisionerWorker:
@@ -112,36 +164,16 @@ class ProvisionerWorker:
                 pass
 
     async def close(self) -> None:
-        for callback in reversed(self._close_callbacks):
-            result = callback()
-            if hasattr(result, "__await__"):
-                await result
+        failure = await _close_callbacks(self._close_callbacks)
+        if failure is None:
+            return
+        if isinstance(failure, _CONTROL_FLOW_EXCEPTIONS):
+            raise failure
+        raise RuntimeError("provisioner cleanup failed") from None
 
 
 def _read_owner_only_file(path: Path) -> bytes:
-    descriptor = -1
-    try:
-        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
-        details = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(details.st_mode)
-            or (hasattr(os, "geteuid") and details.st_uid != os.geteuid())
-            or stat.S_IMODE(details.st_mode) not in {0o400, 0o600}
-        ):
-            raise RuntimeError("provisioner secret file permissions are invalid")
-        chunks: list[bytes] = []
-        size = 0
-        while True:
-            chunk = os.read(descriptor, 64 * 1024)
-            if not chunk:
-                return b"".join(chunks)
-            chunks.append(chunk)
-            size += len(chunk)
-            if size > 1024 * 1024:
-                raise RuntimeError("provisioner secret file is too large")
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
+    return read_owner_only_file(path)
 
 
 def _required_environment(name: str) -> str:
@@ -252,28 +284,20 @@ def _load_factory(reference: str) -> Any:
 
 
 def _build_configured_secret_store() -> EncryptedFileSecretStore:
-    keyring_path = Path(_required_environment("PERFPILOT_SECRET_KEYRING_CONFIG"))
-    try:
-        keyring_config = json.loads(_read_owner_only_file(keyring_path))
-        active_key_id = keyring_config["active_key_id"]
-        raw_keys = keyring_config["keys"]
-        if (
-            not isinstance(active_key_id, str)
-            or not isinstance(raw_keys, dict)
-            or not raw_keys
-            or any(
-                not isinstance(key_id, str) or not isinstance(key_path, str)
-                for key_id, key_path in raw_keys.items()
-            )
-        ):
-            raise ValueError
-        key_files = {key_id: Path(key_path) for key_id, key_path in raw_keys.items()}
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise RuntimeError("secret keyring configuration is invalid") from exc
-    return EncryptedFileSecretStore(
-        Path(_required_environment("PERFPILOT_SECRET_STORE_ROOT")),
-        key_files=key_files,
-        active_key_id=active_key_id,
+    settings = get_settings()
+    keyring_config = getattr(settings, "secret_keyring_config", None)
+    secret_store_root = getattr(settings, "secret_store_root", None)
+    return build_configured_secret_store(
+        keyring_config=(
+            Path(keyring_config)
+            if keyring_config is not None
+            else Path(_required_environment("PERFPILOT_SECRET_KEYRING_CONFIG"))
+        ),
+        secret_store_root=(
+            Path(secret_store_root)
+            if secret_store_root is not None
+            else Path(_required_environment("PERFPILOT_SECRET_STORE_ROOT"))
+        ),
     )
 
 
@@ -303,66 +327,105 @@ def build_production_worker() -> ProvisionerWorker:
         raise RuntimeError("provisioner requires a production environment")
     worker_id = _required_environment("PERFPILOT_PROVISIONER_WORKER_ID")
     sites_origin = _required_environment("PERFPILOT_SITES_ORIGIN")
-    cluster_host = _required_environment("PERFPILOT_TENANT_CLUSTER_HOST")
-    cluster_port = int(os.getenv("PERFPILOT_TENANT_CLUSTER_PORT", "5432"))
-    cluster_sslmode = os.getenv("PERFPILOT_TENANT_CLUSTER_SSLMODE", "verify-full")
+    cluster_host = getattr(settings, "tenant_cluster_host", None) or _required_environment(
+        "PERFPILOT_TENANT_CLUSTER_HOST"
+    )
+    configured_cluster_port = getattr(settings, "tenant_cluster_port", None)
+    cluster_port = (
+        configured_cluster_port
+        if configured_cluster_port is not None
+        else int(os.getenv("PERFPILOT_TENANT_CLUSTER_PORT", "5432"))
+    )
+    cluster_sslmode = getattr(settings, "tenant_cluster_sslmode", None) or os.getenv(
+        "PERFPILOT_TENANT_CLUSTER_SSLMODE", "verify-full"
+    )
     if cluster_sslmode != "verify-full":
         raise RuntimeError("production tenant cluster SSL mode must be verify-full")
     admin_conninfo_path = Path(_required_environment("PERFPILOT_TENANT_ADMIN_CONNINFO_FILE"))
     admin_conninfo = _validate_tenant_admin_conninfo(_read_owner_only_file(admin_conninfo_path))
 
-    secret_store = _build_configured_secret_store()
+    secret_store: EncryptedFileSecretStore | None = None
+    control_engine: Any | None = None
+    tenant_router: Any | None = None
+    s3_client: Any | None = None
+    worker: ProvisionerWorker | None = None
+    build_failure: BaseException | None = None
+    try:
+        secret_store = _build_configured_secret_store()
+        control_engine = create_control_engine(settings.control_database_url.get_secret_value())
+        session_factory = create_control_session_factory(control_engine)
+        repository = SqlAlchemyProvisioningRepository(session_factory=session_factory)
+        route_repository = SqlAlchemyTenantRouteRepository(session_factory=session_factory)
+        cluster = TenantClusterEndpoint(
+            host=cluster_host,
+            port=cluster_port,
+            sslmode=cluster_sslmode,
+        )
+        tenant_router = TenantRouter(
+            control_resources=route_repository,
+            secret_store=secret_store,
+            cluster=cluster,
+        )
+        postgres = PsycopgTenantAdmin(admin_conninfo=admin_conninfo)
+        migrator = AlembicTenantMigrator(
+            migration_root=Path(__file__).resolve().parents[3] / "migrations" / "tenant",
+            cluster_host=cluster_host,
+            cluster_port=cluster_port,
+            sslmode=cluster_sslmode,
+        )
+        s3_client = create_s3_client(settings=settings, client_factory=boto3.client)
+        bucket_admin = S3BucketAdmin(client=s3_client)
+        replicator = _build_tenant_replicator(
+            cluster_host=cluster_host,
+            cluster_port=cluster_port,
+            sslmode=cluster_sslmode,
+        )
+        provisioner = Provisioner(
+            repository=repository,
+            postgres=postgres,
+            secret_store=secret_store,
+            migrator=migrator,
+            bucket_admin=bucket_admin,
+            tenant_router=tenant_router,
+            replicator=replicator,
+            sites_origin=sites_origin,
+        )
+        worker = ProvisionerWorker(
+            provisioner=provisioner,
+            worker_id=worker_id,
+            close_callbacks=(
+                secret_store.close,
+                control_engine.dispose,
+                s3_client.close,
+                tenant_router.dispose,
+            ),
+        )
+    except BaseException as error:
+        build_failure = error
 
-    control_engine = create_control_engine(settings.control_database_url.get_secret_value())
-    session_factory = create_control_session_factory(control_engine)
-    repository = SqlAlchemyProvisioningRepository(session_factory=session_factory)
-    route_repository = SqlAlchemyTenantRouteRepository(session_factory=session_factory)
-    cluster = TenantClusterEndpoint(
-        host=cluster_host,
-        port=cluster_port,
-        sslmode=cluster_sslmode,
-    )
-    tenant_router = TenantRouter(
-        control_resources=route_repository,
-        secret_store=secret_store,
-        cluster=cluster,
-    )
-    postgres = PsycopgTenantAdmin(admin_conninfo=admin_conninfo)
-    migrator = AlembicTenantMigrator(
-        migration_root=Path(__file__).resolve().parents[3] / "migrations" / "tenant",
-        cluster_host=cluster_host,
-        cluster_port=cluster_port,
-        sslmode=cluster_sslmode,
-    )
-    s3_client = boto3.client(
-        "s3",
-        endpoint_url=str(settings.s3_endpoint_url),
-    )
-    bucket_admin = S3BucketAdmin(client=s3_client)
-    replicator = _build_tenant_replicator(
-        cluster_host=cluster_host,
-        cluster_port=cluster_port,
-        sslmode=cluster_sslmode,
-    )
-    provisioner = Provisioner(
-        repository=repository,
-        postgres=postgres,
-        secret_store=secret_store,
-        migrator=migrator,
-        bucket_admin=bucket_admin,
-        tenant_router=tenant_router,
-        replicator=replicator,
-        sites_origin=sites_origin,
-    )
-    return ProvisionerWorker(
-        provisioner=provisioner,
-        worker_id=worker_id,
-        close_callbacks=(
-            secret_store.close,
-            control_engine.dispose,
-            tenant_router.dispose,
-        ),
-    )
+    if build_failure is not None or worker is None:
+        close_callbacks = tuple(
+            callback
+            for resource, callback_name in (
+                (secret_store, "close"),
+                (control_engine, "dispose"),
+                (s3_client, "close"),
+                (tenant_router, "dispose"),
+            )
+            if resource is not None
+            for callback in (getattr(resource, callback_name),)
+        )
+        cleanup_failure: BaseException | None = None
+        try:
+            cleanup_failure = _close_callbacks_blocking(close_callbacks)
+        except BaseException as error:
+            cleanup_failure = error
+        if isinstance(build_failure, _CONTROL_FLOW_EXCEPTIONS):
+            raise build_failure
+        if isinstance(cleanup_failure, _CONTROL_FLOW_EXCEPTIONS):
+            raise cleanup_failure
+        raise RuntimeError("provisioner worker is unavailable") from None
+    return worker
 
 
 def _load_explicit_worker() -> ProvisionerWorker:

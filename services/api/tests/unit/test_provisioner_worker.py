@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tomllib
 from pathlib import Path
@@ -47,6 +48,78 @@ async def test_worker_run_once_distinguishes_work_idle_and_recoverable_failure()
     ]
 
 
+@pytest.mark.asyncio
+async def test_worker_close_attempts_every_callback_and_redacts_cleanup_error() -> None:
+    events: list[str] = []
+    marker = "cleanup-secret-marker"
+
+    class FirstCleanupError(RuntimeError):
+        pass
+
+    class SecondCleanupError(RuntimeError):
+        pass
+
+    first_error = FirstCleanupError(marker)
+
+    async def close_router() -> None:
+        events.append("router")
+        raise first_error
+
+    def close_s3() -> None:
+        events.append("s3")
+        raise SecondCleanupError("second-secret-marker")
+
+    async def close_engine() -> None:
+        events.append("engine")
+
+    def close_secret() -> None:
+        events.append("secret")
+
+    worker = ProvisionerWorker(
+        provisioner=FakeProvisioner([]),  # type: ignore[arg-type]
+        worker_id="provisioner-worker-1",
+        close_callbacks=(close_secret, close_engine, close_s3, close_router),
+    )
+
+    with pytest.raises(RuntimeError, match="^provisioner cleanup failed$") as captured:
+        await worker.close()
+
+    assert events == ["router", "s3", "engine", "secret"]
+    assert marker not in str(captured.value)
+    assert marker not in repr(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_worker_close_finishes_after_cancellation_and_preserves_it() -> None:
+    events: list[str] = []
+
+    async def close_router() -> None:
+        events.append("router")
+        raise asyncio.CancelledError
+
+    def close_s3() -> None:
+        events.append("s3")
+
+    async def close_engine() -> None:
+        events.append("engine")
+
+    def close_secret() -> None:
+        events.append("secret")
+
+    worker = ProvisionerWorker(
+        provisioner=FakeProvisioner([]),  # type: ignore[arg-type]
+        worker_id="provisioner-worker-1",
+        close_callbacks=(close_secret, close_engine, close_s3, close_router),
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await worker.close()
+
+    assert events == ["router", "s3", "engine", "secret"]
+
+
 def test_worker_requires_a_stable_nonempty_identity() -> None:
     with pytest.raises(ValueError, match="worker identity"):
         ProvisionerWorker(
@@ -93,6 +166,8 @@ def test_build_production_worker_rejects_weaker_tenant_tls_modes(
 def test_build_production_worker_accepts_production_with_verify_full(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    reached_secret_loading = False
+
     class ReachedSecretLoading(Exception):
         pass
 
@@ -103,7 +178,9 @@ def test_build_production_worker_accepts_production_with_verify_full(
         )
 
     def stop_at_secret_loading() -> object:
-        raise ReachedSecretLoading
+        nonlocal reached_secret_loading
+        reached_secret_loading = True
+        raise ReachedSecretLoading("secret-loading-marker")
 
     monkeypatch.setattr(
         provisioner_worker,
@@ -122,8 +199,282 @@ def test_build_production_worker_accepts_production_with_verify_full(
         stop_at_secret_loading,
     )
 
-    with pytest.raises(ReachedSecretLoading):
+    with pytest.raises(
+        RuntimeError,
+        match="^provisioner worker is unavailable$",
+    ) as captured:
         provisioner_worker.build_production_worker()
+
+    assert reached_secret_loading is True
+    assert "secret-loading-marker" not in str(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_production_worker_uses_shared_runtime_settings_sigv4_and_closes_s3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[str] = []
+    s3_calls: list[tuple[str, dict[str, object]]] = []
+
+    class SecretValue:
+        def get_secret_value(self) -> str:
+            return "postgresql+psycopg://control.example/db?sslmode=verify-full"
+
+    class FakeSecretStore:
+        def close(self) -> None:
+            closed.append("secret")
+
+    class FakeEngine:
+        async def dispose(self) -> None:
+            closed.append("engine")
+
+    class FakeRouter:
+        async def dispose(self) -> None:
+            closed.append("router")
+
+    class FakeS3Client:
+        def close(self) -> None:
+            closed.append("s3")
+
+    settings = SimpleNamespace(
+        app_env="production",
+        control_database_url=SecretValue(),
+        s3_endpoint_url="https://objects.example.com",
+        s3_region="cn-north-1",
+        tenant_cluster_host="tenant-db.example.com",
+        tenant_cluster_port=6432,
+        tenant_cluster_sslmode="verify-full",
+        secret_keyring_config=Path("/run/secrets/perfpilot/keyring.json"),
+        secret_store_root=Path("/var/lib/perfpilot/secrets"),
+    )
+    secret_store = FakeSecretStore()
+    engine = FakeEngine()
+    router = FakeRouter()
+    s3_client = FakeS3Client()
+
+    monkeypatch.setattr(provisioner_worker, "get_settings", lambda: settings)
+    monkeypatch.setenv("PERFPILOT_PROVISIONER_WORKER_ID", "provisioner-worker-1")
+    monkeypatch.setenv("PERFPILOT_SITES_ORIGIN", "https://sites.example.com")
+    monkeypatch.setenv("PERFPILOT_TENANT_ADMIN_CONNINFO_FILE", "/unused/admin")
+    monkeypatch.delenv("PERFPILOT_TENANT_CLUSTER_HOST", raising=False)
+    monkeypatch.delenv("PERFPILOT_TENANT_CLUSTER_PORT", raising=False)
+    monkeypatch.delenv("PERFPILOT_TENANT_CLUSTER_SSLMODE", raising=False)
+    monkeypatch.setattr(
+        provisioner_worker,
+        "_read_owner_only_file",
+        lambda _: (
+            b"user=tenant_admin password=test-password dbname=postgres "
+            b"host=tenant-db.example.com sslmode=verify-full"
+        ),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "_build_configured_secret_store",
+        lambda: secret_store,
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "create_control_engine",
+        lambda _: engine,
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "create_control_session_factory",
+        lambda _: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "SqlAlchemyProvisioningRepository",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "SqlAlchemyTenantRouteRepository",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "TenantRouter",
+        lambda **kwargs: router,
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "PsycopgTenantAdmin",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "AlembicTenantMigrator",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "S3BucketAdmin",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "_build_tenant_replicator",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "Provisioner",
+        lambda **kwargs: object(),
+    )
+
+    def create_s3(service_name: str, **kwargs: object) -> FakeS3Client:
+        s3_calls.append((service_name, kwargs))
+        return s3_client
+
+    monkeypatch.setattr(provisioner_worker.boto3, "client", create_s3)
+
+    worker = provisioner_worker.build_production_worker()
+
+    assert len(s3_calls) == 1
+    service_name, s3_kwargs = s3_calls[0]
+    assert service_name == "s3"
+    assert s3_kwargs["endpoint_url"] == "https://objects.example.com"
+    assert s3_kwargs["region_name"] == "cn-north-1"
+    assert s3_kwargs["config"].signature_version == "s3v4"
+    assert "verify" not in s3_kwargs
+
+    await worker.close()
+    assert closed == ["router", "s3", "engine", "secret"]
+
+
+def test_production_worker_rolls_back_partial_build_and_redacts_build_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    closed: list[str] = []
+
+    class BuildFailure(RuntimeError):
+        pass
+
+    class CleanupFailure(RuntimeError):
+        pass
+
+    marker = "late-constructor-secret-marker"
+    build_error = BuildFailure(marker)
+
+    class SecretValue:
+        def get_secret_value(self) -> str:
+            return "postgresql+psycopg://control.example/db?sslmode=verify-full"
+
+    class FakeSecretStore:
+        def close(self) -> None:
+            closed.append("secret")
+
+    class FakeEngine:
+        async def dispose(self) -> None:
+            closed.append("engine")
+
+    class FakeRouter:
+        async def dispose(self) -> None:
+            closed.append("router")
+            raise CleanupFailure("cleanup-secret-marker")
+
+    class FakeS3Client:
+        def close(self) -> None:
+            closed.append("s3")
+
+    settings = SimpleNamespace(
+        app_env="production",
+        control_database_url=SecretValue(),
+        s3_endpoint_url="https://objects.example.com",
+        s3_region="cn-north-1",
+        tenant_cluster_host="tenant-db.example.com",
+        tenant_cluster_port=6432,
+        tenant_cluster_sslmode="verify-full",
+        secret_keyring_config=Path("/run/secrets/perfpilot/keyring.json"),
+        secret_store_root=Path("/var/lib/perfpilot/secrets"),
+    )
+    secret_store = FakeSecretStore()
+    engine = FakeEngine()
+    router = FakeRouter()
+    s3_client = FakeS3Client()
+
+    monkeypatch.setattr(provisioner_worker, "get_settings", lambda: settings)
+    monkeypatch.setenv("PERFPILOT_PROVISIONER_WORKER_ID", "provisioner-worker-1")
+    monkeypatch.setenv("PERFPILOT_SITES_ORIGIN", "https://sites.example.com")
+    monkeypatch.setenv("PERFPILOT_TENANT_ADMIN_CONNINFO_FILE", "/unused/admin")
+    monkeypatch.delenv("PERFPILOT_TENANT_CLUSTER_HOST", raising=False)
+    monkeypatch.delenv("PERFPILOT_TENANT_CLUSTER_PORT", raising=False)
+    monkeypatch.delenv("PERFPILOT_TENANT_CLUSTER_SSLMODE", raising=False)
+    monkeypatch.setattr(
+        provisioner_worker,
+        "_read_owner_only_file",
+        lambda _: (
+            b"user=tenant_admin password=test-password dbname=postgres "
+            b"host=tenant-db.example.com sslmode=verify-full"
+        ),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "_build_configured_secret_store",
+        lambda: secret_store,
+    )
+    monkeypatch.setattr(provisioner_worker, "create_control_engine", lambda _: engine)
+    monkeypatch.setattr(
+        provisioner_worker,
+        "create_control_session_factory",
+        lambda _: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "SqlAlchemyProvisioningRepository",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "SqlAlchemyTenantRouteRepository",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(provisioner_worker, "TenantRouter", lambda **kwargs: router)
+    monkeypatch.setattr(
+        provisioner_worker,
+        "PsycopgTenantAdmin",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "AlembicTenantMigrator",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "S3BucketAdmin",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "_build_tenant_replicator",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        provisioner_worker,
+        "Provisioner",
+        lambda **kwargs: (_ for _ in ()).throw(build_error),
+    )
+    monkeypatch.setattr(
+        provisioner_worker.boto3,
+        "client",
+        lambda *args, **kwargs: s3_client,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="^provisioner worker is unavailable$",
+    ) as captured:
+        provisioner_worker.build_production_worker()
+
+    assert closed == ["router", "s3", "engine", "secret"]
+    assert marker not in str(captured.value)
+    assert marker not in repr(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
 
 
 @pytest.mark.parametrize(

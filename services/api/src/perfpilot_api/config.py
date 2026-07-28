@@ -1,5 +1,7 @@
+import re
 from functools import lru_cache
 from ipaddress import ip_address
+from pathlib import Path
 from socket import inet_aton
 from typing import Any, Literal, TypeVar
 from urllib.parse import parse_qsl, urlsplit
@@ -32,6 +34,23 @@ _DEVELOPMENT_AGENT_REGISTRATION_SECRET_REFERENCE = (
 _DEVELOPMENT_ALLOWED_ORIGIN = "http://127.0.0.1:3000"
 _REDACTED_VALIDATION_INPUT = "[redacted]"
 _INVALID_PRODUCTION_SERVICE_URL = "production service URL configuration is invalid"
+_INVALID_PRODUCTION_ARTIFACT_RUNTIME = "production artifact runtime configuration is invalid"
+_DEVELOPMENT_TENANT_CLUSTER_HOST = "127.0.0.1"
+_DEVELOPMENT_SECRET_KEYRING_CONFIG = Path(".perfpilot/keyring.json")
+_DEVELOPMENT_SECRET_STORE_ROOT = Path(".perfpilot/secrets")
+_DEVELOPMENT_S3_REGION = "us-east-1"
+_RUNTIME_HOST_PATTERN = re.compile(r"[^\s/?#@,\\]{1,253}\Z")
+_S3_REGION_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+_PRODUCTION_RUNTIME_FIELDS = frozenset(
+    {
+        "s3_region",
+        "tenant_cluster_host",
+        "tenant_cluster_port",
+        "tenant_cluster_sslmode",
+        "secret_keyring_config",
+        "secret_store_root",
+    }
+)
 
 _Dsn = TypeVar("_Dsn", PostgresDsn, RedisDsn)
 
@@ -108,6 +127,19 @@ class Settings(BaseSettings):
     control_database_url: SecretStr = SecretStr(_DEVELOPMENT_CONTROL_DATABASE_URL)
     redis_url: SecretStr = SecretStr(_DEVELOPMENT_REDIS_URL)
     s3_endpoint_url: AnyHttpUrl = AnyHttpUrl(_DEVELOPMENT_S3_ENDPOINT_URL)
+    s3_region: str = _DEVELOPMENT_S3_REGION
+    tenant_cluster_host: str = _DEVELOPMENT_TENANT_CLUSTER_HOST
+    tenant_cluster_port: int = Field(default=5432, ge=1, le=65535)
+    tenant_cluster_sslmode: Literal[
+        "disable",
+        "allow",
+        "prefer",
+        "require",
+        "verify-ca",
+        "verify-full",
+    ] = "disable"
+    secret_keyring_config: Path = _DEVELOPMENT_SECRET_KEYRING_CONFIG
+    secret_store_root: Path = _DEVELOPMENT_SECRET_STORE_ROOT
     proxy_secret: SecretStr = SecretStr(_DEVELOPMENT_PROXY_SECRET)
     session_secret: SecretStr = SecretStr(_DEVELOPMENT_SESSION_SECRET)
     jws_signing_key_reference: SecretStr = SecretStr(_DEVELOPMENT_JWS_SIGNING_KEY_REFERENCE)
@@ -164,6 +196,21 @@ class Settings(BaseSettings):
         )
         if uses_development_default or any(not value.strip() for value in required_secrets):
             raise _production_validation_error("production secret configuration is required")
+
+        if not _PRODUCTION_RUNTIME_FIELDS.issubset(self.model_fields_set):
+            raise _production_validation_error(_INVALID_PRODUCTION_ARTIFACT_RUNTIME)
+        if (
+            _RUNTIME_HOST_PATTERN.fullmatch(self.tenant_cluster_host) is None
+            or _is_loopback_host(self.tenant_cluster_host)
+            or _S3_REGION_PATTERN.fullmatch(self.s3_region) is None
+            or not self.secret_keyring_config.is_absolute()
+            or self.secret_keyring_config == Path("/")
+            or not self.secret_store_root.is_absolute()
+            or self.secret_store_root == Path("/")
+        ):
+            raise _production_validation_error(_INVALID_PRODUCTION_ARTIFACT_RUNTIME)
+        if self.tenant_cluster_sslmode != "verify-full":
+            raise _production_validation_error("production tenant cluster requires verify-full")
 
         database_url = _parse_production_service_url(
             self.control_database_url,

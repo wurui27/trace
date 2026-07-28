@@ -1,0 +1,103 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/artifacts/slot-response.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "upload"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "upload": {
+      "oneOf": [
+        {"$ref": "#/$defs/liveUpload"},
+        {"$ref": "#/$defs/finalizedUpload"}
+      ]
+    }
+  },
+  "$defs": {
+    "artifactKind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "mime": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
+    },
+    "size": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5368709120
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 44,
+      "maxLength": 44,
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "$comment": "Canonical RFC 4648 standard Base64 encoding of exactly 32 SHA-256 bytes."
+    },
+    "requiredHeaders": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Content-Type", "x-amz-checksum-sha256"],
+      "properties": {
+        "Content-Type": {"$ref": "#/$defs/mime"},
+        "x-amz-checksum-sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "liveUpload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "upload_id",
+        "artifact_kind",
+        "mime",
+        "size",
+        "sha256_b64",
+        "expires_at",
+        "put_url",
+        "required_headers"
+      ],
+      "properties": {
+        "state": {"const": "pending"},
+        "upload_id": {"type": "string", "format": "uuid"},
+        "artifact_kind": {"$ref": "#/$defs/artifactKind"},
+        "mime": {"$ref": "#/$defs/mime"},
+        "size": {"$ref": "#/$defs/size"},
+        "sha256_b64": {"$ref": "#/$defs/sha256"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "put_url": {
+          "type": "string",
+          "format": "uri",
+          "pattern": "^https?://"
+        },
+        "required_headers": {"$ref": "#/$defs/requiredHeaders"}
+      }
+    },
+    "finalizedUpload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "artifact_id",
+        "upload_id",
+        "artifact_kind",
+        "mime",
+        "size",
+        "sha256_b64",
+        "finalized_at"
+      ],
+      "properties": {
+        "state": {"const": "finalized"},
+        "artifact_id": {"type": "string", "format": "uuid"},
+        "upload_id": {"type": "string", "format": "uuid"},
+        "artifact_kind": {"$ref": "#/$defs/artifactKind"},
+        "mime": {"$ref": "#/$defs/mime"},
+        "size": {"$ref": "#/$defs/size"},
+        "sha256_b64": {"$ref": "#/$defs/sha256"},
+        "finalized_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}

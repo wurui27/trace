@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/artifacts/slot-request.schema.json",
+  "$comment": "The HTTP request must carry exactly one Idempotency-Key header matching ^[A-Za-z0-9._:-]{1,255}$. The header is intentionally not duplicated in the JSON body.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["artifact_kind", "mime", "size", "sha256_b64"],
+  "properties": {
+    "artifact_kind": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9_]{0,63}$"
+    },
+    "mime": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
+    },
+    "size": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5368709120
+    },
+    "sha256_b64": {
+      "type": "string",
+      "minLength": 44,
+      "maxLength": 44,
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "$comment": "Canonical RFC 4648 standard Base64 encoding of exactly 32 SHA-256 bytes."
+    }
+  }
+}

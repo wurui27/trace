@@ -127,6 +127,13 @@ class TeamMemberResult:
     role: str
 
 
+@dataclass(frozen=True)
+class TeamRequestContext:
+    user_id: UUID
+    team_id: UUID
+    role: str
+
+
 class LoginRateLimitedError(RuntimeError):
     def __init__(self) -> None:
         super().__init__("login rate limit exceeded")
@@ -1173,6 +1180,63 @@ class AuthService:
                     role=membership.role,
                 )
                 for membership, user in rows
+            )
+
+    async def authorize_team_request(
+        self,
+        *,
+        session_token: str,
+        csrf_token: str,
+        team_id: UUID,
+        access: Literal["read", "write"],
+    ) -> TeamRequestContext:
+        if access not in {"read", "write"}:
+            raise ValueError("team access mode is invalid")
+        now = self._clock()
+        async with self._session_factory() as session, session.begin():
+            stored = await session.scalar(
+                select(AuthSession)
+                .where(
+                    AuthSession.token_digest
+                    == digest_session_token(session_token)
+                )
+                .with_for_update()
+            )
+            if (
+                stored is None
+                or stored.kind != "authenticated"
+                or stored.user_id is None
+                or stored.revoked_at is not None
+                or stored.absolute_expires_at <= now
+                or stored.last_seen_at + timedelta(hours=12) < now
+            ):
+                raise InvalidSessionError
+            if not verify_csrf_token(csrf_token, stored.csrf_secret_hash):
+                raise InvalidCsrfError
+            actor = await session.get(User, stored.user_id)
+            if actor is None or actor.state != "active":
+                raise InvalidSessionError
+            membership = await session.scalar(
+                select(Membership)
+                .join(Team, Team.id == Membership.team_id)
+                .where(
+                    Membership.team_id == team_id,
+                    Membership.user_id == actor.id,
+                    Team.state == "active",
+                )
+            )
+            if membership is None:
+                raise TeamAccessNotFoundError
+            if access == "write" and membership.role not in {
+                "team_owner",
+                "team_member",
+            }:
+                raise RoleForbiddenError
+            stored.last_seen_at = now
+            return TeamRequestContext(
+                user_id=actor.id,
+                team_id=team_id,
+                role=membership.role,
             )
 
     async def add_team_member(

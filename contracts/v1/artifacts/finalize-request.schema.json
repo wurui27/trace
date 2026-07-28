@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/artifacts/finalize-request.schema.json",
+  "$comment": "The analysis-scoped finalize route identifies the upload with this body; byte count and SHA-256 must exactly repeat the saved slot values.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["upload_id", "sha256_b64", "size"],
+  "properties": {
+    "upload_id": {
+      "type": "string",
+      "format": "uuid"
+    },
+    "sha256_b64": {
+      "type": "string",
+      "minLength": 44,
+      "maxLength": 44,
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "$comment": "Canonical RFC 4648 standard Base64 encoding of exactly 32 SHA-256 bytes."
+    },
+    "size": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 5368709120
+    }
+  }
+}

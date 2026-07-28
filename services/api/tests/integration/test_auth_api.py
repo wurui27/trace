@@ -51,6 +51,8 @@ from perfpilot_api.services.auth import (
     LastOwnerError,
     LoginRateLimitedError,
     RedisLoginRateLimiter,
+    RoleForbiddenError,
+    TeamAccessNotFoundError,
 )
 
 _API_ROOT = Path(__file__).resolve().parents[2]
@@ -198,6 +200,117 @@ async def _seed_authenticated_session(
     async with session_factory() as session, session.begin():
         session.add(auth_session)
     return auth_session
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("role", ["team_owner", "team_member"])
+async def test_team_write_authorization_accepts_owner_and_member(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+    role: str,
+) -> None:
+    now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    actor = await _seed_user(auth_session_factory, username=f"writer-{role}")
+    team, _ = await _seed_team_membership(
+        auth_session_factory,
+        user_id=actor.id,
+        team_name=f"write-{role}",
+        role=role,
+    )
+    await _seed_authenticated_session(
+        auth_session_factory,
+        user_id=actor.id,
+        token="team-write-session",
+        csrf_token="team-write-csrf",
+        now=now,
+    )
+    service = AuthService(
+        session_factory=auth_session_factory,
+        rate_limiter=InMemoryLoginRateLimiter(),
+        clock=lambda: now,
+    )
+
+    context = await service.authorize_team_request(
+        session_token="team-write-session",
+        csrf_token="team-write-csrf",
+        team_id=team.id,
+        access="write",
+    )
+
+    assert context.user_id == actor.id
+    assert context.team_id == team.id
+    assert context.role == role
+
+
+@pytest.mark.asyncio
+async def test_team_viewer_can_read_but_cannot_write(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    actor = await _seed_user(auth_session_factory, username="viewer")
+    team, _ = await _seed_team_membership(
+        auth_session_factory,
+        user_id=actor.id,
+        team_name="viewer-team",
+        role="team_viewer",
+    )
+    await _seed_authenticated_session(
+        auth_session_factory,
+        user_id=actor.id,
+        token="team-view-session",
+        csrf_token="team-view-csrf",
+        now=now,
+    )
+    service = AuthService(
+        session_factory=auth_session_factory,
+        rate_limiter=InMemoryLoginRateLimiter(),
+        clock=lambda: now,
+    )
+
+    context = await service.authorize_team_request(
+        session_token="team-view-session",
+        csrf_token="team-view-csrf",
+        team_id=team.id,
+        access="read",
+    )
+    assert context.role == "team_viewer"
+    with pytest.raises(RoleForbiddenError):
+        await service.authorize_team_request(
+            session_token="team-view-session",
+            csrf_token="team-view-csrf",
+            team_id=team.id,
+            access="write",
+        )
+
+
+@pytest.mark.asyncio
+async def test_team_authorization_hides_missing_membership(
+    auth_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    now = datetime(2026, 7, 27, 8, 0, tzinfo=UTC)
+    actor = await _seed_user(auth_session_factory, username="non-member")
+    team = Team(name="unrelated-team", state="active")
+    async with auth_session_factory() as session, session.begin():
+        session.add(team)
+    await _seed_authenticated_session(
+        auth_session_factory,
+        user_id=actor.id,
+        token="non-member-session",
+        csrf_token="non-member-csrf",
+        now=now,
+    )
+    service = AuthService(
+        session_factory=auth_session_factory,
+        rate_limiter=InMemoryLoginRateLimiter(),
+        clock=lambda: now,
+    )
+
+    with pytest.raises(TeamAccessNotFoundError):
+        await service.authorize_team_request(
+            session_token="non-member-session",
+            csrf_token="non-member-csrf",
+            team_id=team.id,
+            access="read",
+        )
 
 
 @pytest.mark.asyncio
@@ -879,6 +992,7 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     closed: list[str] = []
+    upload_service = object()
 
     class FakeEngine:
         async def dispose(self) -> None:
@@ -896,6 +1010,13 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
 
         async def delete(self, *args: object, **kwargs: object) -> int:
             return 1
+
+    class FakeArtifactRuntime:
+        def __init__(self) -> None:
+            self.upload_service = upload_service
+
+        async def close(self) -> None:
+            closed.append("artifacts")
 
     fake_engine = FakeEngine()
     fake_redis = FakeRedis()
@@ -918,6 +1039,18 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
             return fake_redis
 
     monkeypatch.setattr(main_module, "redis", FakeRedisModule, raising=False)
+
+    async def build_artifact_runtime(**kwargs: object) -> FakeArtifactRuntime:
+        assert kwargs["settings"] is settings
+        assert callable(kwargs["control_session_factory"])
+        return FakeArtifactRuntime()
+
+    monkeypatch.setattr(
+        main_module,
+        "build_artifact_runtime",
+        build_artifact_runtime,
+        raising=False,
+    )
     settings = Settings(
         app_env="production",
         control_database_url=(
@@ -926,6 +1059,12 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
         ),
         redis_url="rediss://cache.example.com:6380/0",
         s3_endpoint_url="https://objects.example.com",
+        s3_region="cn-north-1",
+        tenant_cluster_host="tenant-db.example.com",
+        tenant_cluster_port=6432,
+        tenant_cluster_sslmode="verify-full",
+        secret_keyring_config="/run/secrets/perfpilot/keyring.json",
+        secret_store_root="/var/lib/perfpilot/secrets",
         proxy_secret="production-proxy-secret",
         session_secret="production-session-secret",
         jws_signing_key_reference="kms://keys/perfpilot-signing",
@@ -939,8 +1078,9 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
     assert isinstance(app.state.auth_service, AuthService)
     assert isinstance(app.state.proxy_replay_store, RedisReplayStore)
     with TestClient(app, base_url="https://app.example") as client:
+        assert app.state.upload_service is upload_service
         assert client.get("/v1/health").status_code == 200
-    assert closed == ["redis", "engine"]
+    assert closed == ["artifacts", "redis", "engine"]
 
 
 @pytest.mark.asyncio

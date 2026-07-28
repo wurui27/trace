@@ -1,4 +1,6 @@
+import asyncio
 import re
+from pathlib import Path
 
 import pytest
 from fastapi import HTTPException, Request
@@ -50,6 +52,30 @@ def test_testing_app_ignores_hostile_production_environment(
     assert app.state.settings.app_env == "test"
 
 
+def test_development_app_does_not_build_production_artifact_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def forbidden(*args: object, **kwargs: object) -> object:
+        raise AssertionError("production artifact dependencies must not be built")
+
+    monkeypatch.setattr(main, "create_control_engine", forbidden)
+    monkeypatch.setattr(main, "build_artifact_runtime", forbidden)
+    app = create_app(
+        testing=False,
+        settings_override=Settings(app_env="development", _env_file=None),
+        auth_service=object(),  # type: ignore[arg-type]
+        admin_team_service=object(),  # type: ignore[arg-type]
+        replay_store=object(),  # type: ignore[arg-type]
+        proxy_client_identity_required=False,
+    )
+
+    with TestClient(app) as client:
+        response = client.get("/v1/health")
+
+    assert response.status_code == 200
+    assert app.state.upload_service is None
+
+
 def test_unknown_route_uses_stable_error_shape() -> None:
     with TestClient(create_app(testing=True)) as client:
         response = client.get("/v1/missing", headers={"x-request-id": "req-404"})
@@ -79,6 +105,12 @@ def _production_settings(**overrides: object) -> Settings:
         ),
         "redis_url": "rediss://cache.example.com:6380/0",
         "s3_endpoint_url": "https://objects.example.com",
+        "s3_region": "cn-north-1",
+        "tenant_cluster_host": "tenant-db.example.com",
+        "tenant_cluster_port": 6432,
+        "tenant_cluster_sslmode": "verify-full",
+        "secret_keyring_config": "/run/secrets/perfpilot/keyring.json",
+        "secret_store_root": "/var/lib/perfpilot/secrets",
         "proxy_secret": "test-production-proxy-secret",
         "session_secret": "test-production-session-secret",
         "jws_signing_key_reference": "kms://keys/perfpilot-signing",
@@ -94,6 +126,131 @@ def test_valid_explicit_production_settings() -> None:
 
     assert settings.app_env == "production"
     assert [origin.scheme for origin in settings.allowed_origins] == ["https"]
+    assert settings.s3_region == "cn-north-1"
+    assert settings.tenant_cluster_host == "tenant-db.example.com"
+    assert settings.tenant_cluster_port == 6432
+    assert settings.tenant_cluster_sslmode == "verify-full"
+    assert settings.secret_keyring_config == Path("/run/secrets/perfpilot/keyring.json")
+    assert settings.secret_store_root == Path("/var/lib/perfpilot/secrets")
+
+
+def test_production_app_cleanup_attempts_every_dependency_and_redacts_failures(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+    marker = "cleanup-secret-marker"
+
+    class FakeEngine:
+        async def dispose(self) -> None:
+            events.append("engine")
+
+    class FakeArtifactRuntime:
+        upload_service = object()
+
+        async def close(self) -> None:
+            events.append("artifacts")
+            raise RuntimeError(marker)
+
+    monkeypatch.setattr(main, "create_control_engine", lambda _: FakeEngine())
+    monkeypatch.setattr(main, "create_control_session_factory", lambda _: object())
+
+    async def build_artifact_runtime(**kwargs: object) -> FakeArtifactRuntime:
+        return FakeArtifactRuntime()
+
+    monkeypatch.setattr(main, "build_artifact_runtime", build_artifact_runtime)
+    app = create_app(
+        testing=False,
+        settings_override=_production_settings(),
+        auth_service=object(),  # type: ignore[arg-type]
+        admin_team_service=object(),  # type: ignore[arg-type]
+        replay_store=object(),  # type: ignore[arg-type]
+        proxy_client_identity_required=False,
+    )
+
+    with pytest.raises(RuntimeError, match="Application dependency cleanup failed") as captured:
+        with TestClient(app) as client:
+            assert client.get("/v1/health").status_code == 200
+
+    assert events == ["artifacts", "engine"]
+    assert marker not in str(captured.value)
+    assert marker not in repr(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+@pytest.mark.asyncio
+async def test_production_app_cleanup_preserves_late_cancellation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeEngine:
+        async def dispose(self) -> None:
+            events.append("engine")
+            raise asyncio.CancelledError
+
+    class FakeArtifactRuntime:
+        upload_service = object()
+
+        async def close(self) -> None:
+            events.append("artifacts")
+            raise RuntimeError("ordinary cleanup failure")
+
+    monkeypatch.setattr(main, "create_control_engine", lambda _: FakeEngine())
+    monkeypatch.setattr(main, "create_control_session_factory", lambda _: object())
+
+    async def build_artifact_runtime(**kwargs: object) -> FakeArtifactRuntime:
+        return FakeArtifactRuntime()
+
+    monkeypatch.setattr(main, "build_artifact_runtime", build_artifact_runtime)
+    app = create_app(
+        testing=False,
+        settings_override=_production_settings(),
+        auth_service=object(),  # type: ignore[arg-type]
+        admin_team_service=object(),  # type: ignore[arg-type]
+        replay_store=object(),  # type: ignore[arg-type]
+        proxy_client_identity_required=False,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert events == ["artifacts", "engine"]
+
+
+@pytest.mark.asyncio
+async def test_production_app_startup_cancellation_survives_cleanup_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events: list[str] = []
+
+    class FakeEngine:
+        async def dispose(self) -> None:
+            events.append("engine")
+            raise RuntimeError("ordinary cleanup failure")
+
+    monkeypatch.setattr(main, "create_control_engine", lambda _: FakeEngine())
+    monkeypatch.setattr(main, "create_control_session_factory", lambda _: object())
+
+    async def build_artifact_runtime(**kwargs: object) -> object:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(main, "build_artifact_runtime", build_artifact_runtime)
+    app = create_app(
+        testing=False,
+        settings_override=_production_settings(),
+        auth_service=object(),  # type: ignore[arg-type]
+        admin_team_service=object(),  # type: ignore[arg-type]
+        replay_store=object(),  # type: ignore[arg-type]
+        proxy_client_identity_required=False,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        async with app.router.lifespan_context(app):
+            pass
+
+    assert events == ["engine"]
 
 
 @pytest.mark.parametrize("app_env", ["development", "test"])
@@ -103,6 +260,61 @@ def test_nonproduction_keeps_local_plaintext_service_defaults(app_env: str) -> N
     assert settings.control_database_url.get_secret_value().startswith("postgresql+psycopg://")
     assert settings.redis_url.get_secret_value().startswith("redis://")
     assert str(settings.s3_endpoint_url).startswith("http://")
+    assert settings.s3_region == "us-east-1"
+    assert settings.tenant_cluster_host == "127.0.0.1"
+    assert settings.tenant_cluster_port == 5432
+    assert settings.tenant_cluster_sslmode == "disable"
+
+
+@pytest.mark.parametrize(
+    "sslmode",
+    ["disable", "allow", "prefer", "require", "verify-ca"],
+)
+def test_production_tenant_cluster_requires_verify_full(sslmode: str) -> None:
+    with pytest.raises(ValidationError, match="tenant cluster") as exc_info:
+        _production_settings(tenant_cluster_sslmode=sslmode)
+
+    assert exc_info.value.errors()[0]["input"] == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("tenant_cluster_host", ""),
+        ("tenant_cluster_host", "db.example.com/override"),
+        ("tenant_cluster_host", "db-a.example.com,db-b.example.com"),
+        ("tenant_cluster_host", "user@db.example.com"),
+        ("tenant_cluster_port", 0),
+        ("tenant_cluster_port", 65536),
+        ("s3_region", ""),
+        ("s3_region", "region/override"),
+        ("secret_keyring_config", ""),
+        ("secret_keyring_config", "relative/keyring.json"),
+        ("secret_keyring_config", "/"),
+        ("secret_store_root", ""),
+        ("secret_store_root", "relative/secrets"),
+        ("secret_store_root", "/"),
+    ],
+)
+def test_production_rejects_invalid_artifact_runtime_settings(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _production_settings(**{field: value})
+
+    assert exc_info.value.errors()[0]["input"] == "[redacted]"
+
+
+@pytest.mark.parametrize(
+    "host",
+    ["localhost", "127.0.0.1", "127.1", "[::1]", "2130706433"],
+)
+def test_production_rejects_loopback_tenant_cluster_hosts(host: str) -> None:
+    with pytest.raises(ValidationError, match="artifact runtime") as exc_info:
+        _production_settings(tenant_cluster_host=host)
+
+    assert exc_info.value.errors()[0]["input"] == "[redacted]"
 
 
 @pytest.mark.parametrize(
