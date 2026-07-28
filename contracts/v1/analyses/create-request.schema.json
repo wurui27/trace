@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/analyses/create-request.schema.json",
+  "$comment": "Idempotency-Key is an HTTP header and is intentionally absent from this body. APK identity and application metadata are server-derived only after immutable upload finalization.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "analysis_mode", "scenarios", "apk"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "analysis_mode": {"const": "device"},
+    "scenarios": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {"const": "cold_start"},
+        {"const": "scroll"},
+        {"const": "memory_cycle"}
+      ],
+      "items": false
+    },
+    "apk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_kind", "mime", "size", "sha256_b64"],
+      "properties": {
+        "artifact_kind": {"const": "apk"},
+        "mime": {"const": "application/vnd.android.package-archive"},
+        "size": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5368709120
+        },
+        "sha256_b64": {"$ref": "#/$defs/sha256"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 44,
+      "maxLength": 44,
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+      "$comment": "Canonical RFC 4648 standard Base64 encoding of exactly 32 SHA-256 bytes."
+    }
+  }
+}

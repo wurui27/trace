@@ -1093,6 +1093,8 @@ Expected: FAIL until the service containers, bootstrap hooks, and fault helpers 
 
 Bind PostgreSQL, Redis, and MinIO management ports to `127.0.0.1` only. `compose.acceptance.yaml` adds Caddy and exposes only HTTPS API ingress; port 80 is allowed only for ACME redirect/challenge. Give API, Provisioner, dispatcher, scheduler, reconciler, validator, and full Worker separate commands and least-privilege credentials. Mount the secret-store master key from an owner-only container secret and ciphertext storage from a dedicated non-public volume; neither appears in Compose environment values or image layers. Health checks must gate dependent containers.
 
+APK inspection in production is an externally isolated Worker, never the in-process inspector. It runs non-root with no network, a read-only root filesystem, and only a per-claim writable directory; it has no database or object-store credentials. Its input is a version-bound URL, and it returns verified metadata only through the private claim API. Apply CPU, memory, PID, disk, and time limits to every claim. Startup fails when the remote inspector client is not configured; the in-process inspector is limited to test and development environments.
+
 `verify_private_host.py` performs read-only checks for exact Git SHA, image digests, TLS, proxy-signature rejection/acceptance, private database/Redis/MinIO ports, migrations, bucket versioning, secret-file modes, disk capacity, clock synchronization, and Agent outbound reachability. `private-acceptance.md` lists the exact required environment variable names and rollback sequence without containing values.
 
 - [ ] **Step 4: Add CI**

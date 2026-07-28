@@ -38,6 +38,7 @@ _INVALID_PRODUCTION_ARTIFACT_RUNTIME = "production artifact runtime configuratio
 _DEVELOPMENT_TENANT_CLUSTER_HOST = "127.0.0.1"
 _DEVELOPMENT_SECRET_KEYRING_CONFIG = Path(".perfpilot/keyring.json")
 _DEVELOPMENT_SECRET_STORE_ROOT = Path(".perfpilot/secrets")
+_DEVELOPMENT_APKANALYZER_BINARY = Path("/opt/android-sdk/cmdline-tools/latest/bin/apkanalyzer")
 _DEVELOPMENT_S3_REGION = "us-east-1"
 _RUNTIME_HOST_PATTERN = re.compile(r"[^\s/?#@,\\]{1,253}\Z")
 _S3_REGION_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
@@ -49,6 +50,7 @@ _PRODUCTION_RUNTIME_FIELDS = frozenset(
         "tenant_cluster_sslmode",
         "secret_keyring_config",
         "secret_store_root",
+        "apkanalyzer_binary",
     }
 )
 
@@ -140,6 +142,7 @@ class Settings(BaseSettings):
     ] = "disable"
     secret_keyring_config: Path = _DEVELOPMENT_SECRET_KEYRING_CONFIG
     secret_store_root: Path = _DEVELOPMENT_SECRET_STORE_ROOT
+    apkanalyzer_binary: Path = _DEVELOPMENT_APKANALYZER_BINARY
     proxy_secret: SecretStr = SecretStr(_DEVELOPMENT_PROXY_SECRET)
     session_secret: SecretStr = SecretStr(_DEVELOPMENT_SESSION_SECRET)
     jws_signing_key_reference: SecretStr = SecretStr(_DEVELOPMENT_JWS_SIGNING_KEY_REFERENCE)
@@ -207,6 +210,8 @@ class Settings(BaseSettings):
             or self.secret_keyring_config == Path("/")
             or not self.secret_store_root.is_absolute()
             or self.secret_store_root == Path("/")
+            or not self.apkanalyzer_binary.is_absolute()
+            or self.apkanalyzer_binary == Path("/")
         ):
             raise _production_validation_error(_INVALID_PRODUCTION_ARTIFACT_RUNTIME)
         if self.tenant_cluster_sslmode != "verify-full":

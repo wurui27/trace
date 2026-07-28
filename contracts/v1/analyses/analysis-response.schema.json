@@ -1,0 +1,391 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/analyses/analysis-response.schema.json",
+  "$comment": "The same shape is used for create and status reads. A create response includes the pending APK authorization; a later GET may omit the authorization pair so reading status does not silently mint a new upload capability.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "analysis_id",
+    "team_id",
+    "analysis_mode",
+    "state",
+    "version",
+    "application_version_id",
+    "application_metadata",
+    "apk_upload",
+    "scenarios",
+    "sample_verdict_counts",
+    "active_lease",
+    "report_available",
+    "created_at",
+    "started_at",
+    "completed_at",
+    "failure"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "analysis_id": {"type": "string", "format": "uuid"},
+    "team_id": {"type": "string", "format": "uuid"},
+    "analysis_mode": {"const": "device"},
+    "state": {
+      "enum": [
+        "creating",
+        "created",
+        "uploading",
+        "queued",
+        "scheduled",
+        "running",
+        "analyzing",
+        "completed",
+        "partially_completed",
+        "failed",
+        "canceled",
+        "deleted"
+      ]
+    },
+    "version": {"type": "integer", "minimum": 1},
+    "application_version_id": {
+      "oneOf": [
+        {"type": "string", "format": "uuid"},
+        {"type": "null"}
+      ]
+    },
+    "application_metadata": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/applicationMetadata"}
+      ]
+    },
+    "apk_upload": {
+      "oneOf": [
+        {"$ref": "#/$defs/pendingApkUpload"},
+        {"$ref": "#/$defs/finalizedApkUpload"}
+      ]
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scenarioProgress"},
+            {"properties": {"scenario_type": {"const": "cold_start"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scenarioProgress"},
+            {"properties": {"scenario_type": {"const": "scroll"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scenarioProgress"},
+            {"properties": {"scenario_type": {"const": "memory_cycle"}}}
+          ]
+        }
+      ],
+      "items": false
+    },
+    "sample_verdict_counts": {"$ref": "#/$defs/verdictCounts"},
+    "active_lease": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/activeLease"}
+      ]
+    },
+    "report_available": {"type": "boolean"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "started_at": {"$ref": "#/$defs/nullableDateTime"},
+    "completed_at": {"$ref": "#/$defs/nullableDateTime"},
+    "failure": {
+      "oneOf": [
+        {"type": "null"},
+        {"$ref": "#/$defs/failure"}
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "application_version_id": {"type": "null"},
+            "application_metadata": {"type": "null"}
+          }
+        },
+        {
+          "properties": {
+            "application_version_id": {"type": "string", "format": "uuid"},
+            "application_metadata": {"$ref": "#/$defs/applicationMetadata"}
+          }
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {"state": {"const": "failed"}},
+        "required": ["state"]
+      },
+      "then": {
+        "properties": {"failure": {"$ref": "#/$defs/failure"}}
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "minLength": 44,
+      "maxLength": 44,
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
+    },
+    "nullableDateTime": {
+      "oneOf": [
+        {"type": "string", "format": "date-time"},
+        {"type": "null"}
+      ]
+    },
+    "failure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$"},
+        "message": {"type": "string", "minLength": 1, "maxLength": 1000},
+        "retryable": {"type": "boolean"}
+      }
+    },
+    "applicationMetadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "package_name",
+        "version_name",
+        "version_code",
+        "launch_activity",
+        "min_sdk",
+        "target_sdk",
+        "supported_abis",
+        "has_native_libraries"
+      ],
+      "properties": {
+        "package_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+        },
+        "version_name": {
+          "oneOf": [
+            {"type": "string", "maxLength": 255},
+            {"type": "null"}
+          ]
+        },
+        "version_code": {"type": "integer", "minimum": 0},
+        "launch_activity": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 512},
+            {"type": "null"}
+          ]
+        },
+        "min_sdk": {
+          "oneOf": [
+            {"type": "integer", "minimum": 1},
+            {"type": "null"}
+          ]
+        },
+        "target_sdk": {
+          "oneOf": [
+            {"type": "integer", "minimum": 1},
+            {"type": "null"}
+          ]
+        },
+        "supported_abis": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": ["armeabi-v7a", "arm64-v8a", "x86", "x86_64"]
+          }
+        },
+        "has_native_libraries": {"type": "boolean"}
+      }
+    },
+    "requiredHeaders": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Content-Type", "x-amz-checksum-sha256"],
+      "properties": {
+        "Content-Type": {"const": "application/vnd.android.package-archive"},
+        "x-amz-checksum-sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "pendingApkUpload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "upload_id",
+        "artifact_kind",
+        "mime",
+        "size",
+        "sha256_b64",
+        "expires_at"
+      ],
+      "properties": {
+        "state": {"const": "pending"},
+        "upload_id": {"type": "string", "format": "uuid"},
+        "artifact_kind": {"const": "apk"},
+        "mime": {"const": "application/vnd.android.package-archive"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 5368709120},
+        "sha256_b64": {"$ref": "#/$defs/sha256"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "put_url": {"type": "string", "format": "uri", "pattern": "^https://"},
+        "required_headers": {"$ref": "#/$defs/requiredHeaders"}
+      },
+      "oneOf": [
+        {"required": ["put_url", "required_headers"]},
+        {
+          "not": {
+            "anyOf": [
+              {"required": ["put_url"]},
+              {"required": ["required_headers"]}
+            ]
+          }
+        }
+      ]
+    },
+    "finalizedApkUpload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "artifact_id",
+        "upload_id",
+        "artifact_kind",
+        "mime",
+        "size",
+        "sha256_b64",
+        "finalized_at"
+      ],
+      "properties": {
+        "state": {"const": "finalized"},
+        "artifact_id": {"type": "string", "format": "uuid"},
+        "upload_id": {"type": "string", "format": "uuid"},
+        "artifact_kind": {"const": "apk"},
+        "mime": {"const": "application/vnd.android.package-archive"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 5368709120},
+        "sha256_b64": {"$ref": "#/$defs/sha256"},
+        "finalized_at": {"type": "string", "format": "date-time"}
+      }
+    },
+    "verdictCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "invalid", "pending", "validation_error", "total"],
+      "properties": {
+        "valid": {"type": "integer", "minimum": 0, "maximum": 10},
+        "invalid": {"type": "integer", "minimum": 0, "maximum": 10},
+        "pending": {"type": "integer", "minimum": 0, "maximum": 10},
+        "validation_error": {"type": "integer", "minimum": 0, "maximum": 10},
+        "total": {"type": "integer", "minimum": 0, "maximum": 30}
+      }
+    },
+    "scenarioProgress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_job_id",
+        "scenario_type",
+        "state",
+        "version",
+        "device_group_id",
+        "sample_verdict_counts",
+        "started_at",
+        "completed_at",
+        "failure"
+      ],
+      "properties": {
+        "scenario_job_id": {
+          "oneOf": [
+            {"type": "string", "format": "uuid"},
+            {"type": "null"}
+          ]
+        },
+        "scenario_type": {"enum": ["cold_start", "scroll", "memory_cycle"]},
+        "state": {
+          "enum": [
+            "awaiting_input",
+            "queued",
+            "scheduled",
+            "running",
+            "analyzing",
+            "completed",
+            "failed",
+            "canceled"
+          ]
+        },
+        "version": {
+          "oneOf": [
+            {"type": "integer", "minimum": 1},
+            {"type": "null"}
+          ]
+        },
+        "device_group_id": {
+          "oneOf": [
+            {"type": "string", "format": "uuid"},
+            {"type": "null"}
+          ]
+        },
+        "sample_verdict_counts": {"$ref": "#/$defs/verdictCounts"},
+        "started_at": {"$ref": "#/$defs/nullableDateTime"},
+        "completed_at": {"$ref": "#/$defs/nullableDateTime"},
+        "failure": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/failure"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"state": {"const": "awaiting_input"}},
+            "required": ["state"]
+          },
+          "then": {
+            "properties": {
+              "scenario_job_id": {"type": "null"},
+              "version": {"type": "null"}
+            }
+          },
+          "else": {
+            "properties": {
+              "scenario_job_id": {"type": "string", "format": "uuid"},
+              "version": {"type": "integer", "minimum": 1}
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {"state": {"const": "failed"}},
+            "required": ["state"]
+          },
+          "then": {"properties": {"failure": {"$ref": "#/$defs/failure"}}}
+        }
+      ]
+    },
+    "activeLease": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lease_id", "device_id", "state", "expires_at"],
+      "properties": {
+        "lease_id": {"type": "string", "format": "uuid"},
+        "device_id": {"type": "string", "format": "uuid"},
+        "state": {"const": "active"},
+        "expires_at": {"type": "string", "format": "date-time"}
+      }
+    }
+  }
+}

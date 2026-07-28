@@ -9,6 +9,7 @@ from perfpilot_api.api.auth import (
     get_auth_service,
     proxy_router_dependencies,
 )
+from perfpilot_api.api.analyses import analysis_error
 from perfpilot_api.errors import ApiError
 from perfpilot_api.security.csrf import OriginNotAllowedError, require_allowed_origin
 from perfpilot_api.security.sessions import COOKIE_NAME
@@ -18,6 +19,10 @@ from perfpilot_api.services.auth import (
     InvalidSessionError,
     RoleForbiddenError,
     TeamAccessNotFoundError,
+)
+from perfpilot_api.services.analyses import (
+    AnalysisError,
+    AnalysisService,
 )
 from perfpilot_api.services.uploads import (
     DownloadAuthorization,
@@ -219,7 +224,6 @@ async def finalize_upload(
     request: Request,
     response: Response,
     auth_service: Annotated[AuthService, Depends(get_auth_service)],
-    upload_service: Annotated[UploadService, Depends(get_upload_service)],
 ) -> dict[str, object]:
     await _authorize_team(
         request=request,
@@ -227,14 +231,29 @@ async def finalize_upload(
         team_id=team_id,
         access="write",
     )
+    analysis_service: AnalysisService | None = request.app.state.analysis_service
+    upload_service: UploadService | None = request.app.state.upload_service
     try:
-        slot = await upload_service.finalize(
-            team_id=team_id,
-            analysis_id=analysis_id,
-            upload_id=payload.upload_id,
-            caller_sha256_b64=payload.sha256_b64,
-            caller_size=payload.size,
-        )
+        if analysis_service is not None:
+            slot = await analysis_service.finalize_upload(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                upload_id=payload.upload_id,
+                caller_sha256_b64=payload.sha256_b64,
+                caller_size=payload.size,
+            )
+        elif request.app.state.testing and upload_service is not None:
+            slot = await upload_service.finalize(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                upload_id=payload.upload_id,
+                caller_sha256_b64=payload.sha256_b64,
+                caller_size=payload.size,
+            )
+        else:
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    except AnalysisError as error:
+        raise analysis_error(error) from None
     except (
         UploadInvalidRequestError,
         UploadNotFoundError,

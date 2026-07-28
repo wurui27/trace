@@ -642,6 +642,162 @@ def test_migration_round_trip_returns_to_base_and_reupgrades(
     assert set(inspect(engine).get_table_names()) == expected_tables
 
 
+def test_control_task7_downgrade_refuses_to_drop_scheduling_data(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    team_id = UUID("91000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("92000000-0000-4000-8000-000000000001")
+    scenario_id = UUID("93000000-0000-4000-8000-000000000001")
+    recipe_id = UUID("94000000-0000-4000-8000-000000000001")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'Task 7', 'active')"),
+            {"id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                "VALUES (:id, :team_id, 'task7', 'device', 'queued', ARRAY['arm64-v8a'])"
+            ),
+            {"id": analysis_id, "team_id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO scenario_jobs "
+                "(id, analysis_id, scenario_type, state, scenario_recipe_id, "
+                "recipe_version, recipe_hash, supported_abis) VALUES "
+                "(:id, :analysis_id, 'cold_start', 'queued', :recipe_id, 1, "
+                "repeat('a', 64), ARRAY['arm64-v8a'])"
+            ),
+            {"id": scenario_id, "analysis_id": analysis_id, "recipe_id": recipe_id},
+        )
+
+    with pytest.raises(RuntimeError, match="must be exported before downgrade"):
+        command.downgrade(
+            _alembic_config("control", migration_databases.control_url),
+            "0002_tenant_provisioning_state",
+        )
+
+    assert "supported_abis" in {
+        column["name"]
+        for column in inspect(migration_databases.control_engine).get_columns("scenario_jobs")
+    }
+
+
+def test_tenant_task7_downgrade_refuses_to_drop_inspected_apk_metadata(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("tenant", migration_databases.tenant_url)
+    application_id = UUID("95000000-0000-4000-8000-000000000001")
+    version_id = UUID("96000000-0000-4000-8000-000000000001")
+    with migration_databases.tenant_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO applications (id, name, package_name) "
+                "VALUES (:id, 'Task 7', 'com.example.task7')"
+            ),
+            {"id": application_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO application_versions "
+                "(id, application_id, package_name, version_name, version_code, "
+                "has_native_libraries, apk_sha256_b64) VALUES "
+                "(:id, :application_id, 'com.example.task7', '1', 1, false, repeat('A', 44))"
+            ),
+            {"id": version_id, "application_id": application_id},
+        )
+
+    with pytest.raises(RuntimeError, match="must be exported before downgrade"):
+        command.downgrade(
+            _alembic_config("tenant", migration_databases.tenant_url),
+            "0002_artifact_upload_slots",
+        )
+
+    assert "apk_sha256_b64" in {
+        column["name"]
+        for column in inspect(migration_databases.tenant_engine).get_columns("application_versions")
+    }
+
+
+def test_tenant_task7_upgrade_backfills_native_library_metadata_for_existing_analyses(
+    migration_databases: MigrationDatabases,
+) -> None:
+    config = _alembic_config("tenant", migration_databases.tenant_url)
+    command.upgrade(config, "0002_artifact_upload_slots")
+    application_id = UUID("95100000-0000-4000-8000-000000000001")
+    version_id = UUID("96100000-0000-4000-8000-000000000001")
+    analysis_id = UUID("97100000-0000-4000-8000-000000000001")
+    with migration_databases.tenant_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO applications (id, name) VALUES (:id, 'Legacy app')"),
+            {"id": application_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO application_versions "
+                "(id, application_id, package_name, version_name, version_code, "
+                "supported_abis) VALUES "
+                "(:id, :application_id, 'com.example.legacy', '1', 1, "
+                "CAST('[\"arm64-v8a\"]' AS jsonb))"
+            ),
+            {"id": version_id, "application_id": application_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO analyses "
+                "(id, application_version_id, analysis_mode, state) "
+                "VALUES (:id, :version_id, 'device', 'created')"
+            ),
+            {"id": analysis_id, "version_id": version_id},
+        )
+
+    command.upgrade(config, "head")
+
+    columns = {
+        column["name"]: column
+        for column in inspect(migration_databases.tenant_engine).get_columns("application_versions")
+    }
+    with migration_databases.tenant_engine.connect() as connection:
+        has_native_libraries = connection.scalar(
+            text("SELECT has_native_libraries FROM application_versions WHERE id = :id"),
+            {"id": version_id},
+        )
+    assert columns["has_native_libraries"]["nullable"] is False
+    assert has_native_libraries is True
+
+
+def test_tenant_task7_upgrade_rejects_one_legacy_application_with_multiple_packages(
+    migration_databases: MigrationDatabases,
+) -> None:
+    config = _alembic_config("tenant", migration_databases.tenant_url)
+    command.upgrade(config, "0002_artifact_upload_slots")
+    application_id = UUID("95200000-0000-4000-8000-000000000001")
+    with migration_databases.tenant_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO applications (id, name) VALUES (:id, 'Ambiguous app')"),
+            {"id": application_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO application_versions "
+                "(id, application_id, package_name, version_name, version_code) VALUES "
+                "(:first_id, :application_id, 'com.example.first', '1', 1), "
+                "(:second_id, :application_id, 'com.example.second', '2', 2)"
+            ),
+            {
+                "first_id": UUID("96200000-0000-4000-8000-000000000001"),
+                "second_id": UUID("96200000-0000-4000-8000-000000000002"),
+                "application_id": application_id,
+            },
+        )
+
+    with pytest.raises(RuntimeError, match="one application owns multiple packages"):
+        command.upgrade(config, "head")
+
+
 def test_control_constraints_accept_valid_rows_and_reject_duplicates(
     migration_databases: MigrationDatabases,
 ) -> None:

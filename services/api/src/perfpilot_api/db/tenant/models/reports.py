@@ -6,6 +6,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     Numeric,
@@ -24,12 +25,38 @@ class ReportVersion(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
     __tablename__ = "report_versions"
     __table_args__ = (
         UniqueConstraint(
-            "analysis_id", "report_version", name="uq_report_versions_analysis_version"
+            "scenario_result_id",
+            "report_version",
+            name="uq_report_versions_scenario_version",
+        ),
+        ForeignKeyConstraint(
+            ("scenario_result_id", "analysis_id"),
+            ("scenario_results.id", "scenario_results.analysis_id"),
+            name="fk_report_versions_scenario_analysis",
+            ondelete="CASCADE",
         ),
         CheckConstraint("report_version > 0", name="ck_report_versions_version"),
         CheckConstraint(
             "state IN ('complete', 'partial', 'failed')",
             name="ck_report_versions_state",
+        ),
+        CheckConstraint(
+            "(bundle IS NULL AND bundle_sha256_b64 IS NULL) OR "
+            "(bundle IS NOT NULL AND bundle_sha256_b64 IS NOT NULL "
+            "AND scenario_result_id IS NOT NULL)",
+            name="ck_report_versions_bundle_metadata",
+        ),
+        Index(
+            "ix_report_versions_scenario_analysis",
+            "scenario_result_id",
+            "analysis_id",
+        ),
+        Index(
+            "uq_report_versions_legacy_analysis_version",
+            "analysis_id",
+            "report_version",
+            unique=True,
+            postgresql_where=text("scenario_result_id IS NULL"),
         ),
         Index("ix_report_versions_source_artifact_id", "source_artifact_id"),
     )
@@ -38,6 +65,9 @@ class ReportVersion(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("analyses.id", ondelete="CASCADE"),
         nullable=False,
+    )
+    scenario_result_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
     )
     report_version: Mapped[int] = mapped_column(Integer, nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
@@ -54,6 +84,8 @@ class ReportVersion(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
         default=dict,
         server_default=text("'{}'::jsonb"),
     )
+    bundle: Mapped[dict[str, object] | None] = mapped_column(JSONB(none_as_null=True))
+    bundle_sha256_b64: Mapped[str | None] = mapped_column(String(44))
 
 
 class Metric(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
@@ -166,9 +198,7 @@ class Evidence(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
 class Recommendation(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
     __tablename__ = "recommendations"
     __table_args__ = (
-        UniqueConstraint(
-            "finding_id", "rank", name="uq_recommendations_finding_rank"
-        ),
+        UniqueConstraint("finding_id", "rank", name="uq_recommendations_finding_rank"),
         CheckConstraint("rank > 0", name="ck_recommendations_rank_positive"),
     )
 

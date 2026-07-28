@@ -1,0 +1,501 @@
+{
+  "schema_version": "1.0",
+  "analysis_id": "31000000-0000-4000-8000-000000000001",
+  "analysis_mode": "device",
+  "state": "partially_completed",
+  "report_version": 1,
+  "generated_at": "2026-07-28T13:00:00Z",
+  "scenario_reports": [
+    {
+      "scenario_job_id": "32000000-0000-4000-8000-000000000001",
+      "scenario_type": "cold_start",
+      "result_state": "completed",
+      "device_group_id": "35000000-0000-4000-8000-000000000001",
+      "device_group_reason": null,
+      "bundle": {
+        "schema_version": "1.0",
+        "bundle_id": "36000000-0000-4000-8000-000000000001",
+        "scenario_job_id": "32000000-0000-4000-8000-000000000001",
+        "scenario_type": "cold_start",
+        "bundle_state": "complete",
+        "valid_measurement": true,
+        "validity_reasons": [],
+        "sample_ids": ["37000000-0000-4000-8000-000000000001"],
+        "generated_at": "2026-07-28T12:50:00Z",
+        "metrics": [
+          {
+            "metric_id": "38000000-0000-4000-8000-000000000001",
+            "name": "startup.time_to_initial_display_ms",
+            "status": "available",
+            "numeric_value": 812.4,
+            "unit": "ms",
+            "definition": "Median process-cold time to initial display across server-valid samples.",
+            "threshold": {"operator": "lte", "value": 700, "unit": "ms"},
+            "sample_ids": ["37000000-0000-4000-8000-000000000001"]
+          }
+        ],
+        "findings": [
+          {
+            "finding_id": "39000000-0000-4000-8000-000000000001",
+            "rule_id": "startup.main_thread_binder",
+            "kind": "root_cause",
+            "status": "confirmed",
+            "severity": "warning",
+            "confidence": "high",
+            "confidence_ceiling": "high",
+            "title": "Main thread waits on a repeated Binder dependency",
+            "summary": "The same Binder wait chain overlaps the startup window in every valid sample.",
+            "evidence_ids": ["3a000000-0000-4000-8000-000000000001"],
+            "exclusions": [
+              {
+                "code": "environment.thermal_throttling",
+                "status": "excluded",
+                "evidence_ids": ["3a000000-0000-4000-8000-000000000001"]
+              }
+            ],
+            "recommendation": "Move the dependency lookup off the launch-critical main-thread path.",
+            "retest": "Repeat five process-cold launches with the same recipe and compare the Binder interval."
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "3a000000-0000-4000-8000-000000000001",
+            "source": "perfetto.startup_binder_waits",
+            "query_id": "startup.binder_wait_chain.v1",
+            "interval_start_ns": 120000000,
+            "interval_end_ns": 310000000,
+            "artifact_id": "3b000000-0000-4000-8000-000000000001",
+            "fields": {
+              "blocked_duration_ms": 190,
+              "thread_state": "S",
+              "repeated_sample_count": 5
+            }
+          }
+        ],
+        "artifacts": [
+          {
+            "artifact_id": "3b000000-0000-4000-8000-000000000001",
+            "artifact_kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 1048576,
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          }
+        ],
+        "trace_health": {
+          "parse_status": "parsed",
+          "trace_start_ns": 0,
+          "trace_end_ns": 5000000000,
+          "target_resolution": {
+            "package_name": "com.example.rkgallery",
+            "process_name": "com.example.rkgallery",
+            "upid": 17,
+            "pid": 4242,
+            "main_thread_id": 4242
+          },
+          "measurement_window": {
+            "start_ns": 100000000,
+            "end_ns": 900000000,
+            "coverage": "complete"
+          },
+          "data_loss": {
+            "buffer_overruns": 0,
+            "ftrace_events_lost": 0,
+            "traced_buf_patches_failed": 0,
+            "incomplete_slices": 0,
+            "boundary_truncations": 0
+          },
+          "frame_timeline_coverage": "available",
+          "target_display_coverage": "available",
+          "refresh_mode_coverage": "available"
+        },
+        "trace_capabilities": [
+          {"name": "android_startups", "required": true, "status": "available", "reason": null},
+          {"name": "binder", "required": false, "status": "available", "reason": null},
+          {
+            "name": "heapprofd",
+            "required": false,
+            "status": "unavailable",
+            "reason": "The KPI trace intentionally omitted the perturbing data source."
+          }
+        ],
+        "provenance": {
+          "input_artifacts": [
+            {
+              "artifact_id": "3b000000-0000-4000-8000-000000000001",
+              "artifact_kind": "trace",
+              "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }
+          ],
+          "capture_manifest": {
+            "status": "present",
+            "identifier": "3c000000-0000-4000-8000-000000000001",
+            "version": "1",
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "reason": null
+          },
+          "apk": {
+            "status": "present",
+            "identifier": "3d000000-0000-4000-8000-000000000001",
+            "version": "100",
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "reason": null
+          },
+          "device": {
+            "status": "present",
+            "identifier": "3e000000-0000-4000-8000-000000000001",
+            "version": "build-fingerprint-1",
+            "sha256_b64": null,
+            "reason": null
+          },
+          "agent": {
+            "status": "present",
+            "identifier": "3f000000-0000-4000-8000-000000000001",
+            "version": "1.0.0",
+            "sha256_b64": null,
+            "reason": null
+          },
+          "worker_container_image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "tracekit_version": "1.0.0",
+          "tracekit_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "trace_processor_version": "v50.1",
+          "trace_processor_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "sql_bundle_version": "2026.07.1",
+          "sql_bundle_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "analysis_bundle_schema_version": "1.0",
+          "analysis_bundle_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "rules_version": "2026.07.1",
+          "rules_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "scenario_recipe_version": 1,
+          "scenario_recipe_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "query_parameters": [
+            {"name": "target_package", "value": "com.example.rkgallery"},
+            {"name": "startup_mode", "value": "cold"}
+          ]
+        }
+      },
+      "failure": null
+    },
+    {
+      "scenario_job_id": "32000000-0000-4000-8000-000000000002",
+      "scenario_type": "scroll",
+      "result_state": "failed",
+      "device_group_id": "35000000-0000-4000-8000-000000000001",
+      "device_group_reason": null,
+      "bundle": {
+        "schema_version": "1.0",
+        "bundle_id": "36000000-0000-4000-8000-000000000002",
+        "scenario_job_id": "32000000-0000-4000-8000-000000000002",
+        "scenario_type": "scroll",
+        "bundle_state": "partial",
+        "valid_measurement": false,
+        "validity_reasons": ["insufficient_valid_samples"],
+        "sample_ids": ["37000000-0000-4000-8000-000000000002"],
+        "generated_at": "2026-07-28T12:52:00Z",
+        "metrics": [
+          {
+            "metric_id": "38000000-0000-4000-8000-000000000002",
+            "name": "scroll.slow_frame_ratio",
+            "status": "insufficient_data",
+            "numeric_value": null,
+            "unit": "percent",
+            "definition": "Slow frames divided by frames in the declared scroll measurement window.",
+            "threshold": {"operator": "lte", "value": 5, "unit": "percent"},
+            "sample_ids": ["37000000-0000-4000-8000-000000000002"]
+          }
+        ],
+        "findings": [
+          {
+            "finding_id": "39000000-0000-4000-8000-000000000002",
+            "rule_id": "scroll.capture_quality",
+            "kind": "symptom",
+            "status": "insufficient_data",
+            "severity": "informational",
+            "confidence": "none",
+            "confidence_ceiling": "none",
+            "title": "Scroll evidence is incomplete",
+            "summary": "Only one server-valid run remained after the attempt limit.",
+            "evidence_ids": ["3a000000-0000-4000-8000-000000000002"],
+            "exclusions": [
+              {
+                "code": "capture.required_sample_count",
+                "status": "not_excluded",
+                "evidence_ids": ["3a000000-0000-4000-8000-000000000002"]
+              }
+            ],
+            "recommendation": null,
+            "retest": "Repeat the scroll recipe until five server-valid runs are available."
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "3a000000-0000-4000-8000-000000000002",
+            "source": "sample_validator.verdict_counts",
+            "query_id": null,
+            "interval_start_ns": null,
+            "interval_end_ns": null,
+            "artifact_id": "3b000000-0000-4000-8000-000000000002",
+            "fields": {"valid": 1, "invalid": 9, "required_valid": 5}
+          }
+        ],
+        "artifacts": [
+          {
+            "artifact_id": "3b000000-0000-4000-8000-000000000002",
+            "artifact_kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 786432,
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          }
+        ],
+        "trace_health": {
+          "parse_status": "parsed",
+          "trace_start_ns": 0,
+          "trace_end_ns": 4000000000,
+          "target_resolution": {
+            "package_name": "com.example.rkgallery",
+            "process_name": "com.example.rkgallery",
+            "upid": 18,
+            "pid": 4343,
+            "main_thread_id": 4343
+          },
+          "measurement_window": {
+            "start_ns": 500000000,
+            "end_ns": 2500000000,
+            "coverage": "partial"
+          },
+          "data_loss": {
+            "buffer_overruns": 0,
+            "ftrace_events_lost": 27,
+            "traced_buf_patches_failed": 0,
+            "incomplete_slices": 2,
+            "boundary_truncations": 1
+          },
+          "frame_timeline_coverage": "insufficient_data",
+          "target_display_coverage": "available",
+          "refresh_mode_coverage": "available"
+        },
+        "trace_capabilities": [
+          {
+            "name": "frame_timeline",
+            "required": true,
+            "status": "insufficient_data",
+            "reason": "FrameTimeline coverage did not span the complete measurement window."
+          },
+          {"name": "target_display", "required": true, "status": "available", "reason": null}
+        ],
+        "provenance": {
+          "input_artifacts": [
+            {
+              "artifact_id": "3b000000-0000-4000-8000-000000000002",
+              "artifact_kind": "trace",
+              "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }
+          ],
+          "capture_manifest": {
+            "status": "present",
+            "identifier": "3c000000-0000-4000-8000-000000000002",
+            "version": "1",
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "reason": null
+          },
+          "apk": {
+            "status": "present",
+            "identifier": "3d000000-0000-4000-8000-000000000001",
+            "version": "100",
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "reason": null
+          },
+          "device": {
+            "status": "present",
+            "identifier": "3e000000-0000-4000-8000-000000000001",
+            "version": "build-fingerprint-1",
+            "sha256_b64": null,
+            "reason": null
+          },
+          "agent": {
+            "status": "present",
+            "identifier": "3f000000-0000-4000-8000-000000000001",
+            "version": "1.0.0",
+            "sha256_b64": null,
+            "reason": null
+          },
+          "worker_container_image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "tracekit_version": "1.0.0",
+          "tracekit_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "trace_processor_version": "v50.1",
+          "trace_processor_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "sql_bundle_version": "2026.07.1",
+          "sql_bundle_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "analysis_bundle_schema_version": "1.0",
+          "analysis_bundle_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "rules_version": "2026.07.1",
+          "rules_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "scenario_recipe_version": 1,
+          "scenario_recipe_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "query_parameters": [
+            {"name": "target_package", "value": "com.example.rkgallery"},
+            {"name": "target_display_id", "value": 0}
+          ]
+        }
+      },
+      "failure": {
+        "code": "insufficient_valid_samples",
+        "message": "The attempt limit was reached before five server-valid scroll runs were available.",
+        "retryable": false
+      }
+    },
+    {
+      "scenario_job_id": "32000000-0000-4000-8000-000000000003",
+      "scenario_type": "memory_cycle",
+      "result_state": "completed",
+      "device_group_id": "35000000-0000-4000-8000-000000000001",
+      "device_group_reason": null,
+      "bundle": {
+        "schema_version": "1.0",
+        "bundle_id": "36000000-0000-4000-8000-000000000003",
+        "scenario_job_id": "32000000-0000-4000-8000-000000000003",
+        "scenario_type": "memory_cycle",
+        "bundle_state": "complete",
+        "valid_measurement": true,
+        "validity_reasons": [],
+        "sample_ids": ["37000000-0000-4000-8000-000000000003"],
+        "generated_at": "2026-07-28T12:55:00Z",
+        "metrics": [
+          {
+            "metric_id": "38000000-0000-4000-8000-000000000003",
+            "name": "memory.pss_delta_after_cycle_kib",
+            "status": "available",
+            "numeric_value": 2048,
+            "unit": "KiB",
+            "definition": "PSS after the final settle window minus the pre-cycle baseline.",
+            "threshold": {"operator": "lte", "value": 4096, "unit": "KiB"},
+            "sample_ids": ["37000000-0000-4000-8000-000000000003"]
+          }
+        ],
+        "findings": [
+          {
+            "finding_id": "39000000-0000-4000-8000-000000000003",
+            "rule_id": "memory.pss_recovery",
+            "kind": "symptom",
+            "status": "confirmed",
+            "severity": "healthy",
+            "confidence": "high",
+            "confidence_ceiling": "high",
+            "title": "Memory returns within the accepted recovery range",
+            "summary": "PSS remains below the recipe threshold after ten enter/operate/exit rounds.",
+            "evidence_ids": ["3a000000-0000-4000-8000-000000000003"],
+            "exclusions": [],
+            "recommendation": null,
+            "retest": "Repeat the same ten-round memory cycle after changes to retained UI state."
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "3a000000-0000-4000-8000-000000000003",
+            "source": "memory_cycle.summary",
+            "query_id": null,
+            "interval_start_ns": null,
+            "interval_end_ns": null,
+            "artifact_id": "3b000000-0000-4000-8000-000000000003",
+            "fields": {"baseline_pss_kib": 65536, "final_pss_kib": 67584, "rounds": 10}
+          }
+        ],
+        "artifacts": [
+          {
+            "artifact_id": "3b000000-0000-4000-8000-000000000003",
+            "artifact_kind": "memory_summary",
+            "mime": "application/json",
+            "size": 4096,
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          }
+        ],
+        "trace_health": {
+          "parse_status": "not_applicable",
+          "trace_start_ns": null,
+          "trace_end_ns": null,
+          "target_resolution": {
+            "package_name": "com.example.rkgallery",
+            "process_name": "com.example.rkgallery",
+            "upid": null,
+            "pid": 4545,
+            "main_thread_id": null
+          },
+          "measurement_window": {"start_ns": null, "end_ns": null, "coverage": "missing"},
+          "data_loss": {
+            "buffer_overruns": 0,
+            "ftrace_events_lost": 0,
+            "traced_buf_patches_failed": 0,
+            "incomplete_slices": 0,
+            "boundary_truncations": 0
+          },
+          "frame_timeline_coverage": "not_applicable",
+          "target_display_coverage": "not_applicable",
+          "refresh_mode_coverage": "not_applicable"
+        },
+        "trace_capabilities": [
+          {
+            "name": "perfetto_trace",
+            "required": false,
+            "status": "unavailable",
+            "reason": "The memory-cycle contract uses meminfo artifacts and does not require a Trace."
+          },
+          {"name": "meminfo", "required": true, "status": "available", "reason": null}
+        ],
+        "provenance": {
+          "input_artifacts": [
+            {
+              "artifact_id": "3b000000-0000-4000-8000-000000000003",
+              "artifact_kind": "memory_summary",
+              "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }
+          ],
+          "capture_manifest": {
+            "status": "present",
+            "identifier": "3c000000-0000-4000-8000-000000000003",
+            "version": "1",
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "reason": null
+          },
+          "apk": {
+            "status": "present",
+            "identifier": "3d000000-0000-4000-8000-000000000001",
+            "version": "100",
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "reason": null
+          },
+          "device": {
+            "status": "present",
+            "identifier": "3e000000-0000-4000-8000-000000000001",
+            "version": "build-fingerprint-1",
+            "sha256_b64": null,
+            "reason": null
+          },
+          "agent": {
+            "status": "present",
+            "identifier": "3f000000-0000-4000-8000-000000000001",
+            "version": "1.0.0",
+            "sha256_b64": null,
+            "reason": null
+          },
+          "worker_container_image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "tracekit_version": "1.0.0",
+          "tracekit_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "trace_processor_version": "v50.1",
+          "trace_processor_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "sql_bundle_version": "2026.07.1",
+          "sql_bundle_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "analysis_bundle_schema_version": "1.0",
+          "analysis_bundle_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "rules_version": "2026.07.1",
+          "rules_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "scenario_recipe_version": 1,
+          "scenario_recipe_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "query_parameters": [
+            {"name": "target_package", "value": "com.example.rkgallery"},
+            {"name": "round_count", "value": 10}
+          ]
+        }
+      },
+      "failure": null
+    }
+  ]
+}

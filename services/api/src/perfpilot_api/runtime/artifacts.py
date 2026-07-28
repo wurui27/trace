@@ -14,6 +14,11 @@ from perfpilot_api.db.tenant.router import (
 )
 from perfpilot_api.runtime.secrets import build_configured_secret_store
 from perfpilot_api.services import uploads as upload_core
+from perfpilot_api.services.apk_inspection import (
+    S3ApkInspector,
+    S3VersionedObjectReader,
+    SQLAlchemyApkArtifactLocator,
+)
 from perfpilot_api.storage.s3 import S3ArtifactStore
 
 
@@ -98,6 +103,7 @@ async def _close_owned_components(
 @dataclass(slots=True)
 class ArtifactRuntime:
     upload_service: Any
+    apk_inspector: Any
     tenant_router: Any = field(repr=False)
     s3_client: Any = field(repr=False)
     secret_store: Any = field(repr=False)
@@ -161,8 +167,19 @@ async def build_artifact_runtime(
             artifact_store=artifact_store,
             bucket_resolver=bucket_resolver,
         )
+        apk_locator = SQLAlchemyApkArtifactLocator(
+            tenant_router=tenant_router,
+            bucket_resolver=bucket_resolver,
+        )
+        object_reader = S3VersionedObjectReader(client=s3_client)
+        apk_inspector = S3ApkInspector(
+            locator=apk_locator,
+            object_reader=object_reader,
+            apkanalyzer_binary=str(settings.apkanalyzer_binary),
+        )
         runtime = ArtifactRuntime(
             upload_service=upload_service,
+            apk_inspector=apk_inspector,
             tenant_router=tenant_router,
             s3_client=s3_client,
             secret_store=secret_store,

@@ -18,6 +18,7 @@ from perfpilot_api.api.auth import PROXY_CLIENT_IDENTITY_STATE_KEY
 from perfpilot_api.api.auth import ProxyAuthenticationMiddleware
 from perfpilot_api.api.auth import router as auth_router
 from perfpilot_api.api.admin_teams import router as admin_teams_router
+from perfpilot_api.api.analyses import router as analyses_router
 from perfpilot_api.api.health import router as health_router
 from perfpilot_api.api.me import router as me_router
 from perfpilot_api.api.members import router as members_router
@@ -44,6 +45,11 @@ from perfpilot_api.services.auth import (
     AuthService,
     RedisLoginRateLimiter,
     RedisPreAuthSessionLimiter,
+)
+from perfpilot_api.services.analyses import (
+    AnalysisService,
+    ApkInspector,
+    SQLAlchemyAnalysisRepository,
 )
 from perfpilot_api.services.provisioning import AdminTeamService
 from perfpilot_api.services.uploads import UploadService
@@ -134,6 +140,8 @@ def create_app(
     auth_service: AuthService | None = None,
     admin_team_service: AdminTeamService | None = None,
     upload_service: UploadService | None = None,
+    analysis_service: AnalysisService | None = None,
+    apk_inspector: ApkInspector | None = None,
     replay_store: ReplayStore | None = None,
     proxy_clock: Callable[[], float] = time.time,
     client_address_resolver: Callable[[Request], str] | None = None,
@@ -157,9 +165,12 @@ def create_app(
     resolved_auth_service = auth_service
     resolved_admin_team_service = admin_team_service
     resolved_upload_service = upload_service
+    resolved_analysis_service = analysis_service
     resolved_replay_store = replay_store
     artifact_runtime_required = (
-        not testing and settings.app_env == "production" and resolved_upload_service is None
+        not testing
+        and settings.app_env == "production"
+        and (resolved_upload_service is None or resolved_analysis_service is None)
     )
     if not testing and (resolved_auth_service is None or resolved_replay_store is None):
         owned_redis = redis.from_url(settings.redis_url.get_secret_value())
@@ -195,7 +206,7 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
-        nonlocal owned_artifact_runtime, resolved_upload_service
+        nonlocal owned_artifact_runtime, resolved_analysis_service, resolved_upload_service
         lifespan_error: BaseException | None = None
         try:
             if artifact_runtime_required:
@@ -205,8 +216,24 @@ def create_app(
                     settings=settings,
                     control_session_factory=control_session_factory,
                 )
-                resolved_upload_service = owned_artifact_runtime.upload_service
+                if resolved_upload_service is None:
+                    resolved_upload_service = owned_artifact_runtime.upload_service
                 lifespan_app.state.upload_service = resolved_upload_service
+                if resolved_analysis_service is None:
+                    resolved_inspector = apk_inspector
+                    if settings.app_env != "production":
+                        resolved_inspector = resolved_inspector or owned_artifact_runtime.apk_inspector
+                    if resolved_inspector is None:
+                        raise RuntimeError("An externally isolated APK inspector is unavailable")
+                    resolved_analysis_service = AnalysisService(
+                        repository=SQLAlchemyAnalysisRepository(
+                            control_session_factory=control_session_factory,
+                            tenant_router=owned_artifact_runtime.tenant_router,
+                        ),
+                        upload_service=resolved_upload_service,
+                        apk_inspector=resolved_inspector,
+                    )
+                    lifespan_app.state.analysis_service = resolved_analysis_service
             yield
         except BaseException as error:
             lifespan_error = error
@@ -238,6 +265,7 @@ def create_app(
     app.state.auth_service = resolved_auth_service
     app.state.admin_team_service = resolved_admin_team_service
     app.state.upload_service = resolved_upload_service
+    app.state.analysis_service = resolved_analysis_service
     app.state.proxy_replay_store = resolved_replay_store or InMemoryReplayStore(clock=proxy_clock)
     app.state.proxy_clock = proxy_clock
     identity_required = (
@@ -262,6 +290,7 @@ def create_app(
     app.include_router(admin_teams_router)
     app.include_router(me_router)
     app.include_router(members_router)
+    app.include_router(analyses_router)
     app.include_router(uploads_router)
     return app
 

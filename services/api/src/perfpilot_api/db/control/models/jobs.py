@@ -12,7 +12,7 @@ from sqlalchemy import (
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
+from sqlalchemy.dialects.postgresql import ARRAY, UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from perfpilot_api.db.base import (
@@ -31,9 +31,7 @@ class GlobalJob(
 ):
     __tablename__ = "global_jobs"
     __table_args__ = (
-        UniqueConstraint(
-            "team_id", "idempotency_key", name="uq_global_jobs_team_idempotency"
-        ),
+        UniqueConstraint("team_id", "idempotency_key", name="uq_global_jobs_team_idempotency"),
         CheckConstraint(
             "analysis_mode IN ('device', 'trace_upload')",
             name="ck_global_jobs_analysis_mode",
@@ -62,6 +60,9 @@ class GlobalJob(
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     input_artifact_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     required_abi: Mapped[str | None] = mapped_column(String(64))
+    supported_abis: Mapped[list[str]] = mapped_column(
+        ARRAY(String(64)), nullable=False, default=list, server_default=text("'{}'::varchar[]")
+    )
     min_api_level: Mapped[int | None] = mapped_column(Integer)
     attempt_count: Mapped[int] = mapped_column(
         Integer, nullable=False, default=0, server_default=text("0")
@@ -96,9 +97,7 @@ class ScenarioJob(
 ):
     __tablename__ = "scenario_jobs"
     __table_args__ = (
-        UniqueConstraint(
-            "analysis_id", "scenario_type", name="uq_scenario_jobs_analysis_type"
-        ),
+        UniqueConstraint("analysis_id", "scenario_type", name="uq_scenario_jobs_analysis_type"),
         CheckConstraint(
             "scenario_type IN ('cold_start', 'scroll', 'memory_cycle')",
             name="ck_scenario_jobs_type",
@@ -116,6 +115,12 @@ class ScenarioJob(
             name="ck_scenario_jobs_sample_counts",
         ),
         CheckConstraint("version > 0", name="ck_scenario_jobs_version_positive"),
+        CheckConstraint(
+            "(scenario_recipe_id IS NULL AND recipe_version IS NULL AND recipe_hash IS NULL) OR "
+            "(scenario_recipe_id IS NOT NULL AND recipe_version IS NOT NULL "
+            "AND recipe_version > 0 AND recipe_hash IS NOT NULL)",
+            name="ck_scenario_jobs_recipe_binding",
+        ),
         Index("ix_scenario_jobs_state_created", "state", "created_at"),
     )
 
@@ -125,9 +130,15 @@ class ScenarioJob(
         nullable=False,
     )
     scenario_type: Mapped[str] = mapped_column(String(32), nullable=False)
+    scenario_recipe_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    recipe_version: Mapped[int | None] = mapped_column(Integer)
+    recipe_hash: Mapped[str | None] = mapped_column(String(64))
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     input_artifact_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     required_abi: Mapped[str | None] = mapped_column(String(64))
+    supported_abis: Mapped[list[str]] = mapped_column(
+        ARRAY(String(64)), nullable=False, default=list, server_default=text("'{}'::varchar[]")
+    )
     min_api_level: Mapped[int | None] = mapped_column(Integer)
     device_group_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     attempt_count: Mapped[int] = mapped_column(
@@ -163,12 +174,8 @@ class SampleValidationClaim(
             "state IN ('active', 'completed', 'expired', 'revoked')",
             name="ck_sample_validation_claims_state",
         ),
-        CheckConstraint(
-            "retry_count >= 0", name="ck_sample_validation_claims_retry_count"
-        ),
-        CheckConstraint(
-            "version > 0", name="ck_sample_validation_claims_version_positive"
-        ),
+        CheckConstraint("retry_count >= 0", name="ck_sample_validation_claims_retry_count"),
+        CheckConstraint("version > 0", name="ck_sample_validation_claims_version_positive"),
         Index("ix_sample_validation_claims_scenario_job_id", "scenario_job_id"),
         Index("ix_sample_validation_claims_state_expires", "state", "expires_at"),
     )

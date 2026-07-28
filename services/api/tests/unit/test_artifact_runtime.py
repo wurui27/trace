@@ -27,6 +27,7 @@ def _settings() -> SimpleNamespace:
         tenant_cluster_sslmode="verify-full",
         secret_keyring_config=Path("/run/secrets/perfpilot/keyring.json"),
         secret_store_root=Path("/var/lib/perfpilot/secrets"),
+        apkanalyzer_binary=Path("/bin/echo"),
     )
 
 
@@ -169,6 +170,9 @@ async def test_artifact_runtime_builds_authoritative_dependencies_with_sigv4(
     repository = object()
     artifact_store = object()
     upload_service = object()
+    apk_locator = object()
+    object_reader = object()
+    apk_inspector = object()
     session_factory = object()
 
     monkeypatch.setattr(
@@ -208,6 +212,24 @@ async def test_artifact_runtime_builds_authoritative_dependencies_with_sigv4(
         "UploadService",
         lambda **kwargs: events.append(("upload_service", kwargs)) or upload_service,
     )
+    monkeypatch.setattr(
+        artifact_runtime,
+        "SQLAlchemyApkArtifactLocator",
+        lambda **kwargs: events.append(("apk_locator", kwargs)) or apk_locator,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        artifact_runtime,
+        "S3VersionedObjectReader",
+        lambda **kwargs: events.append(("object_reader", kwargs)) or object_reader,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        artifact_runtime,
+        "S3ApkInspector",
+        lambda **kwargs: events.append(("apk_inspector", kwargs)) or apk_inspector,
+        raising=False,
+    )
 
     def create_client(service_name: str, **kwargs: object) -> FakeS3Client:
         events.append(("s3", {"service_name": service_name, **kwargs}))
@@ -221,12 +243,23 @@ async def test_artifact_runtime_builds_authoritative_dependencies_with_sigv4(
     )
 
     assert runtime.upload_service is upload_service
+    assert runtime.apk_inspector is apk_inspector
     assert ("route_repository", {"session_factory": session_factory}) in events
     assert (
         "bucket_resolver",
         {"session_factory": session_factory},
     ) in events
     assert ("upload_repository", {"tenant_router": router}) in events
+    assert ("apk_locator", {"tenant_router": router, "bucket_resolver": bucket_resolver}) in events
+    assert ("object_reader", {"client": s3_client}) in events
+    assert (
+        "apk_inspector",
+        {
+            "locator": apk_locator,
+            "object_reader": object_reader,
+            "apkanalyzer_binary": "/bin/echo",
+        },
+    ) in events
     s3_kwargs = next(value for name, value in events if name == "s3")
     assert isinstance(s3_kwargs, dict)
     assert s3_kwargs["service_name"] == "s3"
@@ -331,6 +364,7 @@ async def test_artifact_runtime_close_finishes_after_cancellation_and_can_retry(
 
     runtime = artifact_runtime.ArtifactRuntime(
         upload_service=object(),
+        apk_inspector=object(),
         tenant_router=FakeRouter(),
         s3_client=FakeClient(),
         secret_store=FakeSecretStore(),
@@ -374,6 +408,7 @@ async def test_artifact_runtime_close_attempts_all_steps_and_redacts_cleanup_err
 
     runtime = artifact_runtime.ArtifactRuntime(
         upload_service=object(),
+        apk_inspector=object(),
         tenant_router=FakeRouter(),
         s3_client=FakeClient(),
         secret_store=FakeSecretStore(),

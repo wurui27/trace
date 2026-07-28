@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/analyses/scenario-execution-manifest.schema.json",
+  "$comment": "An Agent reports immutable execution identities and local diagnostics. It never supplies authoritative sample validity or verdict counts; the control service derives those from tenant records.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "analysis_id",
+    "scenario_job_id",
+    "lease_id",
+    "scenario_type",
+    "expected_version",
+    "sample_attempt_ids",
+    "bundle_id",
+    "total_attempts",
+    "stop_reason",
+    "local_diagnostics",
+    "submitted_at"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "analysis_id": {"type": "string", "format": "uuid"},
+    "scenario_job_id": {"type": "string", "format": "uuid"},
+    "lease_id": {"type": "string", "format": "uuid"},
+    "scenario_type": {"enum": ["cold_start", "scroll", "memory_cycle"]},
+    "expected_version": {"type": "integer", "minimum": 1},
+    "sample_attempt_ids": {
+      "type": "array",
+      "maxItems": 10,
+      "uniqueItems": true,
+      "items": {"type": "string", "format": "uuid"}
+    },
+    "bundle_id": {
+      "oneOf": [
+        {"type": "string", "format": "uuid"},
+        {"type": "null"}
+      ]
+    },
+    "total_attempts": {"type": "integer", "minimum": 0, "maximum": 10},
+    "stop_reason": {
+      "enum": [
+        "server_valid_sample_target_reached",
+        "attempt_limit_reached",
+        "completed",
+        "deterministic_error",
+        "environment_retry_exhausted",
+        "canceled",
+        "lease_revoked"
+      ]
+    },
+    "local_diagnostics": {
+      "type": "array",
+      "maxItems": 100,
+      "items": {"$ref": "#/$defs/diagnostic"}
+    },
+    "submitted_at": {"type": "string", "format": "date-time"}
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "scenario_type": {"enum": ["cold_start", "scroll"]}
+        },
+        "required": ["scenario_type"]
+      },
+      "then": {
+        "properties": {
+          "bundle_id": {"type": "null"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "scenario_type": {"const": "memory_cycle"}
+        },
+        "required": ["scenario_type"]
+      },
+      "then": {
+        "properties": {
+          "sample_attempt_ids": {"maxItems": 0}
+        },
+        "anyOf": [
+          {"properties": {"bundle_id": {"type": "string", "format": "uuid"}}},
+          {
+            "properties": {
+              "stop_reason": {
+                "enum": [
+                  "deterministic_error",
+                  "environment_retry_exhausted",
+                  "canceled",
+                  "lease_revoked"
+                ]
+              },
+              "bundle_id": {"type": "null"}
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "severity", "message"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{0,95}$"
+        },
+        "severity": {"enum": ["info", "warning", "error"]},
+        "message": {"type": "string", "minLength": 1, "maxLength": 1000}
+      }
+    }
+  }
+}

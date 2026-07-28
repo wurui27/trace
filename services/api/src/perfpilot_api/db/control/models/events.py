@@ -1,7 +1,16 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, text
+from sqlalchemy import (
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -31,6 +40,12 @@ class OutboxEvent(
             "ready_at",
             "created_at",
             postgresql_where=text("ready_at IS NOT NULL AND published_at IS NULL"),
+        ),
+        Index(
+            "uq_outbox_events_analysis_queued_subject",
+            "subject_id",
+            unique=True,
+            postgresql_where=text("event_type = 'analysis_queued' AND subject_type = 'analysis'"),
         ),
     )
 
@@ -66,9 +81,7 @@ class InboxEvent(
 ):
     __tablename__ = "inbox_events"
     __table_args__ = (
-        UniqueConstraint(
-            "consumer_name", "event_id", name="uq_inbox_events_consumer_event"
-        ),
+        UniqueConstraint("consumer_name", "event_id", name="uq_inbox_events_consumer_event"),
         CheckConstraint(
             "state IN ('received', 'processed')",
             name="ck_inbox_events_state",

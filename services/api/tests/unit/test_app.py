@@ -111,6 +111,7 @@ def _production_settings(**overrides: object) -> Settings:
         "tenant_cluster_sslmode": "verify-full",
         "secret_keyring_config": "/run/secrets/perfpilot/keyring.json",
         "secret_store_root": "/var/lib/perfpilot/secrets",
+        "apkanalyzer_binary": "/opt/android-sdk/cmdline-tools/latest/bin/apkanalyzer",
         "proxy_secret": "test-production-proxy-secret",
         "session_secret": "test-production-session-secret",
         "jws_signing_key_reference": "kms://keys/perfpilot-signing",
@@ -132,6 +133,45 @@ def test_valid_explicit_production_settings() -> None:
     assert settings.tenant_cluster_sslmode == "verify-full"
     assert settings.secret_keyring_config == Path("/run/secrets/perfpilot/keyring.json")
     assert settings.secret_store_root == Path("/var/lib/perfpilot/secrets")
+    assert settings.apkanalyzer_binary == Path(
+        "/opt/android-sdk/cmdline-tools/latest/bin/apkanalyzer"
+    )
+
+
+def test_production_refuses_owned_in_process_apk_inspector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeEngine:
+        async def dispose(self) -> None:
+            pass
+
+    class FakeArtifactRuntime:
+        upload_service = object()
+        apk_inspector = object()
+        tenant_router = object()
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(main, "create_control_engine", lambda _: FakeEngine())
+    monkeypatch.setattr(main, "create_control_session_factory", lambda _: object())
+
+    async def build_artifact_runtime(**kwargs: object) -> FakeArtifactRuntime:
+        return FakeArtifactRuntime()
+
+    monkeypatch.setattr(main, "build_artifact_runtime", build_artifact_runtime)
+    app = create_app(
+        testing=False,
+        settings_override=_production_settings(),
+        auth_service=object(),  # type: ignore[arg-type]
+        admin_team_service=object(),  # type: ignore[arg-type]
+        replay_store=object(),  # type: ignore[arg-type]
+        proxy_client_identity_required=False,
+    )
+
+    with pytest.raises(RuntimeError, match="externally isolated"):
+        with TestClient(app):
+            pass
 
 
 def test_production_app_cleanup_attempts_every_dependency_and_redacts_failures(
@@ -146,6 +186,8 @@ def test_production_app_cleanup_attempts_every_dependency_and_redacts_failures(
 
     class FakeArtifactRuntime:
         upload_service = object()
+        apk_inspector = object()
+        tenant_router = object()
 
         async def close(self) -> None:
             events.append("artifacts")
@@ -164,6 +206,7 @@ def test_production_app_cleanup_attempts_every_dependency_and_redacts_failures(
         auth_service=object(),  # type: ignore[arg-type]
         admin_team_service=object(),  # type: ignore[arg-type]
         replay_store=object(),  # type: ignore[arg-type]
+        apk_inspector=object(),  # type: ignore[arg-type]
         proxy_client_identity_required=False,
     )
 
@@ -191,6 +234,8 @@ async def test_production_app_cleanup_preserves_late_cancellation(
 
     class FakeArtifactRuntime:
         upload_service = object()
+        apk_inspector = object()
+        tenant_router = object()
 
         async def close(self) -> None:
             events.append("artifacts")
@@ -294,6 +339,8 @@ def test_production_tenant_cluster_requires_verify_full(sslmode: str) -> None:
         ("secret_store_root", ""),
         ("secret_store_root", "relative/secrets"),
         ("secret_store_root", "/"),
+        ("apkanalyzer_binary", "relative/apkanalyzer"),
+        ("apkanalyzer_binary", "/"),
     ],
 )
 def test_production_rejects_invalid_artifact_runtime_settings(

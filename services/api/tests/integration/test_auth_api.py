@@ -1014,6 +1014,8 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
     class FakeArtifactRuntime:
         def __init__(self) -> None:
             self.upload_service = upload_service
+            self.apk_inspector = object()
+            self.tenant_router = object()
 
         async def close(self) -> None:
             closed.append("artifacts")
@@ -1065,6 +1067,7 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
         tenant_cluster_sslmode="verify-full",
         secret_keyring_config="/run/secrets/perfpilot/keyring.json",
         secret_store_root="/var/lib/perfpilot/secrets",
+        apkanalyzer_binary="/bin/echo",
         proxy_secret="production-proxy-secret",
         session_secret="production-session-secret",
         jws_signing_key_reference="kms://keys/perfpilot-signing",
@@ -1073,7 +1076,11 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
         _env_file=None,
     )
 
-    app = create_app(testing=False, settings_override=settings)
+    app = create_app(
+        testing=False,
+        settings_override=settings,
+        apk_inspector=object(),  # type: ignore[arg-type]
+    )
 
     assert isinstance(app.state.auth_service, AuthService)
     assert isinstance(app.state.proxy_replay_store, RedisReplayStore)
