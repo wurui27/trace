@@ -1,7 +1,7 @@
 # PerfPilot 外部分析内核接入设计
 
 - 日期：2026-07-28
-- 状态：待用户书面复核
+- 状态：已于 2026-07-28 获用户确认
 - 主分析内核：SmartPerfetto
 - 内存补证内核：Android-App-Memory-Analysis
 - 产品边界：保留现有 PerfPilot 界面、账户、租户数据库、对象存储、任务和报告体验
