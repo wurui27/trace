@@ -75,9 +75,9 @@ def _production_settings(**overrides: object) -> Settings:
         "app_env": "production",
         "control_database_url": (
             "postgresql+psycopg://perfpilot:test-password@db.example.com:5432/"
-            "perfpilot_control"
+            "perfpilot_control?sslmode=verify-full"
         ),
-        "redis_url": "redis://cache.example.com:6379/0",
+        "redis_url": "rediss://cache.example.com:6380/0",
         "s3_endpoint_url": "https://objects.example.com",
         "proxy_secret": "test-production-proxy-secret",
         "session_secret": "test-production-session-secret",
@@ -96,24 +96,99 @@ def test_valid_explicit_production_settings() -> None:
     assert [origin.scheme for origin in settings.allowed_origins] == ["https"]
 
 
+@pytest.mark.parametrize("app_env", ["development", "test"])
+def test_nonproduction_keeps_local_plaintext_service_defaults(app_env: str) -> None:
+    settings = Settings(app_env=app_env)
+
+    assert settings.control_database_url.get_secret_value().startswith("postgresql+psycopg://")
+    assert settings.redis_url.get_secret_value().startswith("redis://")
+    assert str(settings.s3_endpoint_url).startswith("http://")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "",
+        "?sslmode=disable",
+        "?sslmode=allow",
+        "?sslmode=prefer",
+        "?sslmode=require",
+        "?sslmode=verify-ca",
+        "?sslmode=verify-full&sslmode=disable",
+        "?sslmode=disable&sslmode=verify-full",
+        "?sslmode=verify-full&SSLMode=disable",
+        "?sslmode=verify-full&application_name=a&application_name=b",
+        "?sslmode=verify-full&host=127.0.0.1",
+        "?sslmode=verify-full&service=attacker",
+        "?sslmode=verify-full&servicefile=%2Ftmp%2Fpg_service.conf",
+        "?sslmode=verify-full&passfile=%2Ftmp%2Fpgpass",
+        "?sslmode=verify-full&options=-c%20search_path%3Dpublic",
+    ],
+    ids=[
+        "missing",
+        "disable",
+        "allow",
+        "prefer",
+        "require",
+        "verify-ca",
+        "duplicate-weak-last",
+        "duplicate-strong-last",
+        "confusable-case",
+        "duplicate-other-query-key",
+        "host-override",
+        "service-override",
+        "servicefile-override",
+        "passfile-override",
+        "options-override",
+    ],
+)
+def test_production_control_database_requires_unambiguous_verify_full(
+    query: str,
+) -> None:
+    marker = "database-url-secret-marker"
+    database_url = f"postgresql+psycopg://perfpilot:{marker}@db.example.com:5432/control{query}"
+
+    with pytest.raises(ValidationError, match="production service URL") as exc_info:
+        _production_settings(control_database_url=database_url)
+
+    assert marker not in str(exc_info.value)
+    assert marker not in repr(exc_info.value.errors())
+    assert marker not in exc_info.value.json()
+    assert exc_info.value.errors()[0]["input"] == "[redacted]"
+
+
+def test_production_requires_tls_for_redis_and_s3() -> None:
+    redis_marker = "redis-url-secret-marker"
+    with pytest.raises(ValidationError, match="production service URL") as redis_error:
+        _production_settings(redis_url=f"redis://:{redis_marker}@cache.example.com:6379/0")
+
+    s3_marker = "s3-url-secret-marker"
+    with pytest.raises(ValidationError, match="production service URL") as s3_error:
+        _production_settings(s3_endpoint_url=f"http://objects.example.com/{s3_marker}")
+
+    for marker, error in (
+        (redis_marker, redis_error.value),
+        (s3_marker, s3_error.value),
+    ):
+        assert marker not in str(error)
+        assert marker not in repr(error.errors())
+        assert marker not in error.json()
+        assert error.errors()[0]["input"] == "[redacted]"
+
+
 @pytest.mark.parametrize(
     "override",
     [
         {
             "control_database_url": (
-                "postgresql+psycopg://perfpilot:perfpilot@127.0.0.1:5432/"
-                "perfpilot_control"
+                "postgresql+psycopg://perfpilot:perfpilot@127.0.0.1:5432/perfpilot_control"
             )
         },
         {"redis_url": "redis://127.0.0.1:6379/0"},
         {"s3_endpoint_url": "http://127.0.0.1:9000"},
         {"proxy_secret": "development-only-proxy-secret"},
         {"session_secret": "development-only-session-secret"},
-        {
-            "jws_signing_key_reference": (
-                "development-only-jws-signing-key-reference"
-            )
-        },
+        {"jws_signing_key_reference": ("development-only-jws-signing-key-reference")},
         {
             "agent_registration_secret_reference": (
                 "development-only-agent-registration-secret-reference"
@@ -183,6 +258,7 @@ def test_production_rejects_empty_required_secrets(field: str) -> None:
         ("redis_url", "redis://:url-secret-marker@cache.example.com:65536/0"),
         ("redis_url", "redis://:url-secret-marker@cache example.com:6379/0"),
         ("redis_url", "redis://:url-secret-marker@cache^example.com:6379/0"),
+        ("s3_endpoint_url", "https://url-secret-marker[invalid"),
     ],
     ids=[
         "database-empty",
@@ -201,6 +277,7 @@ def test_production_rejects_empty_required_secrets(field: str) -> None:
         "redis-out-of-range-port",
         "redis-space-in-host",
         "redis-illegal-host",
+        "s3-malformed",
     ],
 )
 def test_production_rejects_invalid_service_url_structure(
@@ -218,19 +295,12 @@ def test_production_rejects_invalid_service_url_structure(
     assert exc_info.value.errors()[0]["input"] == "[redacted]"
 
 
-@pytest.mark.parametrize(
-    "redis_url",
-    [
-        "redis://cache.example.com:6379/0",
-        "rediss://cache.example.com:6380/0",
-    ],
-)
-def test_production_accepts_supported_database_and_redis_urls(
-    redis_url: str,
-) -> None:
+def test_production_accepts_tls_database_and_redis_urls() -> None:
+    redis_url = "rediss://cache.example.com:6380/0"
     settings = _production_settings(
         control_database_url=(
-            "postgresql+psycopg://user:test-password@db.example.com:5432/control"
+            "postgresql+psycopg://user:test-password@db.example.com:5432/"
+            "control?sslmode=verify-full"
         ),
         redis_url=redis_url,
     )
@@ -242,13 +312,13 @@ def test_production_accepts_supported_database_and_redis_urls(
 @pytest.mark.parametrize(
     "database_url",
     [
-        "postgresql+psycopg://user:password@localhost:6432/control",
-        "postgresql+psycopg://user:password@127.0.0.2:6432/control",
-        "postgresql+psycopg://user:password@[::1]:6432/control",
-        "postgresql+psycopg://user:password@127.1:6432/control",
-        "postgresql+psycopg://user:password@2130706433:6432/control",
-        "postgresql+psycopg://user:password@017700000001:6432/control",
-        "postgresql+psycopg://user:password@0x7f000001:6432/control",
+        "postgresql+psycopg://user:password@localhost:6432/control?sslmode=verify-full",
+        "postgresql+psycopg://user:password@127.0.0.2:6432/control?sslmode=verify-full",
+        "postgresql+psycopg://user:password@[::1]:6432/control?sslmode=verify-full",
+        "postgresql+psycopg://user:password@127.1:6432/control?sslmode=verify-full",
+        "postgresql+psycopg://user:password@2130706433:6432/control?sslmode=verify-full",
+        "postgresql+psycopg://user:password@017700000001:6432/control?sslmode=verify-full",
+        "postgresql+psycopg://user:password@0x7f000001:6432/control?sslmode=verify-full",
     ],
 )
 def test_production_rejects_loopback_database_hosts(database_url: str) -> None:
@@ -265,7 +335,7 @@ def test_production_rejects_loopback_in_any_database_host(
 ) -> None:
     database_url = (
         "postgresql+psycopg://user:url-secret-marker@db.example.com:5432,"
-        f"{loopback_host}:5432/control"
+        f"{loopback_host}:5432/control?sslmode=verify-full"
     )
 
     with pytest.raises(ValidationError, match="loopback") as exc_info:
@@ -279,7 +349,7 @@ def test_production_rejects_loopback_in_any_database_host(
 def test_production_accepts_non_loopback_multi_host_database_url() -> None:
     database_url = (
         "postgresql+psycopg://user:password@db-a.example.com:5432,"
-        "db-b.example.com:5432/control"
+        "db-b.example.com:5432/control?sslmode=verify-full"
     )
 
     settings = _production_settings(control_database_url=database_url)
@@ -290,9 +360,9 @@ def test_production_accepts_non_loopback_multi_host_database_url() -> None:
 @pytest.mark.parametrize(
     "endpoint_url",
     [
-        "http://localhost:9100",
-        "http://127.0.0.2:9100",
-        "http://[::1]:9100",
+        "https://localhost:9100",
+        "https://127.0.0.2:9100",
+        "https://[::1]:9100",
     ],
 )
 def test_production_rejects_loopback_object_endpoint_hosts(endpoint_url: str) -> None:

@@ -1,7 +1,18 @@
 from datetime import datetime
 from uuid import UUID
 
-from sqlalchemy import CheckConstraint, DateTime, ForeignKey, Index, Integer, String, UniqueConstraint, text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    CheckConstraint,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    UniqueConstraint,
+    text,
+)
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -71,7 +82,39 @@ class TenantResource(
             "state IN ('requested', 'provisioning', 'active', 'cleanup_pending', 'migrating')",
             name="ck_tenant_resources_state",
         ),
+        CheckConstraint(
+            "provisioning_step IN ('requested', 'database_allocated', 'database_created', "
+            "'roles_allocated', 'roles_created', 'migration_credential_stored', "
+            "'credentials_stored', 'tenant_migrated', "
+            "'bucket_allocated', 'bucket_created', 'route_validated', 'active', 'cleanup')",
+            name="ck_tenant_resources_provisioning_step",
+        ),
+        CheckConstraint(
+            "credential_version > 0",
+            name="ck_tenant_resources_credential_version",
+        ),
+        CheckConstraint(
+            "retry_count >= 0 AND fencing_token >= 0",
+            name="ck_tenant_resources_retry_fence",
+        ),
+        CheckConstraint(
+            "transition_kind IS NULL OR transition_kind IN "
+            "('credential_rotation', 'resource_migration')",
+            name="ck_tenant_resources_transition_kind",
+        ),
         Index("ix_tenant_resources_team_state", "team_id", "state"),
+        Index("ix_tenant_resources_requested_owner_user_id", "requested_owner_user_id"),
+        Index(
+            "ix_tenant_resources_retry_lease",
+            "next_retry_at",
+            "worker_lease_expires_at",
+        ),
+        Index(
+            "uq_tenant_resources_team_serving",
+            "team_id",
+            unique=True,
+            postgresql_where=text("state IN ('active', 'migrating')"),
+        ),
     )
 
     team_id: Mapped[UUID] = mapped_column(
@@ -79,15 +122,99 @@ class TenantResource(
         ForeignKey("teams.id", ondelete="CASCADE"),
         nullable=False,
     )
+    requested_owner_user_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("users.id", ondelete="RESTRICT"),
+        nullable=True,
+    )
     resource_version: Mapped[int] = mapped_column(
         Integer, nullable=False, default=1, server_default=text("1")
     )
     state: Mapped[str] = mapped_column(
         String(32), nullable=False, default="requested", server_default="requested"
     )
+    provisioning_step: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="requested", server_default="requested"
+    )
     database_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    database_owner_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    database_migration_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    database_migration_secret_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    database_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
     database_secret_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    credential_version: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=1, server_default=text("1")
+    )
+    database_migration_revision: Mapped[str | None] = mapped_column(String(255), nullable=True)
     bucket_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    database_ownership_receipt: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    role_ownership_receipt: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    bucket_ownership_receipt: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    last_error_code: Mapped[str | None] = mapped_column(String(96), nullable=True)
+    retry_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=text("0")
+    )
+    next_retry_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    worker_lease_owner: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    worker_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    fencing_token: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
+    )
+    write_paused: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=text("false")
+    )
+    transition_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    transition_step: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    pending_resource_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pending_database_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pending_database_owner_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pending_database_migration_role_name: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    pending_database_migration_secret_ref: Mapped[str | None] = mapped_column(
+        String(512), nullable=True
+    )
+    pending_database_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pending_database_secret_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    pending_credential_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    pending_database_migration_revision: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    pending_bucket_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pending_database_ownership_receipt: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    pending_role_ownership_receipt: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    pending_bucket_ownership_receipt: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    previous_resource_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    previous_database_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    previous_database_owner_role_name: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    previous_database_migration_role_name: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    previous_database_migration_secret_ref: Mapped[str | None] = mapped_column(
+        String(512), nullable=True
+    )
+    previous_database_role_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    previous_database_secret_ref: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    previous_credential_version: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    previous_database_migration_revision: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    previous_bucket_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    previous_database_ownership_receipt: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    previous_role_ownership_receipt: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    previous_bucket_ownership_receipt: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
 
 
 class IdempotencyKey(
@@ -98,21 +225,43 @@ class IdempotencyKey(
 ):
     __tablename__ = "idempotency_keys"
     __table_args__ = (
-        UniqueConstraint("team_id", "key", name="uq_idempotency_keys_team_key"),
+        UniqueConstraint(
+            "operation",
+            "scope_type",
+            "scope_id",
+            "key",
+            name="uq_idempotency_keys_operation_scope_key",
+        ),
+        CheckConstraint(
+            "scope_type IN ('actor', 'team')",
+            name="ck_idempotency_keys_scope_type",
+        ),
+        CheckConstraint(
+            "scope_type = 'actor' OR team_id IS NOT NULL",
+            name="ck_idempotency_keys_team_scope_requires_team",
+        ),
         CheckConstraint(
             "state IN ('pending', 'completed', 'failed')",
             name="ck_idempotency_keys_state",
         ),
         CheckConstraint("version > 0", name="ck_idempotency_keys_version_positive"),
+        Index("ix_idempotency_keys_team_id", "team_id"),
         Index("ix_idempotency_keys_expires_at", "expires_at"),
     )
 
-    team_id: Mapped[UUID] = mapped_column(
+    team_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("teams.id", ondelete="CASCADE"),
-        nullable=False,
+        nullable=True,
     )
     key: Mapped[str] = mapped_column(String(255), nullable=False)
+    operation: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="team_request", server_default="team_request"
+    )
+    scope_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="team", server_default="team"
+    )
+    scope_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     state: Mapped[str] = mapped_column(
         String(32), nullable=False, default="pending", server_default="pending"

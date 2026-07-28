@@ -1,8 +1,8 @@
 from functools import lru_cache
 from ipaddress import ip_address
 from socket import inet_aton
-from typing import Literal, TypeVar
-from urllib.parse import urlsplit
+from typing import Any, Literal, TypeVar
+from urllib.parse import parse_qsl, urlsplit
 
 from pydantic import (
     AnyHttpUrl,
@@ -12,6 +12,7 @@ from pydantic import (
     SecretStr,
     TypeAdapter,
     ValidationError,
+    ModelWrapValidatorHandler,
     model_validator,
 )
 from pydantic_core import InitErrorDetails, PydanticCustomError
@@ -83,6 +84,18 @@ def _parse_production_service_url(
     return validated_url
 
 
+def _has_unambiguous_verify_full(parsed_url: Any) -> bool:
+    try:
+        query_items = parse_qsl(
+            parsed_url.query,
+            keep_blank_values=True,
+            strict_parsing=True,
+        )
+    except ValueError:
+        return False
+    return query_items == [("sslmode", "verify-full")]
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="PERFPILOT_",
@@ -97,15 +110,31 @@ class Settings(BaseSettings):
     s3_endpoint_url: AnyHttpUrl = AnyHttpUrl(_DEVELOPMENT_S3_ENDPOINT_URL)
     proxy_secret: SecretStr = SecretStr(_DEVELOPMENT_PROXY_SECRET)
     session_secret: SecretStr = SecretStr(_DEVELOPMENT_SESSION_SECRET)
-    jws_signing_key_reference: SecretStr = SecretStr(
-        _DEVELOPMENT_JWS_SIGNING_KEY_REFERENCE
-    )
+    jws_signing_key_reference: SecretStr = SecretStr(_DEVELOPMENT_JWS_SIGNING_KEY_REFERENCE)
     agent_registration_secret_reference: SecretStr = SecretStr(
         _DEVELOPMENT_AGENT_REGISTRATION_SECRET_REFERENCE
     )
     allowed_origins: tuple[AnyHttpUrl, ...] = Field(
         default_factory=lambda: (AnyHttpUrl(_DEVELOPMENT_ALLOWED_ORIGIN),)
     )
+
+    @model_validator(mode="wrap")
+    @classmethod
+    def redact_production_field_errors(
+        cls,
+        values: Any,
+        handler: ModelWrapValidatorHandler["Settings"],
+    ) -> "Settings":
+        try:
+            return handler(values)
+        except ValidationError as exc:
+            app_env = values.get("app_env") if isinstance(values, dict) else None
+            leaks_input = any(
+                error.get("input") != _REDACTED_VALIDATION_INPUT for error in exc.errors()
+            )
+            if app_env == "production" and leaks_input:
+                raise _production_validation_error(_INVALID_PRODUCTION_SERVICE_URL) from None
+            raise
 
     @model_validator(mode="after")
     def validate_production_configuration(self) -> "Settings":
@@ -119,8 +148,7 @@ class Settings(BaseSettings):
             self.agent_registration_secret_reference.get_secret_value(),
         )
         uses_development_default = (
-            self.control_database_url.get_secret_value()
-            == _DEVELOPMENT_CONTROL_DATABASE_URL
+            self.control_database_url.get_secret_value() == _DEVELOPMENT_CONTROL_DATABASE_URL
             or self.redis_url.get_secret_value() == _DEVELOPMENT_REDIS_URL
             or str(self.s3_endpoint_url).rstrip("/") == _DEVELOPMENT_S3_ENDPOINT_URL
             or self.proxy_secret.get_secret_value() == _DEVELOPMENT_PROXY_SECRET
@@ -131,14 +159,11 @@ class Settings(BaseSettings):
             == _DEVELOPMENT_AGENT_REGISTRATION_SECRET_REFERENCE
             or (
                 len(self.allowed_origins) == 1
-                and str(self.allowed_origins[0]).rstrip("/")
-                == _DEVELOPMENT_ALLOWED_ORIGIN
+                and str(self.allowed_origins[0]).rstrip("/") == _DEVELOPMENT_ALLOWED_ORIGIN
             )
         )
         if uses_development_default or any(not value.strip() for value in required_secrets):
-            raise _production_validation_error(
-                "production secret configuration is required"
-            )
+            raise _production_validation_error("production secret configuration is required")
 
         database_url = _parse_production_service_url(
             self.control_database_url,
@@ -147,9 +172,15 @@ class Settings(BaseSettings):
         )
         _parse_production_service_url(
             self.redis_url,
-            frozenset({"redis", "rediss"}),
+            frozenset({"rediss"}),
             RedisDsn,
         )
+        parsed_database_url = urlsplit(self.control_database_url.get_secret_value())
+        if (
+            not _has_unambiguous_verify_full(parsed_database_url)
+            or self.s3_endpoint_url.scheme.casefold() != "https"
+        ):
+            raise _production_validation_error(_INVALID_PRODUCTION_SERVICE_URL)
         database_hosts = (host["host"] for host in database_url.hosts())
         if any(_is_loopback_host(host) for host in database_hosts) or _is_loopback_host(
             self.s3_endpoint_url.host
@@ -159,13 +190,9 @@ class Settings(BaseSettings):
             )
 
         if not self.allowed_origins:
-            raise _production_validation_error(
-                "production requires at least one allowed origin"
-            )
+            raise _production_validation_error("production requires at least one allowed origin")
         if any(origin.scheme.casefold() != "https" for origin in self.allowed_origins):
-            raise _production_validation_error(
-                "production allowed origins must use HTTPS"
-            )
+            raise _production_validation_error("production allowed origins must use HTTPS")
         return self
 
 

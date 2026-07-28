@@ -921,7 +921,8 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
     settings = Settings(
         app_env="production",
         control_database_url=(
-            "postgresql+psycopg://perfpilot:test-password@db.example.com:5432/control"
+            "postgresql+psycopg://perfpilot:test-password@db.example.com:5432/"
+            "control?sslmode=verify-full"
         ),
         redis_url="rediss://cache.example.com:6380/0",
         s3_endpoint_url="https://objects.example.com",

@@ -170,9 +170,7 @@ def migration_databases() -> Iterator[MigrationDatabases]:
         for engine in engines:
             engine.dispose()
         if created_databases:
-            with psycopg.connect(
-                _psycopg_conninfo(admin_url), autocommit=True
-            ) as connection:
+            with psycopg.connect(_psycopg_conninfo(admin_url), autocommit=True) as connection:
                 for database_name in reversed(created_databases):
                     connection.execute(
                         sql.SQL("DROP DATABASE {} WITH (FORCE)").format(
@@ -220,17 +218,14 @@ def _unique_column_sets(inspector: object, table_name: str) -> set[tuple[str, ..
 
 def _normalize_postgresql_predicate(predicate: object) -> str:
     normalized = "".join(str(predicate).casefold().split()).replace("::text", "")
-    return normalized.translate(str.maketrans("", "", "()\""))
+    return normalized.translate(str.maketrans("", "", '()"'))
 
 
 @pytest.mark.parametrize(
     "database_url",
     [
         "postgresql://url-user:url-secret-marker@127.0.0.1:55439/postgres",
-        (
-            "postgresql+psycopg://127.0.0.1:55439/postgres"
-            "?application_name=url-secret-marker"
-        ),
+        ("postgresql+psycopg://127.0.0.1:55439/postgres?application_name=url-secret-marker"),
         "postgresql+psycopg://url-user:url-secret-marker@/postgres",
         "postgresql+psycopg://url-user:url-secret-marker@127.0.0.1:55439",
     ],
@@ -273,9 +268,7 @@ def test_control_migration_creates_only_control_tables(
     _upgrade("control", migration_databases.control_url)
 
     control_inspector = inspect(migration_databases.control_engine)
-    assert set(control_inspector.get_table_names()) == CONTROL_TABLES | {
-        "alembic_version"
-    }
+    assert set(control_inspector.get_table_names()) == CONTROL_TABLES | {"alembic_version"}
 
 
 def test_tenant_migration_creates_only_tenant_tables(
@@ -284,9 +277,7 @@ def test_tenant_migration_creates_only_tenant_tables(
     _upgrade("tenant", migration_databases.tenant_url)
 
     tenant_inspector = inspect(migration_databases.tenant_engine)
-    assert set(tenant_inspector.get_table_names()) == TENANT_TABLES | {
-        "alembic_version"
-    }
+    assert set(tenant_inspector.get_table_names()) == TENANT_TABLES | {"alembic_version"}
 
 
 @pytest.mark.parametrize("tree", ["control", "tenant"])
@@ -316,10 +307,7 @@ def test_all_domain_tables_use_uuid_keys_and_timezone_timestamps(
     schema_inspector = inspect(migration_databases.engine_for(tree))
 
     for table_name in _table_inventory(tree):
-        columns = {
-            column["name"]: column
-            for column in schema_inspector.get_columns(table_name)
-        }
+        columns = {column["name"]: column for column in schema_inspector.get_columns(table_name)}
         primary_key = schema_inspector.get_pk_constraint(table_name)
         assert primary_key["constrained_columns"] == ["id"], table_name
         assert columns["id"]["type"].__class__.__name__ == "UUID", table_name
@@ -336,10 +324,7 @@ def test_mutable_control_rows_have_positive_optimistic_versions(
     control_inspector = inspect(migration_databases.control_engine)
 
     for table_name in _VERSIONED_CONTROL_TABLES:
-        columns = {
-            column["name"]: column
-            for column in control_inspector.get_columns(table_name)
-        }
+        columns = {column["name"]: column for column in control_inspector.get_columns(table_name)}
         version = columns["version"]
         assert version["type"].__class__.__name__ in {"INTEGER", "Integer"}
         assert version["nullable"] is False
@@ -362,16 +347,92 @@ def test_control_schema_enforces_required_uniqueness(
     assert ("team_id", "resource_version") in _unique_column_sets(
         control_inspector, "tenant_resources"
     )
-    assert ("team_id", "idempotency_key") in _unique_column_sets(
-        control_inspector, "global_jobs"
-    )
+    assert ("team_id", "idempotency_key") in _unique_column_sets(control_inspector, "global_jobs")
     assert ("analysis_id", "scenario_type") in _unique_column_sets(
         control_inspector, "scenario_jobs"
     )
     assert ("serial",) in _unique_column_sets(control_inspector, "devices")
-    assert ("consumer_name", "event_id") in _unique_column_sets(
-        control_inspector, "inbox_events"
+    assert ("consumer_name", "event_id") in _unique_column_sets(control_inspector, "inbox_events")
+
+
+def test_control_schema_persists_provisioning_checkpoints_and_fencing(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    control_inspector = inspect(migration_databases.control_engine)
+
+    tenant_resource_columns = {
+        column["name"] for column in control_inspector.get_columns("tenant_resources")
+    }
+    assert {
+        "provisioning_step",
+        "requested_owner_user_id",
+        "database_owner_role_name",
+        "database_migration_role_name",
+        "database_migration_secret_ref",
+        "database_role_name",
+        "credential_version",
+        "database_migration_revision",
+        "database_ownership_receipt",
+        "role_ownership_receipt",
+        "bucket_ownership_receipt",
+        "last_error_code",
+        "retry_count",
+        "next_retry_at",
+        "worker_lease_owner",
+        "worker_lease_expires_at",
+        "fencing_token",
+        "write_paused",
+        "transition_kind",
+        "transition_step",
+        "pending_resource_version",
+        "pending_database_name",
+        "pending_database_role_name",
+        "pending_database_secret_ref",
+        "pending_credential_version",
+        "previous_database_name",
+        "previous_database_role_name",
+        "previous_database_secret_ref",
+        "previous_credential_version",
+    } <= tenant_resource_columns
+
+    serving_index = next(
+        index
+        for index in control_inspector.get_indexes("tenant_resources")
+        if index["name"] == "uq_tenant_resources_team_serving"
     )
+    assert serving_index["unique"] is True
+    assert serving_index["column_names"] == ["team_id"]
+    serving_where = serving_index["dialect_options"]["postgresql_where"]
+    normalized_serving_where = _normalize_postgresql_predicate(serving_where)
+    assert "state" in normalized_serving_where
+    assert "active" in normalized_serving_where
+    assert "migrating" in normalized_serving_where
+
+
+def test_control_schema_scopes_idempotency_before_a_team_exists(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    control_inspector = inspect(migration_databases.control_engine)
+
+    idempotency_column_details = {
+        column["name"]: column for column in control_inspector.get_columns("idempotency_keys")
+    }
+    assert {"operation", "scope_type", "scope_id"} <= idempotency_column_details.keys()
+    assert idempotency_column_details["team_id"]["nullable"] is True
+    assert (
+        "operation",
+        "scope_type",
+        "scope_id",
+        "key",
+    ) in _unique_column_sets(control_inspector, "idempotency_keys")
+    assert ("team_id", "key") not in _unique_column_sets(control_inspector, "idempotency_keys")
+    checks = {
+        constraint["name"]: constraint["sqltext"]
+        for constraint in control_inspector.get_check_constraints("idempotency_keys")
+    }
+    assert "team_id IS NOT NULL" in checks["ck_idempotency_keys_team_scope_requires_team"]
 
 
 def test_tenant_schema_enforces_required_uniqueness(
@@ -383,9 +444,7 @@ def test_tenant_schema_enforces_required_uniqueness(
     assert ("analysis_id", "report_version") in _unique_column_sets(
         tenant_inspector, "report_versions"
     )
-    assert ("object_key", "version_id") in _unique_column_sets(
-        tenant_inspector, "artifacts"
-    )
+    assert ("object_key", "version_id") in _unique_column_sets(tenant_inspector, "artifacts")
     assert ("scenario_job_id", "attempt_no") in _unique_column_sets(
         tenant_inspector, "sample_attempts"
     )
@@ -408,8 +467,7 @@ def test_partial_indexes_enforce_active_leases_and_ready_outbox_dispatch(
     assert _normalize_postgresql_predicate(lease_where) == "state='active'"
 
     outbox_columns = {
-        column["name"]: column
-        for column in control_inspector.get_columns("outbox_events")
+        column["name"]: column for column in control_inspector.get_columns("outbox_events")
     }
     assert outbox_columns["ready_at"]["nullable"] is True
     outbox_index = next(
@@ -438,9 +496,7 @@ def test_control_orchestration_tables_exclude_tenant_content(
         "outbox_events",
         "inbox_events",
     }:
-        columns = {
-            column["name"] for column in control_inspector.get_columns(table_name)
-        }
+        columns = {column["name"] for column in control_inspector.get_columns(table_name)}
         assert columns.isdisjoint(_FORBIDDEN_CONTROL_COLUMNS), table_name
         assert all(
             column["type"].__class__.__name__ not in {"JSON", "JSONB"}

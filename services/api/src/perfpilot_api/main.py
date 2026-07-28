@@ -16,6 +16,7 @@ from redis import asyncio as redis
 from perfpilot_api.api.auth import PROXY_CLIENT_IDENTITY_STATE_KEY
 from perfpilot_api.api.auth import ProxyAuthenticationMiddleware
 from perfpilot_api.api.auth import router as auth_router
+from perfpilot_api.api.admin_teams import router as admin_teams_router
 from perfpilot_api.api.health import router as health_router
 from perfpilot_api.api.me import router as me_router
 from perfpilot_api.api.members import router as members_router
@@ -41,6 +42,7 @@ from perfpilot_api.services.auth import (
     RedisLoginRateLimiter,
     RedisPreAuthSessionLimiter,
 )
+from perfpilot_api.services.provisioning import AdminTeamService
 
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -51,9 +53,7 @@ def _transport_client_address(request: Request) -> str:
 
 
 def _verified_client_identity(request: Request) -> str:
-    identity = request.scope.get("state", {}).get(
-        PROXY_CLIENT_IDENTITY_STATE_KEY
-    )
+    identity = request.scope.get("state", {}).get(PROXY_CLIENT_IDENTITY_STATE_KEY)
     if not isinstance(identity, str) or not identity:
         raise RuntimeError("verified proxy client identity is missing")
     return identity
@@ -71,8 +71,7 @@ class RequestIdMiddleware:
         incoming_request_id = Headers(scope=scope).get("x-request-id")
         request_id = (
             incoming_request_id
-            if incoming_request_id
-            and _REQUEST_ID_PATTERN.fullmatch(incoming_request_id)
+            if incoming_request_id and _REQUEST_ID_PATTERN.fullmatch(incoming_request_id)
             else uuid4().hex
         )
         scope.setdefault("state", {})["request_id"] = request_id
@@ -95,6 +94,8 @@ class AuthNoStoreMiddleware:
             path == "/v1/auth"
             or path.startswith("/v1/auth/")
             or path == "/v1/me"
+            or path == "/v1/admin"
+            or path.startswith("/v1/admin/")
             or path == "/v1/teams"
             or path.startswith("/v1/teams/")
         ):
@@ -114,6 +115,7 @@ def create_app(
     *,
     settings_override: Settings | None = None,
     auth_service: AuthService | None = None,
+    admin_team_service: AdminTeamService | None = None,
     replay_store: ReplayStore | None = None,
     proxy_clock: Callable[[], float] = time.time,
     client_address_resolver: Callable[[Request], str] | None = None,
@@ -133,18 +135,18 @@ def create_app(
     owned_engine = None
     owned_redis = None
     resolved_auth_service = auth_service
+    resolved_admin_team_service = admin_team_service
     resolved_replay_store = replay_store
-    if not testing and (
-        resolved_auth_service is None or resolved_replay_store is None
-    ):
+    if not testing and (resolved_auth_service is None or resolved_replay_store is None):
         owned_redis = redis.from_url(settings.redis_url.get_secret_value())
         if resolved_replay_store is None:
             resolved_replay_store = RedisReplayStore(owned_redis)
+    if not testing and (resolved_auth_service is None or resolved_admin_team_service is None):
+        owned_engine = create_control_engine(settings.control_database_url.get_secret_value())
+        session_factory = create_control_session_factory(owned_engine)
         if resolved_auth_service is None:
-            owned_engine = create_control_engine(
-                settings.control_database_url.get_secret_value()
-            )
-            session_factory = create_control_session_factory(owned_engine)
+            if owned_redis is None:
+                raise RuntimeError("Redis authentication dependencies are unavailable")
             resolved_auth_service = AuthService(
                 session_factory=session_factory,
                 rate_limiter=RedisLoginRateLimiter(
@@ -157,6 +159,10 @@ def create_app(
                     key_secret=settings.session_secret.get_secret_value().encode(),
                     nonce_source=lambda: secrets.token_hex(16),
                 ),
+            )
+        if resolved_admin_team_service is None:
+            resolved_admin_team_service = AdminTeamService(
+                session_factory=session_factory,
             )
 
     @asynccontextmanager
@@ -173,14 +179,11 @@ def create_app(
     app.state.testing = testing
     app.state.settings = settings
     app.state.auth_service = resolved_auth_service
-    app.state.proxy_replay_store = resolved_replay_store or InMemoryReplayStore(
-        clock=proxy_clock
-    )
+    app.state.admin_team_service = resolved_admin_team_service
+    app.state.proxy_replay_store = resolved_replay_store or InMemoryReplayStore(clock=proxy_clock)
     app.state.proxy_clock = proxy_clock
     identity_required = (
-        not testing
-        if proxy_client_identity_required is None
-        else proxy_client_identity_required
+        not testing if proxy_client_identity_required is None else proxy_client_identity_required
     )
     app.state.proxy_client_identity_required = identity_required
     app.state.client_address_resolver = client_address_resolver or (
@@ -198,6 +201,7 @@ def create_app(
     app.add_exception_handler(Exception, internal_server_error_handler)
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(admin_teams_router)
     app.include_router(me_router)
     app.include_router(members_router)
     return app
