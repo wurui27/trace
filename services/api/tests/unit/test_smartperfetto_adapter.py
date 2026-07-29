@@ -14,7 +14,7 @@ import httpx
 import pytest
 from pydantic import SecretStr
 
-from perfpilot_api.engines.contracts import EngineInput, SubmitConfig
+from perfpilot_api.engines.contracts import EngineInput, EngineRunRef, SubmitConfig
 from perfpilot_api.engines.errors import EngineAdapterError
 from perfpilot_api.engines.smartperfetto import SmartPerfettoAdapter
 from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
@@ -84,6 +84,7 @@ def _adapter(
     max_trace_bytes: int = 1024,
     max_timeout_seconds: int = 120,
     spool_factory: Callable[..., Any] = tempfile.SpooledTemporaryFile,
+    **adapter_kwargs: object,
 ) -> tuple[SmartPerfettoAdapter, httpx.AsyncClient, httpx.AsyncClient]:
     engine_client = httpx.AsyncClient(
         transport=httpx.MockTransport(engine_handler),
@@ -109,6 +110,7 @@ def _adapter(
             max_sse_event_bytes=64 * 1024,
             spool_max_memory_bytes=1,
             spool_factory=spool_factory,
+            **adapter_kwargs,
         ),
         engine_client,
         artifact_client,
@@ -527,3 +529,375 @@ async def test_preview_cancellation_closes_stream_and_best_effort_cancels_sessio
     assert cancel_paths == [
         f"/api/workspaces/{TEAM_WORKSPACE}/agent/session-synthetic-001/cancel"
     ]
+
+
+def _run_ref(
+    *,
+    run_id: str = "run-session-synthetic-001-1",
+    cursor: str | None = None,
+) -> EngineRunRef:
+    return EngineRunRef(
+        engine_id="smartperfetto",
+        external_session_id="session-synthetic-001",
+        external_run_id=run_id,
+        cursor=cursor,
+        external_workspace_id=TEAM_WORKSPACE,
+    )
+
+
+@pytest.mark.asyncio
+async def test_stream_replays_only_strictly_new_events_and_refreshes_cursor() -> None:
+    requests: list[httpx.Request] = []
+
+    def engine_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            content=(_FIXTURE_ROOT / "progress-stream.sse").read_bytes(),
+            headers={"Content-Type": "text/event-stream"},
+        )
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        batch = await adapter.stream(_run_ref(cursor="1"), "1")
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert requests[0].url.path.endswith(
+        "/agent/runs/run-session-synthetic-001-1/stream"
+    )
+    assert requests[0].headers["Accept"] == "text/event-stream"
+    assert requests[0].headers["Last-Event-ID"] == "1"
+    assert [event.event_id for event in batch.events] == ["2", "3"]
+    assert [event.progress_percent for event in batch.events] == [80, None]
+    assert batch.events[-1].state == "completed"
+    assert batch.run_ref.cursor == "3"
+    assert "Synthetic conclusion" not in repr(batch)
+
+
+class ClosingStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+@pytest.mark.asyncio
+async def test_stream_stops_at_batch_limit_and_closes_response() -> None:
+    stream = ClosingStream(
+        [(_FIXTURE_ROOT / "progress-stream.sse").read_bytes()]
+    )
+
+    def engine_handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=stream)
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+        max_sse_batch_events=1,
+        max_sse_batch_seconds=1.0,
+    )
+    try:
+        batch = await adapter.stream(_run_ref(), None)
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert len(batch.events) == 1
+    assert batch.events[0].event_id == "1"
+    assert stream.closed
+
+
+@pytest.mark.asyncio
+async def test_status_resumes_once_after_404_and_returns_refreshed_run() -> None:
+    requests: list[httpx.Request] = []
+    status_calls = 0
+
+    def engine_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal status_calls
+        requests.append(request)
+        if request.url.path.endswith("/status"):
+            status_calls += 1
+            if status_calls == 1:
+                return httpx.Response(404, json={"success": False, "code": "NOT_FOUND"})
+            return httpx.Response(200, json=_json_fixture("status-completed.json"))
+        if request.url.path.endswith("/agent/resume"):
+            return httpx.Response(200, json=_json_fixture("resume-success.json"))
+        raise AssertionError(f"unexpected request {request.url.path}")
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        status = await adapter.status(_run_ref())
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert json.loads(requests[1].content) == {"sessionId": "session-synthetic-001"}
+    assert "traceId" not in json.loads(requests[1].content)
+    assert status.state == "completed"
+    assert status.run_ref.external_run_id == "run-session-synthetic-001-2-recovered"
+
+
+@pytest.mark.asyncio
+async def test_second_404_after_resume_maps_to_session_lost() -> None:
+    resume_calls = 0
+
+    def engine_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal resume_calls
+        if request.url.path.endswith("/agent/resume"):
+            resume_calls += 1
+            return httpx.Response(200, json=_json_fixture("resume-success.json"))
+        return httpx.Response(404, json={"success": False, "code": "NOT_FOUND"})
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        with pytest.raises(EngineAdapterError) as exc_info:
+            await adapter.status(_run_ref())
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert exc_info.value.stable_code == "engine_session_lost"
+    assert resume_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stream_uses_recovered_run_id_after_one_resume() -> None:
+    requests: list[httpx.Request] = []
+
+    def engine_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path.endswith("/agent/resume"):
+            return httpx.Response(200, json=_json_fixture("resume-success.json"))
+        if request.url.path.endswith("/run-session-synthetic-001-1/stream"):
+            return httpx.Response(404, json={"success": False, "code": "NOT_FOUND"})
+        if request.url.path.endswith(
+            "/run-session-synthetic-001-2-recovered/stream"
+        ):
+            return httpx.Response(
+                200,
+                content=(_FIXTURE_ROOT / "progress-stream.sse").read_bytes(),
+            )
+        raise AssertionError(f"unexpected request {request.url.path}")
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        batch = await adapter.stream(_run_ref(), None)
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert [request.method for request in requests] == ["GET", "POST", "GET"]
+    assert batch.run_ref.external_run_id == "run-session-synthetic-001-2-recovered"
+    assert batch.run_ref.cursor == "3"
+
+
+@pytest.mark.asyncio
+async def test_malformed_or_mismatched_resume_never_changes_route_ownership() -> None:
+    def engine_handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/agent/resume"):
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "sessionId": "another-session",
+                    "status": "running",
+                    "restored": True,
+                    "observability": {"runId": "attacker-run"},
+                },
+            )
+        return httpx.Response(404, json={"success": False, "code": "NOT_FOUND"})
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        with pytest.raises(EngineAdapterError) as exc_info:
+            await adapter.status(_run_ref())
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert exc_info.value.stable_code == "engine_session_lost"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("upstream", "state", "stable_code", "retryable"),
+    [
+        ("pending", "pending", None, False),
+        ("running", "running", None, False),
+        ("awaiting_user", "awaiting_user", "engine_interaction_required", False),
+        ("completed", "completed", None, False),
+        ("failed", "failed", "engine_failed", False),
+        ("cancelled", "canceled", None, False),
+        ("quota_exceeded", "failed", "capacity_exceeded", True),
+    ],
+)
+async def test_status_maps_every_upstream_state(
+    upstream: str,
+    state: str,
+    stable_code: str | None,
+    retryable: bool,
+) -> None:
+    def engine_handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "sessionId": "session-synthetic-001",
+                "status": upstream,
+            },
+        )
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        result = await adapter.status(_run_ref())
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert result.state == state
+    assert result.stable_error_code == stable_code
+    assert result.retryable is retryable
+
+
+@pytest.mark.asyncio
+async def test_cancel_sends_empty_body_and_normalizes_cancelled_spelling() -> None:
+    requests: list[httpx.Request] = []
+
+    def engine_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_json_fixture("cancel-success.json"))
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        state = await adapter.cancel(_run_ref())
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert state == "canceled"
+    assert requests[0].method == "POST"
+    assert requests[0].url.path.endswith("/session-synthetic-001/cancel")
+    assert json.loads(requests[0].content) == {}
+
+
+@pytest.mark.asyncio
+async def test_report_is_recursively_sanitized_and_never_follows_report_url() -> None:
+    requests: list[httpx.Request] = []
+
+    def engine_handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(200, json=_json_fixture("report-completed.json"))
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        result = await adapter.fetch_result(_run_ref())
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert len(requests) == 1
+    assert requests[0].url.path.endswith("/session-synthetic-001/report")
+    assert result.contract == "workspace-agent-v1"
+    assert result.state == "completed"
+    assert result.payload["reportId"] == "report-synthetic-001"
+    rendered = repr(result)
+    for unsafe in (
+        "Bearer synthetic-secret",
+        "synthetic-api-key",
+        "synthetic-token",
+        "s3://synthetic-bucket",
+        "/synthetic/private",
+        "C:\\synthetic\\private",
+        "X-Amz-Signature=synthetic",
+        "synthetic/object/key",
+    ):
+        assert unsafe not in rendered
+    assert "Retain this safe synthetic note" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_report_without_usable_conclusion_or_evidence_is_insufficient() -> None:
+    def engine_handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "success": True,
+                "report": {
+                    "sessionId": "session-synthetic-001",
+                    "reportUrl": "/api/reports/report-empty",
+                    "summary": {"partial": True},
+                    "findings": [],
+                },
+            },
+        )
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        result = await adapter.fetch_result(_run_ref())
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert result.state == "insufficient_data"
+    assert result.payload["report"]["summary"]["partial"] is True  # type: ignore[index]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["cancel", "report"])
+async def test_cancel_and_report_each_resume_exactly_once_after_404(
+    operation: str,
+) -> None:
+    target_calls = 0
+    resume_calls = 0
+
+    def engine_handler(request: httpx.Request) -> httpx.Response:
+        nonlocal target_calls, resume_calls
+        if request.url.path.endswith("/agent/resume"):
+            resume_calls += 1
+            return httpx.Response(200, json=_json_fixture("resume-success.json"))
+        target_calls += 1
+        if target_calls == 1:
+            return httpx.Response(404, json={"success": False, "code": "NOT_FOUND"})
+        fixture = "cancel-success.json" if operation == "cancel" else "report-completed.json"
+        return httpx.Response(200, json=_json_fixture(fixture))
+
+    adapter, engine_client, artifact_client = _adapter(
+        engine_handler=engine_handler,
+        artifact_handler=_successful_artifact,
+    )
+    try:
+        if operation == "cancel":
+            assert await adapter.cancel(_run_ref()) == "canceled"
+        else:
+            assert (await adapter.fetch_result(_run_ref())).state == "completed"
+    finally:
+        await _close(engine_client, artifact_client)
+
+    assert target_calls == 2
+    assert resume_calls == 1

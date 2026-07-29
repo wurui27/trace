@@ -126,6 +126,13 @@ def project_sse_frame(frame: SseFrame, *, occurred_at: datetime) -> EngineEvent:
         raise _contract_error()
     state, message_code = projection
 
+    if frame.event == "error":
+        status = payload.get("status")
+        if status == "quota_exceeded":
+            state, message_code = "failed", "capacity_exceeded"
+        elif status == "awaiting_user":
+            state, message_code = "awaiting_user", "engine_interaction_required"
+
     progress: int | None = None
     if frame.event == "progress":
         content = payload.get("content")

@@ -184,3 +184,26 @@ def test_projection_rejects_malformed_json_without_echoing_it() -> None:
     assert exc_info.value.stable_code == "engine_contract_invalid"
     assert "query-secret-marker" not in str(exc_info.value)
     assert "query-secret-marker" not in repr(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    ("payload", "state", "message_code"),
+    [
+        ({"status": "quota_exceeded"}, "failed", "capacity_exceeded"),
+        ({"status": "awaiting_user"}, "awaiting_user", "engine_interaction_required"),
+        ({"status": "failed"}, "failed", "engine_error"),
+    ],
+)
+def test_error_event_maps_terminal_status_without_copying_raw_error(
+    payload: dict[str, object],
+    state: str,
+    message_code: str,
+) -> None:
+    payload["error"] = "upstream-secret-error"
+    frame = SseFrame(event_id="12", event="error", data=json.dumps(payload))
+
+    event = project_sse_frame(frame, occurred_at=datetime(2026, 7, 28, tzinfo=UTC))
+
+    assert event.state == state
+    assert event.message_code == message_code
+    assert "upstream-secret-error" not in repr(event)
