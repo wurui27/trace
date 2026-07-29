@@ -37,7 +37,9 @@ _UPLOADABLE_KINDS = frozenset(
         "capture_manifest",
         "log",
         "mapping",
+        "memory_evidence",
         "native_symbols",
+        "screenshot",
         "source_archive",
         "trace",
     }

@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +17,7 @@ from perfpilot_api.services.auth import RoleForbiddenError, TeamAccessNotFoundEr
 from perfpilot_api.services.uploads import (
     DownloadAuthorization,
     UploadIdempotencyConflictError,
+    UploadInvalidRequestError,
     UploadSlot,
 )
 
@@ -89,7 +91,15 @@ class FakeUploadService:
         self.calls.append(("create", kwargs))
         if self.error is not None:
             raise self.error
-        return self.pending
+        if kwargs["artifact_kind"] == "memory_capture_manifest":
+            raise UploadInvalidRequestError("upload request is invalid")
+        return replace(
+            self.pending,
+            artifact_kind=kwargs["artifact_kind"],  # type: ignore[arg-type]
+            mime=kwargs["mime"],  # type: ignore[arg-type]
+            size=kwargs["size"],  # type: ignore[arg-type]
+            sha256_b64=kwargs["sha256_b64"],  # type: ignore[arg-type]
+        )
 
     async def finalize(self, **kwargs: object) -> UploadSlot:
         self.calls.append(("finalize", kwargs))
@@ -228,6 +238,83 @@ def test_create_upload_slot_returns_only_the_public_pending_contract() -> None:
         )
     ]
     assert "must-never-leave-the-service" not in response.text
+
+
+@pytest.mark.parametrize("artifact_kind", ["memory_evidence", "screenshot"])
+def test_memory_input_kinds_receive_normal_authenticated_reservations(
+    artifact_kind: str,
+) -> None:
+    auth_service = FakeAuthService()
+    upload_service = FakeUploadService()
+    target = f"/v1/teams/{TEAM_ID}/analyses/{ANALYSIS_ID}/uploads"
+    body = json.dumps(
+        {
+            "artifact_kind": artifact_kind,
+            "mime": "application/octet-stream",
+            "size": 128,
+            "sha256_b64": CHECKSUM,
+        },
+        separators=(",", ":"),
+    ).encode()
+    headers = _proxy_headers(
+        method="POST",
+        target=target,
+        body=body,
+        request_id=f"req-{artifact_kind}",
+    )
+    headers["Idempotency-Key"] = f"memory-{artifact_kind}"
+
+    with _client(auth_service, upload_service) as client:
+        response = client.post(target, content=body, headers=headers)
+
+    assert response.status_code == 201
+    assert response.json()["upload"]["artifact_kind"] == artifact_kind
+    assert auth_service.calls[0]["access"] == "write"
+    assert upload_service.calls == [
+        (
+            "create",
+            {
+                "team_id": TEAM_ID,
+                "analysis_id": ANALYSIS_ID,
+                "idempotency_key": f"memory-{artifact_kind}",
+                "artifact_kind": artifact_kind,
+                "mime": "application/octet-stream",
+                "size": 128,
+                "sha256_b64": CHECKSUM,
+            },
+        )
+    ]
+
+
+def test_memory_capture_manifest_is_rejected_with_stable_public_error() -> None:
+    auth_service = FakeAuthService()
+    upload_service = FakeUploadService()
+    target = f"/v1/teams/{TEAM_ID}/analyses/{ANALYSIS_ID}/uploads"
+    body = json.dumps(
+        {
+            "artifact_kind": "memory_capture_manifest",
+            "mime": "application/octet-stream",
+            "size": 128,
+            "sha256_b64": CHECKSUM,
+        },
+        separators=(",", ":"),
+    ).encode()
+    headers = _proxy_headers(
+        method="POST",
+        target=target,
+        body=body,
+        request_id="req-memory-capture-manifest",
+    )
+    headers["Idempotency-Key"] = "memory-capture-manifest"
+
+    with _client(auth_service, upload_service) as client:
+        response = client.post(target, content=body, headers=headers)
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "request_validation_failed"
+    assert "memory_capture_manifest" not in response.text
+    assert auth_service.calls[0]["access"] == "write"
+    assert upload_service.calls[0][0] == "create"
 
 
 def test_finalize_upload_uses_the_fixed_analysis_route_and_hides_storage_version() -> None:

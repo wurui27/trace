@@ -602,6 +602,55 @@ async def test_create_slot_rejects_noncanonical_or_unapproved_descriptors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("artifact_kind", ["memory_evidence", "screenshot"])
+async def test_memory_input_kinds_can_reserve_uploads(artifact_kind: str) -> None:
+    repository = RecordingRepository(
+        _stored_upload(
+            artifact_kind=artifact_kind,
+            mime="application/octet-stream",
+            size=128,
+        )
+    )
+    store = RecordingStore(repository)
+
+    slot = await _service(repository, store).create_slot(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        idempotency_key=f"memory-{artifact_kind}",
+        artifact_kind=artifact_kind,
+        mime="application/octet-stream",
+        size=128,
+        sha256_b64=CHECKSUM,
+    )
+
+    assert slot.artifact_kind == artifact_kind
+    assert repository.received["descriptor"].artifact_kind == artifact_kind
+    assert store.events == ["presigned"]
+
+
+@pytest.mark.asyncio
+async def test_memory_capture_manifest_cannot_reserve_a_public_upload() -> None:
+    from perfpilot_api.services.uploads import UploadInvalidRequestError
+
+    repository = RecordingRepository()
+    store = RecordingStore(repository)
+
+    with pytest.raises(UploadInvalidRequestError):
+        await _service(repository, store).create_slot(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            idempotency_key="memory-capture-manifest",
+            artifact_kind="memory_capture_manifest",
+            mime="application/octet-stream",
+            size=128,
+            sha256_b64=CHECKSUM,
+        )
+
+    assert repository.events == []
+    assert store.events == []
+
+
+@pytest.mark.asyncio
 async def test_create_slot_persists_before_returning_a_presigned_put() -> None:
     from perfpilot_api.services.uploads import UploadService
 
