@@ -11,6 +11,7 @@ from perfpilot_api.engines.contracts import (
     ResourceProfile,
     SubmitConfig,
 )
+from perfpilot_api.engines.errors import EngineAdapterError, EngineErrorTerminalState
 from perfpilot_api.engines.lock import EngineLock, EngineLockError, EnginePin, load_engine_lock
 from perfpilot_api.engines.registry import AdapterRegistry, AdapterRegistryError
 from perfpilot_api.engines.states import (
@@ -25,6 +26,8 @@ __all__ = [
     "AdapterRegistryError",
     "AnalysisProfile",
     "EngineAdapter",
+    "EngineAdapterError",
+    "EngineErrorTerminalState",
     "EngineEvent",
     "EngineExecutionState",
     "EngineInput",

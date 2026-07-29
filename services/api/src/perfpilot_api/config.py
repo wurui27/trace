@@ -31,6 +31,10 @@ _DEVELOPMENT_JWS_SIGNING_KEY_REFERENCE = "development-only-jws-signing-key-refer
 _DEVELOPMENT_AGENT_REGISTRATION_SECRET_REFERENCE = (
     "development-only-agent-registration-secret-reference"
 )
+_DEVELOPMENT_SMARTPERFETTO_BASE_URL = "http://127.0.0.1:3001"
+_DEVELOPMENT_SMARTPERFETTO_CREDENTIAL_REFERENCE = (
+    "development-only-smartperfetto-credential-reference"
+)
 _DEVELOPMENT_ALLOWED_ORIGIN = "http://127.0.0.1:3000"
 _REDACTED_VALIDATION_INPUT = "[redacted]"
 _INVALID_PRODUCTION_SERVICE_URL = "production service URL configuration is invalid"
@@ -148,6 +152,45 @@ class Settings(BaseSettings):
     agent_registration_secret_reference: SecretStr = SecretStr(
         _DEVELOPMENT_AGENT_REGISTRATION_SECRET_REFERENCE
     )
+    smartperfetto_enabled: bool = False
+    smartperfetto_base_url: SecretStr = SecretStr(_DEVELOPMENT_SMARTPERFETTO_BASE_URL)
+    smartperfetto_credential_reference: SecretStr = SecretStr(
+        _DEVELOPMENT_SMARTPERFETTO_CREDENTIAL_REFERENCE
+    )
+    smartperfetto_connect_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=300,
+        allow_inf_nan=False,
+    )
+    smartperfetto_read_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=300,
+        allow_inf_nan=False,
+    )
+    smartperfetto_write_timeout_seconds: float = Field(
+        default=30.0,
+        gt=0,
+        le=300,
+        allow_inf_nan=False,
+    )
+    smartperfetto_pool_timeout_seconds: float = Field(
+        default=5.0,
+        gt=0,
+        le=300,
+        allow_inf_nan=False,
+    )
+    smartperfetto_max_trace_bytes: int = Field(default=512 * 1024 * 1024, gt=0)
+    smartperfetto_max_json_bytes: int = Field(default=2 * 1024 * 1024, gt=0)
+    smartperfetto_max_sse_event_bytes: int = Field(default=256 * 1024, gt=0)
+    smartperfetto_sse_batch_events: int = Field(default=64, gt=0, le=1024)
+    smartperfetto_sse_batch_seconds: float = Field(
+        default=2.0,
+        gt=0,
+        le=60,
+        allow_inf_nan=False,
+    )
     allowed_origins: tuple[AnyHttpUrl, ...] = Field(
         default_factory=lambda: (AnyHttpUrl(_DEVELOPMENT_ALLOWED_ORIGIN),)
     )
@@ -172,8 +215,41 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_configuration(self) -> "Settings":
+        if self.smartperfetto_enabled:
+            raw_endpoint = self.smartperfetto_base_url.get_secret_value()
+            raw_reference = self.smartperfetto_credential_reference.get_secret_value()
+            try:
+                parsed_smartperfetto_url = urlsplit(raw_endpoint)
+            except ValueError:
+                raise _production_validation_error(
+                    "SmartPerfetto service configuration is invalid"
+                ) from None
+            if (
+                parsed_smartperfetto_url.scheme.casefold() not in {"http", "https"}
+                or parsed_smartperfetto_url.hostname is None
+                or parsed_smartperfetto_url.username is not None
+                or parsed_smartperfetto_url.password is not None
+                or parsed_smartperfetto_url.query
+                or parsed_smartperfetto_url.fragment
+                or parsed_smartperfetto_url.path not in {"", "/"}
+                or not raw_reference.strip()
+            ):
+                raise _production_validation_error(
+                    "SmartPerfetto service configuration is invalid"
+                )
+
         if self.app_env != "production":
             return self
+
+        if self.smartperfetto_enabled and (
+            parsed_smartperfetto_url.scheme.casefold() != "https"
+            or _is_loopback_host(parsed_smartperfetto_url.hostname)
+            or self.smartperfetto_credential_reference.get_secret_value()
+            == _DEVELOPMENT_SMARTPERFETTO_CREDENTIAL_REFERENCE
+        ):
+            raise _production_validation_error(
+                "production SmartPerfetto configuration is invalid"
+            )
 
         required_secrets = (
             self.proxy_secret.get_secret_value(),

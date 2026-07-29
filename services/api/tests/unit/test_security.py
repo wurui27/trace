@@ -4,8 +4,10 @@ import re
 from http.cookies import SimpleCookie
 
 import pytest
+from pydantic import SecretStr, ValidationError
 from starlette.responses import Response
 
+from perfpilot_api.config import Settings
 import perfpilot_api.security.csrf as csrf_security
 import perfpilot_api.security.proxy_signature as proxy_security
 import perfpilot_api.security.sessions as session_security
@@ -16,6 +18,126 @@ from perfpilot_api.security.passwords import (
 )
 
 _URLSAFE_TOKEN_PATTERN = re.compile(r"[A-Za-z0-9_-]{43}")
+
+
+def _production_settings(**overrides: object) -> Settings:
+    values: dict[str, object] = {
+        "app_env": "production",
+        "control_database_url": (
+            "postgresql+psycopg://perfpilot:test-password@db.example.com:5432/"
+            "perfpilot_control?sslmode=verify-full"
+        ),
+        "redis_url": "rediss://cache.example.com:6380/0",
+        "s3_endpoint_url": "https://objects.example.com",
+        "s3_region": "cn-north-1",
+        "tenant_cluster_host": "tenant-db.example.com",
+        "tenant_cluster_port": 6432,
+        "tenant_cluster_sslmode": "verify-full",
+        "secret_keyring_config": "/run/secrets/perfpilot/keyring.json",
+        "secret_store_root": "/var/lib/perfpilot/secrets",
+        "proxy_secret": "test-production-proxy-secret",
+        "session_secret": "test-production-session-secret",
+        "jws_signing_key_reference": "kms://keys/perfpilot-signing",
+        "agent_registration_secret_reference": "vault://secrets/agent-registration",
+        "allowed_origins": ["https://console.example.com"],
+    }
+    values.update(overrides)
+    return Settings(**values)
+
+
+def test_smartperfetto_settings_have_finite_positive_bounds() -> None:
+    settings = Settings(
+        smartperfetto_enabled=True,
+        smartperfetto_base_url="http://127.0.0.1:3001",
+        smartperfetto_credential_reference="development-smartperfetto-secret-ref",
+    )
+
+    assert settings.smartperfetto_connect_timeout_seconds > 0
+    assert settings.smartperfetto_read_timeout_seconds > 0
+    assert settings.smartperfetto_write_timeout_seconds > 0
+    assert settings.smartperfetto_pool_timeout_seconds > 0
+    assert settings.smartperfetto_max_trace_bytes > 0
+    assert settings.smartperfetto_max_json_bytes > 0
+    assert settings.smartperfetto_max_sse_event_bytes > 0
+    assert settings.smartperfetto_sse_batch_events > 0
+    assert settings.smartperfetto_sse_batch_seconds > 0
+
+
+@pytest.mark.parametrize(
+    "field_name",
+    [
+        "smartperfetto_connect_timeout_seconds",
+        "smartperfetto_read_timeout_seconds",
+        "smartperfetto_write_timeout_seconds",
+        "smartperfetto_pool_timeout_seconds",
+        "smartperfetto_max_trace_bytes",
+        "smartperfetto_max_json_bytes",
+        "smartperfetto_max_sse_event_bytes",
+        "smartperfetto_sse_batch_events",
+        "smartperfetto_sse_batch_seconds",
+    ],
+)
+def test_smartperfetto_settings_reject_nonpositive_bounds(field_name: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**{field_name: 0})
+
+
+def test_production_accepts_explicit_https_smartperfetto_service() -> None:
+    settings = _production_settings(
+        smartperfetto_enabled=True,
+        smartperfetto_base_url="https://smartperfetto.example.com",
+        smartperfetto_credential_reference="vault://services/smartperfetto",
+    )
+
+    assert settings.smartperfetto_enabled is True
+    assert settings.smartperfetto_base_url.get_secret_value() == (
+        "https://smartperfetto.example.com"
+    )
+    assert isinstance(settings.smartperfetto_credential_reference, SecretStr)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://smartperfetto.example.com",
+        "https://user:password@smartperfetto.example.com",
+        "https://smartperfetto.example.com?token=secret-marker",
+        "https://smartperfetto.example.com#secret-marker",
+        "https://127.0.0.1",
+        "https://localhost",
+    ],
+)
+def test_production_rejects_unsafe_smartperfetto_endpoints_without_leaking_them(
+    base_url: str,
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _production_settings(
+            smartperfetto_enabled=True,
+            smartperfetto_base_url=base_url,
+            smartperfetto_credential_reference="vault://services/smartperfetto",
+        )
+
+    rendered = f"{exc_info.value!s} {exc_info.value!r}"
+    assert "secret-marker" not in rendered
+    assert "password" not in rendered
+
+
+def test_production_requires_nonempty_smartperfetto_secret_reference_when_enabled() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _production_settings(
+            smartperfetto_enabled=True,
+            smartperfetto_base_url="https://smartperfetto.example.com",
+            smartperfetto_credential_reference="   ",
+        )
+
+    assert "input_value" not in str(exc_info.value)
+
+
+def test_smartperfetto_secret_reference_is_redacted_from_settings_repr() -> None:
+    marker = "smartperfetto-secret-marker"
+    settings = Settings(smartperfetto_credential_reference=marker)
+
+    assert marker not in repr(settings)
 
 
 def test_username_normalization_uses_nfkc_strip_and_casefold() -> None:
