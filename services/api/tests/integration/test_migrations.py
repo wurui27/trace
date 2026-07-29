@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from collections.abc import Iterator
 from dataclasses import dataclass
 from decimal import Decimal
@@ -34,6 +35,8 @@ CONTROL_TABLES = {
     "agent_leases",
     "sample_validation_claims",
     "worker_claims",
+    "team_engine_workspaces",
+    "engine_executions",
     "outbox_events",
     "inbox_events",
     "idempotency_keys",
@@ -68,6 +71,8 @@ _VERSIONED_CONTROL_TABLES = {
     "agent_leases",
     "sample_validation_claims",
     "worker_claims",
+    "team_engine_workspaces",
+    "engine_executions",
     "outbox_events",
     "inbox_events",
 }
@@ -80,6 +85,12 @@ _FORBIDDEN_CONTROL_COLUMNS = {
     "evidence",
     "sample_content",
     "payload",
+    "raw_result",
+    "prompt",
+    "question",
+    "signed_url",
+    "path",
+    "dsn",
 }
 _OUTBOX_COLUMNS = {
     "id",
@@ -221,6 +232,10 @@ def _normalize_postgresql_predicate(predicate: object) -> str:
     return normalized.translate(str.maketrans("", "", '()"'))
 
 
+def _check_string_literals(predicate: object) -> set[str]:
+    return set(re.findall(r"'([^']+)'", str(predicate)))
+
+
 @pytest.mark.parametrize(
     "database_url",
     [
@@ -348,11 +363,246 @@ def test_control_schema_enforces_required_uniqueness(
         control_inspector, "tenant_resources"
     )
     assert ("team_id", "idempotency_key") in _unique_column_sets(control_inspector, "global_jobs")
+    assert ("id", "team_id") in _unique_column_sets(control_inspector, "global_jobs")
     assert ("analysis_id", "scenario_type") in _unique_column_sets(
         control_inspector, "scenario_jobs"
     )
     assert ("serial",) in _unique_column_sets(control_inspector, "devices")
     assert ("consumer_name", "event_id") in _unique_column_sets(control_inspector, "inbox_events")
+
+
+def test_control_schema_persists_external_engine_authority(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    control_inspector = inspect(migration_databases.control_engine)
+
+    workspace_columns = {
+        column["name"] for column in control_inspector.get_columns("team_engine_workspaces")
+    }
+    execution_columns = {
+        column["name"] for column in control_inspector.get_columns("engine_executions")
+    }
+    assert workspace_columns == {
+        "id",
+        "team_id",
+        "engine_id",
+        "external_workspace_id",
+        "state",
+        "version",
+        "created_at",
+        "updated_at",
+    }
+    assert execution_columns == {
+        "id",
+        "analysis_id",
+        "team_id",
+        "engine_id",
+        "attempt_number",
+        "adapter_version",
+        "engine_commit_sha",
+        "engine_image_digest",
+        "input_manifest_hash",
+        "config_hash",
+        "external_workspace_id",
+        "session_id",
+        "run_id",
+        "state",
+        "last_event_cursor",
+        "stable_error_code",
+        "started_at",
+        "completed_at",
+        "raw_result_artifact_id",
+        "normalized_report_version_id",
+        "version",
+        "created_at",
+        "updated_at",
+    }
+    assert workspace_columns.isdisjoint(_FORBIDDEN_CONTROL_COLUMNS)
+    assert execution_columns.isdisjoint(_FORBIDDEN_CONTROL_COLUMNS)
+    workspace_column_details = {
+        column["name"]: column for column in control_inspector.get_columns("team_engine_workspaces")
+    }
+    execution_column_details = {
+        column["name"]: column for column in control_inspector.get_columns("engine_executions")
+    }
+    assert all(
+        workspace_column_details[column_name]["nullable"] is False
+        for column_name in ("team_id", "engine_id", "state", "version")
+    )
+    assert workspace_column_details["external_workspace_id"]["nullable"] is True
+    assert all(
+        execution_column_details[column_name]["nullable"] is False
+        for column_name in (
+            "analysis_id",
+            "team_id",
+            "engine_id",
+            "attempt_number",
+            "adapter_version",
+            "engine_commit_sha",
+            "engine_image_digest",
+            "input_manifest_hash",
+            "config_hash",
+            "state",
+            "version",
+        )
+    )
+    assert all(
+        execution_column_details[column_name]["nullable"] is True
+        for column_name in (
+            "external_workspace_id",
+            "session_id",
+            "run_id",
+            "last_event_cursor",
+            "stable_error_code",
+            "started_at",
+            "completed_at",
+            "raw_result_artifact_id",
+            "normalized_report_version_id",
+        )
+    )
+    assert all(
+        column["type"].__class__.__name__ not in {"JSON", "JSONB"}
+        for table_name in ("team_engine_workspaces", "engine_executions")
+        for column in control_inspector.get_columns(table_name)
+    )
+
+
+def test_control_schema_enforces_external_engine_constraints_and_indexes(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    control_inspector = inspect(migration_databases.control_engine)
+
+    assert ("team_id", "engine_id") in _unique_column_sets(
+        control_inspector, "team_engine_workspaces"
+    )
+    assert ("engine_id", "external_workspace_id") in _unique_column_sets(
+        control_inspector, "team_engine_workspaces"
+    )
+    assert ("analysis_id", "engine_id", "attempt_number") in _unique_column_sets(
+        control_inspector, "engine_executions"
+    )
+    engine_foreign_key = next(
+        foreign_key
+        for foreign_key in control_inspector.get_foreign_keys("engine_executions")
+        if foreign_key["name"] == "fk_engine_executions_analysis_team"
+    )
+    assert engine_foreign_key["constrained_columns"] == ["analysis_id", "team_id"]
+    assert engine_foreign_key["referred_table"] == "global_jobs"
+    assert engine_foreign_key["referred_columns"] == ["id", "team_id"]
+    assert engine_foreign_key["options"]["ondelete"] == "CASCADE"
+    workspace_foreign_key = next(
+        foreign_key
+        for foreign_key in control_inspector.get_foreign_keys("team_engine_workspaces")
+        if foreign_key["referred_table"] == "teams"
+    )
+    assert workspace_foreign_key["options"]["ondelete"] == "CASCADE"
+    indexes = {
+        index["name"]: index["column_names"]
+        for index in control_inspector.get_indexes("engine_executions")
+    }
+    assert indexes["ix_engine_executions_state_created"] == ["state", "created_at"]
+    assert indexes["ix_engine_executions_team_analysis"] == ["team_id", "analysis_id"]
+    execution_checks = {
+        constraint["name"]: _normalize_postgresql_predicate(constraint["sqltext"])
+        for constraint in control_inspector.get_check_constraints("engine_executions")
+    }
+    assert execution_checks["ck_engine_executions_attempt_positive"] == "attempt_number>0"
+    execution_state_check = execution_checks["ck_engine_executions_state"]
+    assert "state" in execution_state_check
+    assert _check_string_literals(execution_state_check) == {
+        "pending",
+        "running",
+        "awaiting_user",
+        "completed",
+        "insufficient_data",
+        "failed",
+        "canceled",
+    }
+    assert execution_checks["ck_engine_executions_commit_sha"] == (
+        "engine_commit_sha~'^[0-9a-f]{40}$'"
+    )
+    assert execution_checks["ck_engine_executions_image_digest"] == (
+        "engine_image_digest~'^sha256:[0-9a-f]{64}$'"
+    )
+    assert execution_checks["ck_engine_executions_input_manifest_hash"] == (
+        "input_manifest_hash~'^[0-9a-f]{64}$'"
+    )
+    assert execution_checks["ck_engine_executions_config_hash"] == "config_hash~'^[0-9a-f]{64}$'"
+    assert execution_checks["ck_engine_executions_version_positive"] == "version>0"
+    workspace_checks = {
+        constraint["name"]: _normalize_postgresql_predicate(constraint["sqltext"])
+        for constraint in control_inspector.get_check_constraints("team_engine_workspaces")
+    }
+    workspace_state_check = workspace_checks["ck_team_engine_workspaces_state"]
+    assert "state" in workspace_state_check
+    assert _check_string_literals(workspace_state_check) == {
+        "provisioning",
+        "active",
+        "deleting",
+        "deleted",
+        "failed",
+    }
+    assert workspace_checks["ck_team_engine_workspaces_version_positive"] == "version>0"
+
+
+def test_control_external_engine_downgrade_refuses_nonempty_metadata(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    team_id = UUID("98000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("98000000-0000-4000-8000-000000000002")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'Engine Team', 'active')"),
+            {"id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                "VALUES (:id, :team_id, 'engine-metadata', 'device', 'queued', ARRAY[]::varchar[])"
+            ),
+            {"id": analysis_id, "team_id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO team_engine_workspaces "
+                "(team_id, engine_id, external_workspace_id, state) "
+                "VALUES (:team_id, 'smartperfetto', 'workspace-1', 'active')"
+            ),
+            {"team_id": team_id},
+        )
+
+    with pytest.raises(RuntimeError, match="engine metadata must be exported"):
+        command.downgrade(
+            _alembic_config("control", migration_databases.control_url),
+            "0003_analysis_orchestration",
+        )
+    assert "team_engine_workspaces" in inspect(
+        migration_databases.control_engine
+    ).get_table_names()
+
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(text("DELETE FROM team_engine_workspaces"))
+        connection.execute(
+            text(
+                "INSERT INTO engine_executions "
+                "(analysis_id, team_id, engine_id, attempt_number, adapter_version, "
+                "engine_commit_sha, engine_image_digest, input_manifest_hash, config_hash, state) "
+                "VALUES (:analysis_id, :team_id, 'smartperfetto', 1, '1.0', repeat('a', 40), "
+                "'sha256:' || repeat('b', 64), repeat('c', 64), repeat('d', 64), 'pending')"
+            ),
+            {"analysis_id": analysis_id, "team_id": team_id},
+        )
+
+    with pytest.raises(RuntimeError, match="engine metadata must be exported"):
+        command.downgrade(
+            _alembic_config("control", migration_databases.control_url),
+            "0003_analysis_orchestration",
+        )
+    assert "engine_executions" in inspect(migration_databases.control_engine).get_table_names()
 
 
 def test_control_schema_persists_provisioning_checkpoints_and_fencing(
@@ -578,6 +828,11 @@ def test_foreign_keys_stay_within_their_database_and_are_indexed(
             foreign_key_columns = tuple(foreign_key["constrained_columns"])
             assert any(
                 columns[: len(foreign_key_columns)] == foreign_key_columns
+                or (
+                    table_name == "engine_executions"
+                    and foreign_key_columns == ("analysis_id", "team_id")
+                    and columns[: len(foreign_key_columns)] == ("team_id", "analysis_id")
+                )
                 for columns in indexed_columns
             ), (table_name, foreign_key_columns)
 

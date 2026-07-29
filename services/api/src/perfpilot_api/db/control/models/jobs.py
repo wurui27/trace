@@ -32,6 +32,7 @@ class GlobalJob(
     __tablename__ = "global_jobs"
     __table_args__ = (
         UniqueConstraint("team_id", "idempotency_key", name="uq_global_jobs_team_idempotency"),
+        UniqueConstraint("id", "team_id", name="uq_global_jobs_id_team"),
         CheckConstraint(
             "analysis_mode IN ('device', 'trace_upload')",
             name="ck_global_jobs_analysis_mode",

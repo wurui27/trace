@@ -1,6 +1,7 @@
 from perfpilot_api.db.base import ControlBase
 from perfpilot_api.db.control.models.agents import Agent, AgentLease, Device
 from perfpilot_api.db.control.models.auth import AuditEvent, AuthSession, User
+from perfpilot_api.db.control.models.engines import EngineExecution, TeamEngineWorkspace
 from perfpilot_api.db.control.models.events import InboxEvent, OutboxEvent
 from perfpilot_api.db.control.models.jobs import (
     GlobalJob,
@@ -23,6 +24,7 @@ __all__ = [
     "AuthSession",
     "ControlBase",
     "Device",
+    "EngineExecution",
     "GlobalJob",
     "IdempotencyKey",
     "InboxEvent",
@@ -31,6 +33,7 @@ __all__ = [
     "SampleValidationClaim",
     "ScenarioJob",
     "Team",
+    "TeamEngineWorkspace",
     "TenantQuota",
     "TenantResource",
     "User",

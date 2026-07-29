@@ -28,10 +28,12 @@ from sqlalchemy.ext.asyncio import (
 
 from perfpilot_api.db.control.models import (
     GlobalJob,
+    EngineExecution,
     IdempotencyKey,
     OutboxEvent,
     ScenarioJob,
     Team,
+    TeamEngineWorkspace,
     TenantQuota,
 )
 from perfpilot_api.db.tenant.models import (
@@ -345,6 +347,165 @@ def _recipe_hash(recipe: dict[str, object]) -> str:
         sort_keys=True,
     ).encode("ascii")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _engine_execution(**overrides: object) -> EngineExecution:
+    values: dict[str, object] = {
+        "analysis_id": ANALYSIS_ID,
+        "team_id": TEAM_ID,
+        "engine_id": "smartperfetto",
+        "attempt_number": 1,
+        "adapter_version": "1.0.0",
+        "engine_commit_sha": "a" * 40,
+        "engine_image_digest": "sha256:" + "b" * 64,
+        "input_manifest_hash": "c" * 64,
+        "config_hash": "d" * 64,
+        "state": "pending",
+    }
+    values.update(overrides)
+    return EngineExecution(**values)  # type: ignore[arg-type]
+
+
+@pytest.mark.asyncio
+async def test_engine_execution_rejects_cross_team_analysis_authority(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _complete_creation(analysis_databases)
+
+    async with analysis_databases.control_sessions() as session:
+        session.add(_engine_execution(team_id=OTHER_TEAM_ID))
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_engine_workspace_unique_constraints_are_enforced(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    async with analysis_databases.control_sessions.begin() as session:
+        session.add(
+            TeamEngineWorkspace(
+                team_id=TEAM_ID,
+                engine_id="smartperfetto",
+                external_workspace_id="workspace-1",
+                state="active",
+            )
+        )
+
+    async with analysis_databases.control_sessions() as session:
+        session.add(
+            TeamEngineWorkspace(
+                team_id=TEAM_ID,
+                engine_id="smartperfetto",
+                external_workspace_id="workspace-2",
+                state="active",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+    async with analysis_databases.control_sessions() as session:
+        session.add(
+            TeamEngineWorkspace(
+                team_id=OTHER_TEAM_ID,
+                engine_id="smartperfetto",
+                external_workspace_id="workspace-1",
+                state="active",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("state", "unknown"),
+        ("engine_commit_sha", "a" * 39),
+        ("engine_image_digest", "latest"),
+        ("input_manifest_hash", "c" * 63),
+        ("config_hash", "d" * 63),
+        ("attempt_number", 0),
+        ("input_manifest_hash", "C" * 64),
+        ("engine_image_digest", "sha256:" + "B" * 64),
+    ],
+)
+async def test_engine_execution_rejects_invalid_authority_metadata(
+    analysis_databases: AnalysisDatabases,
+    field: str,
+    value: str | int,
+) -> None:
+    await _complete_creation(analysis_databases)
+
+    async with analysis_databases.control_sessions() as session:
+        session.add(_engine_execution(**{field: value}))
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_engine_execution_attempts_are_unique_per_engine_and_analysis(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _complete_creation(analysis_databases)
+    async with analysis_databases.control_sessions.begin() as session:
+        session.add(_engine_execution())
+
+    async with analysis_databases.control_sessions() as session:
+        session.add(_engine_execution())
+        with pytest.raises(IntegrityError):
+            await session.commit()
+
+    async with analysis_databases.control_sessions.begin() as session:
+        session.add(_engine_execution(attempt_number=2))
+
+    async with analysis_databases.control_sessions() as session:
+        attempts = await session.scalars(
+            select(EngineExecution.attempt_number)
+            .where(EngineExecution.analysis_id == ANALYSIS_ID)
+            .order_by(EngineExecution.attempt_number)
+        )
+    assert list(attempts) == [1, 2]
+
+
+@pytest.mark.asyncio
+async def test_engine_metadata_cascades_with_its_control_plane_owner(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _complete_creation(analysis_databases)
+    workspace_team_id = uuid4()
+    async with analysis_databases.control_sessions.begin() as session:
+        session.add(Team(id=workspace_team_id, name="Workspace Cascade", state="active"))
+        await session.flush()
+        session.add_all(
+            (
+                _engine_execution(),
+                TeamEngineWorkspace(
+                    team_id=workspace_team_id,
+                    engine_id="smartperfetto",
+                    external_workspace_id="workspace-cascade",
+                    state="active",
+                ),
+            )
+        )
+
+    async with analysis_databases.control_sessions.begin() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        team = await session.get(Team, workspace_team_id)
+        assert job is not None and team is not None
+        await session.delete(job)
+        await session.delete(team)
+
+    async with analysis_databases.control_sessions() as session:
+        execution_count = await session.scalar(
+            select(func.count()).select_from(EngineExecution)
+        )
+        workspace_count = await session.scalar(
+            select(func.count()).select_from(TeamEngineWorkspace)
+        )
+    assert execution_count == 0
+    assert workspace_count == 0
 
 
 @pytest.mark.asyncio
