@@ -11,9 +11,11 @@ from perfpilot_api.engines.contracts import (
     EngineEvent,
     EngineEventBatch,
     EngineInput,
+    EngineRetryDirective,
     EngineResult,
     EngineRunRef,
     EngineStatus,
+    EngineStepOutcome,
     SubmitConfig,
 )
 from perfpilot_api.engines.registry import AdapterRegistry, AdapterRegistryError
@@ -141,6 +143,30 @@ def test_event_batch_and_status_are_immutable_and_refresh_the_run_reference() ->
     assert status.run_ref.cursor == "9"
     with pytest.raises(AttributeError):
         status.state = "failed"  # type: ignore[misc]
+
+
+def test_orchestration_outcomes_never_carry_external_or_payload_fields() -> None:
+    execution_id = UUID("40000000-0000-4000-8000-000000000009")
+    directive = EngineRetryDirective(
+        mode="new_attempt",
+        execution_id=execution_id,
+        attempt_number=2,
+        stable_error_code="capacity_exceeded",
+        retry_after_seconds=5,
+    )
+    outcome = EngineStepOutcome(
+        execution_id=execution_id,
+        state="pending",
+        retry=directive,
+    )
+
+    fields = set(type(outcome).__dataclass_fields__) | set(
+        type(directive).__dataclass_fields__
+    )
+    assert fields.isdisjoint(
+        {"payload", "external_workspace_id", "external_session_id", "external_run_id"}
+    )
+    assert outcome.retry == directive
 
 
 @pytest.mark.asyncio

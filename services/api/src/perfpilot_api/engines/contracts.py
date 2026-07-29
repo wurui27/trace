@@ -12,6 +12,7 @@ from pydantic import SecretStr
 
 AnalysisProfile = Literal["auto", "startup", "scroll"]
 ResourceProfile = Literal["network_service", "isolated_worker"]
+RetryMode = Literal["reconnect", "new_attempt"]
 ExecutionStateValue = Literal[
     "pending",
     "running",
@@ -97,6 +98,22 @@ class EngineStatus:
     state: ExecutionStateValue
     stable_error_code: str | None
     retryable: bool
+
+
+@dataclass(frozen=True, slots=True)
+class EngineRetryDirective:
+    mode: RetryMode
+    execution_id: UUID
+    attempt_number: int
+    stable_error_code: str
+    retry_after_seconds: int
+
+
+@dataclass(frozen=True, slots=True)
+class EngineStepOutcome:
+    execution_id: UUID
+    state: ExecutionStateValue
+    retry: EngineRetryDirective | None
 
 
 @dataclass(frozen=True, slots=True)
