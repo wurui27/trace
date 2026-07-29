@@ -269,6 +269,31 @@ def test_numeric_models_use_decimal_python_types() -> None:
     assert Metric.__table__.c.numeric_value.type.python_type is Decimal
 
 
+def test_engine_execution_orm_uses_external_run_identifiers() -> None:
+    from perfpilot_api.db.control.models import EngineExecution
+
+    column_names = set(EngineExecution.__table__.columns.keys())
+    assert {"external_session_id", "external_run_id"} <= column_names
+    assert {"session_id", "run_id"}.isdisjoint(column_names)
+
+    execution = EngineExecution(
+        analysis_id=uuid4(),
+        team_id=uuid4(),
+        engine_id="smartperfetto",
+        attempt_number=1,
+        adapter_version="1.0.0",
+        engine_commit_sha="a" * 40,
+        engine_image_digest="sha256:" + "b" * 64,
+        input_manifest_hash="c" * 64,
+        config_hash="d" * 64,
+        external_session_id="session-1",
+        external_run_id="run-1",
+        state="pending",
+    )
+    assert execution.external_session_id == "session-1"
+    assert execution.external_run_id == "run-1"
+
+
 @pytest.mark.parametrize("tree", ["control", "tenant"])
 def test_migration_env_disposes_engine_in_a_finally_block(tree: _MigrationTree) -> None:
     source = (_MIGRATIONS_ROOT / tree / "env.py").read_text()
@@ -405,8 +430,8 @@ def test_control_schema_persists_external_engine_authority(
         "input_manifest_hash",
         "config_hash",
         "external_workspace_id",
-        "session_id",
-        "run_id",
+        "external_session_id",
+        "external_run_id",
         "state",
         "last_event_cursor",
         "stable_error_code",
@@ -451,8 +476,8 @@ def test_control_schema_persists_external_engine_authority(
         execution_column_details[column_name]["nullable"] is True
         for column_name in (
             "external_workspace_id",
-            "session_id",
-            "run_id",
+            "external_session_id",
+            "external_run_id",
             "last_event_cursor",
             "stable_error_code",
             "started_at",
