@@ -145,6 +145,12 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     connection = op.get_bind()
+    connection.execute(
+        sa.text(
+            "LOCK TABLE engine_executions, team_engine_workspaces "
+            "IN ACCESS EXCLUSIVE MODE"
+        )
+    )
     if (
         connection.scalar(sa.text("SELECT 1 FROM engine_executions LIMIT 1")) is not None
         or connection.scalar(sa.text("SELECT 1 FROM team_engine_workspaces LIMIT 1")) is not None

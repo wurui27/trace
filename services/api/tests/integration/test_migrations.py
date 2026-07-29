@@ -3,10 +3,12 @@ from __future__ import annotations
 import os
 import re
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from decimal import Decimal
 from importlib import import_module
 from pathlib import Path
+from time import monotonic, sleep
 from typing import Literal, get_args
 from uuid import UUID, uuid4
 
@@ -628,6 +630,71 @@ def test_control_external_engine_downgrade_refuses_nonempty_metadata(
             "0003_analysis_orchestration",
         )
     assert "engine_executions" in inspect(migration_databases.control_engine).get_table_names()
+
+
+def test_control_external_engine_downgrade_serializes_with_concurrent_writers(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    team_id = UUID("98100000-0000-4000-8000-000000000001")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'Engine Race', 'active')"),
+            {"id": team_id},
+        )
+
+    writer_connection = migration_databases.control_engine.connect()
+    writer_transaction = writer_connection.begin()
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        writer_connection.execute(
+            text(
+                "INSERT INTO team_engine_workspaces "
+                "(team_id, engine_id, external_workspace_id, state) "
+                "VALUES (:team_id, 'smartperfetto', 'workspace-race', 'active')"
+            ),
+            {"team_id": team_id},
+        )
+        downgrade_future = executor.submit(
+            command.downgrade,
+            _alembic_config("control", migration_databases.control_url),
+            "0003_analysis_orchestration",
+        )
+
+        lock_wait_query = text(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM pg_locks AS requested_lock "
+            "JOIN pg_class AS locked_relation ON locked_relation.oid = requested_lock.relation "
+            "WHERE locked_relation.relname IN "
+            "('engine_executions', 'team_engine_workspaces') "
+            "AND requested_lock.database = "
+            "(SELECT oid FROM pg_database WHERE datname = current_database()) "
+            "AND requested_lock.mode = 'AccessExclusiveLock' "
+            "AND requested_lock.granted = false)"
+        )
+        deadline = monotonic() + 5
+        with migration_databases.control_engine.connect() as observer_connection:
+            while not observer_connection.scalar(lock_wait_query):
+                if monotonic() >= deadline:
+                    pytest.fail("downgrade did not request the engine metadata table lock")
+                sleep(0.02)
+
+        writer_transaction.commit()
+        with pytest.raises(RuntimeError, match="engine metadata must be exported"):
+            downgrade_future.result(timeout=5)
+    finally:
+        if writer_transaction.is_active:
+            writer_transaction.rollback()
+        writer_connection.close()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    assert {"engine_executions", "team_engine_workspaces"} <= set(
+        inspect(migration_databases.control_engine).get_table_names()
+    )
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0004_external_engine_foundation"
+        )
 
 
 def test_control_schema_persists_provisioning_checkpoints_and_fencing(
