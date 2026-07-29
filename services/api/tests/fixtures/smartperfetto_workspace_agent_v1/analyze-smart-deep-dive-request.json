@@ -1,0 +1,21 @@
+{
+  "traceId": "trace-synthetic-001",
+  "query": "Analyze the selected PerfPilot performance scenes.",
+  "options": {
+    "analysisMode": "auto",
+    "preset": "smart",
+    "smartAction": "analyze",
+    "smartSelection": {
+      "scope": "scene_types",
+      "sceneTypes": [
+        "cold_start",
+        "warm_start",
+        "hot_start",
+        "scroll",
+        "inertial_scroll"
+      ],
+      "label": "PerfPilot supported scenes",
+      "reportId": "report-synthetic-preview-001"
+    }
+  }
+}

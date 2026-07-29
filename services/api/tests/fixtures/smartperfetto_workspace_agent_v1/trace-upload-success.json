@@ -1,0 +1,17 @@
+{
+  "success": true,
+  "trace": {
+    "id": "trace-synthetic-001",
+    "filename": "perfpilot-trace.pftrace",
+    "size": 4096,
+    "uploadedAt": "2026-07-28T00:00:00.000Z",
+    "status": "ready",
+    "port": 19001,
+    "leaseId": "lease-synthetic-001",
+    "leaseState": "active",
+    "leaseMode": "shared",
+    "leaseModeReason": "frontend_interactive",
+    "leaseQueueLength": 0,
+    "processorStatus": "ready"
+  }
+}

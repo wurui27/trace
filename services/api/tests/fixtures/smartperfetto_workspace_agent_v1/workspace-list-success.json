@@ -1,0 +1,21 @@
+{
+  "success": true,
+  "workspaces": [
+    {
+      "id": "pp-11111111-2222-5333-8444-555555555555",
+      "name": "PerfPilot managed workspace",
+      "quotaPolicy": {
+        "maxTraceBytes": 536870912,
+        "maxConcurrentRuns": 2
+      },
+      "retentionPolicy": {
+        "traceRetentionDays": 7,
+        "reportRetentionDays": 30
+      },
+      "createdAt": 1770000000000,
+      "updatedAt": 1770000000000,
+      "providerCount": 0,
+      "memberCount": 1
+    }
+  ]
+}

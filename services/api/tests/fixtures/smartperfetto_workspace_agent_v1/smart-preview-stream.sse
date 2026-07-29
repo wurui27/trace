@@ -1,0 +1,9 @@
+id: 10
+event: progress
+data: {"type":"progress","content":{"phase":"scene_inventory","progress":50,"message":"Synthetic scene inventory"},"timestamp":1770000010000}
+
+id: 11
+event: analysis_completed
+data: {"type":"analysis_completed","data":{"smartScenePreview":{"reportId":"report-synthetic-preview-001","scenes":[{"id":"scene-startup-001","sceneType":"cold_start","durationMs":900},{"id":"scene-scroll-001","sceneType":"scroll","durationMs":1200},{"id":"scene-ignored-001","sceneType":"navigation","durationMs":300}],"eligibleSceneCount":3,"sceneTypeCounts":{"cold_start":1,"scroll":1,"navigation":1}},"terminalRunStatus":"completed"},"timestamp":1770000011000}
+
+: fixture end

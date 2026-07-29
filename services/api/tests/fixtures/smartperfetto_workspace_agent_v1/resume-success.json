@@ -1,0 +1,14 @@
+{
+  "success": true,
+  "sessionId": "session-synthetic-001",
+  "traceId": "trace-synthetic-001",
+  "status": "completed",
+  "message": "Session restored from persistence",
+  "restored": true,
+  "observability": {
+    "runId": "run-session-synthetic-001-2-recovered",
+    "requestId": "request-synthetic-recovered-001",
+    "runSequence": 2,
+    "status": "completed"
+  }
+}

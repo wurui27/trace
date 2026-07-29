@@ -1,0 +1,21 @@
+{
+  "success": true,
+  "sessionId": "session-synthetic-001",
+  "status": "completed",
+  "traceId": "trace-synthetic-001",
+  "query": "Synthetic question",
+  "createdAt": 1770000000000,
+  "observability": {
+    "runId": "run-session-synthetic-001-1",
+    "requestId": "request-synthetic-001",
+    "runSequence": 1,
+    "status": "completed"
+  },
+  "result": {
+    "conclusion": "Synthetic supported conclusion",
+    "confidence": 0.9,
+    "partial": false,
+    "reportUrl": "/api/reports/report-synthetic-001",
+    "findingsCount": 1
+  }
+}

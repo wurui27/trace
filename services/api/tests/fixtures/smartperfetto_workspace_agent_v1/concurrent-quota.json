@@ -1,0 +1,11 @@
+{
+  "success": false,
+  "code": "CONCURRENT_RUN_QUOTA_EXCEEDED",
+  "status": "pending",
+  "error": "Synthetic concurrent quota response",
+  "details": {
+    "activeRuns": 2,
+    "limitRuns": 2,
+    "queuePosition": 1
+  }
+}

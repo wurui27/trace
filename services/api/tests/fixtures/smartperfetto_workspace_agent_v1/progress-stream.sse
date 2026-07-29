@@ -1,0 +1,22 @@
+: synthetic keepalive
+
+event: connected
+data: {"type":"connected"}
+
+id: 1
+event: progress
+data: {"type":"progress","content":{"phase":"trace_loading","progress":25,"message":"Synthetic progress"},"timestamp":1770000001000}
+
+id: 2
+event: progress
+data: {"type":"progress","content":{"phase":"analysis","progress":80,"message":"Synthetic progress"},"timestamp":1770000002000}
+
+id: 3
+event: analysis_completed
+data: {"type":"analysis_completed","data":{"conclusion":"Synthetic conclusion","reportUrl":"/api/reports/report-synthetic-001","terminalRunStatus":"completed"},"timestamp":1770000003000}
+
+id: 4
+event: end
+data: {"type":"end","timestamp":1770000004000}
+
+: fixture end

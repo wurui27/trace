@@ -1,0 +1,11 @@
+{
+  "success": false,
+  "code": "MONTHLY_RUN_QUOTA_EXCEEDED",
+  "status": "quota_exceeded",
+  "error": "Synthetic monthly quota response",
+  "details": {
+    "usedRuns": 100,
+    "limitRuns": 100,
+    "windowStartMs": 1769904000000
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "success": false,
+  "code": "TRACE_PROCESSOR_UNAVAILABLE",
+  "status": "failed",
+  "error": "Synthetic upload failure",
+  "trace": {
+    "id": "trace-must-not-be-consumed"
+  }
+}

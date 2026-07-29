@@ -1,0 +1,46 @@
+{
+  "success": true,
+  "report": {
+    "sessionId": "session-synthetic-001",
+    "traceId": "trace-synthetic-001",
+    "query": "Inspect https://objects.invalid/report?X-Amz-Signature=synthetic",
+    "createdAt": 1770000000000,
+    "completedAt": 1770000005000,
+    "summary": {
+      "conclusion": "The synthetic startup interval contains supported evidence.",
+      "confidence": 0.9,
+      "totalDurationMs": 5000,
+      "rounds": 1,
+      "partial": false
+    },
+    "reportUrl": "/api/reports/report-synthetic-001",
+    "findings": [
+      {
+        "id": "finding-synthetic-001",
+        "category": "startup",
+        "severity": "warning",
+        "title": "Synthetic startup delay",
+        "description": "Bearer synthetic-secret"
+      }
+    ],
+    "analysisNotes": [
+      "s3://synthetic-bucket/private/report.json",
+      "/synthetic/private/note.txt",
+      "C:\\synthetic\\private\\note.txt"
+    ],
+    "logFile": "/synthetic/private/session.log",
+    "metadata": {
+      "authorization": "Bearer synthetic-secret",
+      "apiKey": "synthetic-api-key",
+      "token": "synthetic-token",
+      "objectKey": "synthetic/object/key",
+      "bucket": "synthetic-bucket",
+      "safeNote": "Retain this safe synthetic note",
+      "nested": {
+        "localPath": "C:\\synthetic\\private\\report.json",
+        "artifactUri": "s3://synthetic-bucket/private/report.json",
+        "signedUrl": "https://objects.invalid/report?X-Amz-Signature=synthetic"
+      }
+    }
+  }
+}

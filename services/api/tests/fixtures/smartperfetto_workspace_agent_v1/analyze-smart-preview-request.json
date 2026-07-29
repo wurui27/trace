@@ -1,0 +1,9 @@
+{
+  "traceId": "trace-synthetic-001",
+  "query": "Inventory supported startup and scroll scenes.",
+  "options": {
+    "analysisMode": "auto",
+    "preset": "smart",
+    "smartAction": "preview"
+  }
+}

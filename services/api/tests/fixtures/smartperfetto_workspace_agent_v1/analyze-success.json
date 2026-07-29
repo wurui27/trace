@@ -1,0 +1,16 @@
+{
+  "success": true,
+  "sessionId": "session-synthetic-001",
+  "message": "Smart analysis started",
+  "isNewSession": true,
+  "architecture": "agent-driven",
+  "preset": "smart",
+  "runId": "run-session-synthetic-001-1",
+  "requestId": "request-synthetic-001",
+  "runSequence": 1,
+  "observability": {
+    "runId": "run-session-synthetic-001-1",
+    "requestId": "request-synthetic-001",
+    "runSequence": 1
+  }
+}
