@@ -326,6 +326,12 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     connection = op.get_bind()
+    connection.execute(
+        sa.text(
+            "LOCK TABLE analyses, application_versions, applications, report_versions, "
+            "scenario_recipes, scenario_results IN ACCESS EXCLUSIVE MODE"
+        )
+    )
     data_loss_row = connection.scalar(
         sa.text(
             "SELECT 1 FROM report_versions WHERE scenario_result_id IS NOT NULL "

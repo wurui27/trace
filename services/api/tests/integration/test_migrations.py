@@ -1033,6 +1033,76 @@ def test_control_task7_downgrade_refuses_to_drop_scheduling_data(
     }
 
 
+def test_control_task7_downgrade_serializes_with_concurrent_scheduling_writers(
+    migration_databases: MigrationDatabases,
+) -> None:
+    command.upgrade(
+        _alembic_config("control", migration_databases.control_url),
+        "0003_analysis_orchestration",
+    )
+    team_id = UUID("91100000-0000-4000-8000-000000000001")
+    analysis_id = UUID("92100000-0000-4000-8000-000000000001")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'Task 7 Race', 'active')"),
+            {"id": team_id},
+        )
+
+    writer_connection = migration_databases.control_engine.connect()
+    writer_transaction = writer_connection.begin()
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        writer_connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                "VALUES (:id, :team_id, 'task7-race', 'device', 'queued', "
+                "ARRAY['arm64-v8a'])"
+            ),
+            {"id": analysis_id, "team_id": team_id},
+        )
+        downgrade_future = executor.submit(
+            command.downgrade,
+            _alembic_config("control", migration_databases.control_url),
+            "0002_tenant_provisioning_state",
+        )
+
+        lock_wait_query = text(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM pg_locks AS requested_lock "
+            "JOIN pg_class AS locked_relation ON locked_relation.oid = requested_lock.relation "
+            "WHERE locked_relation.relname = 'global_jobs' "
+            "AND requested_lock.database = "
+            "(SELECT oid FROM pg_database WHERE datname = current_database()) "
+            "AND requested_lock.mode = 'AccessExclusiveLock' "
+            "AND requested_lock.granted = false)"
+        )
+        deadline = monotonic() + 5
+        with migration_databases.control_engine.connect() as observer_connection:
+            while not observer_connection.scalar(lock_wait_query):
+                if monotonic() >= deadline:
+                    pytest.fail("downgrade did not request the scheduling table lock")
+                sleep(0.02)
+
+        writer_transaction.commit()
+        with pytest.raises(RuntimeError, match="must be exported before downgrade"):
+            downgrade_future.result(timeout=5)
+    finally:
+        if writer_transaction.is_active:
+            writer_transaction.rollback()
+        writer_connection.close()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    assert "supported_abis" in {
+        column["name"]
+        for column in inspect(migration_databases.control_engine).get_columns("global_jobs")
+    }
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0003_analysis_orchestration"
+        )
+
+
 def test_tenant_task7_downgrade_refuses_to_drop_inspected_apk_metadata(
     migration_databases: MigrationDatabases,
 ) -> None:
@@ -1067,6 +1137,77 @@ def test_tenant_task7_downgrade_refuses_to_drop_inspected_apk_metadata(
         column["name"]
         for column in inspect(migration_databases.tenant_engine).get_columns("application_versions")
     }
+
+
+def test_tenant_task7_downgrade_serializes_with_concurrent_metadata_writers(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("tenant", migration_databases.tenant_url)
+    application_id = UUID("95100000-0000-4000-8000-000000000002")
+    version_id = UUID("96100000-0000-4000-8000-000000000002")
+    with migration_databases.tenant_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO applications (id, name, package_name) "
+                "VALUES (:id, 'Task 7 Race', 'com.example.task7.race')"
+            ),
+            {"id": application_id},
+        )
+
+    writer_connection = migration_databases.tenant_engine.connect()
+    writer_transaction = writer_connection.begin()
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        writer_connection.execute(
+            text(
+                "INSERT INTO application_versions "
+                "(id, application_id, package_name, version_name, version_code, "
+                "has_native_libraries, apk_sha256_b64) VALUES "
+                "(:id, :application_id, 'com.example.task7.race', '1', 1, false, "
+                "repeat('A', 44))"
+            ),
+            {"id": version_id, "application_id": application_id},
+        )
+        downgrade_future = executor.submit(
+            command.downgrade,
+            _alembic_config("tenant", migration_databases.tenant_url),
+            "0002_artifact_upload_slots",
+        )
+
+        lock_wait_query = text(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM pg_locks AS requested_lock "
+            "JOIN pg_class AS locked_relation ON locked_relation.oid = requested_lock.relation "
+            "WHERE locked_relation.relname = 'application_versions' "
+            "AND requested_lock.database = "
+            "(SELECT oid FROM pg_database WHERE datname = current_database()) "
+            "AND requested_lock.mode = 'AccessExclusiveLock' "
+            "AND requested_lock.granted = false)"
+        )
+        deadline = monotonic() + 5
+        with migration_databases.tenant_engine.connect() as observer_connection:
+            while not observer_connection.scalar(lock_wait_query):
+                if monotonic() >= deadline:
+                    pytest.fail("downgrade did not request the tenant metadata table lock")
+                sleep(0.02)
+
+        writer_transaction.commit()
+        with pytest.raises(RuntimeError, match="must be exported before downgrade"):
+            downgrade_future.result(timeout=5)
+    finally:
+        if writer_transaction.is_active:
+            writer_transaction.rollback()
+        writer_connection.close()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    assert "apk_sha256_b64" in {
+        column["name"]
+        for column in inspect(migration_databases.tenant_engine).get_columns("application_versions")
+    }
+    with migration_databases.tenant_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0003_analysis_orchestration"
+        )
 
 
 def test_tenant_task7_upgrade_backfills_native_library_metadata_for_existing_analyses(
