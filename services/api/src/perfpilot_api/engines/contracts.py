@@ -73,6 +73,7 @@ class EngineRunRef:
     external_session_id: str | None
     external_run_id: str | None
     cursor: str | None
+    external_workspace_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,6 +83,20 @@ class EngineEvent:
     progress_percent: int | None
     message_code: str
     occurred_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class EngineEventBatch:
+    run_ref: EngineRunRef
+    events: tuple[EngineEvent, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EngineStatus:
+    run_ref: EngineRunRef
+    state: ExecutionStateValue
+    stable_error_code: str | None
+    retryable: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,7 +119,9 @@ class EngineAdapter(Protocol):
         self,
         run_ref: EngineRunRef,
         cursor: str | None,
-    ) -> tuple[EngineEvent, ...]: ...
+    ) -> EngineEventBatch: ...
+
+    async def status(self, run_ref: EngineRunRef) -> EngineStatus: ...
 
     async def fetch_result(self, run_ref: EngineRunRef) -> EngineResult: ...
 

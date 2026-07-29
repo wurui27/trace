@@ -3,9 +3,11 @@ from perfpilot_api.engines.contracts import (
     AnalysisProfile,
     EngineAdapter,
     EngineEvent,
+    EngineEventBatch,
     EngineInput,
     EngineResult,
     EngineRunRef,
+    EngineStatus,
     EngineTerminalStateValue,
     ExecutionStateValue,
     ResourceProfile,
@@ -14,6 +16,7 @@ from perfpilot_api.engines.contracts import (
 from perfpilot_api.engines.errors import EngineAdapterError, EngineErrorTerminalState
 from perfpilot_api.engines.lock import EngineLock, EngineLockError, EnginePin, load_engine_lock
 from perfpilot_api.engines.registry import AdapterRegistry, AdapterRegistryError
+from perfpilot_api.engines.smartperfetto import SmartPerfettoAdapter
 from perfpilot_api.engines.states import (
     EngineExecutionState,
     InvalidEngineTransition,
@@ -29,6 +32,7 @@ __all__ = [
     "EngineAdapterError",
     "EngineErrorTerminalState",
     "EngineEvent",
+    "EngineEventBatch",
     "EngineExecutionState",
     "EngineInput",
     "EngineLock",
@@ -36,10 +40,12 @@ __all__ = [
     "EnginePin",
     "EngineResult",
     "EngineRunRef",
+    "EngineStatus",
     "EngineTerminalStateValue",
     "ExecutionStateValue",
     "InvalidEngineTransition",
     "ResourceProfile",
+    "SmartPerfettoAdapter",
     "SubmitConfig",
     "load_engine_lock",
     "transition_engine_state",

@@ -4,9 +4,10 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, BinaryIO
 from urllib.parse import urlsplit
 
 import httpx
@@ -110,18 +111,20 @@ class SmartPerfettoTransport:
     def client(self) -> httpx.AsyncClient:
         return self._client
 
-    async def request_json(
+    async def _headers(
         self,
-        method: str,
-        path: str,
         *,
-        workspace_id: str | None = None,
-        json_body: dict[str, object] | None = None,
-    ) -> SmartPerfettoJsonResponse:
-        safe_path = _validate_path(path)
-        headers = {"Accept": "application/json"}
+        accept: str,
+        workspace_id: str | None,
+        last_event_id: str | None = None,
+    ) -> dict[str, str]:
+        headers = {"Accept": accept}
         if workspace_id is not None:
             headers["X-Workspace-Id"] = validate_external_id(workspace_id)
+        if last_event_id is not None:
+            if re.fullmatch(r"(?:0|[1-9][0-9]*)", last_event_id) is None:
+                raise _error("engine_contract_invalid", retryable=False)
+            headers["Last-Event-ID"] = last_event_id
 
         try:
             resolved = await self._credential_resolver(self._credential_reference)
@@ -133,6 +136,46 @@ class SmartPerfettoTransport:
         except Exception:
             raise _error("engine_auth_failed", retryable=False) from None
         headers["Authorization"] = f"Bearer {token}"
+        return headers
+
+    async def _bounded_json(self, response: httpx.Response) -> dict[str, Any]:
+        chunks: list[bytes] = []
+        size = 0
+        async for chunk in response.aiter_bytes():
+            size += len(chunk)
+            if size > self._max_json_bytes:
+                raise _error("engine_contract_invalid", retryable=False)
+            chunks.append(chunk)
+        try:
+            payload = json.loads(b"".join(chunks))
+        except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
+            raise _error("engine_contract_invalid", retryable=False) from None
+        if not isinstance(payload, dict):
+            raise _error("engine_contract_invalid", retryable=False)
+        return payload
+
+    @staticmethod
+    def _check_status(response: httpx.Response) -> None:
+        if response.status_code in {401, 403}:
+            raise _error("engine_auth_failed", retryable=False)
+        if 500 <= response.status_code <= 599:
+            raise _error("engine_unavailable", retryable=True)
+        if 300 <= response.status_code <= 399:
+            raise _error("engine_contract_invalid", retryable=False)
+
+    async def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        workspace_id: str | None = None,
+        json_body: dict[str, object] | None = None,
+    ) -> SmartPerfettoJsonResponse:
+        safe_path = _validate_path(path)
+        headers = await self._headers(
+            accept="application/json",
+            workspace_id=workspace_id,
+        )
 
         response: httpx.Response | None = None
         try:
@@ -147,30 +190,93 @@ class SmartPerfettoTransport:
                 stream=True,
                 follow_redirects=False,
             )
-            if response.status_code in {401, 403}:
-                raise _error("engine_auth_failed", retryable=False)
-            if 500 <= response.status_code <= 599:
-                raise _error("engine_unavailable", retryable=True)
-            if 300 <= response.status_code <= 399:
-                raise _error("engine_contract_invalid", retryable=False)
-
-            chunks: list[bytes] = []
-            size = 0
-            async for chunk in response.aiter_bytes():
-                size += len(chunk)
-                if size > self._max_json_bytes:
-                    raise _error("engine_contract_invalid", retryable=False)
-                chunks.append(chunk)
-            try:
-                payload = json.loads(b"".join(chunks))
-            except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
-                raise _error("engine_contract_invalid", retryable=False) from None
-            if not isinstance(payload, dict):
-                raise _error("engine_contract_invalid", retryable=False)
+            self._check_status(response)
+            payload = await self._bounded_json(response)
             return SmartPerfettoJsonResponse(
                 status_code=response.status_code,
                 payload=payload,
             )
+        except EngineAdapterError:
+            raise
+        except httpx.TimeoutException:
+            raise _error("engine_timeout", retryable=True) from None
+        except httpx.RequestError:
+            raise _error("engine_unavailable", retryable=True) from None
+        finally:
+            if response is not None:
+                await response.aclose()
+
+    async def request_multipart_json(
+        self,
+        path: str,
+        *,
+        workspace_id: str,
+        filename: str,
+        file: BinaryIO,
+    ) -> SmartPerfettoJsonResponse:
+        safe_path = _validate_path(path)
+        if not filename.startswith("perfpilot-trace-") or not filename.endswith(
+            ".pftrace"
+        ):
+            raise _error("engine_contract_invalid", retryable=False)
+        headers = await self._headers(
+            accept="application/json",
+            workspace_id=workspace_id,
+        )
+        response: httpx.Response | None = None
+        try:
+            request = self._client.build_request(
+                "POST",
+                f"{self._base_url}{safe_path}",
+                headers=headers,
+                files={"file": (filename, file, "application/octet-stream")},
+            )
+            response = await self._client.send(
+                request,
+                stream=True,
+                follow_redirects=False,
+            )
+            self._check_status(response)
+            payload = await self._bounded_json(response)
+            return SmartPerfettoJsonResponse(response.status_code, payload)
+        except EngineAdapterError:
+            raise
+        except httpx.TimeoutException:
+            raise _error("engine_timeout", retryable=True) from None
+        except httpx.RequestError:
+            raise _error("engine_unavailable", retryable=True) from None
+        finally:
+            if response is not None:
+                await response.aclose()
+
+    @asynccontextmanager
+    async def stream_response(
+        self,
+        path: str,
+        *,
+        workspace_id: str,
+        last_event_id: str | None = None,
+    ) -> AsyncIterator[httpx.Response]:
+        safe_path = _validate_path(path)
+        headers = await self._headers(
+            accept="text/event-stream",
+            workspace_id=workspace_id,
+            last_event_id=last_event_id,
+        )
+        response: httpx.Response | None = None
+        try:
+            request = self._client.build_request(
+                "GET",
+                f"{self._base_url}{safe_path}",
+                headers=headers,
+            )
+            response = await self._client.send(
+                request,
+                stream=True,
+                follow_redirects=False,
+            )
+            self._check_status(response)
+            yield response
         except EngineAdapterError:
             raise
         except httpx.TimeoutException:
