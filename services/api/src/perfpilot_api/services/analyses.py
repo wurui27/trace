@@ -69,12 +69,15 @@ _COMPONENT_NAME = re.compile(
 _MANIFEST_SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _SUPPORTED_ABIS = frozenset(("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
 _REPORT_CONTRACT_ROOT = Path(__file__).resolve().parents[5] / "contracts" / "v1" / "reports"
+# RFC 6750 permits very short b64tokens; eight characters distinguishes credentials from
+# ordinary prose such as "the bearer of bad news" while remaining fail-closed for real tokens.
+_BEARER_CREDENTIAL_MIN_LENGTH = 8
 _PRIVATE_REPORT_VALUE = re.compile(
     r"(?i)(?:\b(?:postgres(?:ql)?|mysql|redis|rediss|mongodb(?:\+srv)?|s3|gs|file)://|"
     r"x-amz-(?:signature|credential|security-token)=|"
     r"awsaccesskeyid=|"
-    r"\bbearer[ \t]+(?=[A-Za-z0-9._~+/=-]{12,}(?:[^A-Za-z0-9._~+/=-]|\Z))"
-    r"(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{12,}|"
+    rf"\bbearer[ \t]+[-A-Za-z0-9._~+/]{{{_BEARER_CREDENTIAL_MIN_LENGTH},}}=*"
+    r"(?=[^-A-Za-z0-9._~+/=]|\Z)|"
     r"(?:authorization|access[_-]?token|password|secret|credential|signature)=)"
 )
 _T = TypeVar("_T")

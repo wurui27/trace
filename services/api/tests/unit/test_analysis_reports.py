@@ -102,6 +102,8 @@ def test_report_assembly_rejects_schema_valid_signed_url_in_free_text() -> None:
         {"fields": {"note": "authorization=Bearer private-token"}},
         {"fields": {"note": "s3://private-bucket/private-key"}},
         {"fields": {"note": "request failed with Bearer eyJhbGciOi..."}},
+        {"fields": {"note": "Bearer abcdefghijklmnop"}},
+        {"fields": {"note": "Bearer AbCdEfGh"}},
     ),
 )
 def test_copy_public_json_rejects_private_data(value: object) -> None:
