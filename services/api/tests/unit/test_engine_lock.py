@@ -58,6 +58,65 @@ def test_engine_lock_rejects_unknown_fields(tmp_path: Path) -> None:
         )
 
 
+def test_engine_lock_rejects_nested_duplicate_yaml_keys(tmp_path: Path) -> None:
+    lock_path = tmp_path / "engine-lock.yaml"
+    lock_path.write_text(
+        LOCK_PATH.read_text(encoding="utf-8").replace(
+            "    commit: d5514972ced78c3faa7fc17589c1ea9231645056",
+            "    commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n"
+            "    commit: d5514972ced78c3faa7fc17589c1ea9231645056",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EngineLockError, match=r"^engine lock is invalid$"):
+        load_engine_lock(
+            lock_path,
+            schema_path=SCHEMA_PATH,
+            require_image_digests=False,
+        )
+
+
+def test_engine_lock_rejects_duplicate_keys_in_nested_schema_objects(tmp_path: Path) -> None:
+    schema_path = tmp_path / "engine-lock.schema.json"
+    schema_path.write_text(
+        SCHEMA_PATH.read_text(encoding="utf-8").replace(
+            '"const": "1.0"',
+            '"const": "0.9",\n      "const": "1.0"',
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EngineLockError, match=r"^engine lock is invalid$"):
+        load_engine_lock(
+            LOCK_PATH,
+            schema_path=schema_path,
+            require_image_digests=False,
+        )
+
+
+def test_engine_lock_rejects_yaml_merge_keys(tmp_path: Path) -> None:
+    lock_path = tmp_path / "engine-lock.yaml"
+    lock_path.write_text(
+        LOCK_PATH.read_text(encoding="utf-8").replace(
+            "  android_memory:\n",
+            "  android_memory:\n"
+            "    <<: {commit: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}\n",
+            1,
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(EngineLockError, match=r"^engine lock is invalid$"):
+        load_engine_lock(
+            lock_path,
+            schema_path=SCHEMA_PATH,
+            require_image_digests=False,
+        )
+
+
 def test_engine_lock_accepts_valid_image_digests(tmp_path: Path) -> None:
     lock_path = tmp_path / "engine-lock.yaml"
     lock_path.write_text(
