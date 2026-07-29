@@ -133,3 +133,27 @@ def test_report_availability_uses_the_same_bundle_validation_as_report_read() ->
     versions[0].bundle_sha256_b64 = "A" * 43 + "="
 
     assert not _report_is_available(children, scenarios, versions, parent_state="completed")
+
+
+def test_report_availability_rejects_terminal_sibling_scenario_type_drift() -> None:
+    _, scenarios, _ = _report_rows()
+    for scenario in scenarios:
+        scenario.state = "failed"
+        scenario.failure_code = "trace_invalid"
+    children = [
+        SimpleNamespace(
+            id=scenario.id,
+            state=scenario.state,
+            scenario_type=scenario.scenario_type,
+            failure_code=scenario.failure_code,
+        )
+        for scenario in scenarios
+    ]
+    assert _report_is_available(children, scenarios, [], parent_state="failed")
+
+    children[0].scenario_type, children[1].scenario_type = (
+        children[1].scenario_type,
+        children[0].scenario_type,
+    )
+
+    assert not _report_is_available(children, scenarios, [], parent_state="failed")

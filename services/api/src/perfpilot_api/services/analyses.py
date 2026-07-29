@@ -2543,6 +2543,7 @@ def _report_is_available(
         scenario = tenant_by_id.get(child.id)
         if (
             scenario is None
+            or scenario.scenario_type != child.scenario_type
             or scenario.state != child.state
             or scenario.failure_code != child.failure_code
         ):

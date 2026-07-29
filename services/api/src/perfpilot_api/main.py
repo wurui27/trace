@@ -209,6 +209,8 @@ def create_app(
         nonlocal owned_artifact_runtime, resolved_analysis_service, resolved_upload_service
         lifespan_error: BaseException | None = None
         try:
+            if settings.app_env == "production" and apk_inspector is None:
+                raise RuntimeError("An externally isolated APK inspector is unavailable")
             if artifact_runtime_required:
                 if control_session_factory is None:
                     raise RuntimeError("Artifact runtime dependencies are unavailable")

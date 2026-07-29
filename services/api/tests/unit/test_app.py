@@ -174,6 +174,23 @@ def test_production_refuses_owned_in_process_apk_inspector(
             pass
 
 
+def test_production_rejects_injected_analysis_service_without_apk_inspector() -> None:
+    app = create_app(
+        testing=False,
+        settings_override=_production_settings(),
+        auth_service=object(),  # type: ignore[arg-type]
+        admin_team_service=object(),  # type: ignore[arg-type]
+        upload_service=object(),  # type: ignore[arg-type]
+        analysis_service=object(),  # type: ignore[arg-type]
+        replay_store=object(),  # type: ignore[arg-type]
+        proxy_client_identity_required=False,
+    )
+
+    with pytest.raises(RuntimeError, match="externally isolated"):
+        with TestClient(app):
+            pass
+
+
 def test_production_app_cleanup_attempts_every_dependency_and_redacts_failures(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -254,6 +271,7 @@ async def test_production_app_cleanup_preserves_late_cancellation(
         auth_service=object(),  # type: ignore[arg-type]
         admin_team_service=object(),  # type: ignore[arg-type]
         replay_store=object(),  # type: ignore[arg-type]
+        apk_inspector=object(),  # type: ignore[arg-type]
         proxy_client_identity_required=False,
     )
 
@@ -288,6 +306,7 @@ async def test_production_app_startup_cancellation_survives_cleanup_failure(
         auth_service=object(),  # type: ignore[arg-type]
         admin_team_service=object(),  # type: ignore[arg-type]
         replay_store=object(),  # type: ignore[arg-type]
+        apk_inspector=object(),  # type: ignore[arg-type]
         proxy_client_identity_required=False,
     )
 
