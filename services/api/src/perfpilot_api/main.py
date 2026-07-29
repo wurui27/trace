@@ -217,6 +217,7 @@ def create_app(
                 owned_artifact_runtime = await build_artifact_runtime(
                     settings=settings,
                     control_session_factory=control_session_factory,
+                    include_local_apk_inspector=settings.app_env != "production",
                 )
                 if resolved_upload_service is None:
                     resolved_upload_service = owned_artifact_runtime.upload_service

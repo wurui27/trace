@@ -96,7 +96,11 @@ def test_production_rejects_development_secrets() -> None:
         Settings(app_env="production")
 
 
-def _production_settings(**overrides: object) -> Settings:
+def _production_settings(
+    *,
+    include_apkanalyzer_binary: bool = True,
+    **overrides: object,
+) -> Settings:
     values: dict[str, object] = {
         "app_env": "production",
         "control_database_url": (
@@ -111,13 +115,14 @@ def _production_settings(**overrides: object) -> Settings:
         "tenant_cluster_sslmode": "verify-full",
         "secret_keyring_config": "/run/secrets/perfpilot/keyring.json",
         "secret_store_root": "/var/lib/perfpilot/secrets",
-        "apkanalyzer_binary": "/opt/android-sdk/cmdline-tools/latest/bin/apkanalyzer",
         "proxy_secret": "test-production-proxy-secret",
         "session_secret": "test-production-session-secret",
         "jws_signing_key_reference": "kms://keys/perfpilot-signing",
         "agent_registration_secret_reference": "vault://secrets/agent-registration",
         "allowed_origins": ["https://console.example.com"],
     }
+    if include_apkanalyzer_binary:
+        values["apkanalyzer_binary"] = "/opt/android-sdk/cmdline-tools/latest/bin/apkanalyzer"
     values.update(overrides)
     return Settings(**values)
 
@@ -136,6 +141,12 @@ def test_valid_explicit_production_settings() -> None:
     assert settings.apkanalyzer_binary == Path(
         "/opt/android-sdk/cmdline-tools/latest/bin/apkanalyzer"
     )
+
+
+def test_production_settings_do_not_require_local_apkanalyzer_binary() -> None:
+    settings = _production_settings(include_apkanalyzer_binary=False)
+
+    assert settings.app_env == "production"
 
 
 def test_production_refuses_owned_in_process_apk_inspector(
@@ -172,6 +183,52 @@ def test_production_refuses_owned_in_process_apk_inspector(
     with pytest.raises(RuntimeError, match="externally isolated"):
         with TestClient(app):
             pass
+
+
+def test_production_with_external_inspector_does_not_build_local_inspector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    local_inspector_constructions = 0
+
+    class FakeEngine:
+        async def dispose(self) -> None:
+            pass
+
+    class FakeArtifactRuntime:
+        upload_service = object()
+        apk_inspector = None
+        tenant_router = object()
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(main, "create_control_engine", lambda _: FakeEngine())
+    monkeypatch.setattr(main, "create_control_session_factory", lambda _: object())
+
+    async def build_artifact_runtime(
+        **kwargs: object,
+    ) -> FakeArtifactRuntime:
+        nonlocal local_inspector_constructions
+        if kwargs.get("include_local_apk_inspector", True):
+            local_inspector_constructions += 1
+            raise AssertionError("local S3ApkInspector construction attempted")
+        return FakeArtifactRuntime()
+
+    monkeypatch.setattr(main, "build_artifact_runtime", build_artifact_runtime)
+    app = create_app(
+        testing=False,
+        settings_override=_production_settings(include_apkanalyzer_binary=False),
+        auth_service=object(),  # type: ignore[arg-type]
+        admin_team_service=object(),  # type: ignore[arg-type]
+        apk_inspector=object(),  # type: ignore[arg-type]
+        replay_store=object(),  # type: ignore[arg-type]
+        proxy_client_identity_required=False,
+    )
+
+    with TestClient(app) as client:
+        assert client.get("/v1/health").status_code == 200
+
+    assert local_inspector_constructions == 0
 
 
 def test_production_rejects_injected_analysis_service_without_apk_inspector() -> None:
@@ -358,8 +415,6 @@ def test_production_tenant_cluster_requires_verify_full(sslmode: str) -> None:
         ("secret_store_root", ""),
         ("secret_store_root", "relative/secrets"),
         ("secret_store_root", "/"),
-        ("apkanalyzer_binary", "relative/apkanalyzer"),
-        ("apkanalyzer_binary", "/"),
     ],
 )
 def test_production_rejects_invalid_artifact_runtime_settings(

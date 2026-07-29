@@ -101,11 +101,18 @@ def test_report_assembly_rejects_schema_valid_signed_url_in_free_text() -> None:
         {"downloadUrl": "https://objects.example/private"},
         {"fields": {"note": "authorization=Bearer private-token"}},
         {"fields": {"note": "s3://private-bucket/private-key"}},
+        {"fields": {"note": "request failed with Bearer eyJhbGciOi..."}},
     ),
 )
 def test_copy_public_json_rejects_private_data(value: object) -> None:
     with pytest.raises(AnalysisUnavailableError, match="private data"):
         _copy_public_json(value)
+
+
+def test_copy_public_json_allows_ordinary_bearer_word() -> None:
+    value = {"fields": {"note": "the bearer of bad news"}}
+
+    assert _copy_public_json(value) == value
 
 
 def test_report_assembly_rejects_parent_child_aggregate_drift() -> None:

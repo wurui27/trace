@@ -422,6 +422,50 @@ async def test_finalize_inspects_exact_artifact_before_staging_and_queueing_thre
 
 
 @pytest.mark.asyncio
+async def test_finalize_retry_after_control_queue_failure_reuses_persisted_metadata() -> None:
+    from perfpilot_api.services.analyses import (
+        AnalysisUnavailableError,
+        FinalizationPreparation,
+        SchedulingRequirements,
+    )
+
+    events: list[str] = []
+
+    class RecoverableQueueRepository(FakeAnalysisRepository):
+        async def persist_apk_metadata(self, **kwargs: object) -> UUID:
+            result = await super().persist_apk_metadata(**kwargs)
+            self.finalization_preparation = FinalizationPreparation(
+                requirements=SchedulingRequirements(
+                    min_api_level=28,
+                    supported_abis=("arm64-v8a",),
+                ),
+                inspection_token=None,
+            )
+            return result
+
+        async def queue_control_scenarios(self, **kwargs: object) -> None:
+            await super().queue_control_scenarios(**kwargs)
+            if len(self.queue_calls) == 1:
+                raise AnalysisUnavailableError("control queue is unavailable")
+
+    repository = RecoverableQueueRepository(events)
+    uploads = FakeUploadService(events)
+    inspector = FakeApkInspector(events)
+    service = _service(repository, uploads, inspector)
+
+    with pytest.raises(AnalysisUnavailableError, match="control queue"):
+        await _finalize(service)
+    result = await _finalize(service)
+
+    assert result == _upload_slot(state="finalized")
+    assert len(inspector.calls) == 1
+    assert len(repository.persist_calls) == 1
+    assert len(repository.stage_calls) == 2
+    assert len(repository.queue_calls) == 2
+    assert repository.release_calls == []
+
+
+@pytest.mark.asyncio
 async def test_inspector_unavailable_after_storage_finalize_never_stages_or_queues() -> None:
     from perfpilot_api.services.analyses import ApkInspectionUnavailableError
 

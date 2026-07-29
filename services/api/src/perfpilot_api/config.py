@@ -50,7 +50,6 @@ _PRODUCTION_RUNTIME_FIELDS = frozenset(
         "tenant_cluster_sslmode",
         "secret_keyring_config",
         "secret_store_root",
-        "apkanalyzer_binary",
     }
 )
 
@@ -210,8 +209,6 @@ class Settings(BaseSettings):
             or self.secret_keyring_config == Path("/")
             or not self.secret_store_root.is_absolute()
             or self.secret_store_root == Path("/")
-            or not self.apkanalyzer_binary.is_absolute()
-            or self.apkanalyzer_binary == Path("/")
         ):
             raise _production_validation_error(_INVALID_PRODUCTION_ARTIFACT_RUNTIME)
         if self.tenant_cluster_sslmode != "verify-full":

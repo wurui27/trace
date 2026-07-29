@@ -277,6 +277,72 @@ async def test_artifact_runtime_builds_authoritative_dependencies_with_sigv4(
 
 
 @pytest.mark.asyncio
+async def test_artifact_runtime_can_omit_local_apk_inspector(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeSecretStore:
+        def close(self) -> None:
+            pass
+
+    class FakeRouter:
+        async def dispose(self) -> None:
+            pass
+
+    class FakeS3Client:
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(
+        artifact_runtime,
+        "build_configured_secret_store",
+        lambda **kwargs: FakeSecretStore(),
+    )
+    monkeypatch.setattr(
+        artifact_runtime,
+        "SqlAlchemyTenantRouteRepository",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(artifact_runtime, "TenantRouter", lambda **kwargs: FakeRouter())
+    monkeypatch.setattr(
+        artifact_runtime.upload_core,
+        "SQLAlchemyTenantBucketResolver",
+        lambda **kwargs: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        artifact_runtime.upload_core,
+        "SQLAlchemyUploadRepository",
+        lambda **kwargs: object(),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        artifact_runtime,
+        "create_s3_client",
+        lambda **kwargs: FakeS3Client(),
+    )
+    monkeypatch.setattr(artifact_runtime, "S3ArtifactStore", lambda **kwargs: object())
+    monkeypatch.setattr(
+        artifact_runtime.upload_core,
+        "UploadService",
+        lambda **kwargs: object(),
+    )
+
+    def forbidden_local_inspector(**kwargs: object) -> object:
+        raise AssertionError("local S3ApkInspector construction attempted")
+
+    monkeypatch.setattr(artifact_runtime, "S3ApkInspector", forbidden_local_inspector)
+
+    runtime = await build_artifact_runtime(
+        settings=_settings(),
+        control_session_factory=object(),  # type: ignore[arg-type]
+        include_local_apk_inspector=False,
+    )
+
+    assert runtime.apk_inspector is None
+    await runtime.close()
+
+
+@pytest.mark.asyncio
 async def test_artifact_runtime_cleans_partial_build_and_redacts_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

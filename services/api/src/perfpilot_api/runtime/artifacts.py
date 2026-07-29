@@ -103,7 +103,7 @@ async def _close_owned_components(
 @dataclass(slots=True)
 class ArtifactRuntime:
     upload_service: Any
-    apk_inspector: Any
+    apk_inspector: S3ApkInspector | None
     tenant_router: Any = field(repr=False)
     s3_client: Any = field(repr=False)
     secret_store: Any = field(repr=False)
@@ -129,6 +129,7 @@ async def build_artifact_runtime(
     *,
     settings: Settings,
     control_session_factory: Any,
+    include_local_apk_inspector: bool = True,
 ) -> ArtifactRuntime:
     secret_store: Any | None = None
     tenant_router: Any | None = None
@@ -167,16 +168,18 @@ async def build_artifact_runtime(
             artifact_store=artifact_store,
             bucket_resolver=bucket_resolver,
         )
-        apk_locator = SQLAlchemyApkArtifactLocator(
-            tenant_router=tenant_router,
-            bucket_resolver=bucket_resolver,
-        )
-        object_reader = S3VersionedObjectReader(client=s3_client)
-        apk_inspector = S3ApkInspector(
-            locator=apk_locator,
-            object_reader=object_reader,
-            apkanalyzer_binary=str(settings.apkanalyzer_binary),
-        )
+        apk_inspector: S3ApkInspector | None = None
+        if include_local_apk_inspector:
+            apk_locator = SQLAlchemyApkArtifactLocator(
+                tenant_router=tenant_router,
+                bucket_resolver=bucket_resolver,
+            )
+            object_reader = S3VersionedObjectReader(client=s3_client)
+            apk_inspector = S3ApkInspector(
+                locator=apk_locator,
+                object_reader=object_reader,
+                apkanalyzer_binary=str(settings.apkanalyzer_binary),
+            )
         runtime = ArtifactRuntime(
             upload_service=upload_service,
             apk_inspector=apk_inspector,

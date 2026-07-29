@@ -73,6 +73,8 @@ _PRIVATE_REPORT_VALUE = re.compile(
     r"(?i)(?:\b(?:postgres(?:ql)?|mysql|redis|rediss|mongodb(?:\+srv)?|s3|gs|file)://|"
     r"x-amz-(?:signature|credential|security-token)=|"
     r"awsaccesskeyid=|"
+    r"\bbearer[ \t]+(?=[A-Za-z0-9._~+/=-]{12,}(?:[^A-Za-z0-9._~+/=-]|\Z))"
+    r"(?=[A-Za-z0-9._~+/=-]*[0-9._~+/=-])[A-Za-z0-9._~+/=-]{12,}|"
     r"(?:authorization|access[_-]?token|password|secret|credential|signature)=)"
 )
 _T = TypeVar("_T")
