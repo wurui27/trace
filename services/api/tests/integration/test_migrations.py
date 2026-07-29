@@ -693,7 +693,7 @@ def test_control_external_engine_downgrade_serializes_with_concurrent_writers(
     )
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0004_external_engine_foundation"
+            "0005_memory_upload_mode"
         )
 
 
@@ -960,6 +960,204 @@ def test_named_state_count_and_xor_checks_exist(
     } <= tenant_checks
 
 
+def test_memory_upload_mode_is_present_in_both_databases(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    _upgrade("tenant", migration_databases.tenant_url)
+
+    control_checks = {
+        item["name"]: item["sqltext"]
+        for item in inspect(migration_databases.control_engine).get_check_constraints(
+            "global_jobs"
+        )
+    }
+    tenant_checks = {
+        item["name"]: item["sqltext"]
+        for item in inspect(migration_databases.tenant_engine).get_check_constraints(
+            "analyses"
+        )
+    }
+
+    expected_modes = {"device", "trace_upload", "memory_upload"}
+    assert _check_string_literals(control_checks["ck_global_jobs_analysis_mode"]) == expected_modes
+    assert _check_string_literals(tenant_checks["ck_analyses_mode"]) == expected_modes
+    tenant_columns = {
+        item["name"]: item
+        for item in inspect(migration_databases.tenant_engine).get_columns("analyses")
+    }
+    assert tenant_columns["question"]["nullable"] is True
+    assert tenant_columns["question"]["type"].length == 2000
+
+
+@pytest.mark.parametrize(
+    ("tree", "downgrade_revision", "head_revision"),
+    [
+        ("control", "0004_external_engine_foundation", "0005_memory_upload_mode"),
+        ("tenant", "0003_analysis_orchestration", "0004_memory_upload_mode"),
+    ],
+)
+def test_memory_upload_downgrade_refuses_existing_rows(
+    tree: _MigrationTree,
+    downgrade_revision: str,
+    head_revision: str,
+    migration_databases: MigrationDatabases,
+) -> None:
+    database_url = migration_databases.url_for(tree)
+    engine = migration_databases.engine_for(tree)
+    _upgrade(tree, database_url)
+
+    with engine.begin() as connection:
+        if tree == "control":
+            team_id = UUID("a1000000-0000-4000-8000-000000000001")
+            connection.execute(
+                text("INSERT INTO teams (id, name, state) VALUES (:id, 'Memory', 'active')"),
+                {"id": team_id},
+            )
+            connection.execute(
+                text(
+                    "INSERT INTO global_jobs "
+                    "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                    "VALUES (:id, :team_id, 'memory-upload', 'memory_upload', "
+                    "'created', ARRAY[]::varchar[])"
+                ),
+                {"id": UUID("a2000000-0000-4000-8000-000000000001"), "team_id": team_id},
+            )
+        else:
+            connection.execute(
+                text(
+                    "INSERT INTO analyses (id, analysis_mode, state) "
+                    "VALUES (:id, 'memory_upload', 'created')"
+                ),
+                {"id": UUID("a3000000-0000-4000-8000-000000000001")},
+            )
+
+    with pytest.raises(RuntimeError, match="memory upload downgrade preflight failed"):
+        command.downgrade(
+            _alembic_config(tree, database_url),
+            downgrade_revision,
+        )
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == head_revision
+    if tree == "tenant":
+        assert "question" in {
+            column["name"] for column in inspect(engine).get_columns("analyses")
+        }
+
+
+@pytest.mark.parametrize(
+    ("tree", "downgrade_revision", "head_revision", "table_name", "constraint_name"),
+    [
+        (
+            "control",
+            "0004_external_engine_foundation",
+            "0005_memory_upload_mode",
+            "global_jobs",
+            "ck_global_jobs_analysis_mode",
+        ),
+        (
+            "tenant",
+            "0003_analysis_orchestration",
+            "0004_memory_upload_mode",
+            "analyses",
+            "ck_analyses_mode",
+        ),
+    ],
+)
+def test_memory_upload_downgrade_serializes_with_concurrent_writers(
+    tree: _MigrationTree,
+    downgrade_revision: str,
+    head_revision: str,
+    table_name: str,
+    constraint_name: str,
+    migration_databases: MigrationDatabases,
+) -> None:
+    database_url = migration_databases.url_for(tree)
+    engine = migration_databases.engine_for(tree)
+    _upgrade(tree, database_url)
+
+    team_id = UUID("a4000000-0000-4000-8000-000000000001")
+    if tree == "control":
+        with engine.begin() as connection:
+            connection.execute(
+                text("INSERT INTO teams (id, name, state) VALUES (:id, 'Memory Race', 'active')"),
+                {"id": team_id},
+            )
+
+    writer_connection = engine.connect()
+    writer_transaction = writer_connection.begin()
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        if tree == "control":
+            writer_connection.execute(
+                text(
+                    "INSERT INTO global_jobs "
+                    "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                    "VALUES (:id, :team_id, 'memory-upload-race', 'memory_upload', "
+                    "'created', ARRAY[]::varchar[])"
+                ),
+                {
+                    "id": UUID("a5000000-0000-4000-8000-000000000001"),
+                    "team_id": team_id,
+                },
+            )
+        else:
+            writer_connection.execute(
+                text(
+                    "INSERT INTO analyses (id, analysis_mode, state) "
+                    "VALUES (:id, 'memory_upload', 'created')"
+                ),
+                {"id": UUID("a6000000-0000-4000-8000-000000000001")},
+            )
+
+        downgrade_future = executor.submit(
+            command.downgrade,
+            _alembic_config(tree, database_url),
+            downgrade_revision,
+        )
+        lock_wait_query = text(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM pg_locks AS requested_lock "
+            "JOIN pg_class AS locked_relation ON locked_relation.oid = requested_lock.relation "
+            "WHERE locked_relation.relname = :table_name "
+            "AND requested_lock.database = "
+            "(SELECT oid FROM pg_database WHERE datname = current_database()) "
+            "AND requested_lock.mode = 'AccessExclusiveLock' "
+            "AND requested_lock.granted = false)"
+        )
+        deadline = monotonic() + 5
+        with engine.connect() as observer_connection:
+            while not observer_connection.scalar(lock_wait_query, {"table_name": table_name}):
+                if monotonic() >= deadline:
+                    pytest.fail("memory upload downgrade did not request its table lock")
+                sleep(0.02)
+
+        writer_transaction.commit()
+        with pytest.raises(RuntimeError, match="memory upload downgrade preflight failed"):
+            downgrade_future.result(timeout=5)
+    finally:
+        if writer_transaction.is_active:
+            writer_transaction.rollback()
+        writer_connection.close()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+    checks = {
+        item["name"]: item["sqltext"]
+        for item in inspect(engine).get_check_constraints(table_name)
+    }
+    assert _check_string_literals(checks[constraint_name]) == {
+        "device",
+        "trace_upload",
+        "memory_upload",
+    }
+    with engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == head_revision
+    if tree == "tenant":
+        assert "question" in {
+            column["name"] for column in inspect(engine).get_columns("analyses")
+        }
+
+
 @pytest.mark.parametrize("tree", ["control", "tenant"])
 def test_each_migration_tree_has_one_head(
     tree: _MigrationTree,
@@ -1206,7 +1404,7 @@ def test_tenant_task7_downgrade_serializes_with_concurrent_metadata_writers(
     }
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0003_analysis_orchestration"
+            "0004_memory_upload_mode"
         )
 
 

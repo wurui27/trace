@@ -34,7 +34,7 @@ class GlobalJob(
         UniqueConstraint("team_id", "idempotency_key", name="uq_global_jobs_team_idempotency"),
         UniqueConstraint("id", "team_id", name="uq_global_jobs_id_team"),
         CheckConstraint(
-            "analysis_mode IN ('device', 'trace_upload')",
+            "analysis_mode IN ('device', 'trace_upload', 'memory_upload')",
             name="ck_global_jobs_analysis_mode",
         ),
         CheckConstraint(
