@@ -6,6 +6,8 @@
 - 内存补证内核：Android-App-Memory-Analysis
 - 产品边界：保留现有 PerfPilot 界面、账户、租户数据库、对象存储、任务和报告体验
 
+> 2026-07-29 更新：本文中的 Android Memory 单 ZIP 输入、单目录执行和基础 Worker 细节已由《[PerfPilot Android Memory Adapter 设计](./2026-07-29-perfpilot-android-memory-adapter-design.md)》取代。SmartPerfetto 与 PerfPilot AI 的其余边界保持有效。
+
 ## 1. 决策摘要
 
 PerfPilot 不再开发另一套 Trace 分析内核。SmartPerfetto 负责主要 Trace 分析，Android-App-Memory-Analysis 负责内存专项证据，PerfPilot 负责租户隔离、任务编排、结果规范化和最终建议。
