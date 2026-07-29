@@ -1,0 +1,14 @@
+schema_version: "1.0"
+engines:
+  smartperfetto:
+    source: https://github.com/Gracker/SmartPerfetto.git
+    ref: v1.0.38
+    commit: 1508f99788bfcf18cc861e4bf4f8b472e84240c3
+    image_digest: null
+    api_contract: workspace-agent-v1
+  android_memory:
+    source: https://github.com/Gracker/Android-App-Memory-Analysis.git
+    ref: null
+    commit: d5514972ced78c3faa7fc17589c1ea9231645056
+    image_digest: null
+    output_contract: android-memory-ai-context-1.2

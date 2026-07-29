@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "engines"],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "engines": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["smartperfetto", "android_memory"],
+      "properties": {
+        "smartperfetto": {
+          "$ref": "#/$defs/smartperfettoPin"
+        },
+        "android_memory": {
+          "$ref": "#/$defs/androidMemoryPin"
+        }
+      }
+    }
+  },
+  "$defs": {
+    "basePin": {
+      "type": "object",
+      "required": ["source", "ref", "commit", "image_digest"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "pattern": "^https://github\\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\\.git$"
+        },
+        "ref": {
+          "type": ["string", "null"],
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[a-f0-9]{40}$"
+        },
+        "image_digest": {
+          "type": ["string", "null"],
+          "pattern": "^sha256:[a-f0-9]{64}$"
+        }
+      }
+    },
+    "smartperfettoPin": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/basePin"
+        }
+      ],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "ref",
+        "commit",
+        "image_digest",
+        "api_contract"
+      ],
+      "properties": {
+        "source": true,
+        "ref": true,
+        "commit": true,
+        "image_digest": true,
+        "api_contract": {
+          "const": "workspace-agent-v1"
+        }
+      }
+    },
+    "androidMemoryPin": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/basePin"
+        }
+      ],
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source",
+        "ref",
+        "commit",
+        "image_digest",
+        "output_contract"
+      ],
+      "properties": {
+        "source": true,
+        "ref": true,
+        "commit": true,
+        "image_digest": true,
+        "output_contract": {
+          "const": "android-memory-ai-context-1.2"
+        }
+      }
+    }
+  }
+}
