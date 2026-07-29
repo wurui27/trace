@@ -16,6 +16,16 @@ from perfpilot_api.engines.contracts import (
     RetryMode,
     SubmitConfig,
 )
+from perfpilot_api.engines.android_memory_contracts import (
+    AndroidMemoryAnalysisContract,
+    AndroidMemoryContext,
+    AndroidMemoryGenerator,
+    AndroidMemoryPrivacy,
+    ArtifactRole,
+    MemoryArtifactRef,
+    MemoryCaptureManifest,
+    MemorySubject,
+)
 from perfpilot_api.engines.errors import EngineAdapterError, EngineErrorTerminalState
 from perfpilot_api.engines.lock import EngineLock, EngineLockError, EnginePin, load_engine_lock
 from perfpilot_api.engines.registry import AdapterRegistry, AdapterRegistryError
@@ -31,6 +41,11 @@ __all__ = [
     "AdapterRegistry",
     "AdapterRegistryError",
     "AnalysisProfile",
+    "AndroidMemoryAnalysisContract",
+    "AndroidMemoryContext",
+    "AndroidMemoryGenerator",
+    "AndroidMemoryPrivacy",
+    "ArtifactRole",
     "EngineAdapter",
     "EngineAdapterError",
     "EngineErrorTerminalState",
@@ -49,6 +64,9 @@ __all__ = [
     "EngineTerminalStateValue",
     "ExecutionStateValue",
     "InvalidEngineTransition",
+    "MemoryArtifactRef",
+    "MemoryCaptureManifest",
+    "MemorySubject",
     "ResourceProfile",
     "RetryMode",
     "SmartPerfettoAdapter",
