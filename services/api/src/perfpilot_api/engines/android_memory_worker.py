@@ -43,6 +43,7 @@ class MemoryWorkerResult:
 
 class AndroidMemoryWorker(Protocol):
     isolation: Literal["local", "oci"]
+    image_reference: str | None
 
     async def start(
         self,
@@ -1117,6 +1118,7 @@ class _WorkerBase:
 
 class LocalAndroidMemoryWorker(_WorkerBase):
     isolation: Literal["local"] = "local"
+    image_reference: None = None
 
     def __init__(
         self,
@@ -1246,6 +1248,7 @@ class OciAndroidMemoryWorker(_WorkerBase):
         )
         self._container_runtime = container_runtime
         self._image_reference = image_reference
+        self.image_reference = image_reference
         self._pids_limit = pids_limit
         self._memory_bytes = memory_bytes
         self._cpu_limit = float(cpu_limit)

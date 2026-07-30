@@ -513,9 +513,47 @@ async def test_download_uses_only_the_finalized_fixed_version_for_five_minutes()
     assert location.version_id == "download-fixed-version"
     assert store.received["expires_in_seconds"] == 300
     assert authorization.expires_at == NOW + timedelta(minutes=5)
+    assert authorization.tenant_resource_version == 1
+    assert authorization.artifact_version == 2
+    assert authorization.artifact_kind == "apk"
+    assert authorization.mime == "application/vnd.android.package-archive"
+    assert authorization.size == 4
+    assert authorization.sha256_b64 == CHECKSUM
     rendered = repr(authorization)
     assert "download-secret" not in rendered
     assert "download-fixed-version" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource_version", "artifact_version"),
+    [(2, 2), (1, 3)],
+)
+async def test_download_fails_closed_when_expected_route_or_artifact_version_changes(
+    resource_version: int,
+    artifact_version: int,
+) -> None:
+    from perfpilot_api.services.uploads import UploadUnavailableError
+
+    repository = RecordingRepository(
+        _stored_upload(
+            state="finalized",
+            version=2,
+            version_id="download-fixed-version",
+            finalized_at=NOW - timedelta(minutes=1),
+            expires_at=NOW + timedelta(days=29),
+        )
+    )
+    store = RecordingStore(repository)
+
+    with pytest.raises(UploadUnavailableError, match="unavailable"):
+        await _service(repository, store).download(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            artifact_id=ARTIFACT_ID,
+            expected_tenant_resource_version=resource_version,
+            expected_artifact_version=artifact_version,
+        )
 
 
 @pytest.mark.asyncio

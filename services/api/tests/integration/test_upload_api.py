@@ -113,6 +113,12 @@ class FakeUploadService:
             raise self.error
         return DownloadAuthorization(
             artifact_id=ARTIFACT_ID,
+            tenant_resource_version=1,
+            artifact_version=2,
+            artifact_kind="trace",
+            mime="application/octet-stream",
+            size=128,
+            sha256_b64="YWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWFhYWE=",
             url="https://objects.example/download-signature",
             expires_at=NOW + timedelta(minutes=5),
         )

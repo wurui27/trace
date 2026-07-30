@@ -21,12 +21,13 @@ from perfpilot_api.engines.contracts import (
 )
 from perfpilot_api.engines.errors import EngineAdapterError
 from perfpilot_api.engines.lock import EngineLock, EnginePin
-from perfpilot_api.engines.registry import AdapterRegistry
+from perfpilot_api.engines.registry import AdapterRegistry, AdapterRegistryError
 from perfpilot_api.services.engine_executions import (
     EngineExecutionRecord,
     EngineExecutionService,
     FinalizationClaim,
     RetryReservation,
+    build_engine_execution_service,
     build_smartperfetto_execution_service,
     result_artifact_id,
 )
@@ -132,6 +133,8 @@ class FakeAdapter:
         )
         self.fetch_error: EngineAdapterError | None = None
         self.cancel_calls = 0
+        self.cancel_refs: list[EngineRunRef] = []
+        self.status_value = "running"
 
     async def submit(
         self,
@@ -157,7 +160,7 @@ class FakeAdapter:
         return self.batch
 
     async def status(self, run_ref: EngineRunRef) -> EngineStatus:
-        return EngineStatus(run_ref, "running", None, False)
+        return EngineStatus(run_ref, self.status_value, None, False)  # type: ignore[arg-type]
 
     async def fetch_result(self, run_ref: EngineRunRef) -> EngineResult:
         if self.fetch_error is not None:
@@ -166,7 +169,63 @@ class FakeAdapter:
 
     async def cancel(self, run_ref: EngineRunRef) -> str:
         self.cancel_calls += 1
+        self.cancel_refs.append(run_ref)
         return "canceled"
+
+
+class FakeAndroidMemoryAdapter(FakeAdapter):
+    descriptor = AdapterDescriptor(
+        engine_id="android_memory",
+        adapter_version="1.0.0",
+        profiles=frozenset({"auto"}),
+        required_inputs=frozenset({"memory_capture_manifest"}),
+        optional_inputs=frozenset({"memory_evidence"}),
+        accepted_contracts=frozenset({"android-memory-ai-context-1.2"}),
+        default_timeout_seconds=900,
+        resource_profile="isolated_worker",
+        stable_error_codes=frozenset(
+            {
+                "worker_unavailable",
+                "engine_timeout",
+                "integrity_mismatch",
+                "incompatible_contract",
+                "privacy_violation",
+            }
+        ),
+    )
+
+    def __init__(self, *, result_state: str = "completed") -> None:
+        super().__init__()
+        self.status_value = result_state
+        self.result = EngineResult(
+            "android-memory-ai-context-1.2",
+            result_state,  # type: ignore[arg-type]
+            {"context_type": "android-memory-ai-context"},
+        )
+        self.batch = EngineEventBatch(
+            run_ref=EngineRunRef(
+                "android_memory",
+                None,
+                f"memory-{EXECUTION_ID.hex}",
+                None,
+                None,
+            ),
+            events=(),
+        )
+
+    async def submit(
+        self,
+        inputs: tuple[EngineInput, ...],
+        config: SubmitConfig,
+    ) -> EngineRunRef:
+        self.submitted.append(config)
+        return EngineRunRef(
+            "android_memory",
+            None,
+            f"memory-{config.execution_id.hex}",
+            None,
+            None,
+        )
 
 
 class FakeRepository:
@@ -277,10 +336,12 @@ class FakeRepository:
 
     async def reserve_retry(self, **kwargs: object) -> RetryReservation:
         self.events.append("retry-reserved")
+        stable_error_code = kwargs["stable_error_code"]
+        assert isinstance(stable_error_code, str)
         self.record = replace(
             self.record,
             state="failed",
-            stable_error_code="capacity_exceeded",
+            stable_error_code=stable_error_code,
             version=self.record.version + 1,
         )
         self.next_attempt = replace(
@@ -355,6 +416,31 @@ def _service() -> tuple[
     return service, repository, workspaces, adapter, sink
 
 
+def _isolated_service(
+    *, result_state: str = "completed"
+) -> tuple[
+    EngineExecutionService,
+    FakeRepository,
+    FakeWorkspaceService,
+    FakeAndroidMemoryAdapter,
+    FakeSink,
+]:
+    repository = FakeRepository()
+    repository.record = _record(engine_id="android_memory")
+    workspaces = FakeWorkspaceService()
+    adapter = FakeAndroidMemoryAdapter(result_state=result_state)
+    sink = FakeSink()
+    service = EngineExecutionService(
+        repository=repository,  # type: ignore[arg-type]
+        workspace_service=workspaces,  # type: ignore[arg-type]
+        registry=AdapterRegistry((adapter,)),
+        engine_lock=_lock(),
+        result_sink=sink,
+        now=lambda: NOW,
+    )
+    return service, repository, workspaces, adapter, sink
+
+
 @pytest.mark.asyncio
 async def test_submit_resolves_workspace_and_persists_only_server_run_reference() -> None:
     service, repository, workspaces, adapter, _sink = _service()
@@ -382,6 +468,131 @@ async def test_submit_resolves_workspace_and_persists_only_server_run_reference(
     assert submitted.state == "running"
     assert submitted.external_session_id == "session-1"
     assert repository.events == ["allocated", "submitted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("result_state", ["completed", "insufficient_data"])
+async def test_isolated_engine_skips_workspace_and_sinks_terminal_result(
+    result_state: str,
+) -> None:
+    service, repository, workspaces, adapter, sink = _isolated_service(result_state=result_state)
+
+    submitted = await service.submit_attempt(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+        inputs=(),
+        profile="auto",
+        question=None,
+        timeout_seconds=900,
+    )
+    outcome = await service.step(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=submitted.id,
+    )
+
+    assert workspaces.calls == []
+    assert adapter.submitted == [SubmitConfig(EXECUTION_ID, ANALYSIS_ID, "auto", None, None, 900)]
+    assert repository.record.external_workspace_id is None
+    assert repository.record.external_session_id is None
+    assert repository.record.external_run_id == f"memory-{EXECUTION_ID.hex}"
+    assert sink.events == ["sink"]
+    assert outcome.state == result_state
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stable_code",
+    ["capacity_exceeded", "worker_unavailable", "engine_timeout"],
+)
+async def test_bounded_recoverable_failures_reserve_a_new_attempt(stable_code: str) -> None:
+    service, repository, _workspaces, adapter, _sink = _isolated_service()
+    repository.record = replace(
+        repository.record,
+        state="running",
+        external_run_id=f"memory-{EXECUTION_ID.hex}",
+        started_at=NOW,
+        version=2,
+    )
+    adapter.stream_error = EngineAdapterError(
+        stable_code=stable_code,
+        retryable=False,
+        terminal_state=None,
+    )
+
+    outcome = await service.step(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+    )
+
+    assert outcome.retry is not None and outcome.retry.mode == "new_attempt"
+    assert outcome.retry.stable_error_code == stable_code
+    assert outcome.retry.attempt_number == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "stable_code",
+    ["integrity_mismatch", "incompatible_contract", "privacy_violation"],
+)
+async def test_integrity_schema_and_privacy_failures_are_terminal_even_if_misflagged(
+    stable_code: str,
+) -> None:
+    service, repository, _workspaces, adapter, _sink = _isolated_service()
+    repository.record = replace(
+        repository.record,
+        state="running",
+        external_run_id=f"memory-{EXECUTION_ID.hex}",
+        started_at=NOW,
+        version=2,
+    )
+    adapter.stream_error = EngineAdapterError(
+        stable_code=stable_code,
+        retryable=True,
+        terminal_state=None,
+    )
+
+    outcome = await service.step(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+    )
+
+    assert outcome.state == "failed"
+    assert outcome.retry is None
+    assert repository.record.stable_error_code == stable_code
+
+
+@pytest.mark.asyncio
+async def test_cancel_isolated_run_calls_worker_without_workspace_or_session() -> None:
+    service, repository, _workspaces, adapter, _sink = _isolated_service()
+    repository.record = replace(
+        repository.record,
+        state="running",
+        external_run_id=f"memory-{EXECUTION_ID.hex}",
+        started_at=NOW,
+        version=2,
+    )
+
+    outcome = await service.cancel_attempt(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+    )
+
+    assert adapter.cancel_calls == 1
+    assert adapter.cancel_refs == [
+        EngineRunRef(
+            "android_memory",
+            None,
+            f"memory-{EXECUTION_ID.hex}",
+            None,
+            None,
+        )
+    ]
+    assert outcome.state == "canceled"
 
 
 @pytest.mark.asyncio
@@ -615,3 +826,19 @@ async def test_internal_composition_requires_sink_and_builds_no_public_route() -
     finally:
         await engine_client.aclose()
         await artifact_client.aclose()
+
+
+def test_general_composition_registers_only_explicit_optional_adapters() -> None:
+    android = FakeAndroidMemoryAdapter()
+    service = build_engine_execution_service(
+        control_session_factory=object(),  # type: ignore[arg-type]
+        workspace_service=FakeWorkspaceService(),  # type: ignore[arg-type]
+        adapters=(None, android),
+        engine_lock=_lock(),
+        result_sink=FakeSink(),
+        now=lambda: NOW,
+    )
+
+    assert service._registry.require("android_memory") is android
+    with pytest.raises(AdapterRegistryError, match="not registered"):
+        service._registry.require("smartperfetto")

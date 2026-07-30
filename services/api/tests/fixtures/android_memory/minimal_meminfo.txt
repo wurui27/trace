@@ -1,0 +1,7 @@
+** MEMINFO in pid 1234 [com.example.app] **
+ App Summary
+                       Pss(KB)
+                        ------
+           Java Heap:     1024
+         Native Heap:     2048
+               TOTAL:     4096       TOTAL SWAP PSS: 0

@@ -11,6 +11,7 @@ import perfpilot_api.config as config
 import perfpilot_api.errors as errors
 import perfpilot_api.main as main
 from perfpilot_api.config import Settings
+from perfpilot_api.engines.registry import AdapterRegistryError
 from perfpilot_api.main import create_app
 
 
@@ -125,6 +126,145 @@ def _production_settings(
         values["apkanalyzer_binary"] = "/opt/android-sdk/cmdline-tools/latest/bin/apkanalyzer"
     values.update(overrides)
     return Settings(**values)
+
+
+class _FakeMemoryWorker:
+    def __init__(self, *, isolation: str, image_reference: str | None = None) -> None:
+        self.isolation = isolation
+        self.image_reference = image_reference
+        self.shutdown_calls = 0
+
+    async def shutdown(self) -> None:
+        self.shutdown_calls += 1
+
+
+def _memory_app_dependencies() -> dict[str, object]:
+    return {
+        "auth_service": object(),
+        "admin_team_service": object(),
+        "upload_service": object(),
+        "analysis_service": object(),
+        "memory_capture_service": object(),
+        "apk_inspector": object(),
+        "replay_store": object(),
+        "proxy_client_identity_required": False,
+    }
+
+
+@pytest.mark.asyncio
+async def test_production_enabled_memory_requires_injected_oci_worker() -> None:
+    settings = _production_settings(
+        android_memory_enabled=True,
+        android_memory_backend="oci",
+        android_memory_image_reference=("registry.example/android-memory@sha256:" + "a" * 64),
+        android_memory_checkout_root="/opt/android-memory",
+        android_memory_python_binary="/usr/local/bin/python3",
+        android_memory_run_root="/var/lib/perfpilot/android-memory",
+        android_memory_container_runtime="/usr/bin/docker",
+    )
+    for worker in (
+        None,
+        _FakeMemoryWorker(isolation="local"),
+        _FakeMemoryWorker(
+            isolation="oci",
+            image_reference="registry.example/android-memory@sha256:" + "b" * 64,
+        ),
+    ):
+        app = create_app(
+            testing=False,
+            settings_override=settings,
+            android_memory_worker=worker,  # type: ignore[arg-type]
+            **_memory_app_dependencies(),  # type: ignore[arg-type]
+        )
+        with pytest.raises(
+            RuntimeError,
+            match="^An externally isolated Android Memory worker is unavailable$",
+        ):
+            async with app.router.lifespan_context(app):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_production_injected_memory_worker_is_registered_and_shutdown() -> None:
+    settings = _production_settings(
+        android_memory_enabled=True,
+        android_memory_backend="oci",
+        android_memory_image_reference=("registry.example/android-memory@sha256:" + "a" * 64),
+        android_memory_checkout_root="/opt/android-memory",
+        android_memory_python_binary="/usr/local/bin/python3",
+        android_memory_run_root="/var/lib/perfpilot/android-memory",
+        android_memory_container_runtime="/usr/bin/docker",
+    )
+    worker = _FakeMemoryWorker(
+        isolation="oci",
+        image_reference=settings.android_memory_image_reference,
+    )
+    app = create_app(
+        testing=False,
+        settings_override=settings,
+        android_memory_worker=worker,  # type: ignore[arg-type]
+        **_memory_app_dependencies(),  # type: ignore[arg-type]
+    )
+
+    async with app.router.lifespan_context(app):
+        adapter = app.state.engine_adapter_registry.require("android_memory")
+        assert adapter.descriptor.resource_profile == "isolated_worker"
+        assert app.state.android_memory_image_digest == "sha256:" + "a" * 64
+
+    assert worker.shutdown_calls == 1
+    assert app.state.android_memory_artifact_client.is_closed
+
+
+@pytest.mark.asyncio
+async def test_development_enabled_memory_builds_local_worker_from_absolute_settings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed: list[dict[str, object]] = []
+    worker = _FakeMemoryWorker(isolation="local")
+
+    def build_worker(**kwargs: object) -> _FakeMemoryWorker:
+        constructed.append(kwargs)
+        return worker
+
+    monkeypatch.setattr(main, "LocalAndroidMemoryWorker", build_worker)
+    settings = Settings(
+        app_env="development",
+        android_memory_enabled=True,
+        android_memory_backend="local",
+        android_memory_checkout_root="/opt/android-memory",
+        android_memory_python_binary="/usr/local/bin/python3",
+        android_memory_run_root="/tmp/perfpilot-memory",
+        _env_file=None,
+    )
+    app = create_app(
+        testing=False,
+        settings_override=settings,
+        **_memory_app_dependencies(),  # type: ignore[arg-type]
+    )
+
+    async with app.router.lifespan_context(app):
+        app.state.engine_adapter_registry.require("android_memory")
+
+    assert constructed == [
+        {
+            "python_binary": settings.android_memory_python_binary,
+            "repository_root": settings.android_memory_checkout_root,
+            "run_root": settings.android_memory_run_root / "worker",
+            "runtime_commit": "d5514972ced78c3faa7fc17589c1ea9231645056",
+            "max_output_bytes": settings.android_memory_max_output_bytes,
+        }
+    ]
+    assert worker.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_disabled_memory_composition_remains_empty() -> None:
+    app = create_app(testing=True)
+    async with app.router.lifespan_context(app):
+        with pytest.raises(AdapterRegistryError):
+            app.state.engine_adapter_registry.require("android_memory")
+        assert app.state.android_memory_worker is None
+        assert app.state.android_memory_artifact_client is None
 
 
 def test_valid_explicit_production_settings() -> None:
