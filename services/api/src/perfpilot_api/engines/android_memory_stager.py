@@ -332,7 +332,7 @@ class _CleanupState:
                 return
             try:
                 await asyncio.to_thread(_remove_owned_directory, self.owned)
-            except BaseException:
+            except Exception:
                 pass
             finally:
                 self._finalize()
@@ -363,6 +363,11 @@ class StagedMemoryInput:
         """Remove this stage's directory without affecting a later owner."""
 
         await self._cleanup_state.cleanup()
+
+    async def abandon(self) -> None:
+        """Best-effort remove this stage and unconditionally release ownership."""
+
+        await self._cleanup_state.abandon()
 
 
 class AndroidMemoryStager:

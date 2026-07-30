@@ -36,7 +36,14 @@ def valid_context_payload() -> dict[str, object]:
         "context_type": "android-memory-ai-context",
         "schema_version": "1.2",
         "generator": {"name": "android-memory-ai", "version": "1.2.0"},
-        "analysis_contract": {"privacy": {"local_paths_included": False}},
+        "analysis_contract": {
+            "support_level": "limited",
+            "primary_intent_support_level": "limited",
+            "privacy": {
+                "raw_contents_embedded": False,
+                "local_paths_included": False,
+            },
+        },
     }
 
 
@@ -69,9 +76,7 @@ def test_capture_manifest_rejects_duplicate_singleton_roles() -> None:
     payload = valid_manifest_payload()
     artifacts = payload["artifacts"]
     assert isinstance(artifacts, list)
-    artifacts.append(
-        {"artifact_id": "e4000000-0000-4000-8000-000000000002", "role": "meminfo"}
-    )
+    artifacts.append({"artifact_id": "e4000000-0000-4000-8000-000000000002", "role": "meminfo"})
 
     with pytest.raises(ValidationError, match="singleton artifact roles"):
         MemoryCaptureManifest.model_validate(payload)
@@ -116,8 +121,7 @@ def test_capture_manifest_serializes_utc_timestamp_normally() -> None:
 def test_capture_manifest_rejects_more_than_2048_artifacts() -> None:
     payload = valid_manifest_payload()
     payload["artifacts"] = [
-        {"artifact_id": str(UUID(int=index + 1)), "role": "auto"}
-        for index in range(2049)
+        {"artifact_id": str(UUID(int=index + 1)), "role": "auto"} for index in range(2049)
     ]
 
     with pytest.raises(ValidationError):
@@ -235,9 +239,7 @@ def test_upstream_context_preserves_unknown_fields_at_each_required_level() -> N
         (("generator", "version"), "1.2.1"),
     ],
 )
-def test_upstream_context_rejects_wrong_required_values(
-    path: tuple[str, ...], value: str
-) -> None:
+def test_upstream_context_rejects_wrong_required_values(path: tuple[str, ...], value: str) -> None:
     payload = valid_context_payload()
     target: dict[str, object] = payload
     for key in path[:-1]:
@@ -256,6 +258,61 @@ def test_upstream_context_rejects_non_false_local_paths(invalid_value: object) -
     payload["analysis_contract"]["privacy"]["local_paths_included"] = invalid_value
     with pytest.raises(ValidationError):
         AndroidMemoryContext.model_validate(payload)
+
+
+@pytest.mark.parametrize("invalid_value", [0, "false", None, True])
+def test_upstream_context_rejects_non_false_raw_contents(invalid_value: object) -> None:
+    payload = valid_context_payload()
+    payload["analysis_contract"]["privacy"]["raw_contents_embedded"] = invalid_value
+    with pytest.raises(ValidationError):
+        AndroidMemoryContext.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value"),
+    [
+        ("support_level", "Insufficient"),
+        ("support_level", "insufficient_data"),
+        ("support_level", "unknown"),
+        ("support_level", 1),
+        ("primary_intent_support_level", "Insufficient"),
+        ("primary_intent_support_level", "insufficient_data"),
+        ("primary_intent_support_level", "unknown"),
+        ("primary_intent_support_level", 1),
+    ],
+)
+def test_upstream_context_rejects_non_exact_support_levels(
+    field: str, invalid_value: object
+) -> None:
+    payload = valid_context_payload()
+    payload["analysis_contract"][field] = invalid_value
+
+    with pytest.raises(ValidationError):
+        AndroidMemoryContext.model_validate(payload, strict=True)
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        ("analysis_contract", "support_level"),
+        ("analysis_contract", "primary_intent_support_level"),
+        ("analysis_contract", "privacy", "raw_contents_embedded"),
+        ("analysis_contract", "privacy", "local_paths_included"),
+    ],
+)
+def test_upstream_context_requires_every_support_and_privacy_field(
+    path: tuple[str, ...],
+) -> None:
+    payload = valid_context_payload()
+    target: dict[str, object] = payload
+    for key in path[:-1]:
+        nested = target[key]
+        assert isinstance(nested, dict)
+        target = nested
+    del target[path[-1]]
+
+    with pytest.raises(ValidationError):
+        AndroidMemoryContext.model_validate(payload, strict=True)
 
 
 def test_contract_errors_redact_rejected_input_values() -> None:

@@ -26,6 +26,7 @@ from perfpilot_api.engines.android_memory_contracts import (
     MemoryCaptureManifest,
     MemorySubject,
 )
+from perfpilot_api.engines.android_memory import AndroidMemoryAdapter
 from perfpilot_api.engines.errors import EngineAdapterError, EngineErrorTerminalState
 from perfpilot_api.engines.lock import EngineLock, EngineLockError, EnginePin, load_engine_lock
 from perfpilot_api.engines.registry import AdapterRegistry, AdapterRegistryError
@@ -42,6 +43,7 @@ __all__ = [
     "AdapterRegistryError",
     "AnalysisProfile",
     "AndroidMemoryAnalysisContract",
+    "AndroidMemoryAdapter",
     "AndroidMemoryContext",
     "AndroidMemoryGenerator",
     "AndroidMemoryPrivacy",

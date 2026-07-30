@@ -336,9 +336,7 @@ class SQLAlchemyEngineExecutionRepository:
             session_id = validate_external_id(run_ref.external_session_id or "")
             run_id = validate_external_id(run_ref.external_run_id or "")
         except EngineAdapterError:
-            raise EngineExecutionOwnershipError(
-                "engine route ownership changed"
-            ) from None
+            raise EngineExecutionOwnershipError("engine route ownership changed") from None
         return workspace_id, session_id, run_id
 
     async def persist_observation(
@@ -665,9 +663,7 @@ class SQLAlchemyEngineExecutionRepository:
                 analysis_id=analysis_id,
                 for_update=False,
             )
-            return now >= (job.started_at or job.created_at) + timedelta(
-                seconds=deadline_seconds
-            )
+            return now >= (job.started_at or job.created_at) + timedelta(seconds=deadline_seconds)
 
 
 class EngineExecutionService:
@@ -752,6 +748,7 @@ class EngineExecutionService:
             run_ref = await adapter.submit(
                 inputs,
                 SubmitConfig(
+                    execution_id=record.id,
                     analysis_id=analysis_id,
                     profile=profile,
                     question=question,
@@ -1106,10 +1103,7 @@ class EngineExecutionService:
         )
         if record.state in _TERMINAL_STATES:
             return EngineStepOutcome(record.id, record.state, None)
-        if (
-            record.external_workspace_id is not None
-            and record.external_session_id is not None
-        ):
+        if record.external_workspace_id is not None and record.external_session_id is not None:
             adapter = self._registry.require(record.engine_id)
             try:
                 await adapter.cancel(self._run_ref(record))

@@ -8,7 +8,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    field_validator,
+    model_validator,
+)
 
 
 _AndroidPackage = Annotated[
@@ -167,17 +174,20 @@ class AndroidMemoryGenerator(_FrozenUpstreamModel):
 
 
 class AndroidMemoryPrivacy(_FrozenUpstreamModel):
+    raw_contents_embedded: Literal[False]
     local_paths_included: Literal[False]
 
-    @field_validator("local_paths_included", mode="before")
+    @field_validator("raw_contents_embedded", "local_paths_included", mode="before")
     @classmethod
     def _require_actual_false(cls, value: object) -> object:
         if value is not False:
-            raise ValueError("local_paths_included must be false")
+            raise ValueError("Android memory privacy flags must be false")
         return value
 
 
 class AndroidMemoryAnalysisContract(_FrozenUpstreamModel):
+    support_level: Literal["insufficient", "limited", "supported", "strong"]
+    primary_intent_support_level: Literal["insufficient", "limited", "supported", "strong"]
     privacy: AndroidMemoryPrivacy
 
 

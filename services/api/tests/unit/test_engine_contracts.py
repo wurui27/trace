@@ -31,9 +31,7 @@ class FakeAdapter:
         accepted_contracts=frozenset({"workspace-agent-v1"}),
         default_timeout_seconds=1800,
         resource_profile="network_service",
-        stable_error_codes=frozenset(
-            {"capacity_exceeded", "engine_timeout", "engine_unavailable"}
-        ),
+        stable_error_codes=frozenset({"capacity_exceeded", "engine_timeout", "engine_unavailable"}),
     )
 
     async def submit(
@@ -160,9 +158,7 @@ def test_orchestration_outcomes_never_carry_external_or_payload_fields() -> None
         retry=directive,
     )
 
-    fields = set(type(outcome).__dataclass_fields__) | set(
-        type(directive).__dataclass_fields__
-    )
+    fields = set(type(outcome).__dataclass_fields__) | set(type(directive).__dataclass_fields__)
     assert fields.isdisjoint(
         {"payload", "external_workspace_id", "external_session_id", "external_run_id"}
     )
@@ -172,7 +168,9 @@ def test_orchestration_outcomes_never_carry_external_or_payload_fields() -> None
 @pytest.mark.asyncio
 async def test_fake_adapter_implements_callable_async_protocol_shape() -> None:
     adapter = FakeAdapter()
+    execution_id = UUID("40000000-0000-4000-8000-000000000004")
     config = SubmitConfig(
+        execution_id=execution_id,
         analysis_id=UUID("40000000-0000-4000-8000-000000000002"),
         profile="auto",
         question=None,
@@ -190,6 +188,11 @@ async def test_fake_adapter_implements_callable_async_protocol_shape() -> None:
 
     run_ref = await adapter.submit((input_value,), config)
 
+    assert tuple(type(config).__dataclass_fields__)[:2] == (
+        "execution_id",
+        "analysis_id",
+    )
+    assert config.execution_id == execution_id
     assert await adapter.stream(run_ref, run_ref.cursor)
     assert (await adapter.status(run_ref)).state == "running"
     assert (await adapter.fetch_result(run_ref)).state == "completed"

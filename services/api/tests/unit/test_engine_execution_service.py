@@ -377,6 +377,7 @@ async def test_submit_resolves_workspace_and_persists_only_server_run_reference(
     )
 
     assert workspaces.calls == [TEAM_ID]
+    assert adapter.submitted[0].execution_id == EXECUTION_ID
     assert adapter.submitted[0].external_workspace_id == "workspace-server-owned"
     assert submitted.state == "running"
     assert submitted.external_session_id == "session-1"

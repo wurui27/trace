@@ -1607,6 +1607,48 @@ async def test_successful_stage_retains_resources_when_cleanup_needs_retry(
 
 
 @pytest.mark.asyncio
+async def test_abandon_unconditionally_releases_resources_when_removal_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manifest_payload = _manifest_bytes(((MEMINFO_ID, "meminfo"),))
+    client = _client(
+        _responses(
+            {
+                "/private/manifest.json": manifest_payload,
+                "/private/attacker-name/original-meminfo-secret.txt": MEMINFO_BYTES,
+            }
+        )
+    )
+    run_id = "public-abandon"
+
+    try:
+        staged = await _stager(client, tmp_path).stage(
+            run_id=run_id,
+            inputs=(_manifest_input(manifest_payload), _meminfo_input()),
+        )
+        owned = staged._cleanup_state.owned  # type: ignore[attr-defined]
+
+        def failing_remove(_: stager_module._OwnedWorkspace) -> bool:
+            raise RuntimeError(f"remove failed: {PRIVATE_FAILURE_MARKER}")
+
+        monkeypatch.setattr(stager_module, "_remove_owned_directory", failing_remove)
+
+        await staged.abandon()
+        await staged.abandon()
+
+        assert staged.input_dir.is_dir()
+        for fd in (owned.input_fd, owned.run_fd, owned.root_fd):
+            with pytest.raises(OSError):
+                os.fstat(fd)
+        with stager_module._ACTIVE_OWNERS_LOCK:
+            assert owned.owner_key not in stager_module._ACTIVE_OWNERS
+    finally:
+        await client.aclose()
+        shutil.rmtree(tmp_path / run_id, ignore_errors=True)
+
+
+@pytest.mark.asyncio
 async def test_cleanup_is_idempotent_and_never_deletes_a_later_same_id_owner(
     tmp_path: Path,
 ) -> None:
