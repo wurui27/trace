@@ -39,6 +39,7 @@ _DEVELOPMENT_ALLOWED_ORIGIN = "http://127.0.0.1:3000"
 _REDACTED_VALIDATION_INPUT = "[redacted]"
 _INVALID_PRODUCTION_SERVICE_URL = "production service URL configuration is invalid"
 _INVALID_PRODUCTION_ARTIFACT_RUNTIME = "production artifact runtime configuration is invalid"
+_INVALID_PRODUCTION_ANDROID_MEMORY = "production Android memory configuration is invalid"
 _DEVELOPMENT_TENANT_CLUSTER_HOST = "127.0.0.1"
 _DEVELOPMENT_SECRET_KEYRING_CONFIG = Path(".perfpilot/keyring.json")
 _DEVELOPMENT_SECRET_STORE_ROOT = Path(".perfpilot/secrets")
@@ -46,6 +47,12 @@ _DEVELOPMENT_APKANALYZER_BINARY = Path("/opt/android-sdk/cmdline-tools/latest/bi
 _DEVELOPMENT_S3_REGION = "us-east-1"
 _RUNTIME_HOST_PATTERN = re.compile(r"[^\s/?#@,\\]{1,253}\Z")
 _S3_REGION_PATTERN = re.compile(r"[a-z0-9][a-z0-9-]{0,62}\Z")
+_ANDROID_MEMORY_FIRST_REPOSITORY_COMPONENT = re.compile(
+    r"[a-z0-9]+(?:[.-][a-z0-9]+)*(?::[1-9][0-9]{0,4})?\Z"
+)
+_ANDROID_MEMORY_REPOSITORY_COMPONENT = re.compile(
+    r"[a-z0-9]+(?:(?:[._-]|__)[a-z0-9]+)*\Z"
+)
 _PRODUCTION_RUNTIME_FIELDS = frozenset(
     {
         "s3_region",
@@ -120,6 +127,47 @@ def _has_unambiguous_verify_full(parsed_url: Any) -> bool:
     return query_items == [("sslmode", "verify-full")]
 
 
+def _safe_absolute_runtime_path(value: Path) -> bool:
+    rendered = str(value)
+    return (
+        value.is_absolute()
+        and value != Path("/")
+        and "," not in rendered
+        and "\n" not in rendered
+        and "\r" not in rendered
+        and "\x00" not in rendered
+    )
+
+
+def is_valid_android_memory_image_reference(value: object) -> bool:
+    if not isinstance(value, str) or value.startswith("-"):
+        return False
+    if any(character.isspace() or ord(character) < 0x20 for character in value):
+        return False
+    if any(character in value for character in (",", "=")):
+        return False
+    repository, separator, digest = value.partition("@sha256:")
+    if separator != "@sha256:" or "@" in repository or len(digest) != 64:
+        return False
+    if not repository or re.fullmatch(r"[a-f0-9]{64}", digest) is None:
+        return False
+    components = repository.split("/")
+    if any(not component for component in components):
+        return False
+    if _ANDROID_MEMORY_FIRST_REPOSITORY_COMPONENT.fullmatch(components[0]) is None:
+        return False
+    if any(
+        _ANDROID_MEMORY_REPOSITORY_COMPONENT.fullmatch(component) is None
+        for component in components[1:]
+    ):
+        return False
+    if ":" in components[0]:
+        port = int(components[0].rsplit(":", 1)[1])
+        if port > 65535:
+            return False
+    return True
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_prefix="PERFPILOT_",
@@ -191,6 +239,28 @@ class Settings(BaseSettings):
         le=60,
         allow_inf_nan=False,
     )
+    android_memory_enabled: bool = False
+    android_memory_backend: Literal["local", "oci"] = "local"
+    android_memory_image_reference: str | None = None
+    android_memory_checkout_root: Path = Path("/Users/ray/Android-App-Memory-Analysis")
+    android_memory_python_binary: Path = Path("/usr/local/bin/python3")
+    android_memory_run_root: Path = Path(".perfpilot/android-memory-runs")
+    android_memory_container_runtime: Path = Path("/usr/bin/docker")
+    android_memory_max_files: int = Field(default=2048, ge=1, le=2048, strict=True)
+    android_memory_max_file_bytes: int = Field(default=5 * 1024**3, gt=0, strict=True)
+    android_memory_max_total_bytes: int = Field(default=8 * 1024**3, gt=0, strict=True)
+    android_memory_max_output_bytes: int = Field(default=32 * 1024**2, gt=0, strict=True)
+    android_memory_timeout_seconds: int = Field(default=900, ge=1, le=3600, strict=True)
+    android_memory_cpu_limit: float = Field(
+        default=4.0,
+        gt=0,
+        le=64,
+        allow_inf_nan=False,
+        strict=True,
+    )
+    android_memory_memory_bytes: int = Field(default=8 * 1024**3, gt=0, strict=True)
+    android_memory_pids_limit: int = Field(default=128, ge=16, le=4096, strict=True)
+    android_memory_tmpfs_bytes: int = Field(default=1024**3, gt=0, strict=True)
     allowed_origins: tuple[AnyHttpUrl, ...] = Field(
         default_factory=lambda: (AnyHttpUrl(_DEVELOPMENT_ALLOWED_ORIGIN),)
     )
@@ -215,6 +285,31 @@ class Settings(BaseSettings):
 
     @model_validator(mode="after")
     def validate_production_configuration(self) -> "Settings":
+        android_memory_invalid = self.android_memory_max_total_bytes < (
+            self.android_memory_max_file_bytes
+        )
+        if self.android_memory_enabled:
+            android_memory_invalid = android_memory_invalid or not all(
+                _safe_absolute_runtime_path(path)
+                for path in (
+                    self.android_memory_checkout_root,
+                    self.android_memory_python_binary,
+                    self.android_memory_run_root,
+                )
+            )
+            if self.android_memory_backend == "oci":
+                android_memory_invalid = (
+                    android_memory_invalid
+                    or not _safe_absolute_runtime_path(self.android_memory_container_runtime)
+                    or not is_valid_android_memory_image_reference(
+                        self.android_memory_image_reference
+                    )
+                )
+        if android_memory_invalid:
+            if self.app_env == "production":
+                raise _production_validation_error(_INVALID_PRODUCTION_ANDROID_MEMORY)
+            raise ValueError("Android memory configuration is invalid")
+
         if self.smartperfetto_enabled:
             raw_endpoint = self.smartperfetto_base_url.get_secret_value()
             raw_reference = self.smartperfetto_credential_reference.get_secret_value()
@@ -240,6 +335,9 @@ class Settings(BaseSettings):
 
         if self.app_env != "production":
             return self
+
+        if self.android_memory_enabled and self.android_memory_backend != "oci":
+            raise _production_validation_error(_INVALID_PRODUCTION_ANDROID_MEMORY)
 
         if self.smartperfetto_enabled and (
             parsed_smartperfetto_url.scheme.casefold() != "https"

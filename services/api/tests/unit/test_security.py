@@ -2,6 +2,7 @@ import base64
 import hashlib
 import re
 from http.cookies import SimpleCookie
+from pathlib import Path
 
 import pytest
 from pydantic import SecretStr, ValidationError
@@ -138,6 +139,203 @@ def test_smartperfetto_secret_reference_is_redacted_from_settings_repr() -> None
     settings = Settings(smartperfetto_credential_reference=marker)
 
     assert marker not in repr(settings)
+
+
+def test_android_memory_settings_have_bounded_defaults() -> None:
+    settings = Settings()
+
+    assert settings.android_memory_enabled is False
+    assert settings.android_memory_backend == "local"
+    assert settings.android_memory_checkout_root == Path("/Users/ray/Android-App-Memory-Analysis")
+    assert settings.android_memory_python_binary == Path("/usr/local/bin/python3")
+    assert settings.android_memory_run_root == Path(".perfpilot/android-memory-runs")
+    assert settings.android_memory_container_runtime == Path("/usr/bin/docker")
+    assert settings.android_memory_max_files == 2048
+    assert settings.android_memory_max_file_bytes == 5 * 1024**3
+    assert settings.android_memory_max_total_bytes == 8 * 1024**3
+    assert settings.android_memory_max_output_bytes == 32 * 1024**2
+    assert settings.android_memory_timeout_seconds == 900
+    assert settings.android_memory_cpu_limit == 4.0
+    assert settings.android_memory_memory_bytes == 8 * 1024**3
+    assert settings.android_memory_pids_limit == 128
+    assert settings.android_memory_tmpfs_bytes == 1024**3
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("android_memory_max_files", 0),
+        ("android_memory_max_files", 2049),
+        ("android_memory_max_files", True),
+        ("android_memory_max_file_bytes", 0),
+        ("android_memory_max_file_bytes", True),
+        ("android_memory_max_total_bytes", 0),
+        ("android_memory_max_output_bytes", 0),
+        ("android_memory_timeout_seconds", 0),
+        ("android_memory_timeout_seconds", 3601),
+        ("android_memory_cpu_limit", 0),
+        ("android_memory_cpu_limit", 65),
+        ("android_memory_cpu_limit", float("inf")),
+        ("android_memory_cpu_limit", float("nan")),
+        ("android_memory_cpu_limit", True),
+        ("android_memory_memory_bytes", 0),
+        ("android_memory_pids_limit", 15),
+        ("android_memory_pids_limit", 4097),
+        ("android_memory_pids_limit", True),
+        ("android_memory_tmpfs_bytes", 0),
+    ],
+)
+def test_android_memory_settings_reject_invalid_limits(
+    field_name: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(**{field_name: value})
+
+
+def test_android_memory_total_bytes_must_cover_one_file() -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            android_memory_max_file_bytes=1024,
+            android_memory_max_total_bytes=1023,
+        )
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value"),
+    [
+        ("android_memory_checkout_root", "relative/checkout"),
+        ("android_memory_checkout_root", "/"),
+        ("android_memory_python_binary", "python3"),
+        ("android_memory_python_binary", "/"),
+        ("android_memory_run_root", "relative/runs"),
+        ("android_memory_run_root", "/"),
+    ],
+)
+def test_enabled_android_memory_requires_absolute_nonroot_paths(
+    field_name: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            android_memory_enabled=True,
+            **{field_name: value},
+        )
+
+
+def test_android_memory_environment_aliases_are_loaded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("PERFPILOT_ANDROID_MEMORY_ENABLED", "true")
+    monkeypatch.setenv("PERFPILOT_ANDROID_MEMORY_BACKEND", "oci")
+    monkeypatch.setenv(
+        "PERFPILOT_ANDROID_MEMORY_IMAGE_REFERENCE",
+        "registry.example/android-memory@sha256:" + "a" * 64,
+    )
+    monkeypatch.setenv("PERFPILOT_ANDROID_MEMORY_RUN_ROOT", "/var/lib/perfpilot/memory")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.android_memory_enabled is True
+    assert settings.android_memory_backend == "oci"
+    assert settings.android_memory_image_reference is not None
+
+
+def test_production_rejects_local_android_memory_with_one_redacted_error() -> None:
+    marker = "/private/android-memory-path-marker"
+    with pytest.raises(ValidationError) as caught:
+        _production_settings(
+            android_memory_enabled=True,
+            android_memory_backend="local",
+            android_memory_checkout_root=marker,
+            android_memory_run_root="/var/lib/perfpilot/android-memory",
+        )
+
+    rendered = f"{caught.value!s} {caught.value!r}"
+    assert "production Android memory configuration is invalid" in rendered
+    assert marker not in rendered
+
+
+def test_production_accepts_digest_pinned_oci_android_memory() -> None:
+    settings = _production_settings(
+        android_memory_enabled=True,
+        android_memory_backend="oci",
+        android_memory_image_reference=("registry.example/android-memory@sha256:" + "a" * 64),
+        android_memory_run_root="/var/lib/perfpilot/android-memory",
+        android_memory_checkout_root="/opt/android-memory",
+        android_memory_python_binary="/usr/local/bin/python3",
+        android_memory_container_runtime="/usr/bin/docker",
+    )
+
+    assert settings.android_memory_backend == "oci"
+
+
+@pytest.mark.parametrize(
+    "image_reference",
+    [
+        None,
+        "registry.example/android-memory:latest",
+        "registry/image@sha256:" + "A" * 64,
+        "--env=PRIVATE@sha256:" + "a" * 64,
+        "registry.example/android=memory@sha256:" + "a" * 64,
+    ],
+)
+def test_enabled_oci_android_memory_rejects_unpinned_images(
+    image_reference: str | None,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(
+            android_memory_enabled=True,
+            android_memory_backend="oci",
+            android_memory_image_reference=image_reference,
+            android_memory_run_root="/tmp/perfpilot-memory",
+        )
+
+
+def test_invalid_android_memory_image_error_does_not_leak_reference() -> None:
+    marker = "--env=PRIVATE-secret-marker@sha256:" + "a" * 64
+
+    with pytest.raises(ValidationError) as caught:
+        _production_settings(
+            android_memory_enabled=True,
+            android_memory_backend="oci",
+            android_memory_image_reference=marker,
+            android_memory_run_root="/var/lib/perfpilot/android-memory",
+        )
+
+    assert marker not in f"{caught.value!s} {caught.value!r}"
+
+
+@pytest.mark.parametrize(
+    "image_reference",
+    [
+        "registry.example.com/team/android-memory@sha256:" + "a" * 64,
+        "localhost:5000/team/android-memory@sha256:" + "a" * 64,
+    ],
+)
+def test_enabled_oci_android_memory_accepts_safe_repository_references(
+    image_reference: str,
+) -> None:
+    settings = Settings(
+        android_memory_enabled=True,
+        android_memory_backend="oci",
+        android_memory_image_reference=image_reference,
+        android_memory_run_root="/tmp/perfpilot-memory",
+    )
+
+    assert settings.android_memory_image_reference == image_reference
+
+
+def test_android_memory_dockerfile_is_nonroot_and_requires_external_pinned_base() -> None:
+    root = Path(__file__).resolve().parents[4]
+    dockerfile = (root / "infra/engines/android-memory/Dockerfile").read_text()
+
+    assert dockerfile.startswith("ARG PYTHON_BASE_IMAGE\nFROM ${PYTHON_BASE_IMAGE}\n")
+    assert "ARG PYTHON_BASE_IMAGE=" not in dockerfile
+    assert "65532" in dockerfile
+    assert "COPY --chown=65532:65532 . /opt/android-memory" in dockerfile
+    assert "USER 65532:65532" in dockerfile
+    assert 'ENTRYPOINT ["python3", "tools/ai_context.py"]' in dockerfile
+    assert "sudo" not in dockerfile.casefold()
+    assert "SECRET" not in dockerfile
 
 
 def test_username_normalization_uses_nfkc_strip_and_casefold() -> None:
