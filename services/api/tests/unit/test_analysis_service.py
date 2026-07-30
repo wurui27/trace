@@ -18,6 +18,7 @@ APPLICATION_VERSION_ID = UUID("60000000-0000-4000-8000-000000000001")
 INSPECTION_TOKEN = UUID("60000000-0000-4000-8000-000000000002")
 CANDIDATE_ONE = UUID("70000000-0000-4000-8000-000000000001")
 CANDIDATE_TWO = UUID("70000000-0000-4000-8000-000000000002")
+CANDIDATE_THREE = UUID("70000000-0000-4000-8000-000000000003")
 CHILD_IDS = (
     UUID("80000000-0000-4000-8000-000000000001"),
     UUID("80000000-0000-4000-8000-000000000002"),
@@ -61,6 +62,10 @@ class FakeAnalysisRepository:
         self.queue_calls: list[dict[str, object]] = []
         self.release_calls: list[dict[str, object]] = []
         self.fail_calls: list[dict[str, object]] = []
+        self.memory_calls: list[dict[str, object]] = []
+        self.created_modes: list[str] = []
+        self.memory_records: dict[str, tuple[str, Any]] = {}
+        self.missing_application_versions: set[UUID] = set()
         self.prepared_scenarios = _prepared_scenarios()
         from perfpilot_api.services.analyses import FinalizationPreparation
 
@@ -132,6 +137,35 @@ class FakeAnalysisRepository:
     async def queue_control_scenarios(self, **kwargs: object) -> None:
         self.events.append("queue_control_scenarios")
         self.queue_calls.append(kwargs)
+
+    async def create_memory_analysis(self, **kwargs: object) -> Any:
+        from perfpilot_api.services.analyses import (
+            AnalysisIdempotencyConflictError,
+            AnalysisNotFoundError,
+        )
+
+        self.events.append("create_memory_analysis")
+        self.memory_calls.append(kwargs)
+        self.created_modes.append("memory_upload")
+        application_version_id = kwargs["application_version_id"]
+        if application_version_id in self.missing_application_versions:
+            raise AnalysisNotFoundError("application version was not found")
+        key = str(kwargs["idempotency_key"])
+        request_hash = str(kwargs["request_hash"])
+        stored = self.memory_records.get(key)
+        if stored is not None:
+            stored_hash, view = stored
+            if stored_hash != request_hash:
+                raise AnalysisIdempotencyConflictError("idempotency key was reused")
+            return view
+        view = replace(
+            _analysis_view(),
+            analysis_mode="memory_upload",
+            application_version_id=application_version_id,
+            question=kwargs["question"],
+        )
+        self.memory_records[key] = (request_hash, view)
+        return view
 
 
 class FakeUploadService:
@@ -242,7 +276,7 @@ def _service(
 ) -> Any:
     from perfpilot_api.services.analyses import AnalysisService
 
-    candidates = iter((CANDIDATE_ONE, CANDIDATE_TWO))
+    candidates = iter((CANDIDATE_ONE, CANDIDATE_TWO, CANDIDATE_THREE))
     return AnalysisService(
         repository=repository,
         upload_service=upload_service,
@@ -264,6 +298,22 @@ async def _create(service: Any, *, checksum: str = CHECKSUM) -> Any:
     )
 
 
+async def _create_memory(
+    service: Any,
+    *,
+    idempotency_key: str = "memory-analysis-1",
+    application_version_id: UUID = APPLICATION_VERSION_ID,
+    question: str | None = "退出页面后内存没有下降",
+) -> Any:
+    return await service.create_memory_analysis(
+        team_id=TEAM_ID,
+        requested_by_user_id=USER_ID,
+        idempotency_key=idempotency_key,
+        application_version_id=application_version_id,
+        question=question,
+    )
+
+
 async def _finalize(service: Any) -> Any:
     return await service.finalize_device_upload(
         team_id=TEAM_ID,
@@ -272,6 +322,178 @@ async def _finalize(service: Any) -> Any:
         caller_sha256_b64=CHECKSUM,
         caller_size=4,
     )
+
+
+@pytest.mark.asyncio
+async def test_create_memory_analysis_binds_existing_application_version() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    uploads = FakeUploadService(events)
+    service = _service(repository, uploads, FakeApkInspector(events))
+
+    view = await _create_memory(service)
+
+    assert view.analysis_mode == "memory_upload"
+    assert view.application_version_id == APPLICATION_VERSION_ID
+    assert view.question == "退出页面后内存没有下降"
+    assert view.state == "created"
+    assert repository.created_modes == ["memory_upload"]
+    assert repository.memory_calls == [
+        {
+            "team_id": TEAM_ID,
+            "requested_by_user_id": USER_ID,
+            "idempotency_key": "memory-analysis-1",
+            "request_hash": repository.memory_calls[0]["request_hash"],
+            "candidate_analysis_id": CANDIDATE_ONE,
+            "application_version_id": APPLICATION_VERSION_ID,
+            "question": "退出页面后内存没有下降",
+            "now": NOW,
+        }
+    ]
+    assert uploads.create_calls == []
+    assert events == ["create_memory_analysis"]
+
+
+@pytest.mark.parametrize(
+    ("question", "expected"),
+    (("  focus on retained activity  ", "focus on retained activity"), (" \n\t ", None)),
+)
+@pytest.mark.asyncio
+async def test_create_memory_analysis_normalizes_question(
+    question: str,
+    expected: str | None,
+) -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    service = _service(repository, FakeUploadService(events), FakeApkInspector(events))
+
+    view = await _create_memory(service, question=question)
+
+    assert view.question == expected
+    assert repository.memory_calls[0]["question"] == expected
+
+
+@pytest.mark.asyncio
+async def test_create_memory_analysis_accepts_2000_character_question() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    service = _service(repository, FakeUploadService(events), FakeApkInspector(events))
+
+    view = await _create_memory(service, question="问" * 2_000)
+
+    assert view.question == "问" * 2_000
+
+
+@pytest.mark.asyncio
+async def test_create_memory_analysis_rejects_question_over_2000_characters() -> None:
+    from perfpilot_api.services.analyses import AnalysisInvalidRequestError
+
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    service = _service(repository, FakeUploadService(events), FakeApkInspector(events))
+
+    with pytest.raises(AnalysisInvalidRequestError, match="analysis request is invalid"):
+        await _create_memory(service, question="问" * 2_001)
+
+    assert repository.memory_calls == []
+
+
+@pytest.mark.parametrize("idempotency_key", ("", "invalid key", "a" * 256))
+@pytest.mark.asyncio
+async def test_create_memory_analysis_rejects_invalid_idempotency_key_before_side_effects(
+    idempotency_key: str,
+) -> None:
+    from perfpilot_api.services.analyses import AnalysisInvalidRequestError
+
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    generated_candidates: list[UUID] = []
+
+    def uuid_source() -> UUID:
+        generated_candidates.append(CANDIDATE_ONE)
+        return CANDIDATE_ONE
+
+    from perfpilot_api.services.analyses import AnalysisService
+
+    service = AnalysisService(
+        repository=repository,
+        upload_service=FakeUploadService(events),
+        apk_inspector=FakeApkInspector(events),
+        clock=lambda: NOW,
+        uuid_source=uuid_source,
+    )
+
+    with pytest.raises(AnalysisInvalidRequestError, match="analysis request is invalid"):
+        await _create_memory(service, idempotency_key=idempotency_key)
+
+    assert generated_candidates == []
+    assert repository.memory_calls == []
+    assert events == []
+
+
+@pytest.mark.asyncio
+async def test_create_memory_analysis_replays_exact_request_and_conflicts_on_mismatch() -> None:
+    from perfpilot_api.services.analyses import AnalysisIdempotencyConflictError
+
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    uploads = FakeUploadService(events)
+    service = _service(repository, uploads, FakeApkInspector(events))
+
+    first = await _create_memory(service, question="  retained objects  ")
+    replay = await _create_memory(service, question="retained objects")
+    with pytest.raises(AnalysisIdempotencyConflictError):
+        await _create_memory(service, question="different question")
+
+    assert replay is first
+    assert len({str(call["request_hash"]) for call in repository.memory_calls[:2]}) == 1
+    assert uploads.create_calls == []
+
+
+@pytest.mark.asyncio
+async def test_create_memory_analysis_conflicts_when_application_version_changes() -> None:
+    from perfpilot_api.services.analyses import AnalysisIdempotencyConflictError
+
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    service = _service(
+        repository,
+        FakeUploadService(events),
+        FakeApkInspector(events),
+    )
+
+    await _create_memory(service)
+    with pytest.raises(AnalysisIdempotencyConflictError):
+        await _create_memory(
+            service,
+            application_version_id=UUID("60000000-0000-4000-8000-000000000002"),
+        )
+
+
+@pytest.mark.parametrize(
+    "application_version_id",
+    (
+        UUID("60000000-0000-4000-8000-000000000099"),
+        UUID("60000000-0000-4000-8000-000000000100"),
+    ),
+)
+@pytest.mark.asyncio
+async def test_create_memory_analysis_missing_and_other_tenant_versions_are_indistinguishable(
+    application_version_id: UUID,
+) -> None:
+    from perfpilot_api.services.analyses import AnalysisNotFoundError
+
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    repository.missing_application_versions.add(application_version_id)
+    uploads = FakeUploadService(events)
+    service = _service(repository, uploads, FakeApkInspector(events))
+
+    with pytest.raises(AnalysisNotFoundError) as caught:
+        await _create_memory(service, application_version_id=application_version_id)
+
+    assert str(caught.value) == "application version was not found"
+    assert uploads.create_calls == []
 
 
 @pytest.mark.asyncio

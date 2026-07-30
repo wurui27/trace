@@ -6,9 +6,10 @@ import json
 import os
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Any
 from uuid import UUID, uuid4
 
 import psycopg
@@ -57,6 +58,8 @@ from perfpilot_api.services.analyses import (
     SQLAlchemyAnalysisRepository,
     SchedulingRequirements,
     StaleTaskVersionError,
+    canonical_analysis_request_hash,
+    canonical_memory_analysis_request_hash,
     scenario_job_id,
 )
 
@@ -67,6 +70,9 @@ ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000001")
 OTHER_ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000002")
 ARTIFACT_ID = UUID("40000000-0000-4000-8000-000000000001")
 UPLOAD_ID = UUID("50000000-0000-4000-8000-000000000001")
+APPLICATION_ID = UUID("70000000-0000-4000-8000-000000000001")
+APPLICATION_VERSION_ID = UUID("71000000-0000-4000-8000-000000000001")
+OTHER_APPLICATION_VERSION_ID = UUID("71000000-0000-4000-8000-000000000002")
 NOW = datetime(2026, 7, 28, 8, 0, tzinfo=UTC)
 CHECKSUM = "iNQmb9TmM40TuEX88olXnVf6kQbc4EZhDbs8WjoWj4E="
 OTHER_CHECKSUM = "ERERERERERERERERERERERERERERERERERERERERERE="
@@ -119,6 +125,76 @@ class DirectTenantRouter:
             yield session
 
 
+class MappingTenantRouter:
+    def __init__(
+        self,
+        session_factories: dict[UUID, async_sessionmaker[AsyncSession]],
+    ) -> None:
+        self._session_factories = session_factories
+        self.calls: list[UUID] = []
+
+    @asynccontextmanager
+    async def session(self, team_id: UUID) -> AsyncIterator[AsyncSession]:
+        self.calls.append(team_id)
+        async with self._session_factories[team_id].begin() as session:
+            session.info["team_id"] = team_id
+            session.info["tenant_resource_version"] = 1
+            yield session
+
+
+class FailOnceTenantRouter(DirectTenantRouter):
+    def __init__(self, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        super().__init__(session_factory)
+        self.fail_next_transaction = True
+
+    @asynccontextmanager
+    async def session(self, team_id: UUID) -> AsyncIterator[AsyncSession]:
+        self.calls.append(team_id)
+        async with self._session_factory.begin() as session:
+            session.info["team_id"] = team_id
+            session.info["tenant_resource_version"] = 1
+            yield session
+            if self.fail_next_transaction:
+                self.fail_next_transaction = False
+                raise RuntimeError("injected tenant transaction failure")
+
+
+@dataclass
+class ReservationRaceCoordinator:
+    initial_lookup: asyncio.Barrier = field(default_factory=lambda: asyncio.Barrier(2))
+    second_lookup: asyncio.Barrier = field(default_factory=lambda: asyncio.Barrier(2))
+    enabled: bool = True
+
+    async def synchronize(self, lookup_number: int) -> None:
+        if lookup_number == 1:
+            await asyncio.wait_for(self.initial_lookup.wait(), timeout=2)
+        elif lookup_number == 2:
+            try:
+                await asyncio.wait_for(self.second_lookup.wait(), timeout=0.25)
+            except TimeoutError:
+                pass
+            self.enabled = False
+
+
+class CoordinatedControlSession(AsyncSession):
+    def __init__(
+        self,
+        *args: object,
+        coordinator: ReservationRaceCoordinator,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._coordinator = coordinator
+        self._idempotency_lookups = 0
+
+    async def scalar(self, statement: Any, *args: Any, **kwargs: Any) -> Any:
+        result = await super().scalar(statement, *args, **kwargs)
+        if self._coordinator.enabled and "FROM idempotency_keys" in str(statement):
+            self._idempotency_lookups += 1
+            await self._coordinator.synchronize(self._idempotency_lookups)
+        return result
+
+
 @dataclass
 class AnalysisDatabases:
     control_engine: AsyncEngine
@@ -126,6 +202,15 @@ class AnalysisDatabases:
     control_sessions: async_sessionmaker[AsyncSession]
     tenant_sessions: async_sessionmaker[AsyncSession]
     tenant_router: DirectTenantRouter
+    repository: SQLAlchemyAnalysisRepository
+
+
+@dataclass
+class TwoTenantAnalysisDatabases:
+    base: AnalysisDatabases
+    other_tenant_engine: AsyncEngine
+    other_tenant_sessions: async_sessionmaker[AsyncSession]
+    tenant_router: MappingTenantRouter
     repository: SQLAlchemyAnalysisRepository
 
 
@@ -207,6 +292,59 @@ async def analysis_databases() -> AsyncIterator[AnalysisDatabases]:
                     )
 
 
+@pytest.fixture
+async def two_tenant_analysis_databases(
+    analysis_databases: AnalysisDatabases,
+) -> AsyncIterator[TwoTenantAnalysisDatabases]:
+    admin_url = _postgres_url()
+    database_name = f"perfpilot_analysis_tenant_other_{uuid4().hex}"
+    database_created = False
+    other_tenant_engine: AsyncEngine | None = None
+    try:
+        with psycopg.connect(_conninfo(admin_url), autocommit=True) as connection:
+            connection.execute(
+                sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(
+                    sql.Identifier(database_name)
+                )
+            )
+            database_created = True
+
+        other_tenant_url = admin_url.set(database=database_name)
+        command.upgrade(_migration_config("tenant", other_tenant_url), "head")
+        other_tenant_engine = create_async_engine(other_tenant_url)
+        other_tenant_sessions = async_sessionmaker(
+            other_tenant_engine,
+            expire_on_commit=False,
+        )
+        tenant_router = MappingTenantRouter(
+            {
+                TEAM_ID: analysis_databases.tenant_sessions,
+                OTHER_TEAM_ID: other_tenant_sessions,
+            }
+        )
+        repository = SQLAlchemyAnalysisRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=tenant_router,  # type: ignore[arg-type]
+        )
+        yield TwoTenantAnalysisDatabases(
+            base=analysis_databases,
+            other_tenant_engine=other_tenant_engine,
+            other_tenant_sessions=other_tenant_sessions,
+            tenant_router=tenant_router,
+            repository=repository,
+        )
+    finally:
+        if other_tenant_engine is not None:
+            await other_tenant_engine.dispose()
+        if database_created:
+            with psycopg.connect(_conninfo(admin_url), autocommit=True) as connection:
+                connection.execute(
+                    sql.SQL("DROP DATABASE {} WITH (FORCE)").format(
+                        sql.Identifier(database_name)
+                    )
+                )
+
+
 async def _reserve_creation(
     repository: SQLAlchemyAnalysisRepository,
     *,
@@ -278,6 +416,160 @@ async def _seed_finalized_apk(database: AnalysisDatabases) -> None:
                 version=2,
             )
         )
+
+
+async def _seed_memory_application_versions(database: AnalysisDatabases) -> None:
+    async with database.tenant_sessions.begin() as session:
+        session.add(
+            Application(
+                id=APPLICATION_ID,
+                name="Memory Repository App",
+                package_name="dev.perfpilot.memory",
+            )
+        )
+        session.add_all(
+            (
+                ApplicationVersion(
+                    id=APPLICATION_VERSION_ID,
+                    application_id=APPLICATION_ID,
+                    package_name="dev.perfpilot.memory",
+                    version_name="1.0",
+                    version_code=1,
+                    min_api_level=28,
+                    target_api_level=35,
+                    launch_activity="dev.perfpilot.memory.MainActivity",
+                    supported_abis=["arm64-v8a"],
+                    has_native_libraries=False,
+                    apk_sha256_b64=CHECKSUM,
+                    manifest_sha256="a" * 64,
+                ),
+                ApplicationVersion(
+                    id=OTHER_APPLICATION_VERSION_ID,
+                    application_id=APPLICATION_ID,
+                    package_name="dev.perfpilot.memory",
+                    version_name="2.0",
+                    version_code=2,
+                    min_api_level=28,
+                    target_api_level=35,
+                    launch_activity="dev.perfpilot.memory.MainActivity",
+                    supported_abis=["arm64-v8a"],
+                    has_native_libraries=False,
+                    apk_sha256_b64=OTHER_CHECKSUM,
+                    manifest_sha256="b" * 64,
+                ),
+            )
+        )
+
+
+async def _seed_memory_application_version(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory.begin() as session:
+        session.add(
+            Application(
+                id=APPLICATION_ID,
+                name="Other Tenant Memory App",
+                package_name="dev.perfpilot.memory",
+            )
+        )
+        session.add(
+            ApplicationVersion(
+                id=APPLICATION_VERSION_ID,
+                application_id=APPLICATION_ID,
+                package_name="dev.perfpilot.memory",
+                version_name="1.0",
+                version_code=1,
+                min_api_level=28,
+                target_api_level=35,
+                launch_activity="dev.perfpilot.memory.MainActivity",
+                supported_abis=["arm64-v8a"],
+                has_native_libraries=False,
+                apk_sha256_b64=CHECKSUM,
+                manifest_sha256="a" * 64,
+            )
+        )
+
+
+async def _create_memory_analysis(
+    database: AnalysisDatabases,
+    *,
+    analysis_id: UUID = ANALYSIS_ID,
+    application_version_id: UUID = APPLICATION_VERSION_ID,
+    idempotency_key: str = "memory-analysis-create-1",
+    question: str | None = "退出页面后内存没有下降",
+):
+    request_hash = canonical_memory_analysis_request_hash(
+        application_version_id=application_version_id,
+        question=question,
+    )
+    return await database.repository.create_memory_analysis(
+        team_id=TEAM_ID,
+        requested_by_user_id=USER_ID,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        candidate_analysis_id=analysis_id,
+        application_version_id=application_version_id,
+        question=question,
+        now=NOW,
+    )
+
+
+async def _create_device_analysis_graph(
+    database: AnalysisDatabases,
+    repository: SQLAlchemyAnalysisRepository,
+    *,
+    idempotency_key: str,
+) -> tuple[str, UUID, str]:
+    request_hash = canonical_analysis_request_hash(
+        scenarios=("cold_start", "scroll", "memory_cycle"),
+        apk_mime=APK_MIME,
+        apk_size=4,
+        apk_sha256_b64=CHECKSUM,
+    )
+    reservation = await repository.reserve_creation(
+        team_id=TEAM_ID,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        candidate_analysis_id=ANALYSIS_ID,
+        now=NOW,
+    )
+    await repository.ensure_tenant_parent(
+        team_id=TEAM_ID,
+        analysis_id=reservation.analysis_id,
+        requested_by_user_id=USER_ID,
+    )
+    async with database.tenant_sessions.begin() as session:
+        session.add(
+            Artifact(
+                id=ARTIFACT_ID,
+                analysis_id=reservation.analysis_id,
+                upload_id=UPLOAD_ID,
+                idempotency_key="initial-apk",
+                request_hash="b" * 64,
+                artifact_kind="apk",
+                mime_type=APK_MIME,
+                size_bytes=4,
+                sha256_b64=CHECKSUM,
+                object_key="raw/analyses/race/initial.apk",
+                state="pending",
+                expires_at=NOW + timedelta(minutes=15),
+                version=1,
+            )
+        )
+    await repository.mark_tenant_created(
+        team_id=TEAM_ID,
+        analysis_id=reservation.analysis_id,
+        now=NOW,
+    )
+    await repository.complete_creation(
+        team_id=TEAM_ID,
+        analysis_id=reservation.analysis_id,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        expected_version=reservation.version,
+        now=NOW,
+    )
+    return "device", reservation.analysis_id, request_hash
 
 
 def _apk_metadata() -> InspectedApkMetadata:
@@ -596,6 +888,442 @@ async def test_creation_resumes_after_tenant_parent_without_duplicate_rows(
     assert key is not None and key.state == "completed" and key.version == 2
     assert tenant_parent is not None and tenant_parent.state == "created"
     assert tenant_count == 1
+
+
+@pytest.mark.asyncio
+async def test_memory_creation_binds_existing_version_and_replays_without_side_effects(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _seed_memory_application_versions(analysis_databases)
+    async with analysis_databases.control_sessions() as session:
+        quota = await session.scalar(select(TenantQuota).where(TenantQuota.team_id == TEAM_ID))
+        assert quota is not None
+        quota_before = (
+            quota.active_device_limit,
+            quota.queued_device_limit,
+            quota.version,
+            quota.updated_at,
+        )
+
+    first = await _create_memory_analysis(analysis_databases)
+    replay = await _create_memory_analysis(
+        analysis_databases,
+        analysis_id=OTHER_ANALYSIS_ID,
+    )
+
+    assert replay == first
+    assert first.analysis_id == ANALYSIS_ID
+    assert first.analysis_mode == "memory_upload"
+    assert first.application_version_id == APPLICATION_VERSION_ID
+    assert first.question == "退出页面后内存没有下降"
+    assert first.state == "created"
+    assert first.apk_upload is None
+    assert first.scenarios == ()
+
+    expected_hash = canonical_memory_analysis_request_hash(
+        application_version_id=APPLICATION_VERSION_ID,
+        question="退出页面后内存没有下降",
+    )
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        key = await session.scalar(
+            select(IdempotencyKey).where(IdempotencyKey.response_resource_id == ANALYSIS_ID)
+        )
+        quota = await session.scalar(select(TenantQuota).where(TenantQuota.team_id == TEAM_ID))
+        job_count = await session.scalar(select(func.count()).select_from(GlobalJob))
+        key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
+        scenario_job_count = await session.scalar(select(func.count()).select_from(ScenarioJob))
+        execution_count = await session.scalar(select(func.count()).select_from(EngineExecution))
+        outbox_count = await session.scalar(select(func.count()).select_from(OutboxEvent))
+    assert job is not None
+    assert (job.team_id, job.idempotency_key, job.analysis_mode, job.state) == (
+        TEAM_ID,
+        "memory-analysis-create-1",
+        "memory_upload",
+        "created",
+    )
+    assert job.version == 2
+    assert key is not None
+    assert (key.team_id, key.request_hash, key.state, key.response_resource_id) == (
+        TEAM_ID,
+        expected_hash,
+        "completed",
+        ANALYSIS_ID,
+    )
+    assert quota is not None
+    assert (
+        quota.active_device_limit,
+        quota.queued_device_limit,
+        quota.version,
+        quota.updated_at,
+    ) == quota_before
+    assert (job_count, key_count, scenario_job_count, execution_count, outbox_count) == (
+        1,
+        1,
+        0,
+        0,
+        0,
+    )
+
+    async with analysis_databases.tenant_sessions() as session:
+        analysis = await session.get(Analysis, ANALYSIS_ID)
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+        scenario_count = await session.scalar(select(func.count()).select_from(ScenarioResult))
+        artifact_count = await session.scalar(select(func.count()).select_from(Artifact))
+    assert analysis is not None
+    assert (
+        analysis.application_version_id,
+        analysis.requested_by_user_id,
+        analysis.analysis_mode,
+        analysis.question,
+        analysis.state,
+    ) == (
+        APPLICATION_VERSION_ID,
+        USER_ID,
+        "memory_upload",
+        "退出页面后内存没有下降",
+        "created",
+    )
+    assert (analysis_count, scenario_count, artifact_count) == (1, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_memory_creation_rejects_version_and_question_idempotency_mismatches(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _seed_memory_application_versions(analysis_databases)
+    await _create_memory_analysis(analysis_databases)
+
+    with pytest.raises(AnalysisIdempotencyConflictError):
+        await _create_memory_analysis(
+            analysis_databases,
+            analysis_id=OTHER_ANALYSIS_ID,
+            question="different question",
+        )
+    with pytest.raises(AnalysisIdempotencyConflictError):
+        await _create_memory_analysis(
+            analysis_databases,
+            analysis_id=OTHER_ANALYSIS_ID,
+            application_version_id=OTHER_APPLICATION_VERSION_ID,
+        )
+
+    async with analysis_databases.control_sessions() as session:
+        job_count = await session.scalar(select(func.count()).select_from(GlobalJob))
+        key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
+    async with analysis_databases.tenant_sessions() as session:
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+    assert (job_count, key_count, analysis_count) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_memory_creation_replay_verifies_stored_tenant_question(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _seed_memory_application_versions(analysis_databases)
+    await _create_memory_analysis(analysis_databases)
+    async with analysis_databases.tenant_sessions.begin() as session:
+        analysis = await session.get(Analysis, ANALYSIS_ID)
+        assert analysis is not None
+        analysis.question = "tampered question"
+
+    with pytest.raises(AnalysisUnavailableError, match="tenant analysis state is unavailable"):
+        await _create_memory_analysis(
+            analysis_databases,
+            analysis_id=OTHER_ANALYSIS_ID,
+        )
+
+    async with analysis_databases.control_sessions() as session:
+        job_count = await session.scalar(select(func.count()).select_from(GlobalJob))
+        key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
+    async with analysis_databases.tenant_sessions() as session:
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+    assert (job_count, key_count, analysis_count) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_deleted_memory_analysis_never_returns_private_question_on_load_or_replay(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _seed_memory_application_versions(analysis_databases)
+    await _create_memory_analysis(analysis_databases, question="customer-secret-question")
+    async with analysis_databases.tenant_sessions.begin() as session:
+        analysis = await session.get(Analysis, ANALYSIS_ID)
+        assert analysis is not None and analysis.tombstoned_at is None
+        analysis.state = "deleted"
+
+    with pytest.raises(
+        AnalysisUnavailableError,
+        match="tenant analysis state is unavailable",
+    ):
+        await _create_memory_analysis(
+            analysis_databases,
+            analysis_id=OTHER_ANALYSIS_ID,
+            question="customer-secret-question",
+        )
+    with pytest.raises(
+        AnalysisUnavailableError,
+        match="tenant analysis state is unavailable",
+    ):
+        await analysis_databases.repository.load_view(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            now=NOW,
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_creation_replays_after_tenant_transaction_rollback(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _seed_memory_application_versions(analysis_databases)
+    failing_router = FailOnceTenantRouter(analysis_databases.tenant_sessions)
+    repository = SQLAlchemyAnalysisRepository(
+        control_session_factory=analysis_databases.control_sessions,
+        tenant_router=failing_router,  # type: ignore[arg-type]
+    )
+    request_hash = canonical_memory_analysis_request_hash(
+        application_version_id=APPLICATION_VERSION_ID,
+        question="retained objects",
+    )
+
+    with pytest.raises(RuntimeError, match="injected tenant transaction failure"):
+        await repository.create_memory_analysis(
+            team_id=TEAM_ID,
+            requested_by_user_id=USER_ID,
+            idempotency_key="memory-tenant-rollback",
+            request_hash=request_hash,
+            candidate_analysis_id=ANALYSIS_ID,
+            application_version_id=APPLICATION_VERSION_ID,
+            question="retained objects",
+            now=NOW,
+        )
+
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        key = await session.scalar(
+            select(IdempotencyKey).where(IdempotencyKey.response_resource_id == ANALYSIS_ID)
+        )
+    async with analysis_databases.tenant_sessions() as session:
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+        version = await session.get(ApplicationVersion, APPLICATION_VERSION_ID)
+    assert job is not None and (job.state, job.version) == ("creating", 1)
+    assert key is not None and (key.state, key.version) == ("pending", 1)
+    assert analysis_count == 0
+    assert version is not None
+
+    replay = await repository.create_memory_analysis(
+        team_id=TEAM_ID,
+        requested_by_user_id=USER_ID,
+        idempotency_key="memory-tenant-rollback",
+        request_hash=request_hash,
+        candidate_analysis_id=OTHER_ANALYSIS_ID,
+        application_version_id=APPLICATION_VERSION_ID,
+        question="retained objects",
+        now=NOW,
+    )
+
+    assert replay.analysis_id == ANALYSIS_ID
+    assert replay.question == "retained objects"
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        key = await session.scalar(
+            select(IdempotencyKey).where(IdempotencyKey.response_resource_id == ANALYSIS_ID)
+        )
+        job_count = await session.scalar(select(func.count()).select_from(GlobalJob))
+        key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
+    async with analysis_databases.tenant_sessions() as session:
+        analysis = await session.get(Analysis, ANALYSIS_ID)
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+    assert job is not None and (job.state, job.version) == ("created", 2)
+    assert key is not None and (key.state, key.version) == ("completed", 2)
+    assert analysis is not None and analysis.state == "created"
+    assert (job_count, key_count, analysis_count) == (1, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_memory_creation_missing_routed_version_leaves_no_partial_rows(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    missing_version_id = UUID("71000000-0000-4000-8000-000000000099")
+
+    with pytest.raises(AnalysisNotFoundError, match="application version was not found"):
+        await _create_memory_analysis(
+            analysis_databases,
+            application_version_id=missing_version_id,
+        )
+
+    async with analysis_databases.control_sessions() as session:
+        job_count = await session.scalar(select(func.count()).select_from(GlobalJob))
+        key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
+        scenario_job_count = await session.scalar(select(func.count()).select_from(ScenarioJob))
+    async with analysis_databases.tenant_sessions() as session:
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+        artifact_count = await session.scalar(select(func.count()).select_from(Artifact))
+        scenario_count = await session.scalar(select(func.count()).select_from(ScenarioResult))
+    assert (job_count, key_count, scenario_job_count) == (0, 0, 0)
+    assert (analysis_count, artifact_count, scenario_count) == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_memory_version_lookup_routes_by_authoritative_team_id(
+    two_tenant_analysis_databases: TwoTenantAnalysisDatabases,
+) -> None:
+    databases = two_tenant_analysis_databases
+    await _seed_memory_application_version(databases.other_tenant_sessions)
+    request_hash = canonical_memory_analysis_request_hash(
+        application_version_id=APPLICATION_VERSION_ID,
+        question="retained objects",
+    )
+
+    with pytest.raises(AnalysisNotFoundError, match="application version was not found"):
+        await databases.repository.create_memory_analysis(
+            team_id=TEAM_ID,
+            requested_by_user_id=USER_ID,
+            idempotency_key="routed-memory-analysis",
+            request_hash=request_hash,
+            candidate_analysis_id=ANALYSIS_ID,
+            application_version_id=APPLICATION_VERSION_ID,
+            question="retained objects",
+            now=NOW,
+        )
+
+    assert databases.tenant_router.calls == [TEAM_ID]
+    async with databases.base.control_sessions() as session:
+        job_count = await session.scalar(select(func.count()).select_from(GlobalJob))
+        key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
+    async with databases.base.tenant_sessions() as session:
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+        version_count = await session.scalar(select(func.count()).select_from(ApplicationVersion))
+    async with databases.other_tenant_sessions() as session:
+        other_analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+        other_version_count = await session.scalar(
+            select(func.count()).select_from(ApplicationVersion)
+        )
+    assert (job_count, key_count, analysis_count, version_count) == (0, 0, 0, 0)
+    assert (other_analysis_count, other_version_count) == (0, 1)
+
+    view = await databases.repository.create_memory_analysis(
+        team_id=OTHER_TEAM_ID,
+        requested_by_user_id=USER_ID,
+        idempotency_key="routed-memory-analysis",
+        request_hash=request_hash,
+        candidate_analysis_id=OTHER_ANALYSIS_ID,
+        application_version_id=APPLICATION_VERSION_ID,
+        question="retained objects",
+        now=NOW,
+    )
+
+    assert view.analysis_id == OTHER_ANALYSIS_ID
+    assert view.team_id == OTHER_TEAM_ID
+    assert databases.tenant_router.calls == [TEAM_ID, OTHER_TEAM_ID, OTHER_TEAM_ID]
+    async with databases.base.control_sessions() as session:
+        job = await session.get(GlobalJob, OTHER_ANALYSIS_ID)
+        key = await session.scalar(
+            select(IdempotencyKey).where(
+                IdempotencyKey.response_resource_id == OTHER_ANALYSIS_ID
+            )
+        )
+    async with databases.other_tenant_sessions() as session:
+        analysis = await session.get(Analysis, OTHER_ANALYSIS_ID)
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+        version_count = await session.scalar(select(func.count()).select_from(ApplicationVersion))
+    assert job is not None and (job.team_id, job.state) == (OTHER_TEAM_ID, "created")
+    assert key is not None and (key.team_id, key.state) == (OTHER_TEAM_ID, "completed")
+    assert analysis is not None and analysis.application_version_id == APPLICATION_VERSION_ID
+    assert (analysis_count, version_count) == (1, 1)
+
+
+@pytest.mark.asyncio
+async def test_device_and_memory_creation_serialize_cross_mode_idempotency(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _seed_memory_application_versions(analysis_databases)
+    coordinator = ReservationRaceCoordinator()
+    coordinated_sessions = async_sessionmaker(
+        analysis_databases.control_engine,
+        class_=CoordinatedControlSession,
+        expire_on_commit=False,
+        coordinator=coordinator,
+    )
+    repository = SQLAlchemyAnalysisRepository(
+        control_session_factory=coordinated_sessions,
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    )
+    idempotency_key = "cross-mode-analysis-race"
+    memory_hash = canonical_memory_analysis_request_hash(
+        application_version_id=APPLICATION_VERSION_ID,
+        question="retained objects",
+    )
+
+    async def create_memory() -> tuple[str, UUID, str]:
+        view = await repository.create_memory_analysis(
+            team_id=TEAM_ID,
+            requested_by_user_id=USER_ID,
+            idempotency_key=idempotency_key,
+            request_hash=memory_hash,
+            candidate_analysis_id=OTHER_ANALYSIS_ID,
+            application_version_id=APPLICATION_VERSION_ID,
+            question="retained objects",
+            now=NOW,
+        )
+        return "memory_upload", view.analysis_id, memory_hash
+
+    outcomes = await asyncio.gather(
+        _create_device_analysis_graph(
+            analysis_databases,
+            repository,
+            idempotency_key=idempotency_key,
+        ),
+        create_memory(),
+        return_exceptions=True,
+    )
+    successes = [outcome for outcome in outcomes if not isinstance(outcome, BaseException)]
+    failures = [outcome for outcome in outcomes if isinstance(outcome, BaseException)]
+
+    assert len(successes) == len(failures) == 1
+    assert isinstance(failures[0], AnalysisIdempotencyConflictError)
+    winner_mode, winner_analysis_id, winner_hash = successes[0]
+
+    async with analysis_databases.control_sessions() as session:
+        job = await session.scalar(select(GlobalJob))
+        key = await session.scalar(select(IdempotencyKey))
+        quota = await session.scalar(select(TenantQuota).where(TenantQuota.team_id == TEAM_ID))
+        job_count = await session.scalar(select(func.count()).select_from(GlobalJob))
+        key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
+        scenario_job_count = await session.scalar(select(func.count()).select_from(ScenarioJob))
+    async with analysis_databases.tenant_sessions() as session:
+        analysis = await session.scalar(select(Analysis))
+        analysis_count = await session.scalar(select(func.count()).select_from(Analysis))
+        artifact_count = await session.scalar(select(func.count()).select_from(Artifact))
+        scenario_count = await session.scalar(select(func.count()).select_from(ScenarioResult))
+
+    assert job is not None and key is not None and analysis is not None and quota is not None
+    assert (job.id, job.team_id, job.idempotency_key, job.analysis_mode, job.state) == (
+        winner_analysis_id,
+        TEAM_ID,
+        idempotency_key,
+        winner_mode,
+        "created",
+    )
+    assert (key.response_resource_id, key.request_hash, key.state) == (
+        winner_analysis_id,
+        winner_hash,
+        "completed",
+    )
+    assert (analysis.id, analysis.analysis_mode, analysis.state) == (
+        winner_analysis_id,
+        winner_mode,
+        "created",
+    )
+    assert quota.version == 1
+    assert (job_count, key_count, scenario_job_count, analysis_count, scenario_count) == (
+        1,
+        1,
+        0,
+        1,
+        0,
+    )
+    assert artifact_count == (1 if winner_mode == "device" else 0)
 
 
 @pytest.mark.asyncio

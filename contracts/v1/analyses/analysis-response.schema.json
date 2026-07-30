@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/analyses/analysis-response.schema.json",
-  "$comment": "The same shape is used for create and status reads. A create response includes the pending APK authorization; a later GET may omit the authorization pair so reading status does not silently mint a new upload capability.",
+  "$comment": "The same closed shape is used for create and authenticated status reads. Device create responses may include the pending APK authorization; a later GET may omit the authorization pair so reading status does not silently mint a new upload capability. Manual memory_upload responses contain the private normalized question and never contain an APK authorization or device scenarios.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -27,7 +27,7 @@
     "schema_version": {"const": "1.0"},
     "analysis_id": {"type": "string", "format": "uuid"},
     "team_id": {"type": "string", "format": "uuid"},
-    "analysis_mode": {"const": "device"},
+    "analysis_mode": {"enum": ["device", "memory_upload"]},
     "state": {
       "enum": [
         "creating",
@@ -60,34 +60,14 @@
     "apk_upload": {
       "oneOf": [
         {"$ref": "#/$defs/pendingApkUpload"},
-        {"$ref": "#/$defs/finalizedApkUpload"}
+        {"$ref": "#/$defs/finalizedApkUpload"},
+        {"type": "null"}
       ]
     },
     "scenarios": {
       "type": "array",
-      "minItems": 3,
       "maxItems": 3,
-      "prefixItems": [
-        {
-          "allOf": [
-            {"$ref": "#/$defs/scenarioProgress"},
-            {"properties": {"scenario_type": {"const": "cold_start"}}}
-          ]
-        },
-        {
-          "allOf": [
-            {"$ref": "#/$defs/scenarioProgress"},
-            {"properties": {"scenario_type": {"const": "scroll"}}}
-          ]
-        },
-        {
-          "allOf": [
-            {"$ref": "#/$defs/scenarioProgress"},
-            {"properties": {"scenario_type": {"const": "memory_cycle"}}}
-          ]
-        }
-      ],
-      "items": false
+      "items": {"$ref": "#/$defs/scenarioProgress"}
     },
     "sample_verdict_counts": {"$ref": "#/$defs/verdictCounts"},
     "active_lease": {
@@ -104,6 +84,12 @@
       "oneOf": [
         {"type": "null"},
         {"$ref": "#/$defs/failure"}
+      ]
+    },
+    "question": {
+      "oneOf": [
+        {"type": "string", "maxLength": 2000},
+        {"type": "null"}
       ]
     }
   },
@@ -132,6 +118,43 @@
       "then": {
         "properties": {"failure": {"$ref": "#/$defs/failure"}}
       }
+    },
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "analysis_mode": {"const": "device"},
+            "apk_upload": {
+              "oneOf": [
+                {"$ref": "#/$defs/pendingApkUpload"},
+                {"$ref": "#/$defs/finalizedApkUpload"}
+              ]
+            },
+            "scenarios": {"$ref": "#/$defs/deviceScenarios"}
+          },
+          "required": ["analysis_mode"],
+          "not": {"required": ["question"]}
+        },
+        {
+          "properties": {
+            "analysis_mode": {"const": "memory_upload"},
+            "application_version_id": {"type": "string", "format": "uuid"},
+            "application_metadata": {"$ref": "#/$defs/applicationMetadata"},
+            "apk_upload": {"type": "null"},
+            "scenarios": {"type": "array", "maxItems": 0},
+            "sample_verdict_counts": {"$ref": "#/$defs/zeroVerdictCounts"},
+            "active_lease": {"type": "null"},
+            "report_available": {"const": false},
+            "question": {
+              "oneOf": [
+                {"type": "string", "maxLength": 2000},
+                {"type": "null"}
+              ]
+            }
+          },
+          "required": ["analysis_mode", "question"]
+        }
+      ]
     }
   ],
   "$defs": {
@@ -291,6 +314,44 @@
         "validation_error": {"type": "integer", "minimum": 0, "maximum": 10},
         "total": {"type": "integer", "minimum": 0, "maximum": 30}
       }
+    },
+    "zeroVerdictCounts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["valid", "invalid", "pending", "validation_error", "total"],
+      "properties": {
+        "valid": {"const": 0},
+        "invalid": {"const": 0},
+        "pending": {"const": 0},
+        "validation_error": {"const": 0},
+        "total": {"const": 0}
+      }
+    },
+    "deviceScenarios": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scenarioProgress"},
+            {"properties": {"scenario_type": {"const": "cold_start"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scenarioProgress"},
+            {"properties": {"scenario_type": {"const": "scroll"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scenarioProgress"},
+            {"properties": {"scenario_type": {"const": "memory_cycle"}}}
+          ]
+        }
+      ],
+      "items": false
     },
     "scenarioProgress": {
       "type": "object",
