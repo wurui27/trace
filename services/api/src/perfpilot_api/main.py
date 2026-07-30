@@ -21,6 +21,7 @@ from perfpilot_api.api.admin_teams import router as admin_teams_router
 from perfpilot_api.api.analyses import router as analyses_router
 from perfpilot_api.api.health import router as health_router
 from perfpilot_api.api.me import router as me_router
+from perfpilot_api.api.memory_captures import router as memory_captures_router
 from perfpilot_api.api.members import router as members_router
 from perfpilot_api.api.uploads import router as uploads_router
 from perfpilot_api.config import Settings, get_settings
@@ -52,7 +53,15 @@ from perfpilot_api.services.analyses import (
     SQLAlchemyAnalysisRepository,
 )
 from perfpilot_api.services.provisioning import AdminTeamService
-from perfpilot_api.services.uploads import UploadService
+from perfpilot_api.services.internal_artifacts import (
+    S3InternalArtifactSink,
+    SQLAlchemyInternalArtifactRepository,
+)
+from perfpilot_api.services.memory_analyses import (
+    MemoryCaptureService,
+    SQLAlchemyMemoryCaptureRepository,
+)
+from perfpilot_api.services.uploads import SQLAlchemyTenantBucketResolver, UploadService
 
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -141,6 +150,7 @@ def create_app(
     admin_team_service: AdminTeamService | None = None,
     upload_service: UploadService | None = None,
     analysis_service: AnalysisService | None = None,
+    memory_capture_service: MemoryCaptureService | None = None,
     apk_inspector: ApkInspector | None = None,
     replay_store: ReplayStore | None = None,
     proxy_clock: Callable[[], float] = time.time,
@@ -166,11 +176,16 @@ def create_app(
     resolved_admin_team_service = admin_team_service
     resolved_upload_service = upload_service
     resolved_analysis_service = analysis_service
+    resolved_memory_capture_service = memory_capture_service
     resolved_replay_store = replay_store
     artifact_runtime_required = (
         not testing
         and settings.app_env == "production"
-        and (resolved_upload_service is None or resolved_analysis_service is None)
+        and (
+            resolved_upload_service is None
+            or resolved_analysis_service is None
+            or resolved_memory_capture_service is None
+        )
     )
     if not testing and (resolved_auth_service is None or resolved_replay_store is None):
         owned_redis = redis.from_url(settings.redis_url.get_secret_value())
@@ -206,7 +221,10 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
-        nonlocal owned_artifact_runtime, resolved_analysis_service, resolved_upload_service
+        nonlocal owned_artifact_runtime
+        nonlocal resolved_analysis_service
+        nonlocal resolved_memory_capture_service
+        nonlocal resolved_upload_service
         lifespan_error: BaseException | None = None
         try:
             if settings.app_env == "production" and apk_inspector is None:
@@ -237,6 +255,22 @@ def create_app(
                         apk_inspector=resolved_inspector,
                     )
                     lifespan_app.state.analysis_service = resolved_analysis_service
+                if resolved_memory_capture_service is None:
+                    resolved_memory_capture_service = MemoryCaptureService(
+                        repository=SQLAlchemyMemoryCaptureRepository(
+                            tenant_router=owned_artifact_runtime.tenant_router,
+                        ),
+                        manifest_sink=S3InternalArtifactSink(
+                            repository=SQLAlchemyInternalArtifactRepository(
+                                tenant_router=owned_artifact_runtime.tenant_router,
+                            ),
+                            bucket_resolver=SQLAlchemyTenantBucketResolver(
+                                session_factory=control_session_factory,
+                            ),
+                            client=owned_artifact_runtime.s3_client,
+                        ),
+                    )
+                    lifespan_app.state.memory_capture_service = resolved_memory_capture_service
             yield
         except BaseException as error:
             lifespan_error = error
@@ -269,6 +303,7 @@ def create_app(
     app.state.admin_team_service = resolved_admin_team_service
     app.state.upload_service = resolved_upload_service
     app.state.analysis_service = resolved_analysis_service
+    app.state.memory_capture_service = resolved_memory_capture_service
     app.state.proxy_replay_store = resolved_replay_store or InMemoryReplayStore(clock=proxy_clock)
     app.state.proxy_clock = proxy_clock
     identity_required = (
@@ -295,6 +330,7 @@ def create_app(
     app.include_router(members_router)
     app.include_router(analyses_router)
     app.include_router(uploads_router)
+    app.include_router(memory_captures_router)
     return app
 
 

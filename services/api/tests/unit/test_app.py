@@ -198,6 +198,7 @@ def test_production_with_external_inspector_does_not_build_local_inspector(
         upload_service = object()
         apk_inspector = None
         tenant_router = object()
+        s3_client = object()
 
         async def close(self) -> None:
             pass
@@ -262,6 +263,7 @@ def test_production_app_cleanup_attempts_every_dependency_and_redacts_failures(
         upload_service = object()
         apk_inspector = object()
         tenant_router = object()
+        s3_client = object()
 
         async def close(self) -> None:
             events.append("artifacts")
@@ -310,6 +312,7 @@ async def test_production_app_cleanup_preserves_late_cancellation(
         upload_service = object()
         apk_inspector = object()
         tenant_router = object()
+        s3_client = object()
 
         async def close(self) -> None:
             events.append("artifacts")
@@ -334,9 +337,9 @@ async def test_production_app_cleanup_preserves_late_cancellation(
 
     with pytest.raises(asyncio.CancelledError):
         async with app.router.lifespan_context(app):
-            pass
+            events.append("running")
 
-    assert events == ["artifacts", "engine"]
+    assert events == ["running", "artifacts", "engine"]
 
 
 @pytest.mark.asyncio

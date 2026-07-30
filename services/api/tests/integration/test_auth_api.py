@@ -1016,6 +1016,7 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
             self.upload_service = upload_service
             self.apk_inspector = object()
             self.tenant_router = object()
+            self.s3_client = object()
 
         async def close(self) -> None:
             closed.append("artifacts")
