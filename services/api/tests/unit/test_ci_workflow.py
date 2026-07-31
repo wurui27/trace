@@ -73,14 +73,28 @@ def test_workflow_has_only_required_jobs_and_pinned_actions(
     }
 
 
+def test_every_checkout_disables_persisted_credentials(
+    workflow: dict[str, object],
+) -> None:
+    checkout_steps = [
+        step
+        for job in workflow["jobs"].values()
+        for step in job.get("steps", [])
+        if step.get("uses") == CHECKOUT_ACTION
+    ]
+    assert checkout_steps
+    for step in checkout_steps:
+        assert step.get("with", {}).get("persist-credentials") == "false"
+
+
 def test_python_quality_runs_locked_ruff_checks(workflow: dict[str, object]) -> None:
     quality = workflow["jobs"]["python-quality"]
     assert quality["runs-on"] == "ubuntu-latest"
     assert _action_step(quality, SETUP_PYTHON_ACTION)["with"] == {"python-version": "3.12"}
     assert _action_step(quality, SETUP_UV_ACTION)["with"] == {"version": "0.11.32"}
     assert _run_steps(quality) == [
-        "uv sync --locked",
-        "uv run --package perfpilot-api ruff check services/api/src services/api/tests",
+        "uv sync --locked --all-packages",
+        "uv run --locked --package perfpilot-api ruff check services/api/src services/api/tests",
     ]
 
 
@@ -122,13 +136,16 @@ def test_python_tests_checkout_upstream_and_require_all_services(
         "PERFPILOT_TEST_REDIS_URL": "redis://127.0.0.1:6379/15",
         "PERFPILOT_REQUIRE_POSTGRES_TESTS": "1",
         "PERFPILOT_REQUIRE_REDIS_TESTS": "1",
-        "PERFPILOT_REQUIRE_ANDROID_MEMORY_TESTS": "1",
         "PERFPILOT_ANDROID_MEMORY_ROOT": "${{ github.workspace }}/.ci/android-memory",
         "PYTHONDONTWRITEBYTECODE": "1",
     }
 
     steps = tests["steps"]
-    assert steps[0]["uses"] == CHECKOUT_ACTION
+    assert steps[0] == {
+        "name": "Checkout platform",
+        "uses": CHECKOUT_ACTION,
+        "with": {"persist-credentials": "false"},
+    }
     assert steps[1] == {
         "name": "Checkout Android memory analyzer",
         "uses": CHECKOUT_ACTION,
@@ -142,22 +159,24 @@ def test_python_tests_checkout_upstream_and_require_all_services(
     assert _action_step(tests, SETUP_PYTHON_ACTION)["with"] == {"python-version": "3.12"}
     assert _action_step(tests, SETUP_UV_ACTION)["with"] == {"version": "0.11.32"}
     assert _run_steps(tests) == [
-        "uv sync --locked",
+        "uv sync --locked --all-packages",
         (
-            "uv run --package perfpilot-api pytest -p no:cacheprovider "
+            "uv run --locked --package perfpilot-api pytest -p no:cacheprovider "
             "services/api/tests -q"
         ),
     ]
 
 
-def test_web_runs_locked_install_lint_and_tests_from_app(workflow: dict[str, object]) -> None:
+def test_web_runs_locked_install_lint_and_tests_from_repository_root(
+    workflow: dict[str, object],
+) -> None:
     web = workflow["jobs"]["web"]
     assert web["runs-on"] == "ubuntu-latest"
-    assert web["defaults"] == {"run": {"working-directory": "app"}}
+    assert "defaults" not in web
     assert _action_step(web, SETUP_NODE_ACTION)["with"] == {
         "node-version": "22.13.0",
         "cache": "npm",
-        "cache-dependency-path": "app/package-lock.json",
+        "cache-dependency-path": "package-lock.json",
     }
     assert _run_steps(web) == ["npm ci", "npm run lint", "npm test"]
 

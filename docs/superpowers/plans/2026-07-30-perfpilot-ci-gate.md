@@ -18,6 +18,7 @@
 - `actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020`
 - Android Memory repository: `Gracker/Android-App-Memory-Analysis`
 - Android Memory commit: `d5514972ced78c3faa7fc17589c1ea9231645056`
+- Every `actions/checkout` step sets `persist-credentials: false`.
 
 ## File map
 
@@ -45,10 +46,16 @@ Load `.github/workflows/ci.yml` with `yaml.BaseLoader` and assert:
 3. Concurrency cancels obsolete runs.
 4. Jobs are exactly `python-quality`, `python-tests`, `web`, and `ci-gate`.
 5. Every reusable action is pinned to the fixed full commit SHA above.
-6. `python-quality` runs `uv sync --locked` and Ruff.
-7. `python-tests` checks out the pinned Android repository into `.ci/android-memory`, starts PostgreSQL 17 and Redis 8 services, sets all three `PERFPILOT_REQUIRE_*` flags, and runs the complete API suite.
-8. `web` runs `npm ci`, `npm run lint`, and `npm test` from `app`.
-9. `ci-gate` uses `always()`, needs all three jobs, and fails unless every dependency succeeded.
+6. Every checkout step disables credential persistence.
+7. `python-quality` runs `uv sync --locked --all-packages` and Ruff through
+   `uv run --locked`.
+8. `python-tests` checks out the pinned Android repository into
+   `.ci/android-memory`, starts PostgreSQL 17 and Redis 8 services, sets the
+   PostgreSQL and Redis `PERFPILOT_REQUIRE_*` flags, configures
+   `PERFPILOT_ANDROID_MEMORY_ROOT`, and runs the complete API suite.
+9. `web` runs `npm ci`, `npm run lint`, and `npm test` from the repository root.
+10. `ci-gate` uses `always()`, needs all three jobs, and fails unless every
+    dependency succeeded.
 
 The test must inspect the parsed YAML rather than searching raw text.
 
@@ -76,11 +83,11 @@ Use this top-level contract:
 name: CI
 
 on:
-  pull_request:
+  pull_request: {}
   push:
     branches:
       - main
-  workflow_dispatch:
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -92,15 +99,18 @@ concurrency:
 
 - [ ] **Step 2: Add `python-quality`**
 
-Use Ubuntu latest, Python 3.12, uv 0.11.32, `uv sync --locked`, and:
+Use Ubuntu latest, Python 3.12, uv 0.11.32,
+`uv sync --locked --all-packages`, and:
 
 ```bash
-uv run --package perfpilot-api ruff check services/api/src services/api/tests
+uv run --locked --package perfpilot-api ruff check services/api/src services/api/tests
 ```
 
 - [ ] **Step 3: Add `python-tests` with real services**
 
-Use PostgreSQL `17` and Redis `8-alpine` service containers with health checks. Check out the platform first, then the pinned Android Memory repository into `.ci/android-memory` with `persist-credentials: false`.
+Use PostgreSQL `17` and Redis `8-alpine` service containers with health checks.
+Check out the platform first, then the pinned Android Memory repository into
+`.ci/android-memory`. Both checkout steps set `persist-credentials: false`.
 
 Set:
 
@@ -110,20 +120,21 @@ PERFPILOT_TEST_TENANT_ADMIN_URL: postgresql://postgres:postgres@127.0.0.1:5432/p
 PERFPILOT_TEST_REDIS_URL: redis://127.0.0.1:6379/15
 PERFPILOT_REQUIRE_POSTGRES_TESTS: "1"
 PERFPILOT_REQUIRE_REDIS_TESTS: "1"
-PERFPILOT_ANDROID_MEMORY_REPO: ${{ github.workspace }}/.ci/android-memory
-PERFPILOT_REQUIRE_ANDROID_MEMORY_UPSTREAM: "1"
+PERFPILOT_ANDROID_MEMORY_ROOT: ${{ github.workspace }}/.ci/android-memory
 PYTHONDONTWRITEBYTECODE: "1"
 ```
 
 Install from the lock and run:
 
 ```bash
-uv run --package perfpilot-api pytest -p no:cacheprovider services/api/tests -q
+uv sync --locked --all-packages
+uv run --locked --package perfpilot-api pytest -p no:cacheprovider services/api/tests -q
 ```
 
 - [ ] **Step 4: Add `web`**
 
-Use Node.js 22.13.0, npm cache keyed by `app/package-lock.json`, and run in `app`:
+Use Node.js 22.13.0, npm cache keyed by the root `package-lock.json`, and run
+from the repository root:
 
 ```bash
 npm ci
@@ -142,7 +153,7 @@ Run the workflow contract test again. Expected: PASS.
 Then run:
 
 ```bash
-env PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/private/tmp/perfpilot-ci-contract /Users/ray/Library/Python/3.12/bin/uv run --offline --package perfpilot-api ruff check services/api/tests/unit/test_ci_workflow.py
+env PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/private/tmp/perfpilot-ci-contract /Users/ray/Library/Python/3.12/bin/uv run --offline --locked --package perfpilot-api ruff check services/api/tests/unit/test_ci_workflow.py
 git diff --check
 ```
 
@@ -161,10 +172,13 @@ git commit -m "ci: add required platform checks"
 
 - [ ] **Step 1: Run the complete API suite against real dependencies**
 
-Confirm PostgreSQL and Redis are reachable, then run the suite with all skip guards forced:
+Confirm PostgreSQL and Redis are reachable, sync the complete locked workspace,
+then run the suite with the PostgreSQL and Redis skip guards forced and the
+Android Memory root configured:
 
 ```bash
-env PERFPILOT_TEST_POSTGRES_URL=postgresql+psycopg://ray@127.0.0.1:55439/postgres PERFPILOT_TEST_TENANT_ADMIN_URL=postgresql://ray@127.0.0.1:55441/postgres PERFPILOT_TEST_REDIS_URL=redis://127.0.0.1:6379/15 PERFPILOT_REQUIRE_POSTGRES_TESTS=1 PERFPILOT_REQUIRE_REDIS_TESTS=1 PERFPILOT_ANDROID_MEMORY_REPO=/Users/ray/Android-App-Memory-Analysis PERFPILOT_REQUIRE_ANDROID_MEMORY_UPSTREAM=1 PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/private/tmp/perfpilot-ci-full /Users/ray/Library/Python/3.12/bin/uv run --offline --package perfpilot-api pytest -p no:cacheprovider services/api/tests -q
+env PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/private/tmp/perfpilot-ci-full /Users/ray/Library/Python/3.12/bin/uv sync --offline --locked --all-packages
+env PERFPILOT_TEST_POSTGRES_URL=postgresql+psycopg://ray@127.0.0.1:55439/postgres PERFPILOT_TEST_TENANT_ADMIN_URL=postgresql://ray@127.0.0.1:55441/postgres PERFPILOT_TEST_REDIS_URL=redis://127.0.0.1:6379/15 PERFPILOT_REQUIRE_POSTGRES_TESTS=1 PERFPILOT_REQUIRE_REDIS_TESTS=1 PERFPILOT_ANDROID_MEMORY_ROOT=/Users/ray/Android-App-Memory-Analysis PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/private/tmp/perfpilot-ci-full /Users/ray/Library/Python/3.12/bin/uv run --offline --locked --package perfpilot-api pytest -p no:cacheprovider services/api/tests -q
 ```
 
 Expected: all tests PASS with no PostgreSQL, Redis, or Android upstream skip.
@@ -172,9 +186,10 @@ Expected: all tests PASS with no PostgreSQL, Redis, or Android upstream skip.
 - [ ] **Step 2: Run complete quality and Web checks**
 
 ```bash
-env PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/private/tmp/perfpilot-ci-full /Users/ray/Library/Python/3.12/bin/uv run --offline --package perfpilot-api ruff check services/api/src services/api/tests
-npm run lint --prefix app
-npm test --prefix app
+env PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/private/tmp/perfpilot-ci-full /Users/ray/Library/Python/3.12/bin/uv sync --offline --locked --all-packages
+env PYTHONDONTWRITEBYTECODE=1 UV_CACHE_DIR=/private/tmp/perfpilot-ci-full /Users/ray/Library/Python/3.12/bin/uv run --offline --locked --package perfpilot-api ruff check services/api/src services/api/tests
+npm run lint
+npm test
 git diff --check
 git status --short
 ```

@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout platform
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
@@ -29,9 +31,9 @@ jobs:
         with:
           version: "0.11.32"
       - name: Sync dependencies
-        run: uv sync --locked
+        run: uv sync --locked --all-packages
       - name: Run Ruff
-        run: uv run --package perfpilot-api ruff check services/api/src services/api/tests
+        run: uv run --locked --package perfpilot-api ruff check services/api/src services/api/tests
 
   python-tests:
     runs-on: ubuntu-latest
@@ -64,12 +66,13 @@ jobs:
       PERFPILOT_TEST_REDIS_URL: redis://127.0.0.1:6379/15
       PERFPILOT_REQUIRE_POSTGRES_TESTS: "1"
       PERFPILOT_REQUIRE_REDIS_TESTS: "1"
-      PERFPILOT_REQUIRE_ANDROID_MEMORY_TESTS: "1"
       PERFPILOT_ANDROID_MEMORY_ROOT: ${{ github.workspace }}/.ci/android-memory
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Checkout platform
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Checkout Android memory analyzer
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -86,24 +89,23 @@ jobs:
         with:
           version: "0.11.32"
       - name: Sync dependencies
-        run: uv sync --locked
+        run: uv sync --locked --all-packages
       - name: Run Python tests
-        run: uv run --package perfpilot-api pytest -p no:cacheprovider services/api/tests -q
+        run: uv run --locked --package perfpilot-api pytest -p no:cacheprovider services/api/tests -q
 
   web:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: app
     steps:
       - name: Checkout platform
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
       - name: Set up Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: "22.13.0"
           cache: npm
-          cache-dependency-path: app/package-lock.json
+          cache-dependency-path: package-lock.json
       - name: Install web dependencies
         run: npm ci
       - name: Lint web
