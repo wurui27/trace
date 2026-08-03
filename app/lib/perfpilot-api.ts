@@ -67,7 +67,7 @@ export interface AnalysisResponse {
   } | null;
 }
 
-interface MeResponse {
+export interface MeResponse {
   readonly schema_version: "1.0";
   readonly memberships: ReadonlyArray<{
     readonly team: { readonly id: string; readonly name: string };
@@ -629,7 +629,7 @@ export async function submitTraceAnalysis(
     await client.finalizeInput(teamId, created.analysis_id, input, slot.upload.upload_id, signal);
   });
 
-  onProgress?.("analyzing");
+  onProgress?.("analyzing", created.analysis_id);
   let current = await client.analysis(teamId, created.analysis_id, signal);
   let retryDelay = 2_000;
   while (!TERMINAL_STATES.has(current.state)) {

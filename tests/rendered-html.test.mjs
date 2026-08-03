@@ -114,3 +114,14 @@ test("returns 404 for an unknown performance problem", async () => {
 
   assert.equal(response.status, 404);
 });
+
+test("server-renders the live analysis route without demo findings", async () => {
+  const response = await render("/analyses/analysis-live-1");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /分析进度/);
+  assert.match(html, /正在读取分析状态/);
+  assert.doesNotMatch(html, /首页启动慢/);
+  assert.doesNotMatch(html, /Acme Gallery/);
+});
