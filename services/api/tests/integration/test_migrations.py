@@ -39,6 +39,8 @@ CONTROL_TABLES = {
     "worker_claims",
     "team_engine_workspaces",
     "engine_executions",
+    "synthesis_executions",
+    "ai_invocations",
     "outbox_events",
     "inbox_events",
     "idempotency_keys",
@@ -75,6 +77,7 @@ _VERSIONED_CONTROL_TABLES = {
     "worker_claims",
     "team_engine_workspaces",
     "engine_executions",
+    "synthesis_executions",
     "outbox_events",
     "inbox_events",
 }
@@ -90,6 +93,10 @@ _FORBIDDEN_CONTROL_COLUMNS = {
     "raw_result",
     "prompt",
     "question",
+    "response",
+    "endpoint",
+    "credential_reference",
+    "external_error",
     "signed_url",
     "path",
     "dsn",
@@ -102,6 +109,7 @@ _OUTBOX_COLUMNS = {
     "event_type",
     "subject_type",
     "subject_id",
+    "subject_version",
     "ready_at",
     "published_at",
     "dead_lettered_at",
@@ -360,7 +368,7 @@ def test_trace_execution_state_downgrade_refuses_active_trace(
 
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0006_trace_execution_states"
+            "0007_analysis_report_versions"
         )
 
 
@@ -669,7 +677,7 @@ def test_control_execution_tenant_version_migration_round_trips_empty_table(
     assert tenant_version["default"] is None
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_trace_worker_claims"
+            "0008_ai_synthesis"
         )
 
     command.downgrade(config, "0005_memory_upload_mode")
@@ -772,7 +780,7 @@ def test_control_execution_tenant_version_downgrade_refuses_rows(
 
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_trace_worker_claims"
+            "0008_ai_synthesis"
         )
     assert "tenant_resource_version" in {
         column["name"]
@@ -962,7 +970,7 @@ def test_control_external_engine_downgrade_serializes_with_concurrent_writers(
     )
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_trace_worker_claims"
+            "0008_ai_synthesis"
         )
 
 
@@ -1061,6 +1069,141 @@ def test_tenant_schema_enforces_required_uniqueness(
     )
 
 
+def test_tenant_report_versions_enforce_exclusive_scenario_and_analysis_content(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("tenant", migration_databases.tenant_url)
+    analysis_id = UUID("a2000000-0000-4000-8000-000000000001")
+    scenario_id = UUID("a2000000-0000-4000-8000-000000000002")
+    with migration_databases.tenant_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO analyses "
+                "(id, analysis_mode, analysis_profile, input_manifest, state) VALUES "
+                "(:id, 'trace_upload', 'auto', CAST('[]' AS jsonb), 'analyzing')"
+            ),
+            {"id": analysis_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO scenario_results (id, analysis_id, scenario_type, state) "
+                "VALUES (:id, :analysis_id, 'cold_start', 'completed')"
+            ),
+            {"id": scenario_id, "analysis_id": analysis_id},
+        )
+        insert = text(
+            "INSERT INTO report_versions "
+            "(id, analysis_id, scenario_result_id, report_version, state, generated_at, "
+            "tool_version, rule_version, bundle, bundle_sha256_b64, report, "
+            "report_sha256_b64) VALUES "
+            "(:id, :analysis_id, :scenario_result_id, :report_version, 'complete', now(), "
+            "'tool-1', 'rule-1', CAST(:bundle AS jsonb), :bundle_sha256_b64, "
+            "CAST(:report AS jsonb), :report_sha256_b64)"
+        )
+        common = {"analysis_id": analysis_id, "bundle_sha256_b64": None, "report_sha256_b64": None}
+        valid_contents = (
+            {
+                "scenario_result_id": scenario_id,
+                "bundle": '{"scenario":true}',
+                "bundle_sha256_b64": "A" * 44,
+                "report": None,
+                "report_sha256_b64": None,
+            },
+            {
+                "scenario_result_id": None,
+                "bundle": None,
+                "bundle_sha256_b64": None,
+                "report": '{"analysis":true}',
+                "report_sha256_b64": "B" * 44,
+            },
+            {
+                "scenario_result_id": None,
+                "bundle": None,
+                "bundle_sha256_b64": None,
+                "report": None,
+                "report_sha256_b64": None,
+            },
+        )
+        for report_version, content in enumerate(valid_contents, start=1):
+            connection.execute(
+                insert,
+                common | content | {"id": uuid4(), "report_version": report_version},
+            )
+
+        invalid_contents = (
+            {"scenario_result_id": scenario_id, "bundle": '{"scenario":true}', "report": None},
+            {"scenario_result_id": scenario_id, "bundle": None, "bundle_sha256_b64": "A" * 44, "report": None},
+            {"scenario_result_id": None, "bundle": None, "report": '{"analysis":true}'},
+            {"scenario_result_id": None, "bundle": None, "report": None, "report_sha256_b64": "B" * 44},
+            {"scenario_result_id": scenario_id, "bundle": '{"scenario":true}', "bundle_sha256_b64": "A" * 44, "report": '{"analysis":true}', "report_sha256_b64": "B" * 44},
+            {"scenario_result_id": None, "bundle": '{"scenario":true}', "bundle_sha256_b64": "A" * 44, "report": None},
+            {"scenario_result_id": scenario_id, "bundle": None, "report": '{"analysis":true}', "report_sha256_b64": "B" * 44},
+        )
+        for content in invalid_contents:
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(
+                        insert,
+                        common
+                        | content
+                        | {"id": uuid4(), "report_version": 10 + len(content)},
+                    )
+
+
+def test_tenant_ai_report_downgrade_refuses_new_content_or_artifact_references(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("tenant", migration_databases.tenant_url)
+    analysis_id = UUID("a3000000-0000-4000-8000-000000000001")
+    artifact_id = UUID("a3000000-0000-4000-8000-000000000002")
+    with migration_databases.tenant_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO analyses "
+                "(id, analysis_mode, analysis_profile, input_manifest, state) VALUES "
+                "(:id, 'trace_upload', 'auto', CAST('[]' AS jsonb), 'analyzing')"
+            ),
+            {"id": analysis_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO artifacts "
+                "(id, analysis_id, upload_id, artifact_kind, mime_type, size_bytes, "
+                "sha256_b64, object_key, version_id, state, finalized_at, expires_at) VALUES "
+                "(:id, :analysis_id, :upload_id, 'ai_projection', 'application/json', 2, "
+                "repeat('A', 44), 'private/ai-projection.json', 'version-1', 'finalized', "
+                "now(), now() + interval '1 day')"
+            ),
+            {"id": artifact_id, "analysis_id": analysis_id, "upload_id": uuid4()},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO report_versions "
+                "(id, analysis_id, report_version, state, generated_at, tool_version, "
+                "rule_version, report, report_sha256_b64, ai_projection_artifact_id) VALUES "
+                "(:id, :analysis_id, 1, 'complete', now(), 'tool-1', 'rule-1', "
+                "CAST(:report AS jsonb), repeat('B', 44), :artifact_id)"
+            ),
+            {
+                "id": uuid4(),
+                "analysis_id": analysis_id,
+                "artifact_id": artifact_id,
+                "report": '{"analysis":true}',
+            },
+        )
+
+    with pytest.raises(RuntimeError, match="AI report downgrade preflight failed"):
+        command.downgrade(
+            _alembic_config("tenant", migration_databases.tenant_url),
+            "0006_trace_execution_states",
+        )
+
+    with migration_databases.tenant_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0007_analysis_report_versions"
+        )
+
+
 def test_tenant_artifact_upload_schema_enforces_immutable_slot_invariants(
     migration_databases: MigrationDatabases,
 ) -> None:
@@ -1127,6 +1270,7 @@ def test_partial_indexes_enforce_active_leases_and_ready_outbox_dispatch(
         column["name"]: column for column in control_inspector.get_columns("outbox_events")
     }
     assert outbox_columns["ready_at"]["nullable"] is True
+    assert outbox_columns["subject_version"]["nullable"] is True
     outbox_index = next(
         index
         for index in control_inspector.get_indexes("outbox_events")
@@ -1135,6 +1279,33 @@ def test_partial_indexes_enforce_active_leases_and_ready_outbox_dispatch(
     outbox_where = outbox_index["dialect_options"]["postgresql_where"]
     assert _normalize_postgresql_predicate(outbox_where) == (
         "ready_atisnotnullandpublished_atisnull"
+    )
+    engine_result_index = next(
+        index
+        for index in control_inspector.get_indexes("outbox_events")
+        if index["name"] == "uq_outbox_events_engine_result_ready_subject"
+    )
+    assert engine_result_index["unique"] is True
+    assert engine_result_index["column_names"] == ["subject_id"]
+    assert _normalize_postgresql_predicate(
+        engine_result_index["dialect_options"]["postgresql_where"]
+    ) == "event_type='engine_result_ready'andsubject_type='engine_execution'"
+    synthesis_index = next(
+        index
+        for index in control_inspector.get_indexes("outbox_events")
+        if index["name"] == "uq_outbox_events_analysis_synthesis_requested_subject"
+    )
+    assert synthesis_index["unique"] is True
+    assert synthesis_index["column_names"] == ["subject_id"]
+    assert _normalize_postgresql_predicate(
+        synthesis_index["dialect_options"]["postgresql_where"]
+    ) == "event_type='analysis_synthesis_requested'andsubject_type='synthesis_execution'"
+    outbox_checks = {
+        constraint["name"]: _normalize_postgresql_predicate(constraint["sqltext"])
+        for constraint in control_inspector.get_check_constraints("outbox_events")
+    }
+    assert outbox_checks["ck_outbox_events_subject_version_positive"] == (
+        "subject_versionisnullorsubject_version>0"
     )
 
     worker_claim_index = next(
@@ -1148,6 +1319,211 @@ def test_partial_indexes_enforce_active_leases_and_ready_outbox_dispatch(
     assert _normalize_postgresql_predicate(worker_claim_where) == (
         "state='active'andglobal_job_idisnotnull"
     )
+
+
+def test_control_schema_persists_only_nonsecret_ai_synthesis_audit_metadata(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    control_inspector = inspect(migration_databases.control_engine)
+
+    synthesis_columns = {
+        column["name"]: column
+        for column in control_inspector.get_columns("synthesis_executions")
+    }
+    invocation_columns = {
+        column["name"]: column for column in control_inspector.get_columns("ai_invocations")
+    }
+    assert set(synthesis_columns) == {
+        "id",
+        "team_id",
+        "analysis_id",
+        "source_execution_id",
+        "tenant_resource_version",
+        "generation",
+        "state",
+        "request_fingerprint",
+        "normalizer_version",
+        "report_worker_image_digest",
+        "projection_sha256_b64",
+        "projection_artifact_id",
+        "provider_protocol",
+        "provider_name",
+        "provider_model",
+        "prompt_template_version",
+        "prompt_template_sha256_b64",
+        "attempt_count",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "latency_ms",
+        "stable_error_code",
+        "candidate_artifact_id",
+        "candidate_sha256_b64",
+        "report_generated_at",
+        "report_version_id",
+        "started_at",
+        "completed_at",
+        "version",
+        "created_at",
+        "updated_at",
+    }
+    assert set(invocation_columns) == {
+        "id",
+        "synthesis_execution_id",
+        "team_id",
+        "analysis_id",
+        "attempt_number",
+        "request_fingerprint",
+        "provider_protocol",
+        "provider_name",
+        "provider_model",
+        "prompt_template_version",
+        "state",
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "latency_ms",
+        "stable_error_code",
+        "started_at",
+        "completed_at",
+        "created_at",
+        "updated_at",
+    }
+    assert set(synthesis_columns).isdisjoint(_FORBIDDEN_CONTROL_COLUMNS)
+    assert set(invocation_columns).isdisjoint(_FORBIDDEN_CONTROL_COLUMNS)
+    assert all(
+        column["type"].__class__.__name__ not in {"JSON", "JSONB"}
+        for column in (*synthesis_columns.values(), *invocation_columns.values())
+    )
+    assert ("analysis_id", "source_execution_id", "generation") in _unique_column_sets(
+        control_inspector, "synthesis_executions"
+    )
+    assert ("synthesis_execution_id", "attempt_number") in _unique_column_sets(
+        control_inspector, "ai_invocations"
+    )
+    for table_name in ("synthesis_executions", "ai_invocations"):
+        foreign_key = next(
+            foreign_key
+            for foreign_key in control_inspector.get_foreign_keys(table_name)
+            if foreign_key["constrained_columns"] == ["analysis_id", "team_id"]
+        )
+        assert foreign_key["referred_table"] == "global_jobs"
+        assert foreign_key["referred_columns"] == ["id", "team_id"]
+        assert foreign_key["options"]["ondelete"] == "CASCADE"
+
+
+def test_control_ai_synthesis_constraints_reject_inconsistent_metadata(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    team_id = UUID("a1000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("a1000000-0000-4000-8000-000000000002")
+    source_execution_id = UUID("a1000000-0000-4000-8000-000000000003")
+    synthesis_id = UUID("a1000000-0000-4000-8000-000000000004")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'AI audit', 'active')"),
+            {"id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                "VALUES (:id, :team_id, 'ai-audit', 'trace_upload', 'analyzing', "
+                "ARRAY[]::varchar[])"
+            ),
+            {"id": analysis_id, "team_id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO engine_executions "
+                "(id, analysis_id, team_id, engine_id, attempt_number, "
+                "tenant_resource_version, adapter_version, engine_commit_sha, "
+                "engine_image_digest, input_manifest_hash, config_hash, state) VALUES "
+                "(:id, :analysis_id, :team_id, 'smartperfetto', 1, 1, '1.0.0', "
+                "repeat('a', 40), 'sha256:' || repeat('b', 64), repeat('c', 64), "
+                "repeat('d', 64), 'completed')"
+            ),
+            {
+                "id": source_execution_id,
+                "analysis_id": analysis_id,
+                "team_id": team_id,
+            },
+        )
+        synthesis_insert = text(
+            "INSERT INTO synthesis_executions "
+            "(id, team_id, analysis_id, source_execution_id, tenant_resource_version, "
+            "generation, state, request_fingerprint, normalizer_version, "
+            "report_worker_image_digest, projection_sha256_b64, provider_protocol, "
+            "provider_name, provider_model, prompt_template_version, "
+            "prompt_template_sha256_b64, attempt_count, started_at, completed_at) VALUES "
+            "(:id, :team_id, :analysis_id, :source_execution_id, :tenant_resource_version, "
+            ":generation, :state, repeat('a', 64), 'normalizer-1', "
+            "'sha256:' || repeat('b', 64), repeat('A', 44), 'openai-compatible', "
+            "'provider', 'model', 'v1', repeat('B', 44), :attempt_count, "
+            ":started_at, :completed_at)"
+        )
+        valid_synthesis = {
+            "id": synthesis_id,
+            "team_id": team_id,
+            "analysis_id": analysis_id,
+            "source_execution_id": source_execution_id,
+            "tenant_resource_version": 1,
+            "generation": 1,
+            "state": "pending",
+            "attempt_count": 0,
+            "started_at": None,
+            "completed_at": None,
+        }
+        connection.execute(synthesis_insert, valid_synthesis)
+
+        for overrides in (
+            {"id": uuid4(), "generation": 0},
+            {"id": uuid4(), "state": "unknown"},
+            {"id": uuid4(), "state": "running", "started_at": None},
+            {"id": uuid4(), "state": "succeeded", "completed_at": None},
+            {"id": uuid4(), "team_id": uuid4()},
+        ):
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(synthesis_insert, valid_synthesis | overrides)
+
+        invocation_insert = text(
+            "INSERT INTO ai_invocations "
+            "(id, synthesis_execution_id, team_id, analysis_id, attempt_number, "
+            "request_fingerprint, provider_protocol, provider_name, provider_model, "
+            "prompt_template_version, state, prompt_tokens, completion_tokens, total_tokens, "
+            "started_at, completed_at) VALUES "
+            "(:id, :synthesis_execution_id, :team_id, :analysis_id, :attempt_number, "
+            "repeat('a', 64), 'openai-compatible', 'provider', 'model', 'v1', :state, "
+            ":prompt_tokens, :completion_tokens, :total_tokens, :started_at, :completed_at)"
+        )
+        valid_invocation = {
+            "id": uuid4(),
+            "synthesis_execution_id": synthesis_id,
+            "team_id": team_id,
+            "analysis_id": analysis_id,
+            "attempt_number": 1,
+            "state": "running",
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+            "started_at": "2026-08-03T00:00:00+00:00",
+            "completed_at": None,
+        }
+        connection.execute(invocation_insert, valid_invocation)
+        for overrides in (
+            {"id": uuid4(), "attempt_number": 3},
+            {"id": uuid4(), "state": "unknown"},
+            {"id": uuid4(), "state": "succeeded", "completed_at": None},
+            {"id": uuid4(), "prompt_tokens": 2, "completion_tokens": 3, "total_tokens": 4},
+            {"id": uuid4(), "prompt_tokens": -1},
+            {"id": uuid4(), "team_id": uuid4()},
+        ):
+            with pytest.raises(IntegrityError):
+                with connection.begin_nested():
+                    connection.execute(invocation_insert, valid_invocation | overrides)
 
 
 def test_control_orchestration_tables_exclude_tenant_content(
@@ -1274,8 +1650,8 @@ def test_memory_upload_mode_is_present_in_both_databases(
 @pytest.mark.parametrize(
     ("tree", "downgrade_revision", "head_revision"),
     [
-        ("control", "0004_external_engine_foundation", "0007_trace_worker_claims"),
-        ("tenant", "0003_analysis_orchestration", "0006_trace_execution_states"),
+        ("control", "0004_external_engine_foundation", "0008_ai_synthesis"),
+        ("tenant", "0003_analysis_orchestration", "0007_analysis_report_versions"),
     ],
 )
 def test_memory_upload_downgrade_refuses_existing_rows(
@@ -1332,14 +1708,14 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "control",
             "0004_external_engine_foundation",
-            "0007_trace_worker_claims",
+                "0008_ai_synthesis",
             "global_jobs",
             "ck_global_jobs_analysis_mode",
         ),
         (
             "tenant",
             "0003_analysis_orchestration",
-            "0006_trace_execution_states",
+                "0007_analysis_report_versions",
             "analyses",
             "ck_analyses_mode",
         ),
@@ -1685,7 +2061,7 @@ def test_tenant_task7_downgrade_serializes_with_concurrent_metadata_writers(
     }
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0006_trace_execution_states"
+            "0007_analysis_report_versions"
         )
 
 

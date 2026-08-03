@@ -9,6 +9,7 @@ from perfpilot_api.db.control.models.jobs import (
     ScenarioJob,
     WorkerClaim,
 )
+from perfpilot_api.db.control.models.synthesis import AIInvocation, SynthesisExecution
 from perfpilot_api.db.control.models.tenancy import (
     IdempotencyKey,
     Membership,
@@ -20,6 +21,7 @@ from perfpilot_api.db.control.models.tenancy import (
 __all__ = [
     "Agent",
     "AgentLease",
+    "AIInvocation",
     "AuditEvent",
     "AuthSession",
     "ControlBase",
@@ -36,6 +38,7 @@ __all__ = [
     "TeamEngineWorkspace",
     "TenantQuota",
     "TenantResource",
+    "SynthesisExecution",
     "User",
     "WorkerClaim",
 ]

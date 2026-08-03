@@ -35,16 +35,30 @@ class ReportVersion(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
             name="fk_report_versions_scenario_analysis",
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ("ai_projection_artifact_id",),
+            ("artifacts.id",),
+            name="fk_report_versions_ai_projection_artifact",
+            ondelete="SET NULL",
+        ),
+        ForeignKeyConstraint(
+            ("ai_synthesis_artifact_id",),
+            ("artifacts.id",),
+            name="fk_report_versions_ai_synthesis_artifact",
+            ondelete="SET NULL",
+        ),
         CheckConstraint("report_version > 0", name="ck_report_versions_version"),
         CheckConstraint(
             "state IN ('complete', 'partial', 'failed')",
             name="ck_report_versions_state",
         ),
         CheckConstraint(
-            "(bundle IS NULL AND bundle_sha256_b64 IS NULL) OR "
-            "(bundle IS NOT NULL AND bundle_sha256_b64 IS NOT NULL "
-            "AND scenario_result_id IS NOT NULL)",
-            name="ck_report_versions_bundle_metadata",
+            "NOT (bundle IS NOT NULL AND report IS NOT NULL) AND "
+            "((bundle IS NULL) = (bundle_sha256_b64 IS NULL)) AND "
+            "((report IS NULL) = (report_sha256_b64 IS NULL)) AND "
+            "(bundle IS NULL OR scenario_result_id IS NOT NULL) AND "
+            "(report IS NULL OR scenario_result_id IS NULL)",
+            name="ck_report_versions_content_shape",
         ),
         Index(
             "ix_report_versions_scenario_analysis",
@@ -59,6 +73,8 @@ class ReportVersion(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
             postgresql_where=text("scenario_result_id IS NULL"),
         ),
         Index("ix_report_versions_source_artifact_id", "source_artifact_id"),
+        Index("ix_report_versions_ai_projection_artifact_id", "ai_projection_artifact_id"),
+        Index("ix_report_versions_ai_synthesis_artifact_id", "ai_synthesis_artifact_id"),
     )
 
     analysis_id: Mapped[UUID] = mapped_column(
@@ -86,6 +102,14 @@ class ReportVersion(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
     )
     bundle: Mapped[dict[str, object] | None] = mapped_column(JSONB(none_as_null=True))
     bundle_sha256_b64: Mapped[str | None] = mapped_column(String(44))
+    report: Mapped[dict[str, object] | None] = mapped_column(JSONB(none_as_null=True))
+    report_sha256_b64: Mapped[str | None] = mapped_column(String(44))
+    ai_projection_artifact_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+    )
+    ai_synthesis_artifact_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+    )
 
 
 class Metric(UUIDPrimaryKeyMixin, TimestampMixin, TenantBase):
