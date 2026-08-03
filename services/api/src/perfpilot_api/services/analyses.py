@@ -69,6 +69,20 @@ _COMPONENT_NAME = re.compile(
 )
 _MANIFEST_SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _SUPPORTED_ABIS = frozenset(("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
+_TRACE_INPUT_ORDER = (
+    "trace",
+    "memory_evidence",
+    "apk",
+    "source_archive",
+    "mapping",
+    "native_symbols",
+    "log",
+)
+_TRACE_INPUT_KINDS = frozenset(_TRACE_INPUT_ORDER)
+_MIME_TYPE = re.compile(
+    r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/"
+    r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\Z"
+)
 _REPORT_CONTRACT_ROOT = Path(__file__).resolve().parents[5] / "contracts" / "v1" / "reports"
 # RFC 6750 permits very short b64tokens; eight characters distinguishes credentials from
 # ordinary prose such as "the bearer of bad news" while remaining fail-closed for real tokens.
@@ -228,6 +242,8 @@ class AnalysisView:
     completed_at: datetime | None
     failure_code: str | None
     question: str | None = None
+    analysis_profile: Literal["auto", "startup", "scroll"] | None = None
+    input_uploads: tuple[UploadSlot, ...] = ()
 
 
 MemoryAnalysisView = AnalysisView
@@ -252,6 +268,20 @@ class ApkInspector(Protocol):
 
 
 class AnalysisRepository(Protocol):
+    async def create_trace_analysis(
+        self,
+        *,
+        team_id: UUID,
+        requested_by_user_id: UUID,
+        idempotency_key: str,
+        request_hash: str,
+        candidate_analysis_id: UUID,
+        analysis_profile: Literal["auto", "startup", "scroll"],
+        question: str | None,
+        inputs: tuple[dict[str, object], ...],
+        now: datetime,
+    ) -> AnalysisView: ...
+
     async def create_memory_analysis(
         self,
         *,
@@ -479,6 +509,72 @@ def canonical_memory_analysis_request_hash(
         {
             "analysis_mode": "memory_upload",
             "application_version_id": str(application_version_id),
+            "question": question,
+            "schema_version": "1.0",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _canonical_trace_inputs(
+    inputs: tuple[dict[str, object], ...],
+) -> tuple[dict[str, object], ...]:
+    if not 1 <= len(inputs) <= len(_TRACE_INPUT_ORDER):
+        raise AnalysisInvalidRequestError("analysis request is invalid")
+    by_kind: dict[str, dict[str, object]] = {}
+    for item in inputs:
+        if set(item) != {"kind", "mime", "size", "sha256_b64"}:
+            raise AnalysisInvalidRequestError("analysis request is invalid")
+        kind = item.get("kind")
+        mime = item.get("mime")
+        size = item.get("size")
+        checksum = item.get("sha256_b64")
+        checksum_valid = False
+        if isinstance(checksum, str):
+            try:
+                decoded = base64.b64decode(checksum, validate=True)
+                checksum_valid = (
+                    len(decoded) == 32
+                    and base64.b64encode(decoded).decode("ascii") == checksum
+                )
+            except (binascii.Error, ValueError):
+                pass
+        if (
+            not isinstance(kind, str)
+            or kind not in _TRACE_INPUT_KINDS
+            or kind in by_kind
+            or not isinstance(mime, str)
+            or _MIME_TYPE.fullmatch(mime) is None
+            or type(size) is not int
+            or not 1 <= size <= 5 * 1024 * 1024 * 1024
+            or not checksum_valid
+        ):
+            raise AnalysisInvalidRequestError("analysis request is invalid")
+        by_kind[kind] = {
+            "kind": kind,
+            "mime": mime,
+            "size": size,
+            "sha256_b64": checksum,
+        }
+    if "trace" not in by_kind:
+        raise AnalysisInvalidRequestError("analysis request is invalid")
+    return tuple(by_kind[kind] for kind in _TRACE_INPUT_ORDER if kind in by_kind)
+
+
+def canonical_trace_analysis_request_hash(
+    *,
+    analysis_profile: Literal["auto", "startup", "scroll"],
+    question: str | None,
+    inputs: tuple[dict[str, object], ...],
+) -> str:
+    payload = json.dumps(
+        {
+            "analysis_mode": "trace_upload",
+            "analysis_profile": analysis_profile,
+            "inputs": list(inputs),
             "question": question,
             "schema_version": "1.0",
         },
@@ -730,6 +826,45 @@ class AnalysisService:
                 candidate_analysis_id=self._uuid_source(),
                 application_version_id=application_version_id,
                 question=normalized_question,
+                now=self._clock(),
+            )
+        )
+
+    async def create_trace_analysis(
+        self,
+        *,
+        team_id: UUID,
+        requested_by_user_id: UUID,
+        idempotency_key: str,
+        analysis_profile: str,
+        question: str | None,
+        inputs: tuple[dict[str, object], ...],
+    ) -> AnalysisView:
+        _validate_idempotency_key(idempotency_key)
+        if analysis_profile not in ("auto", "startup", "scroll"):
+            raise AnalysisInvalidRequestError("analysis request is invalid")
+        normalized_question = question.strip() if question is not None else None
+        if normalized_question == "":
+            normalized_question = None
+        if normalized_question is not None and len(normalized_question) > 2_000:
+            raise AnalysisInvalidRequestError("analysis request is invalid")
+        canonical_inputs = _canonical_trace_inputs(inputs)
+        typed_profile: Literal["auto", "startup", "scroll"] = analysis_profile  # type: ignore[assignment]
+        request_hash = canonical_trace_analysis_request_hash(
+            analysis_profile=typed_profile,
+            question=normalized_question,
+            inputs=canonical_inputs,
+        )
+        return await _repository_call(
+            lambda: self._repository.create_trace_analysis(
+                team_id=team_id,
+                requested_by_user_id=requested_by_user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                candidate_analysis_id=self._uuid_source(),
+                analysis_profile=typed_profile,
+                question=normalized_question,
+                inputs=canonical_inputs,
                 now=self._clock(),
             )
         )
@@ -1119,7 +1254,7 @@ class SQLAlchemyAnalysisRepository:
         team_id: UUID,
         idempotency_key: str,
         request_hash: str,
-        analysis_mode: Literal["device", "memory_upload"],
+        analysis_mode: Literal["device", "trace_upload", "memory_upload"],
     ) -> CreationReservation:
         if not hmac.compare_digest(key.request_hash, request_hash):
             raise AnalysisIdempotencyConflictError(
@@ -1146,7 +1281,7 @@ class SQLAlchemyAnalysisRepository:
         team_id: UUID,
         idempotency_key: str,
         request_hash: str,
-        analysis_mode: Literal["device", "memory_upload"],
+        analysis_mode: Literal["device", "trace_upload", "memory_upload"],
     ) -> CreationReservation | None:
         existing = await session.scalar(
             select(IdempotencyKey)
@@ -1181,7 +1316,7 @@ class SQLAlchemyAnalysisRepository:
         team_id: UUID,
         idempotency_key: str,
         request_hash: str,
-        analysis_mode: Literal["device", "memory_upload"],
+        analysis_mode: Literal["device", "trace_upload", "memory_upload"],
     ) -> tuple[CreationReservation | None, TenantQuota | None]:
         locked_team_id = await session.scalar(
             select(Team.id).where(Team.id == team_id).with_for_update()
@@ -1204,13 +1339,14 @@ class SQLAlchemyAnalysisRepository:
         )
         return existing, quota
 
-    async def _reserve_memory_creation(
+    async def _reserve_direct_creation(
         self,
         *,
         team_id: UUID,
         idempotency_key: str,
         request_hash: str,
         candidate_analysis_id: UUID,
+        analysis_mode: Literal["trace_upload", "memory_upload"],
         now: datetime,
     ) -> CreationReservation:
         async with self._control_session_factory() as session:
@@ -1220,7 +1356,7 @@ class SQLAlchemyAnalysisRepository:
                     team_id=team_id,
                     idempotency_key=idempotency_key,
                     request_hash=request_hash,
-                    analysis_mode="memory_upload",
+                    analysis_mode=analysis_mode,
                 )
                 if existing is not None:
                     return existing
@@ -1230,7 +1366,7 @@ class SQLAlchemyAnalysisRepository:
                     team_id=team_id,
                     idempotency_key=idempotency_key,
                     request_hash=request_hash,
-                    analysis_mode="memory_upload",
+                    analysis_mode=analysis_mode,
                 )
                 if existing is not None:
                     return existing
@@ -1239,7 +1375,7 @@ class SQLAlchemyAnalysisRepository:
                     id=candidate_analysis_id,
                     team_id=team_id,
                     idempotency_key=idempotency_key,
-                    analysis_mode="memory_upload",
+                    analysis_mode=analysis_mode,
                     state="creating",
                     input_artifact_id=None,
                     required_abi=None,
@@ -1272,7 +1408,7 @@ class SQLAlchemyAnalysisRepository:
                     version=job.version,
                 )
 
-    async def _complete_memory_creation(
+    async def _complete_direct_creation(
         self,
         *,
         team_id: UUID,
@@ -1280,6 +1416,7 @@ class SQLAlchemyAnalysisRepository:
         idempotency_key: str,
         request_hash: str,
         expected_version: int,
+        analysis_mode: Literal["trace_upload", "memory_upload"],
         now: datetime,
     ) -> None:
         async with self._control_session_factory() as session:
@@ -1294,7 +1431,7 @@ class SQLAlchemyAnalysisRepository:
                 )
                 if (
                     job is None
-                    or job.analysis_mode != "memory_upload"
+                    or job.analysis_mode != analysis_mode
                     or job.idempotency_key != idempotency_key
                 ):
                     raise AnalysisUnavailableError("analysis creation state is unavailable")
@@ -1378,11 +1515,12 @@ class SQLAlchemyAnalysisRepository:
             if application_version is None:
                 raise AnalysisNotFoundError("application version was not found")
 
-            reservation = await self._reserve_memory_creation(
+            reservation = await self._reserve_direct_creation(
                 team_id=team_id,
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
                 candidate_analysis_id=candidate_analysis_id,
+                analysis_mode="memory_upload",
                 now=now,
             )
             await session.execute(
@@ -1409,12 +1547,79 @@ class SQLAlchemyAnalysisRepository:
             ):
                 raise AnalysisUnavailableError("tenant analysis state is unavailable")
 
-        await self._complete_memory_creation(
+        await self._complete_direct_creation(
             team_id=team_id,
             analysis_id=reservation.analysis_id,
             idempotency_key=idempotency_key,
             request_hash=request_hash,
             expected_version=reservation.version,
+            analysis_mode="memory_upload",
+            now=now,
+        )
+        return await self.load_view(
+            team_id=team_id,
+            analysis_id=reservation.analysis_id,
+            now=now,
+        )
+
+    async def create_trace_analysis(
+        self,
+        *,
+        team_id: UUID,
+        requested_by_user_id: UUID,
+        idempotency_key: str,
+        request_hash: str,
+        candidate_analysis_id: UUID,
+        analysis_profile: Literal["auto", "startup", "scroll"],
+        question: str | None,
+        inputs: tuple[dict[str, object], ...],
+        now: datetime,
+    ) -> AnalysisView:
+        reservation = await self._reserve_direct_creation(
+            team_id=team_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            candidate_analysis_id=candidate_analysis_id,
+            analysis_mode="trace_upload",
+            now=now,
+        )
+        manifest = [dict(item) for item in inputs]
+        async with self._tenant_router.session(team_id) as session:
+            await session.execute(
+                postgresql_insert(Analysis)
+                .values(
+                    id=reservation.analysis_id,
+                    application_version_id=None,
+                    requested_by_user_id=requested_by_user_id,
+                    analysis_mode="trace_upload",
+                    question=question,
+                    analysis_profile=analysis_profile,
+                    input_manifest=manifest,
+                    state="created",
+                    version=1,
+                )
+                .on_conflict_do_nothing(index_elements=(Analysis.id,))
+            )
+            tenant_analysis = await session.get(Analysis, reservation.analysis_id)
+            if (
+                tenant_analysis is None
+                or tenant_analysis.analysis_mode != "trace_upload"
+                or tenant_analysis.application_version_id is not None
+                or tenant_analysis.question != question
+                or tenant_analysis.analysis_profile != analysis_profile
+                or tenant_analysis.input_manifest != manifest
+                or tenant_analysis.tombstoned_at is not None
+                or tenant_analysis.state == "deleted"
+            ):
+                raise AnalysisUnavailableError("tenant analysis state is unavailable")
+
+        await self._complete_direct_creation(
+            team_id=team_id,
+            analysis_id=reservation.analysis_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            expected_version=reservation.version,
+            analysis_mode="trace_upload",
             now=now,
         )
         return await self.load_view(
@@ -1752,6 +1957,61 @@ class SQLAlchemyAnalysisRepository:
                 ).all()
             )
 
+        if job.analysis_mode != tenant_analysis.analysis_mode:
+            raise AnalysisUnavailableError("tenant analysis state is unavailable")
+        if job.analysis_mode == "trace_upload":
+            stored_manifest = tenant_analysis.input_manifest
+            question = tenant_analysis.question
+            if (
+                tenant_analysis.application_version_id is not None
+                or application_version is not None
+                or artifact is not None
+                or children
+                or tenant_scenarios
+                or sample_attempts
+                or report_versions
+                or lease is not None
+                or tenant_analysis.analysis_profile not in ("auto", "startup", "scroll")
+                or not isinstance(stored_manifest, list)
+                or not all(isinstance(item, dict) for item in stored_manifest)
+                or question is not None
+                and (not question or question != question.strip() or len(question) > 2_000)
+            ):
+                raise AnalysisUnavailableError("trace analysis state is unavailable")
+            try:
+                canonical_manifest = _canonical_trace_inputs(tuple(stored_manifest))
+            except AnalysisInvalidRequestError:
+                raise AnalysisUnavailableError("trace analysis state is unavailable") from None
+            if list(canonical_manifest) != stored_manifest:
+                raise AnalysisUnavailableError("trace analysis state is unavailable")
+            return AnalysisView(
+                analysis_id=job.id,
+                team_id=job.team_id,
+                analysis_mode="trace_upload",
+                state=job.state,
+                version=job.version,
+                application_version_id=None,
+                application_metadata=None,
+                apk_upload=None,
+                scenarios=(),
+                sample_verdict_counts=SampleVerdictCounts(
+                    valid=0,
+                    invalid=0,
+                    pending=0,
+                    validation_error=0,
+                    total=0,
+                ),
+                active_lease=None,
+                report_available=False,
+                created_at=job.created_at,
+                started_at=job.started_at,
+                completed_at=job.completed_at,
+                failure_code=job.failure_code,
+                question=question,
+                analysis_profile=tenant_analysis.analysis_profile,  # type: ignore[arg-type]
+                input_uploads=(),
+            )
+
         children_by_type = {child.scenario_type: child for child in children}
         if len(children_by_type) != len(children):
             raise AnalysisUnavailableError("analysis child state is unavailable")
@@ -1809,8 +2069,6 @@ class SQLAlchemyAnalysisRepository:
         if children_by_type:
             raise AnalysisUnavailableError("analysis child state is unavailable")
 
-        if job.analysis_mode != tenant_analysis.analysis_mode:
-            raise AnalysisUnavailableError("tenant analysis state is unavailable")
         application_metadata = self._application_metadata(application_version)
         if tenant_analysis.application_version_id is not None and application_metadata is None:
             raise AnalysisUnavailableError("application metadata is unavailable")

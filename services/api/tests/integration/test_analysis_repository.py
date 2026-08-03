@@ -60,6 +60,7 @@ from perfpilot_api.services.analyses import (
     StaleTaskVersionError,
     canonical_analysis_request_hash,
     canonical_memory_analysis_request_hash,
+    canonical_trace_analysis_request_hash,
     scenario_job_id,
 )
 
@@ -514,6 +515,39 @@ async def _create_memory_analysis(
     )
 
 
+async def _create_trace_analysis(
+    database: AnalysisDatabases,
+    *,
+    analysis_id: UUID = ANALYSIS_ID,
+    idempotency_key: str = "trace-analysis-create-1",
+    question: str | None = "为什么滑动卡顿？",
+):
+    inputs: tuple[dict[str, object], ...] = (
+        {
+            "kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 4,
+            "sha256_b64": CHECKSUM,
+        },
+    )
+    request_hash = canonical_trace_analysis_request_hash(
+        analysis_profile="auto",
+        question=question,
+        inputs=inputs,
+    )
+    return await database.repository.create_trace_analysis(
+        team_id=TEAM_ID,
+        requested_by_user_id=USER_ID,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        candidate_analysis_id=analysis_id,
+        analysis_profile="auto",
+        question=question,
+        inputs=inputs,
+        now=NOW,
+    )
+
+
 async def _create_device_analysis_graph(
     database: AnalysisDatabases,
     repository: SQLAlchemyAnalysisRepository,
@@ -889,6 +923,65 @@ async def test_creation_resumes_after_tenant_parent_without_duplicate_rows(
     assert key is not None and key.state == "completed" and key.version == 2
     assert tenant_parent is not None and tenant_parent.state == "created"
     assert tenant_count == 1
+
+
+@pytest.mark.asyncio
+async def test_trace_creation_persists_tenant_manifest_without_device_side_effects(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    first = await _create_trace_analysis(analysis_databases)
+    replay = await _create_trace_analysis(
+        analysis_databases,
+        analysis_id=OTHER_ANALYSIS_ID,
+    )
+
+    assert replay == first
+    assert first.analysis_id == ANALYSIS_ID
+    assert first.analysis_mode == "trace_upload"
+    assert first.analysis_profile == "auto"
+    assert first.question == "为什么滑动卡顿？"
+    assert first.application_version_id is None
+    assert first.apk_upload is None
+    assert first.scenarios == ()
+    assert first.input_uploads == ()
+
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        job_count = await session.scalar(select(func.count()).select_from(GlobalJob))
+        key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
+        scenario_job_count = await session.scalar(select(func.count()).select_from(ScenarioJob))
+        execution_count = await session.scalar(select(func.count()).select_from(EngineExecution))
+        outbox_count = await session.scalar(select(func.count()).select_from(OutboxEvent))
+    assert job is not None
+    assert (job.analysis_mode, job.state, job.device_migration_allowed) == (
+        "trace_upload",
+        "created",
+        False,
+    )
+    assert (job_count, key_count, scenario_job_count, execution_count, outbox_count) == (
+        1,
+        1,
+        0,
+        0,
+        0,
+    )
+
+    async with analysis_databases.tenant_sessions() as session:
+        analysis = await session.get(Analysis, ANALYSIS_ID)
+        artifact_count = await session.scalar(select(func.count()).select_from(Artifact))
+        scenario_count = await session.scalar(select(func.count()).select_from(ScenarioResult))
+    assert analysis is not None
+    assert analysis.analysis_profile == "auto"
+    assert analysis.input_manifest == [
+        {
+            "kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 4,
+            "sha256_b64": CHECKSUM,
+        }
+    ]
+    assert analysis.question == "为什么滑动卡顿？"
+    assert (artifact_count, scenario_count) == (0, 0)
 
 
 @pytest.mark.asyncio

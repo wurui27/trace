@@ -171,6 +171,15 @@ class Analysis(
             "(apk_inspection_token IS NOT NULL AND apk_inspection_claimed_at IS NOT NULL)",
             name="ck_analyses_apk_inspection_claim",
         ),
+        CheckConstraint(
+            "(analysis_mode = 'trace_upload' "
+            "AND analysis_profile IN ('auto', 'startup', 'scroll') "
+            "AND input_manifest IS NOT NULL "
+            "AND jsonb_typeof(input_manifest) = 'array') OR "
+            "(analysis_mode <> 'trace_upload' "
+            "AND analysis_profile IS NULL AND input_manifest IS NULL)",
+            name="ck_analyses_trace_input_metadata",
+        ),
         CheckConstraint("version > 0", name="ck_analyses_version_positive"),
         Index("ix_analyses_application_version_id", "application_version_id"),
         Index("ix_analyses_state_created", "state", "created_at"),
@@ -185,6 +194,8 @@ class Analysis(
     requested_by_user_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     analysis_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     question: Mapped[str | None] = mapped_column(String(2000))
+    analysis_profile: Mapped[str | None] = mapped_column(String(32))
+    input_manifest: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

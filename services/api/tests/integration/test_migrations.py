@@ -298,6 +298,17 @@ def test_engine_execution_orm_uses_external_run_identifiers_and_tenant_version()
     assert execution.tenant_resource_version == 7
 
 
+def test_trace_analysis_orm_keeps_profile_and_manifest_in_the_tenant_database() -> None:
+    from perfpilot_api.db.control.models import GlobalJob
+    from perfpilot_api.db.tenant.models import Analysis
+
+    tenant_columns = set(Analysis.__table__.columns.keys())
+    control_columns = set(GlobalJob.__table__.columns.keys())
+
+    assert {"analysis_profile", "input_manifest"} <= tenant_columns
+    assert {"analysis_profile", "input_manifest"}.isdisjoint(control_columns)
+
+
 @pytest.mark.parametrize("tree", ["control", "tenant"])
 def test_migration_env_disposes_engine_in_a_finally_block(tree: _MigrationTree) -> None:
     source = (_MIGRATIONS_ROOT / tree / "env.py").read_text()
@@ -1197,7 +1208,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
     ("tree", "downgrade_revision", "head_revision"),
     [
         ("control", "0004_external_engine_foundation", "0006_engine_tenant_version"),
-        ("tenant", "0003_analysis_orchestration", "0004_memory_upload_mode"),
+        ("tenant", "0003_analysis_orchestration", "0005_trace_upload_inputs"),
     ],
 )
 def test_memory_upload_downgrade_refuses_existing_rows(
@@ -1261,7 +1272,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "tenant",
             "0003_analysis_orchestration",
-            "0004_memory_upload_mode",
+            "0005_trace_upload_inputs",
             "analyses",
             "ck_analyses_mode",
         ),
@@ -1607,7 +1618,7 @@ def test_tenant_task7_downgrade_serializes_with_concurrent_metadata_writers(
     }
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0004_memory_upload_mode"
+            "0005_trace_upload_inputs"
         )
 
 

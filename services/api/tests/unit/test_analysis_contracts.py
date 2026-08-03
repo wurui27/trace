@@ -241,6 +241,81 @@ def test_memory_create_request_is_closed_without_raw_question_length_limit() -> 
             validator.validate(mutation)
 
 
+def test_trace_create_request_requires_one_trace_and_closes_each_input_kind() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/create-request.schema.json", schemas)
+    payload = {
+        "schema_version": "1.0",
+        "analysis_mode": "trace_upload",
+        "analysis_profile": "auto",
+        "question": "为什么滑动卡顿？",
+        "inputs": [
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4_096,
+                "sha256_b64": _sha(),
+            },
+            {
+                "kind": "mapping",
+                "mime": "text/plain",
+                "size": 1_024,
+                "sha256_b64": "A" * 42 + "E=",
+            },
+        ],
+    }
+
+    validator.validate(payload)
+    validator.validate({**payload, "analysis_profile": "startup", "question": None})
+    validator.validate(
+        {
+            **payload,
+            "analysis_profile": "scroll",
+            "inputs": list(reversed(payload["inputs"])),
+        }
+    )
+
+    invalid_payloads = (
+        {**payload, "analysis_profile": "memory"},
+        {**payload, "inputs": payload["inputs"][1:]},
+        {**payload, "inputs": [payload["inputs"][0], payload["inputs"][0]]},
+        {
+            **payload,
+            "inputs": [
+                *payload["inputs"],
+                {
+                    "kind": "mapping",
+                    "mime": "text/plain",
+                    "size": 2_048,
+                    "sha256_b64": _sha(),
+                },
+            ],
+        },
+        {
+            **payload,
+            "inputs": [
+                {
+                    **payload["inputs"][0],
+                    "kind": "unknown",
+                }
+            ],
+        },
+        {
+            **payload,
+            "inputs": [
+                {
+                    **payload["inputs"][0],
+                    "sha256_b64": "not-a-checksum",
+                }
+            ],
+        },
+        {**payload, "unexpected": True},
+    )
+    for mutation in invalid_payloads:
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(mutation)
+
+
 def test_memory_question_whitespace_matches_python_strip_across_regex_runtimes() -> None:
     schemas = _schemas()
     schema = schemas["contracts/v1/analyses/create-request.schema.json"]

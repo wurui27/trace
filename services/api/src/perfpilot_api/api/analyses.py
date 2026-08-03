@@ -69,8 +69,42 @@ class CreateMemoryAnalysisRequest(BaseModel):
     question: str | None = None
 
 
+class TraceAnalysisInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: Literal[
+        "trace",
+        "memory_evidence",
+        "apk",
+        "source_archive",
+        "mapping",
+        "native_symbols",
+        "log",
+    ]
+    mime: str = Field(
+        min_length=3,
+        max_length=255,
+        pattern=(
+            r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/"
+            r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
+        ),
+    )
+    size: int = Field(strict=True, ge=1, le=_MAX_UPLOAD_BYTES)
+    sha256_b64: str = Field(pattern=_SHA256_PATTERN)
+
+
+class CreateTraceAnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    analysis_mode: Literal["trace_upload"]
+    analysis_profile: Literal["auto", "startup", "scroll"]
+    question: str | None = None
+    inputs: tuple[TraceAnalysisInput, ...] = Field(min_length=1, max_length=7)
+
+
 CreateAnalysisRequest = Annotated[
-    CreateDeviceAnalysisRequest | CreateMemoryAnalysisRequest,
+    CreateDeviceAnalysisRequest | CreateMemoryAnalysisRequest | CreateTraceAnalysisRequest,
     Field(discriminator="analysis_mode"),
 ]
 
@@ -230,6 +264,8 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
         if (
             view.apk_upload is None
             or view.question is not None
+            or view.analysis_profile is not None
+            or view.input_uploads
             or tuple(item.scenario_type for item in view.scenarios)
             != ("cold_start", "scroll", "memory_cycle")
         ):
@@ -242,6 +278,20 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
             or view.scenarios
             or view.active_lease is not None
             or view.report_available
+            or (view.question is not None and len(view.question) > 2_000)
+            or view.analysis_profile is not None
+            or view.input_uploads
+            or view.sample_verdict_counts.total != 0
+        ):
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    elif view.analysis_mode == "trace_upload":
+        if (
+            view.application_version_id is not None
+            or view.application_metadata is not None
+            or view.apk_upload is not None
+            or view.scenarios
+            or view.active_lease is not None
+            or view.analysis_profile not in ("auto", "startup", "scroll")
             or (view.question is not None and len(view.question) > 2_000)
             or view.sample_verdict_counts.total != 0
         ):
@@ -292,6 +342,10 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
     }
     if view.analysis_mode == "memory_upload":
         result["question"] = view.question
+    elif view.analysis_mode == "trace_upload":
+        result["analysis_profile"] = view.analysis_profile
+        result["question"] = view.question
+        result["input_uploads"] = [_apk_upload(slot) for slot in view.input_uploads]
     return result
 
 
@@ -330,6 +384,15 @@ async def create_analysis(
                 idempotency_key=idempotency_key,
                 application_version_id=payload.application_version_id,
                 question=payload.question,
+            )
+        elif payload.analysis_mode == "trace_upload":
+            view = await analysis_service.create_trace_analysis(
+                team_id=team_id,
+                requested_by_user_id=principal.user_id,
+                idempotency_key=idempotency_key,
+                analysis_profile=payload.analysis_profile,
+                question=payload.question,
+                inputs=tuple(item.model_dump(mode="json") for item in payload.inputs),
             )
         else:
             view = await analysis_service.create_device_analysis(

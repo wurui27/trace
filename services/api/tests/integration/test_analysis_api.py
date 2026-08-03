@@ -99,6 +99,19 @@ class FakeAnalysisService:
         )
         return view
 
+    async def create_trace_analysis(self, **kwargs: object) -> AnalysisView:
+        self.calls.append(("create_trace", kwargs))
+        if self.error is not None:
+            raise self.error
+        question = kwargs["question"]
+        normalized_question = str(question).strip() if question is not None else None
+        if normalized_question == "":
+            normalized_question = None
+        return _trace_created_view(
+            profile=str(kwargs["analysis_profile"]),
+            question=normalized_question,
+        )
+
     async def get_analysis(self, **kwargs: object) -> AnalysisView:
         self.calls.append(("get", kwargs))
         if self.error is not None:
@@ -236,6 +249,37 @@ def _memory_created_view(*, question: str | None) -> AnalysisView:
     )
 
 
+def _trace_created_view(*, profile: str, question: str | None) -> AnalysisView:
+    empty_counts = SampleVerdictCounts(
+        valid=0,
+        invalid=0,
+        pending=0,
+        validation_error=0,
+        total=0,
+    )
+    return AnalysisView(
+        analysis_id=ANALYSIS_ID,
+        team_id=TEAM_ID,
+        analysis_mode="trace_upload",
+        state="created",
+        version=2,
+        application_version_id=None,
+        application_metadata=None,
+        apk_upload=None,
+        scenarios=(),
+        sample_verdict_counts=empty_counts,
+        active_lease=None,
+        report_available=False,
+        created_at=NOW,
+        started_at=None,
+        completed_at=None,
+        failure_code=None,
+        question=question,
+        analysis_profile=profile,  # type: ignore[arg-type]
+        input_uploads=(),
+    )
+
+
 def _settings() -> Settings:
     return Settings(
         app_env="test",
@@ -313,6 +357,77 @@ def _memory_create_body(
     if extra is not None:
         payload.update(extra)
     return json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+
+
+def _trace_create_body() -> bytes:
+    return json.dumps(
+        {
+            "schema_version": "1.0",
+            "analysis_mode": "trace_upload",
+            "analysis_profile": "auto",
+            "question": "  为什么滑动卡顿？  ",
+            "inputs": [
+                {
+                    "kind": "trace",
+                    "mime": "application/octet-stream",
+                    "size": 4,
+                    "sha256_b64": CHECKSUM,
+                }
+            ],
+        },
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode()
+
+
+def test_create_trace_analysis_returns_direct_parent_without_device_side_effects() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    target = f"/v1/teams/{TEAM_ID}/analyses"
+    body = _trace_create_body()
+    headers = _headers(
+        method="POST",
+        target=target,
+        body=body,
+        request_id="req-trace-analysis-create",
+    )
+    headers["Idempotency-Key"] = "trace-analysis-1"
+
+    with _client(auth_service, analysis_service) as client:
+        response = client.post(target, content=body, headers=headers)
+
+    assert response.status_code == 201
+    Draft202012Validator(
+        json.loads(_ANALYSIS_RESPONSE_SCHEMA.read_text(encoding="utf-8")),
+        format_checker=FormatChecker(),
+    ).validate(response.json())
+    assert response.json()["analysis_mode"] == "trace_upload"
+    assert response.json()["analysis_profile"] == "auto"
+    assert response.json()["question"] == "为什么滑动卡顿？"
+    assert response.json()["input_uploads"] == []
+    assert response.json()["apk_upload"] is None
+    assert response.json()["scenarios"] == []
+    assert response.json()["active_lease"] is None
+    assert analysis_service.calls == [
+        (
+            "create_trace",
+            {
+                "team_id": TEAM_ID,
+                "requested_by_user_id": USER_ID,
+                "idempotency_key": "trace-analysis-1",
+                "analysis_profile": "auto",
+                "question": "  为什么滑动卡顿？  ",
+                "inputs": (
+                    {
+                        "kind": "trace",
+                        "mime": "application/octet-stream",
+                        "size": 4,
+                        "sha256_b64": CHECKSUM,
+                    },
+                ),
+            },
+        )
+    ]
 
 
 def test_create_memory_analysis_returns_private_question_without_upload_or_scenarios() -> None:

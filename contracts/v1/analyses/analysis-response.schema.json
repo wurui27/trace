@@ -27,7 +27,7 @@
     "schema_version": {"const": "1.0"},
     "analysis_id": {"type": "string", "format": "uuid"},
     "team_id": {"type": "string", "format": "uuid"},
-    "analysis_mode": {"enum": ["device", "memory_upload"]},
+    "analysis_mode": {"enum": ["device", "trace_upload", "memory_upload"]},
     "state": {
       "enum": [
         "creating",
@@ -91,6 +91,17 @@
         {"type": "string", "maxLength": 2000},
         {"type": "null"}
       ]
+    },
+    "analysis_profile": {"enum": ["auto", "startup", "scroll"]},
+    "input_uploads": {
+      "type": "array",
+      "maxItems": 7,
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/pendingInputUpload"},
+          {"$ref": "#/$defs/finalizedInputUpload"}
+        ]
+      }
     }
   },
   "allOf": [
@@ -133,7 +144,13 @@
             "scenarios": {"$ref": "#/$defs/deviceScenarios"}
           },
           "required": ["analysis_mode"],
-          "not": {"required": ["question"]}
+          "not": {
+            "anyOf": [
+              {"required": ["question"]},
+              {"required": ["analysis_profile"]},
+              {"required": ["input_uploads"]}
+            ]
+          }
         },
         {
           "properties": {
@@ -152,7 +169,47 @@
               ]
             }
           },
-          "required": ["analysis_mode", "question"]
+          "required": ["analysis_mode", "question"],
+          "not": {
+            "anyOf": [
+              {"required": ["analysis_profile"]},
+              {"required": ["input_uploads"]}
+            ]
+          }
+        },
+        {
+          "properties": {
+            "analysis_mode": {"const": "trace_upload"},
+            "application_version_id": {"type": "null"},
+            "application_metadata": {"type": "null"},
+            "apk_upload": {"type": "null"},
+            "scenarios": {"type": "array", "maxItems": 0},
+            "sample_verdict_counts": {"$ref": "#/$defs/zeroVerdictCounts"},
+            "active_lease": {"type": "null"},
+            "analysis_profile": {"enum": ["auto", "startup", "scroll"]},
+            "question": {
+              "oneOf": [
+                {"type": "string", "maxLength": 2000},
+                {"type": "null"}
+              ]
+            },
+            "input_uploads": {
+              "type": "array",
+              "maxItems": 7,
+              "items": {
+                "oneOf": [
+                  {"$ref": "#/$defs/pendingInputUpload"},
+                  {"$ref": "#/$defs/finalizedInputUpload"}
+                ]
+              }
+            }
+          },
+          "required": [
+            "analysis_mode",
+            "analysis_profile",
+            "question",
+            "input_uploads"
+          ]
         }
       ]
     }
@@ -242,6 +299,100 @@
       "properties": {
         "Content-Type": {"const": "application/vnd.android.package-archive"},
         "x-amz-checksum-sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "inputRequiredHeaders": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["Content-Type", "x-amz-checksum-sha256"],
+      "properties": {
+        "Content-Type": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
+        },
+        "x-amz-checksum-sha256": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "inputKind": {
+      "enum": [
+        "trace",
+        "memory_evidence",
+        "apk",
+        "source_archive",
+        "mapping",
+        "native_symbols",
+        "log"
+      ]
+    },
+    "pendingInputUpload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "upload_id",
+        "artifact_kind",
+        "mime",
+        "size",
+        "sha256_b64",
+        "expires_at"
+      ],
+      "properties": {
+        "state": {"const": "pending"},
+        "upload_id": {"type": "string", "format": "uuid"},
+        "artifact_kind": {"$ref": "#/$defs/inputKind"},
+        "mime": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
+        },
+        "size": {"type": "integer", "minimum": 1, "maximum": 5368709120},
+        "sha256_b64": {"$ref": "#/$defs/sha256"},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "put_url": {"type": "string", "format": "uri", "pattern": "^https://"},
+        "required_headers": {"$ref": "#/$defs/inputRequiredHeaders"}
+      },
+      "oneOf": [
+        {"required": ["put_url", "required_headers"]},
+        {
+          "not": {
+            "anyOf": [
+              {"required": ["put_url"]},
+              {"required": ["required_headers"]}
+            ]
+          }
+        }
+      ]
+    },
+    "finalizedInputUpload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "artifact_id",
+        "upload_id",
+        "artifact_kind",
+        "mime",
+        "size",
+        "sha256_b64",
+        "finalized_at"
+      ],
+      "properties": {
+        "state": {"const": "finalized"},
+        "artifact_id": {"type": "string", "format": "uuid"},
+        "upload_id": {"type": "string", "format": "uuid"},
+        "artifact_kind": {"$ref": "#/$defs/inputKind"},
+        "mime": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
+        },
+        "size": {"type": "integer", "minimum": 1, "maximum": 5368709120},
+        "sha256_b64": {"$ref": "#/$defs/sha256"},
+        "finalized_at": {"type": "string", "format": "date-time"}
       }
     },
     "pendingApkUpload": {

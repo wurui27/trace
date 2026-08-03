@@ -63,8 +63,10 @@ class FakeAnalysisRepository:
         self.release_calls: list[dict[str, object]] = []
         self.fail_calls: list[dict[str, object]] = []
         self.memory_calls: list[dict[str, object]] = []
+        self.trace_calls: list[dict[str, object]] = []
         self.created_modes: list[str] = []
         self.memory_records: dict[str, tuple[str, Any]] = {}
+        self.trace_records: dict[str, tuple[str, Any]] = {}
         self.missing_application_versions: set[UUID] = set()
         self.prepared_scenarios = _prepared_scenarios()
         from perfpilot_api.services.analyses import FinalizationPreparation
@@ -165,6 +167,30 @@ class FakeAnalysisRepository:
             question=kwargs["question"],
         )
         self.memory_records[key] = (request_hash, view)
+        return view
+
+    async def create_trace_analysis(self, **kwargs: object) -> Any:
+        from perfpilot_api.services.analyses import AnalysisIdempotencyConflictError
+
+        self.events.append("create_trace_analysis")
+        self.trace_calls.append(kwargs)
+        self.created_modes.append("trace_upload")
+        key = str(kwargs["idempotency_key"])
+        request_hash = str(kwargs["request_hash"])
+        stored = self.trace_records.get(key)
+        if stored is not None:
+            stored_hash, view = stored
+            if stored_hash != request_hash:
+                raise AnalysisIdempotencyConflictError("idempotency key was reused")
+            return view
+        view = replace(
+            _analysis_view(),
+            analysis_mode="trace_upload",
+            question=kwargs["question"],
+            analysis_profile=kwargs["analysis_profile"],
+            input_uploads=(),
+        )
+        self.trace_records[key] = (request_hash, view)
         return view
 
 
@@ -314,6 +340,35 @@ async def _create_memory(
     )
 
 
+async def _create_trace(
+    service: Any,
+    *,
+    idempotency_key: str = "trace-analysis-1",
+    analysis_profile: str = "auto",
+    question: str | None = "为什么滑动卡顿？",
+    inputs: tuple[dict[str, object], ...] | None = None,
+) -> Any:
+    return await service.create_trace_analysis(
+        team_id=TEAM_ID,
+        requested_by_user_id=USER_ID,
+        idempotency_key=idempotency_key,
+        analysis_profile=analysis_profile,
+        question=question,
+        inputs=(
+            inputs
+            if inputs is not None
+            else (
+                {
+                    "kind": "trace",
+                    "mime": "application/octet-stream",
+                    "size": 4,
+                    "sha256_b64": CHECKSUM,
+                },
+            )
+        ),
+    )
+
+
 async def _finalize(service: Any) -> Any:
     return await service.finalize_device_upload(
         team_id=TEAM_ID,
@@ -322,6 +377,110 @@ async def _finalize(service: Any) -> Any:
         caller_sha256_b64=CHECKSUM,
         caller_size=4,
     )
+
+
+@pytest.mark.asyncio
+async def test_create_trace_analysis_canonicalizes_inputs_and_question() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    service = _service(repository, FakeUploadService(events), FakeApkInspector(events))
+    inputs = (
+        {
+            "kind": "mapping",
+            "mime": "text/plain",
+            "size": 2,
+            "sha256_b64": OTHER_CHECKSUM,
+        },
+        {
+            "kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 4,
+            "sha256_b64": CHECKSUM,
+        },
+    )
+
+    view = await _create_trace(
+        service,
+        question="  为什么滑动卡顿？  ",
+        inputs=inputs,
+    )
+
+    assert view.analysis_mode == "trace_upload"
+    assert view.analysis_profile == "auto"
+    assert view.question == "为什么滑动卡顿？"
+    assert repository.trace_calls[0]["inputs"] == tuple(reversed(inputs))
+    assert repository.trace_calls[0]["candidate_analysis_id"] == CANDIDATE_ONE
+    assert events == ["create_trace_analysis"]
+
+
+@pytest.mark.asyncio
+async def test_create_trace_analysis_replays_reordered_inputs_with_same_hash() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    service = _service(repository, FakeUploadService(events), FakeApkInspector(events))
+    trace = {
+        "kind": "trace",
+        "mime": "application/octet-stream",
+        "size": 4,
+        "sha256_b64": CHECKSUM,
+    }
+    mapping = {
+        "kind": "mapping",
+        "mime": "text/plain",
+        "size": 2,
+        "sha256_b64": OTHER_CHECKSUM,
+    }
+
+    first = await _create_trace(service, inputs=(trace, mapping))
+    replay = await _create_trace(service, inputs=(mapping, trace))
+
+    assert replay is first
+    assert len({str(call["request_hash"]) for call in repository.trace_calls}) == 1
+
+
+@pytest.mark.parametrize(
+    "inputs",
+    (
+        (),
+        (
+            {
+                "kind": "mapping",
+                "mime": "text/plain",
+                "size": 2,
+                "sha256_b64": CHECKSUM,
+            },
+        ),
+        (
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4,
+                "sha256_b64": CHECKSUM,
+            },
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 5,
+                "sha256_b64": OTHER_CHECKSUM,
+            },
+        ),
+    ),
+)
+@pytest.mark.asyncio
+async def test_create_trace_analysis_rejects_invalid_input_sets_before_side_effects(
+    inputs: tuple[dict[str, object], ...],
+) -> None:
+    from perfpilot_api.services.analyses import AnalysisInvalidRequestError
+
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    service = _service(repository, FakeUploadService(events), FakeApkInspector(events))
+
+    with pytest.raises(AnalysisInvalidRequestError, match="analysis request is invalid"):
+        await _create_trace(service, inputs=inputs)
+
+    assert repository.trace_calls == []
+    assert events == []
 
 
 @pytest.mark.asyncio
