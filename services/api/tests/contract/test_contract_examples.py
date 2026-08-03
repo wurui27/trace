@@ -121,3 +121,39 @@ def test_trace_v11_completed_synthesis_requires_full_design_provenance() -> None
         },
     }
     report_schema.validate(trace_ai)
+
+
+def test_public_synthesis_reference_limits_match_private_output() -> None:
+    private_schema = validator(load("contracts/v1/ai/synthesis-output.schema.json"))
+    private_output = load("contracts/v1/examples/synthesis-output.valid.json")
+    references = [f"8a000000-0000-4000-8000-{index:012d}" for index in range(1, 22)]
+    private_output["top_findings"][0]["evidence_ids"] = references
+    with pytest.raises(jsonschema.ValidationError):
+        private_schema.validate(private_output)
+
+    report_schema = validator(load("contracts/v1/reports/analysis-report.schema.json"))
+    trace_ai = load("contracts/v1/examples/analysis-report.trace-ai.valid.json")
+    trace_ai["synthesis"] = {
+        "state": "completed",
+        "output": private_output,
+        "synthesis_artifact_id": "88000000-0000-4000-8000-000000000001",
+        "failure_code": None,
+        "provenance": {
+            "provider_protocol": "chat-completions-json-schema-v1",
+            "provider_name": "approved-provider",
+            "model": "approved-model",
+            "prompt_template_version": "1.0.0",
+            "prompt_template_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "normalizer_version": "smartperfetto-normalizer-1",
+            "report_worker_image_digest": "sha256:" + "1" * 64,
+            "projection_artifact_id": "89000000-0000-4000-8000-000000000001",
+            "projection_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "generated_at": "2026-08-03T12:00:00Z",
+            "prompt_tokens": 100,
+            "completion_tokens": 200,
+            "total_tokens": 300,
+            "generation": 1,
+        },
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        report_schema.validate(trace_ai)
