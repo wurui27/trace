@@ -16,8 +16,13 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
-_TIMESTAMP_STATE_CHECK = "(" \
+_SYNTHESIS_TIMESTAMP_STATE_CHECK = "(" \
     "(state = 'pending' AND started_at IS NULL AND completed_at IS NULL) OR " \
+    "(state = 'running' AND started_at IS NOT NULL AND completed_at IS NULL) OR " \
+    "(state IN ('succeeded', 'failed', 'canceled') AND started_at IS NOT NULL " \
+    "AND completed_at IS NOT NULL AND completed_at >= started_at)" \
+")"
+_INVOCATION_TIMESTAMP_STATE_CHECK = "(" \
     "(state = 'running' AND started_at IS NOT NULL AND completed_at IS NULL) OR " \
     "(state IN ('succeeded', 'failed') AND started_at IS NOT NULL " \
     "AND completed_at IS NOT NULL AND completed_at >= started_at)" \
@@ -125,10 +130,13 @@ def upgrade() -> None:
             name="ck_synthesis_executions_attempt_count_range",
         ),
         sa.CheckConstraint(
-            "state IN ('pending', 'running', 'succeeded', 'failed')",
+            "state IN ('pending', 'running', 'succeeded', 'failed', 'canceled')",
             name="ck_synthesis_executions_state",
         ),
-        sa.CheckConstraint(_TIMESTAMP_STATE_CHECK, name="ck_synthesis_executions_timestamps"),
+        sa.CheckConstraint(
+            _SYNTHESIS_TIMESTAMP_STATE_CHECK,
+            name="ck_synthesis_executions_timestamps",
+        ),
         sa.CheckConstraint(
             "request_fingerprint ~ '^[0-9a-f]{64}$'",
             name="ck_synthesis_executions_request_fingerprint",
@@ -222,7 +230,10 @@ def upgrade() -> None:
             "state IN ('running', 'succeeded', 'failed')",
             name="ck_ai_invocations_state",
         ),
-        sa.CheckConstraint(_TIMESTAMP_STATE_CHECK, name="ck_ai_invocations_timestamps"),
+        sa.CheckConstraint(
+            _INVOCATION_TIMESTAMP_STATE_CHECK,
+            name="ck_ai_invocations_timestamps",
+        ),
         sa.CheckConstraint(
             "request_fingerprint ~ '^[0-9a-f]{64}$'",
             name="ck_ai_invocations_request_fingerprint",

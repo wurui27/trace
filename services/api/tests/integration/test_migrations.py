@@ -1477,6 +1477,15 @@ def test_control_ai_synthesis_constraints_reject_inconsistent_metadata(
             "completed_at": None,
         }
         connection.execute(synthesis_insert, valid_synthesis)
+        canceled_synthesis = valid_synthesis | {
+            "id": uuid4(),
+            "generation": 2,
+            "state": "canceled",
+            "attempt_count": 1,
+            "started_at": "2026-08-03T00:00:00+00:00",
+            "completed_at": "2026-08-03T00:00:01+00:00",
+        }
+        connection.execute(synthesis_insert, canceled_synthesis)
 
         for overrides in (
             {"id": uuid4(), "generation": 0},
@@ -1488,6 +1497,21 @@ def test_control_ai_synthesis_constraints_reject_inconsistent_metadata(
             with pytest.raises(IntegrityError):
                 with connection.begin_nested():
                     connection.execute(synthesis_insert, valid_synthesis | overrides)
+
+        with pytest.raises(IntegrityError, match="ck_synthesis_executions_timestamps"):
+            with connection.begin_nested():
+                connection.execute(
+                    synthesis_insert,
+                    valid_synthesis
+                    | {
+                        "id": uuid4(),
+                        "generation": 3,
+                        "state": "canceled",
+                        "attempt_count": 1,
+                        "started_at": "2026-08-03T00:00:01+00:00",
+                        "completed_at": "2026-08-03T00:00:00+00:00",
+                    },
+                )
 
         invocation_insert = text(
             "INSERT INTO ai_invocations "
