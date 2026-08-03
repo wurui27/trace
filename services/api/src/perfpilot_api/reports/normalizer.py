@@ -11,7 +11,10 @@ from dataclasses import dataclass, field
 from uuid import UUID, uuid5
 
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
-from perfpilot_api.services.canonical_result_reader import LoadedCanonicalResult
+from perfpilot_api.services.canonical_result_reader import (
+    LoadedCanonicalResult,
+    validated_canonical_document,
+)
 
 
 _NORMALIZED_REPORT_NAMESPACE = UUID("71c6af46-884d-5b2b-9453-1e2b0e7be879")
@@ -163,7 +166,7 @@ def _claims(report: Mapping[str, object]) -> dict[str, dict[str, object]]:
 
 
 def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
-    document = _mapping(source.document)
+    document = _mapping(validated_canonical_document(source))
     engine, result = _mapping(document.get("engine")), _mapping(document.get("result"))
     if (
         document.get("schema_version") != "1.0"
@@ -206,9 +209,16 @@ def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
     if not permitted_evidence.issubset(evidence_by_id):
         raise _fail()
     scenario_reports: list[dict[str, object]] = []
+    metric_source_ids: set[str] = set()
     for scenario_type, envelope in envelopes.items():
         evidence = [_evidence(source.analysis_id, evidence_by_id[item], item, source.artifact_id) for item in permitted_evidence if item in { _id(value.get("id")) for value in _sequence(envelope.get("evidence")) }]
-        metric_items = _metrics(source.analysis_id, envelope, evidence_by_id, permitted_evidence)
+        metric_items = _metrics(
+            source.analysis_id,
+            envelope,
+            evidence_by_id,
+            permitted_evidence,
+            metric_source_ids,
+        )
         scenario_reports.append({
             "scenario_id": str(_stable_id("scenario", source.analysis_id, str(envelope["id"]))),
             "scenario_type": scenario_type,
@@ -266,15 +276,30 @@ def _evidence(analysis_id: UUID, raw: Mapping[str, object], source_id: str, arti
     return {"evidence_id": str(_stable_id("evidence", analysis_id, source_id)), "source": _id(raw.get("source")), "query_id": _text(raw.get("queryId"), public=True, nullable=True), "interval_start_ns": _finite(raw.get("intervalStartNs"), nullable=True), "interval_end_ns": _finite(raw.get("intervalEndNs"), nullable=True), "artifact_id": str(artifact_id), "fields": copied}
 
 
-def _metrics(analysis_id: UUID, envelope: Mapping[str, object], evidence: Mapping[str, object], permitted: set[str]) -> list[dict[str, object]]:
+def _metrics(
+    analysis_id: UUID,
+    envelope: Mapping[str, object],
+    evidence: Mapping[str, object],
+    permitted: set[str],
+    global_source_ids: set[str],
+) -> list[dict[str, object]]:
     items: list[dict[str, object]] = []
     seen: set[str] = set()
+    envelope_evidence_ids = {_id(item.get("id")) for item in map(_mapping, _sequence(envelope.get("evidence")))}
     for raw in _sequence(envelope.get("columns")):
         column, source_id = _mapping(raw), _id(_mapping(raw).get("id"))
         evidence_id = _id(column.get("evidenceId"))
-        if column.get("type") != "metric@1" or source_id in seen or evidence_id not in evidence or evidence_id not in permitted:
+        if (
+            column.get("type") != "metric@1"
+            or source_id in seen
+            or source_id in global_source_ids
+            or evidence_id not in envelope_evidence_ids
+            or evidence_id not in evidence
+            or evidence_id not in permitted
+        ):
             raise _fail()
         seen.add(source_id)
+        global_source_ids.add(source_id)
         value = _finite(column.get("value"), nullable=True)
         unit = _text(column.get("unit"), nullable=True)
         if value is not None and unit is None:

@@ -4,6 +4,7 @@ import base64
 import hashlib
 import json
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 from uuid import UUID
 
@@ -73,6 +74,34 @@ def test_missing_measurement_value_is_insufficient_data_never_zero() -> None:
     metric = core["scenario_reports"][0]["metrics"][0]  # type: ignore[index]
     assert metric["status"] == "insufficient_data"
     assert metric["numeric_value"] is None
+
+
+def test_normalizer_reparses_authoritative_bytes_not_mutable_loaded_document() -> None:
+    source = _source()
+    expected = normalize_smartperfetto_result(source).canonical_bytes
+    source.document["result"] = {"state": "completed", "payload": {"report": {}}}
+    assert normalize_smartperfetto_result(source).canonical_bytes == expected
+
+
+def test_normalizer_rejects_forged_canonical_bytes_or_checksum() -> None:
+    source = _source()
+    for forged in (replace(source, canonical_bytes=b"{}"), replace(source, sha256_b64="x" * 44)):
+        with pytest.raises(SmartPerfettoNormalizationError, match="^SmartPerfetto result cannot be normalized$"):
+            normalize_smartperfetto_result(forged)
+
+
+@pytest.mark.parametrize("mutation", ["cross_scenario_evidence", "duplicate_metric_id"])
+def test_normalizer_rejects_cross_scenario_metric_evidence_and_global_metric_id_collisions(
+    mutation: str,
+) -> None:
+    document = json.loads(FIXTURE.read_text())
+    envelopes = _report(document)["dataEnvelopes"]  # type: ignore[index]
+    if mutation == "cross_scenario_evidence":
+        envelopes[0]["columns"][0]["evidenceId"] = "scroll-jank"
+    else:
+        envelopes[1]["columns"][0]["id"] = envelopes[0]["columns"][0]["id"]
+    with pytest.raises(SmartPerfettoNormalizationError, match="^SmartPerfetto result cannot be normalized$"):
+        normalize_smartperfetto_result(_source(document))
 
 
 @pytest.mark.parametrize("mutation", ["version", "nan", "duplicate", "unsupported"])

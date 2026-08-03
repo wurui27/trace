@@ -54,6 +54,42 @@ class LoadedCanonicalResult:
     canonical_bytes: bytes = field(repr=False)
 
 
+def validated_canonical_document(source: LoadedCanonicalResult) -> dict[str, object]:
+    """Defensively rebuild a loaded result from its pinned bytes only."""
+
+    try:
+        if (
+            not isinstance(source, LoadedCanonicalResult)
+            or not isinstance(source.canonical_bytes, bytes)
+            or not isinstance(source.sha256_b64, str)
+            or not all(
+                isinstance(value, UUID)
+                for value in (source.team_id, source.analysis_id, source.execution_id, source.artifact_id)
+            )
+            or type(source.tenant_resource_version) is not int
+            or source.tenant_resource_version < 1
+        ):
+            raise ValueError
+        checksum = base64.b64encode(hashlib.sha256(source.canonical_bytes).digest()).decode("ascii")
+        if not hmac.compare_digest(checksum, source.sha256_b64):
+            raise ValueError
+        document = json.loads(source.canonical_bytes)
+        if not isinstance(document, dict):
+            raise ValueError
+        _validator().validate(document)
+        if (
+            canonical_json_bytes(document) != source.canonical_bytes
+            or document.get("analysis_id") != str(source.analysis_id)
+            or document.get("execution_id") != str(source.execution_id)
+            or document.get("artifact_id") != str(source.artifact_id)
+            or document.get("tenant_resource_version") != source.tenant_resource_version
+        ):
+            raise ValueError
+        return document
+    except Exception:
+        raise CanonicalResultIntegrityError from None
+
+
 class _Execution(Protocol):
     id: UUID
     team_id: UUID
@@ -224,23 +260,9 @@ class CanonicalResultReader:
         return payload
 
     @staticmethod
-    def _parse(
-        payload: bytes,
-        *,
-        team_id: UUID,
-        analysis_id: UUID,
-        execution_id: UUID,
-        artifact_id: UUID,
-        tenant_resource_version: int,
-        execution: _Execution,
-    ) -> dict[str, object]:
+    def _parse(source: LoadedCanonicalResult, *, execution: _Execution) -> dict[str, object]:
         try:
-            document = json.loads(payload)
-            if not isinstance(document, dict):
-                raise ValueError
-            _validator().validate(document)
-            if canonical_json_bytes(document) != payload:
-                raise ValueError
+            document = validated_canonical_document(source)
             result = document["result"]
             engine = document["engine"]
             attempt = document["attempt"]
@@ -248,11 +270,7 @@ class CanonicalResultReader:
                 raise ValueError
             payload_hash = hashlib.sha256(canonical_json_bytes(result["payload"])).hexdigest()
             if (
-                document["analysis_id"] != str(analysis_id)
-                or document["execution_id"] != str(execution_id)
-                or document["artifact_id"] != str(artifact_id)
-                or document["tenant_resource_version"] != tenant_resource_version
-                or engine.get("engine_id") != execution.engine_id
+                engine.get("engine_id") != execution.engine_id
                 or engine.get("adapter_version") != execution.adapter_version
                 or engine.get("source_commit_sha") != execution.engine_commit_sha
                 or engine.get("image_digest") != execution.engine_image_digest
@@ -297,24 +315,26 @@ class CanonicalResultReader:
             asyncio.to_thread(self._read_sync, self._client, tenant=tenant, record=record)
         )
         await self._dependency(self._artifact_repository.require_resource_version(tenant))
-        document = self._parse(
-            payload,
-            team_id=team_id,
-            analysis_id=analysis_id,
-            execution_id=execution_id,
-            artifact_id=artifact_id,
-            tenant_resource_version=resource_version,
-            execution=execution,
-        )
-        return LoadedCanonicalResult(
+        loaded = LoadedCanonicalResult(
             team_id=team_id,
             analysis_id=analysis_id,
             execution_id=execution_id,
             artifact_id=artifact_id,
             tenant_resource_version=resource_version,
             sha256_b64=record.sha256_b64,
-            document=document,
+            document={},
             canonical_bytes=payload,
+        )
+        document = self._parse(loaded, execution=execution)
+        return LoadedCanonicalResult(
+            team_id=loaded.team_id,
+            analysis_id=loaded.analysis_id,
+            execution_id=loaded.execution_id,
+            artifact_id=loaded.artifact_id,
+            tenant_resource_version=loaded.tenant_resource_version,
+            sha256_b64=loaded.sha256_b64,
+            document=document,
+            canonical_bytes=loaded.canonical_bytes,
         )
 
 
@@ -323,4 +343,5 @@ __all__ = [
     "CanonicalResultReader",
     "CanonicalResultUnavailableError",
     "LoadedCanonicalResult",
+    "validated_canonical_document",
 ]
