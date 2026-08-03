@@ -352,13 +352,33 @@ def _oci(
     return OciAndroidMemoryWorker(**values)  # type: ignore[arg-type]
 
 
+class FakeDelayedTerminalWorker:
+    def __init__(self) -> None:
+        self.status_calls = 0
+
+    async def status(self, _run_id: str) -> str:
+        self.status_calls += 1
+        return "running" if self.status_calls <= 100 else "failed"
+
+
 async def _terminal(worker: object, run_id: str) -> str:
-    for _ in range(100):
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5.0
+    while True:
         state = await worker.status(run_id)  # type: ignore[attr-defined]
         if state != "running":
             return state
-        await asyncio.sleep(0)
-    raise AssertionError("worker did not reach a terminal state")
+        if loop.time() >= deadline:
+            raise AssertionError("worker did not reach a terminal state within 5.0 seconds")
+        await asyncio.sleep(0.001)
+
+
+@pytest.mark.asyncio
+async def test_terminal_wait_is_not_limited_by_scheduler_turn_count() -> None:
+    worker = FakeDelayedTerminalWorker()
+
+    assert await _terminal(worker, "memory-run-1") == "failed"
+    assert worker.status_calls == 101
 
 
 def test_worker_result_is_frozen_slots_and_worker_isolation_is_explicit(tmp_path: Path) -> None:
