@@ -16,6 +16,7 @@
     "db:generate": "drizzle-kit generate"
   },
   "dependencies": {
+    "@noble/hashes": "2.2.0",
     "drizzle-orm": "0.45.2",
     "lucide-react": "^1.26.0",
     "next": "16.2.6",

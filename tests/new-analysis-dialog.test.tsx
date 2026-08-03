@@ -9,7 +9,7 @@ import { NewAnalysisDialog } from "../app/components/new-analysis-dialog";
 afterEach(cleanup);
 
 describe("NewAnalysisDialog", () => {
-  it("opens, switches modes, and closes while managing page focus and scroll", async () => {
+  it("opens on the real Trace workflow and closes while managing focus and scroll", async () => {
     const user = userEvent.setup();
     const initialOverflow = document.body.style.overflow;
 
@@ -30,6 +30,9 @@ describe("NewAnalysisDialog", () => {
     ).toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "真机自动测试" }),
+    ).toBeDisabled();
+    expect(
+      screen.getByRole("button", { name: "上传 Trace 分析" }),
     ).toHaveAttribute("aria-pressed", "true");
     const closeButton = screen.getByRole("button", { name: "关闭" });
     const cancelButton = screen.getByRole("button", { name: "取消" });
@@ -43,21 +46,24 @@ describe("NewAnalysisDialog", () => {
     expect(closeButton).toHaveFocus();
 
     expect(document.body).toHaveStyle({ overflow: "hidden" });
-    expect(screen.getByText("选择 APK")).toBeInTheDocument();
-    expect(screen.getByText("选择真机")).toBeInTheDocument();
-    expect(screen.getByText("选择场景")).toBeInTheDocument();
-
-    await user.click(
-      screen.getByRole("button", { name: "上传 Trace 分析" }),
-    );
-
+    expect(screen.getByLabelText("分析重点")).toBeInTheDocument();
+    expect(screen.getByLabelText("补充问题（可选）")).toBeInTheDocument();
     expect(screen.getByLabelText("Trace 文件")).toBeRequired();
+    expect(screen.getByLabelText("内存证据（可选）")).not.toBeRequired();
     expect(screen.getByLabelText("APK 文件（可选）")).not.toBeRequired();
     expect(screen.getByLabelText("源码压缩包（可选）")).not.toBeRequired();
     expect(screen.getByLabelText("Mapping 文件（可选）")).not.toBeRequired();
     expect(
       screen.getByLabelText("Native Symbols（可选）"),
     ).not.toBeRequired();
+    expect(screen.getByLabelText("日志文件（可选）")).not.toBeRequired();
+    const startButton = screen.getByRole("button", { name: "开始分析" });
+    expect(startButton).toBeDisabled();
+    await user.upload(
+      screen.getByLabelText("Trace 文件"),
+      new File([new Uint8Array([1])], "trace.pb"),
+    );
+    expect(startButton).toBeEnabled();
 
     await user.click(screen.getByRole("button", { name: "关闭" }));
 
