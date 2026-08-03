@@ -177,6 +177,11 @@ async def _seed_tenant(
                 analysis_mode=analysis_mode,
                 state="created",
                 version=1,
+                **(
+                    {"analysis_profile": "auto", "input_manifest": []}
+                    if analysis_mode == "trace_upload"
+                    else {}
+                ),
             )
             for analysis_id, analysis_mode in analyses
         )
