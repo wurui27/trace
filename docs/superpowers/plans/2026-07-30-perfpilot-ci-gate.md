@@ -56,8 +56,21 @@ Load `.github/workflows/ci.yml` with `yaml.BaseLoader` and assert:
 9. `web` runs `npm ci`, `npm run lint`, and `npm test` from the repository root.
 10. `ci-gate` uses `always()`, needs all three jobs, and fails unless every
     dependency succeeded.
+11. No job or step sets `continue-on-error`; the three prerequisite jobs and
+    their steps have no `if`, while only the `ci-gate` job may use the exact
+    `if: ${{ always() }}` expression and its step has no `if`.
+12. No job defines `permissions`, so a job cannot override the exact top-level
+    `contents: read` policy.
+13. `python-quality`, `python-tests`, and `web` have no `needs` and therefore
+    remain independent.
+14. The workflow has no top-level `defaults`, the `web` job has no `defaults`,
+    and no Web step sets `working-directory`.
+15. `.github/workflows` contains exactly one workflow YAML file: `ci.yml`.
 
-The test must inspect the parsed YAML rather than searching raw text.
+The test must inspect the parsed YAML rather than searching raw text. It must
+also deep-copy the valid workflow, inject each forbidden policy weakening, and
+prove the policy helper rejects every mutation with `AssertionError`. A
+synthetic second workflow path must likewise be rejected.
 
 - [ ] **Step 2: Prove the red state**
 

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from copy import deepcopy
 from itertools import product
 from pathlib import Path
 
@@ -14,6 +15,45 @@ CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 SETUP_PYTHON_ACTION = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
 SETUP_UV_ACTION = "astral-sh/setup-uv@d0cc045d04ccac9d8b7881df0226f9e82c39688e"
 SETUP_NODE_ACTION = "actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020"
+PREREQUISITE_JOBS = ("python-quality", "python-tests", "web")
+
+
+def _assert_workflow_policy(workflow: dict[str, object]) -> None:
+    assert "defaults" not in workflow
+
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    for job_name, job in jobs.items():
+        assert isinstance(job, dict)
+        assert "continue-on-error" not in job, job_name
+        assert "permissions" not in job, job_name
+
+        steps = job["steps"]
+        assert isinstance(steps, list)
+        for step_index, step in enumerate(steps):
+            assert isinstance(step, dict)
+            assert "continue-on-error" not in step, (job_name, step_index)
+
+    for job_name in PREREQUISITE_JOBS:
+        job = jobs[job_name]
+        assert "needs" not in job, job_name
+        assert "if" not in job, job_name
+        for step_index, step in enumerate(job["steps"]):
+            assert "if" not in step, (job_name, step_index)
+
+    gate = jobs["ci-gate"]
+    assert gate.get("if") == "${{ always() }}"
+    for step_index, step in enumerate(gate["steps"]):
+        assert "if" not in step, ("ci-gate", step_index)
+
+    web = jobs["web"]
+    assert "defaults" not in web
+    for step_index, step in enumerate(web["steps"]):
+        assert "working-directory" not in step, ("web", step_index)
+
+
+def _assert_workflow_paths(workflow_paths: list[Path]) -> None:
+    assert workflow_paths == [WORKFLOW_PATH]
 
 
 @pytest.fixture(scope="module")
@@ -34,6 +74,116 @@ def _action_step(job: dict[str, object], action: str) -> dict[str, object]:
     steps = job["steps"]
     assert isinstance(steps, list)
     return next(step for step in steps if step.get("uses") == action)
+
+
+def _set_nested(
+    root: dict[str, object],
+    path: tuple[str | int, ...],
+    value: object,
+) -> None:
+    target: object = root
+    for segment in path[:-1]:
+        if isinstance(segment, int):
+            assert isinstance(target, list)
+            target = target[segment]
+        else:
+            assert isinstance(target, dict)
+            target = target[segment]
+
+    leaf = path[-1]
+    if isinstance(leaf, int):
+        assert isinstance(target, list)
+        target[leaf] = value
+    else:
+        assert isinstance(target, dict)
+        target[leaf] = value
+
+
+def test_actual_workflow_satisfies_strict_policy(workflow: dict[str, object]) -> None:
+    _assert_workflow_policy(workflow)
+
+
+def test_workflow_directory_contains_only_ci_workflow() -> None:
+    workflow_paths = sorted(
+        path
+        for path in WORKFLOW_PATH.parent.iterdir()
+        if path.suffix in {".yml", ".yaml"}
+    )
+    _assert_workflow_paths(workflow_paths)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        pytest.param(
+            ("jobs", "web", "continue-on-error"),
+            "true",
+            id="job-continue-on-error",
+        ),
+        pytest.param(
+            ("jobs", "ci-gate", "steps", 0, "continue-on-error"),
+            "true",
+            id="gate-step-continue-on-error",
+        ),
+        pytest.param(
+            ("jobs", "python-quality", "permissions"),
+            {"contents": "write"},
+            id="job-permissions",
+        ),
+        pytest.param(
+            ("jobs", "python-tests", "needs"),
+            ["python-quality"],
+            id="prerequisite-needs",
+        ),
+        pytest.param(
+            ("defaults",),
+            {"run": {"working-directory": "app"}},
+            id="workflow-working-directory",
+        ),
+        pytest.param(
+            ("jobs", "web", "defaults"),
+            {"run": {"working-directory": "app"}},
+            id="web-job-working-directory",
+        ),
+        pytest.param(
+            ("jobs", "web", "steps", 2, "working-directory"),
+            "app",
+            id="web-step-working-directory",
+        ),
+        pytest.param(
+            ("jobs", "python-tests", "if"),
+            "${{ false }}",
+            id="prerequisite-job-if",
+        ),
+        pytest.param(
+            ("jobs", "python-tests", "steps", 5, "if"),
+            "${{ false }}",
+            id="prerequisite-test-step-if",
+        ),
+        pytest.param(
+            ("jobs", "ci-gate", "steps", 0, "if"),
+            "${{ false }}",
+            id="gate-step-if",
+        ),
+    ],
+)
+def test_policy_rejects_execution_weakening(
+    workflow: dict[str, object],
+    path: tuple[str | int, ...],
+    value: object,
+) -> None:
+    weakened = deepcopy(workflow)
+    _set_nested(weakened, path, value)
+
+    with pytest.raises(AssertionError):
+        _assert_workflow_policy(weakened)
+
+
+def test_policy_rejects_a_second_workflow_file() -> None:
+    workflow_paths = [WORKFLOW_PATH, WORKFLOW_PATH.with_name("release.yml")]
+
+    with pytest.raises(AssertionError):
+        _assert_workflow_paths(workflow_paths)
 
 
 def test_workflow_has_required_triggers_permissions_and_concurrency(
