@@ -603,14 +603,31 @@ async def test_output_limit_and_symlink_output_fail_closed(tmp_path: Path) -> No
 
 
 @pytest.mark.asyncio
-async def test_timeout_kills_process_marks_failed_and_cleans(tmp_path: Path) -> None:
+async def test_timeout_kills_process_marks_timed_out_and_cleans(tmp_path: Path) -> None:
     factory = FakeProcessFactory(blocked=True)
     staged = _staged(tmp_path)
     worker = _local(tmp_path, factory)
     await worker.start(run_id="memory-run-1", staged=staged, question=None, timeout_seconds=0.001)  # type: ignore[arg-type]
-    assert await _terminal(worker, "memory-run-1") == "failed"
+    assert await _terminal(worker, "memory-run-1") == "timed_out"
     assert factory.processes[0].killed == 1
     assert staged.cleanup_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_timed_out_state_survives_worker_restart(tmp_path: Path) -> None:
+    worker = _local(tmp_path, FakeProcessFactory(blocked=True))
+    staged = _staged(tmp_path)
+    await worker.start(
+        run_id="memory-run-1",
+        staged=staged,  # type: ignore[arg-type]
+        question=None,
+        timeout_seconds=0.001,  # type: ignore[arg-type]
+    )
+    assert await _terminal(worker, "memory-run-1") == "timed_out"
+
+    recovered = _local(tmp_path, FakeProcessFactory())
+
+    assert await recovered.status("memory-run-1") == "timed_out"
 
 
 @pytest.mark.asyncio
@@ -630,7 +647,7 @@ async def test_oci_timeout_uses_runtime_kill_then_reaps_run_before_cleanup(
         timeout_seconds=0.001,
     )
 
-    assert await _terminal(worker, "memory-run-1") == "failed"
+    assert await _terminal(worker, "memory-run-1") == "timed_out"
     control_calls = [call[0] for call in factory.calls][1:]
     assert control_calls[:2] == [
         (
@@ -1673,6 +1690,24 @@ async def test_persisted_state_schema_rejects_extra_or_impossible_combinations(
         await worker.status("memory-run-1")
 
     assert marker not in f"{caught.value!s} {caught.value!r}"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extra",
+    [{"exit_code": -9}, {"reason": "timeout"}],
+)
+async def test_timed_out_state_rejects_extra_fields(
+    tmp_path: Path,
+    extra: dict[str, object],
+) -> None:
+    run_dir = tmp_path / "runs/memory-run-1"
+    run_dir.mkdir(parents=True)
+    state = {"schema_version": "1.0", "state": "timed_out", **extra}
+    (run_dir / "state.json").write_text(json.dumps(state))
+
+    with pytest.raises(AndroidMemoryWorkerError):
+        await _local(tmp_path, FakeProcessFactory()).status("memory-run-1")
 
 
 @pytest.mark.asyncio

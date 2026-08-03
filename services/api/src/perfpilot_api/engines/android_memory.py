@@ -590,6 +590,8 @@ class AndroidMemoryAdapter:
             return EngineStatus(run_ref, "failed", "engine_failed", False)
         if worker_state == "failed":
             return EngineStatus(run_ref, "failed", "engine_failed", False)
+        if worker_state == "timed_out":
+            return EngineStatus(run_ref, "failed", "engine_timeout", True)
         if worker_state == "canceled":
             return EngineStatus(run_ref, "canceled", None, False)
         return EngineStatus(run_ref, "failed", "worker_unavailable", True)
@@ -597,6 +599,8 @@ class AndroidMemoryAdapter:
     async def fetch_result(self, run_ref: EngineRunRef) -> EngineResult:
         run_id = self._validate_run_ref(run_ref)
         worker_state = await self._read_worker_state(run_id)
+        if worker_state == "timed_out":
+            raise _error("engine_timeout", retryable=True)
         if worker_state == "lost":
             raise _error("worker_unavailable", retryable=True)
         if worker_state == "running":
@@ -667,7 +671,7 @@ class AndroidMemoryAdapter:
             return "failed"
         if worker_state == "canceled":
             return "canceled"
-        if worker_state == "failed":
+        if worker_state in {"failed", "timed_out"}:
             return "failed"
         raise _error("worker_unavailable", retryable=True)
 
@@ -767,7 +771,7 @@ class AndroidMemoryAdapter:
             failure = _worker_error(caught)
         if failure is not None:
             raise failure
-        if state not in {"running", "completed", "failed", "canceled", "lost"}:
+        if state not in {"running", "completed", "failed", "timed_out", "canceled", "lost"}:
             return "lost"
         return state
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import replace
+import asyncio
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
+from pathlib import Path
 from uuid import UUID
 
 import httpx
@@ -9,6 +11,8 @@ import pytest
 from pydantic import SecretStr
 
 from perfpilot_api.config import Settings
+from perfpilot_api.engines.android_memory import AndroidMemoryAdapter
+from perfpilot_api.engines.android_memory_worker import LocalAndroidMemoryWorker
 from perfpilot_api.engines.contracts import (
     AdapterDescriptor,
     EngineEvent,
@@ -38,6 +42,47 @@ TEAM_ID = UUID("e1000000-0000-4000-8000-000000000001")
 ANALYSIS_ID = UUID("e2000000-0000-4000-8000-000000000001")
 EXECUTION_ID = UUID("e3000000-0000-4000-8000-000000000001")
 NOW = datetime(2026, 7, 29, 8, 0, tzinfo=UTC)
+
+
+class TimeoutReader:
+    async def read(self, _size: int = -1) -> bytes:
+        await asyncio.sleep(0)
+        return b""
+
+
+class TimeoutProcess:
+    def __init__(self) -> None:
+        self.returncode: int | None = None
+        self.stdout = TimeoutReader()
+        self.stderr = TimeoutReader()
+        self._done = asyncio.Event()
+
+    async def wait(self) -> int:
+        await self._done.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+    def kill(self) -> None:
+        self.returncode = -9
+        self._done.set()
+
+
+class TimeoutProcessFactory:
+    async def __call__(self, *_args: object, **_kwargs: object) -> TimeoutProcess:
+        return TimeoutProcess()
+
+
+@dataclass
+class TimeoutStaged:
+    input_dir: Path
+    cleanup_calls: int = 0
+
+    async def cleanup(self) -> None:
+        self.cleanup_calls += 1
+
+
+async def timeout_commit(_root: Path) -> str:
+    return "c" * 40
 
 
 def _record(**overrides: object) -> EngineExecutionRecord:
@@ -530,6 +575,73 @@ async def test_bounded_recoverable_failures_reserve_a_new_attempt(stable_code: s
     assert outcome.retry is not None and outcome.retry.mode == "new_attempt"
     assert outcome.retry.stable_error_code == stable_code
     assert outcome.retry.attempt_number == 2
+
+
+@pytest.mark.asyncio
+async def test_real_memory_worker_timeout_reserves_new_attempt(tmp_path: Path) -> None:
+    repository_root = tmp_path / "checkout"
+    repository_root.mkdir()
+    input_dir = tmp_path / "input"
+    input_dir.mkdir()
+    run_id = f"memory-{EXECUTION_ID.hex}"
+    staged = TimeoutStaged(input_dir)
+    worker = LocalAndroidMemoryWorker(
+        python_binary=Path("/usr/local/bin/python3"),
+        repository_root=repository_root,
+        run_root=tmp_path / "runs",
+        runtime_commit="c" * 40,
+        max_output_bytes=1024,
+        process_factory=TimeoutProcessFactory(),
+        commit_resolver=timeout_commit,
+    )
+    await worker.start(
+        run_id=run_id,
+        staged=staged,  # type: ignore[arg-type]
+        question=None,
+        timeout_seconds=0.001,  # type: ignore[arg-type]
+    )
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + 5
+    while await worker.status(run_id) == "running":
+        if loop.time() >= deadline:
+            pytest.fail("worker did not reach a terminal state")
+        await asyncio.sleep(0.001)
+    assert await worker.status(run_id) == "timed_out"
+
+    repository = FakeRepository()
+    repository.record = _record(
+        engine_id="android_memory",
+        state="running",
+        external_run_id=run_id,
+        started_at=NOW,
+        version=2,
+    )
+    adapter = AndroidMemoryAdapter(
+        stager=object(),  # type: ignore[arg-type]
+        worker=worker,
+        max_timeout_seconds=900,
+        now=lambda: NOW,
+    )
+    service = EngineExecutionService(
+        repository=repository,  # type: ignore[arg-type]
+        workspace_service=FakeWorkspaceService(),  # type: ignore[arg-type]
+        registry=AdapterRegistry((adapter,)),
+        engine_lock=_lock(),
+        result_sink=FakeSink(),
+        now=lambda: NOW,
+    )
+
+    outcome = await service.step(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+    )
+
+    assert outcome.retry is not None
+    assert outcome.retry.mode == "new_attempt"
+    assert outcome.retry.stable_error_code == "engine_timeout"
+    assert outcome.retry.attempt_number == 2
+    assert repository.record.stable_error_code == "engine_timeout"
 
 
 @pytest.mark.asyncio

@@ -575,6 +575,7 @@ async def test_worker_start_timeout_preserves_the_stable_timeout_mapping() -> No
         ("completed", 2, "insufficient_data", None, False),
         ("completed", 17, "failed", "engine_failed", False),
         ("failed", 1, "failed", "engine_failed", False),
+        ("timed_out", -1, "failed", "engine_timeout", True),
         ("canceled", -1, "canceled", None, False),
         ("lost", -1, "failed", "worker_unavailable", True),
     ],
@@ -705,6 +706,14 @@ async def test_cancel_is_idempotent_and_does_not_delete_terminal_result() -> Non
 
 
 @pytest.mark.asyncio
+async def test_cancel_treats_timeout_as_finished_failure() -> None:
+    worker = FakeWorker(state="timed_out")
+
+    assert await _adapter(worker=worker).cancel(_run_ref()) == "failed"
+    assert worker.cancel_calls == []
+
+
+@pytest.mark.asyncio
 async def test_cancel_lost_or_unavailable_maps_to_retryable_worker_unavailable() -> None:
     marker = "file:///private/worker.sock"
     workers = (
@@ -780,6 +789,18 @@ async def test_fetch_result_maps_failed_or_unknown_exit_to_engine_failed(
         await _adapter(worker=worker).fetch_result(_run_ref())
 
     assert caught.value.stable_code == "engine_failed"
+
+
+@pytest.mark.asyncio
+async def test_fetch_result_maps_timeout_to_retryable_engine_timeout() -> None:
+    worker = FakeWorker(state="timed_out", exit_code=-1, payload=b"")
+
+    with pytest.raises(EngineAdapterError) as caught:
+        await _adapter(worker=worker).fetch_result(_run_ref())
+
+    assert caught.value.stable_code == "engine_timeout"
+    assert caught.value.retryable is True
+    assert worker.result_calls == []
 
 
 @pytest.mark.asyncio

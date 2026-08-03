@@ -450,6 +450,50 @@ async def test_concurrent_capacity_retry_reserves_one_next_attempt(
     assert [(row.attempt_number, row.state) for row in rows] == [(1, "failed"), (2, "pending")]
 
 
+@pytest.mark.asyncio
+async def test_engine_timeout_retries_stop_at_job_limit(
+    execution_database: ExecutionDatabase,
+) -> None:
+    current = await _running(execution_database)
+    created_attempts: list[int] = []
+
+    for attempt_number in (2, 3):
+        reservation = await execution_database.repository.reserve_retry(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            execution_id=current.id,
+            stable_error_code="engine_timeout",
+            now=NOW,
+            deadline_seconds=1800,
+        )
+        assert reservation.next_attempt is not None
+        created_attempts.append(reservation.next_attempt.attempt_number)
+        pending = reservation.next_attempt
+        current = await execution_database.repository.mark_submitted(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            execution_id=pending.id,
+            expected_version=pending.version,
+            run_ref=_run_ref(run_id=f"run-{attempt_number}"),
+            now=NOW,
+        )
+
+    exhausted = await execution_database.repository.reserve_retry(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=current.id,
+        stable_error_code="engine_timeout",
+        now=NOW,
+        deadline_seconds=1800,
+    )
+    async with execution_database.sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+
+    assert created_attempts == [2, 3]
+    assert exhausted.next_attempt is None
+    assert job is not None and job.retry_count == job.max_retries == 2
+
+
 def test_control_execution_schema_has_no_payload_or_request_material() -> None:
     columns = {column.key for column in inspect(EngineExecution).columns}
 

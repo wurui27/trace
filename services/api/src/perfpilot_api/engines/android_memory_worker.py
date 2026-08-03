@@ -23,7 +23,14 @@ from perfpilot_api.engines.android_memory_stager import StagedMemoryInput
 from perfpilot_api.engines.errors import EngineAdapterError
 
 
-WorkerState = Literal["running", "completed", "failed", "canceled", "lost"]
+WorkerState = Literal[
+    "running",
+    "completed",
+    "failed",
+    "timed_out",
+    "canceled",
+    "lost",
+]
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}\Z")
 _COMMIT = re.compile(r"[a-f0-9]{40}\Z")
 _STATE_LIMIT = 64 * 1024
@@ -587,7 +594,7 @@ class _WorkerBase:
                 and -255 <= exit_code <= 255
                 and exit_code not in (0, 2)
             )
-        elif state in {"canceled", "lost"}:
+        elif state in {"timed_out", "canceled", "lost"}:
             valid = valid and set(decoded) == common
         else:
             valid = False
@@ -951,7 +958,9 @@ class _WorkerBase:
                 persisted = _PersistedState("lost")
             elif active.cancel_requested:
                 persisted = _PersistedState("canceled")
-            elif timed_out or exit_code not in (0, 1, 2) or exit_code == 1:
+            elif timed_out:
+                persisted = _PersistedState("timed_out")
+            elif exit_code not in (0, 1, 2) or exit_code == 1:
                 persisted = _PersistedState("failed", exit_code)
             else:
                 try:
