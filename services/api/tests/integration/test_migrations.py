@@ -309,6 +309,61 @@ def test_trace_analysis_orm_keeps_profile_and_manifest_in_the_tenant_database() 
     assert {"analysis_profile", "input_manifest"}.isdisjoint(control_columns)
 
 
+def test_trace_execution_state_migration_allows_trace_without_application_version(
+    migration_databases: MigrationDatabases,
+) -> None:
+    config = _alembic_config("tenant", migration_databases.tenant_url)
+    command.upgrade(config, "0005_trace_upload_inputs")
+    insert = text(
+        "INSERT INTO analyses "
+        "(id, analysis_mode, analysis_profile, input_manifest, state) "
+        "VALUES (:id, 'trace_upload', 'auto', CAST('[]' AS jsonb), 'analyzing')"
+    )
+    with pytest.raises(IntegrityError):
+        with migration_databases.tenant_engine.begin() as connection:
+            connection.execute(
+                insert,
+                {"id": UUID("ba000000-0000-4000-8000-000000000001")},
+            )
+
+    command.upgrade(config, "head")
+
+    with migration_databases.tenant_engine.begin() as connection:
+        connection.execute(
+            insert,
+            {"id": UUID("ba000000-0000-4000-8000-000000000002")},
+        )
+
+
+def test_trace_execution_state_downgrade_refuses_active_trace(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("tenant", migration_databases.tenant_url)
+    with migration_databases.tenant_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO analyses "
+                "(id, analysis_mode, analysis_profile, input_manifest, state) "
+                "VALUES (:id, 'trace_upload', 'auto', CAST('[]' AS jsonb), 'completed')"
+            ),
+            {"id": UUID("bb000000-0000-4000-8000-000000000001")},
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="trace execution state downgrade preflight failed",
+    ):
+        command.downgrade(
+            _alembic_config("tenant", migration_databases.tenant_url),
+            "0005_trace_upload_inputs",
+        )
+
+    with migration_databases.tenant_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0006_trace_execution_states"
+        )
+
+
 @pytest.mark.parametrize("tree", ["control", "tenant"])
 def test_migration_env_disposes_engine_in_a_finally_block(tree: _MigrationTree) -> None:
     source = (_MIGRATIONS_ROOT / tree / "env.py").read_text()
@@ -1208,7 +1263,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
     ("tree", "downgrade_revision", "head_revision"),
     [
         ("control", "0004_external_engine_foundation", "0006_engine_tenant_version"),
-        ("tenant", "0003_analysis_orchestration", "0005_trace_upload_inputs"),
+        ("tenant", "0003_analysis_orchestration", "0006_trace_execution_states"),
     ],
 )
 def test_memory_upload_downgrade_refuses_existing_rows(
@@ -1272,7 +1327,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "tenant",
             "0003_analysis_orchestration",
-            "0005_trace_upload_inputs",
+            "0006_trace_execution_states",
             "analyses",
             "ck_analyses_mode",
         ),
@@ -1618,7 +1673,7 @@ def test_tenant_task7_downgrade_serializes_with_concurrent_metadata_writers(
     }
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0005_trace_upload_inputs"
+            "0006_trace_execution_states"
         )
 
 

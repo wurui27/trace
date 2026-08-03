@@ -32,6 +32,7 @@ _ALLOWED_ANALYSIS_TRANSITIONS: dict[AnalysisState, frozenset[AnalysisState]] = {
     AnalysisState.UPLOADING: frozenset(
         {
             AnalysisState.QUEUED,
+            AnalysisState.ANALYZING,
             AnalysisState.FAILED,
             AnalysisState.CANCELED,
         }

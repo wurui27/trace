@@ -83,6 +83,7 @@ def test_parent_derivation_fails_closed_for_missing_or_unknown_children(
         ("queued", "scheduled"),
         ("scheduled", "running"),
         ("scheduled", "queued"),
+        ("uploading", "analyzing"),
         ("running", "analyzing"),
         ("running", "queued"),
         ("analyzing", "running"),

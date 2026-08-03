@@ -157,7 +157,7 @@ class Analysis(
             name="ck_analyses_mode",
         ),
         CheckConstraint(
-            "application_version_id IS NOT NULL OR state IN "
+            "analysis_mode = 'trace_upload' OR application_version_id IS NOT NULL OR state IN "
             "('creating', 'created', 'uploading', 'failed', 'canceled', 'deleted')",
             name="ck_analyses_application_version_ready",
         ),

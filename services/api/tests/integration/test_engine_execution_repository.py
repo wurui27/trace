@@ -199,7 +199,7 @@ async def _running(database: ExecutionDatabase):
 
 
 @pytest.mark.asyncio
-async def test_attempt_allocation_serializes_and_increments(
+async def test_initial_attempt_allocation_serializes_and_reuses_the_durable_attempt(
     execution_database: ExecutionDatabase,
 ) -> None:
     attempts = await asyncio.gather(
@@ -211,9 +211,12 @@ async def test_attempt_allocation_serializes_and_increments(
         ),
     )
 
-    assert sorted(record.attempt_number for record in attempts) == [1, 2]
+    assert attempts[0] == attempts[1]
+    assert {record.attempt_number for record in attempts} == {1}
     assert all(record.state == "pending" for record in attempts)
     assert all(record.tenant_resource_version == 7 for record in attempts)
+    async with execution_database.sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(EngineExecution)) == 1
 
 
 @pytest.mark.asyncio

@@ -10,7 +10,7 @@ from typing import Callable, Literal, Protocol
 from uuid import UUID
 
 import httpx
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from perfpilot_api.db.control.models import EngineExecution, GlobalJob
@@ -262,17 +262,31 @@ class SQLAlchemyEngineExecutionRepository:
             }:
                 raise EngineExecutionNotFoundError("analysis is not executable")
             latest = await session.scalar(
-                select(func.max(EngineExecution.attempt_number)).where(
+                select(EngineExecution)
+                .where(
                     EngineExecution.analysis_id == analysis_id,
                     EngineExecution.team_id == team_id,
                     EngineExecution.engine_id == seed.engine_id,
                 )
+                .order_by(EngineExecution.attempt_number.desc())
+                .limit(1)
             )
+            if latest is not None:
+                if (
+                    latest.tenant_resource_version != seed.tenant_resource_version
+                    or latest.adapter_version != seed.adapter_version
+                    or latest.engine_commit_sha != seed.engine_commit_sha
+                    or latest.engine_image_digest != seed.engine_image_digest
+                    or latest.input_manifest_hash != seed.input_manifest_hash
+                    or latest.config_hash != seed.config_hash
+                ):
+                    raise EngineExecutionOwnershipError("engine execution seed changed")
+                return self._record(latest)
             row = EngineExecution(
                 analysis_id=analysis_id,
                 team_id=team_id,
                 engine_id=seed.engine_id,
-                attempt_number=(latest or 0) + 1,
+                attempt_number=1,
                 tenant_resource_version=seed.tenant_resource_version,
                 adapter_version=seed.adapter_version,
                 engine_commit_sha=seed.engine_commit_sha,

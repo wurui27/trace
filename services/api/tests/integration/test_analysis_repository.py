@@ -63,6 +63,7 @@ from perfpilot_api.services.analyses import (
     canonical_trace_analysis_request_hash,
     scenario_job_id,
 )
+from perfpilot_api.services.trace_executions import SQLAlchemyTraceExecutionRepository
 from perfpilot_api.services.uploads import (
     SQLAlchemyUploadRepository,
     TenantBucket,
@@ -1101,6 +1102,81 @@ async def test_trace_status_keeps_optional_pending_when_required_trace_is_ready(
     assert [item.state for item in ready.input_uploads] == ["finalized", "pending"]
     assert ready.input_uploads[0].artifact_id == ARTIFACT_ID
     assert ready.input_uploads[1].upload_id == mapping.upload_id
+
+
+@pytest.mark.asyncio
+async def test_trace_execution_repository_loads_immutable_input_and_projects_both_parents(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _create_trace_analysis(analysis_databases)
+    upload_repository = SQLAlchemyUploadRepository(
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    )
+    tenant = TenantBucket(team_id=TEAM_ID, bucket="unused", resource_version=1)
+    trace = await upload_repository.reserve_slot(
+        tenant=tenant,
+        analysis_id=ANALYSIS_ID,
+        idempotency_key="input-trace",
+        request_hash="d" * 64,
+        descriptor=UploadDescriptor("trace", "application/octet-stream", 4, CHECKSUM),
+        artifact_id=ARTIFACT_ID,
+        upload_id=UPLOAD_ID,
+        object_key=f"raw/analyses/{ANALYSIS_ID}/inputs/trace/{UPLOAD_ID}",
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    finalized = await upload_repository.finalize_upload(
+        tenant=tenant,
+        analysis_id=ANALYSIS_ID,
+        upload_id=trace.upload_id,
+        expected_version=trace.version,
+        storage_version_id="trace-version-1",
+        finalized_at=NOW + timedelta(minutes=1),
+        expires_at=NOW + timedelta(days=30),
+    )
+    assert finalized is not None
+    await analysis_databases.repository.mark_trace_uploading(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=NOW,
+    )
+    repository = SQLAlchemyTraceExecutionRepository(
+        control_session_factory=analysis_databases.control_sessions,
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    )
+
+    loaded = await repository.load_analysis(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+
+    assert loaded.analysis_state == "uploading"
+    assert loaded.tenant_resource_version == 1
+    assert loaded.latest_execution is None
+    assert [(item.artifact_kind, item.state, item.version) for item in loaded.input_artifacts] == [
+        ("trace", "finalized", 2)
+    ]
+
+    await repository.project_parent(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        target_state="analyzing",
+        failure_code=None,
+        now=NOW + timedelta(minutes=2),
+    )
+    await repository.project_parent(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        target_state="completed",
+        failure_code=None,
+        now=NOW + timedelta(minutes=3),
+    )
+
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+    async with analysis_databases.tenant_sessions() as session:
+        analysis = await session.get(Analysis, ANALYSIS_ID)
+    assert job is not None and analysis is not None
+    assert (job.state, analysis.state) == ("completed", "completed")
+    assert job.completed_at == analysis.completed_at == NOW + timedelta(minutes=3)
+    assert (job.version, analysis.version) == (5, 4)
 
 
 @pytest.mark.asyncio
