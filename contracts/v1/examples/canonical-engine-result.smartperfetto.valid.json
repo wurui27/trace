@@ -1,0 +1,33 @@
+{
+  "schema_version": "1.0",
+  "result_type": "canonical-engine-result",
+  "artifact_id": "c79e45ad-fcb4-5b16-a327-f3aae70eebbc",
+  "analysis_id": "00000000-0000-4000-8000-000000000001",
+  "execution_id": "00000000-0000-4000-8000-000000000101",
+  "tenant_resource_version": 1,
+  "engine": {
+    "engine_id": "smartperfetto",
+    "adapter_version": "1.0.0",
+    "source_contract": "workspace-agent-v1",
+    "source_commit_sha": "1111111111111111111111111111111111111111",
+    "image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "attempt": {
+    "number": 1,
+    "input_manifest_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+    "config_hash": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "result": {
+    "state": "completed",
+    "payload_sha256": "07b9aa68bf4d16936ee0d6f7b0234db1cc1d2e1e6b80e7c0a6fa8963289723b3",
+    "payload": {
+      "reportId": "report-1",
+      "report": {
+        "reportId": "report-1",
+        "summary": {
+          "conclusion": "Main thread blocked"
+        }
+      }
+    }
+  }
+}

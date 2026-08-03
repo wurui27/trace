@@ -1,0 +1,199 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.dev/contracts/v1/engines/canonical-engine-result.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "result_type",
+    "artifact_id",
+    "analysis_id",
+    "execution_id",
+    "tenant_resource_version",
+    "engine",
+    "attempt",
+    "result"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "1.0"
+    },
+    "result_type": {
+      "const": "canonical-engine-result"
+    },
+    "artifact_id": {
+      "type": "string",
+      "format": "uuid",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "analysis_id": {
+      "type": "string",
+      "format": "uuid",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "execution_id": {
+      "type": "string",
+      "format": "uuid",
+      "minLength": 36,
+      "maxLength": 36,
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+    },
+    "tenant_resource_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "engine": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "engine_id",
+        "adapter_version",
+        "source_contract",
+        "source_commit_sha",
+        "image_digest"
+      ],
+      "properties": {
+        "engine_id": {
+          "enum": [
+            "smartperfetto",
+            "android_memory"
+          ]
+        },
+        "adapter_version": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 32,
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._+-]*$",
+          "not": {
+            "pattern": "[\r\n\u2028\u2029]"
+          }
+        },
+        "source_contract": {
+          "enum": [
+            "workspace-agent-v1",
+            "android-memory-ai-context-1.2"
+          ]
+        },
+        "source_commit_sha": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40,
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "image_digest": {
+          "type": "string",
+          "minLength": 71,
+          "maxLength": 71,
+          "pattern": "^sha256:[0-9a-f]{64}$"
+        }
+      }
+    },
+    "attempt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "number",
+        "input_manifest_hash",
+        "config_hash"
+      ],
+      "properties": {
+        "number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "input_manifest_hash": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "config_hash": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "result": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "payload_sha256",
+        "payload"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "completed",
+            "insufficient_data"
+          ]
+        },
+        "payload_sha256": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "payload": {
+          "type": "object"
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "engine": {
+            "properties": {
+              "engine_id": {
+                "const": "smartperfetto"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "engine": {
+            "properties": {
+              "source_contract": {
+                "const": "workspace-agent-v1"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "engine": {
+            "properties": {
+              "engine_id": {
+                "const": "android_memory"
+              }
+            }
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "engine": {
+            "properties": {
+              "source_contract": {
+                "const": "android-memory-ai-context-1.2"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}
