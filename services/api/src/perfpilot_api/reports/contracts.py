@@ -3,28 +3,42 @@
 from __future__ import annotations
 
 import json
+import math
+import numbers
 from functools import lru_cache
 from pathlib import Path
 from typing import Literal
 
-from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema import Draft202012Validator, FormatChecker, validators
 from jsonschema.exceptions import ValidationError
 
 
 ContractName = Literal[
-    "analysis_report",
-    "normalized_trace_report",
-    "analysis_projection",
-    "synthesis_output",
+    "analysis-report",
+    "normalized-trace-report",
+    "analysis-projection",
+    "synthesis-output",
 ]
 
 _CONTRACT_SCHEMAS: dict[ContractName, str] = {
-    "analysis_report": "reports/analysis-report.schema.json",
-    "normalized_trace_report": "reports/normalized-trace-report.schema.json",
-    "analysis_projection": "ai/analysis-projection.schema.json",
-    "synthesis_output": "ai/synthesis-output.schema.json",
+    "analysis-report": "reports/analysis-report.schema.json",
+    "normalized-trace-report": "reports/normalized-trace-report.schema.json",
+    "analysis-projection": "ai/analysis-projection.schema.json",
+    "synthesis-output": "ai/synthesis-output.schema.json",
 }
 _CONTRACT_ROOT = Path(__file__).resolve().parents[5] / "contracts" / "v1"
+_FINITE_NUMBER_CHECKER = Draft202012Validator.TYPE_CHECKER.redefine(
+    "number",
+    lambda _checker, instance: (
+        isinstance(instance, numbers.Number)
+        and not isinstance(instance, bool)
+        and math.isfinite(instance)
+    ),
+)
+_FiniteDraft202012Validator = validators.extend(
+    Draft202012Validator,
+    type_checker=_FINITE_NUMBER_CHECKER,
+)
 
 
 class ReportContractError(ValueError):
@@ -50,7 +64,7 @@ def _validator(name: ContractName) -> Draft202012Validator:
     try:
         relative_path = _CONTRACT_SCHEMAS[name]
         schema = json.loads((_CONTRACT_ROOT / relative_path).read_text(encoding="utf-8"))
-        return Draft202012Validator(schema, format_checker=FormatChecker())
+        return _FiniteDraft202012Validator(schema, format_checker=FormatChecker())
     except (KeyError, OSError, UnicodeError, ValueError):
         raise ReportContractError from None
 

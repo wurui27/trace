@@ -171,7 +171,7 @@ def test_report_availability_rejects_terminal_sibling_scenario_type_drift() -> N
 
 def test_report_contract_boundary_preserves_legacy_reports_and_redacts_v11_failures() -> None:
     legacy = _example()
-    copied = validate_contract("analysis_report", legacy)
+    copied = validate_contract("analysis-report", legacy)
     assert copied == legacy
 
     trace_ai = json.loads(
@@ -180,12 +180,12 @@ def test_report_contract_boundary_preserves_legacy_reports_and_redacts_v11_failu
         )
     )
     assert (
-        validate_contract("analysis_report", trace_ai)["synthesis"]["failure_code"]
+        validate_contract("analysis-report", trace_ai)["synthesis"]["failure_code"]
         == "synthesis_unavailable"
     )
 
     trace_ai["synthesis"]["output"] = {"private": "private-token"}
     with pytest.raises(ReportContractError) as exc_info:
-        validate_contract("analysis_report", trace_ai)
+        validate_contract("analysis-report", trace_ai)
     assert str(exc_info.value) == "report contract is invalid"
     assert "private-token" not in str(exc_info.value)

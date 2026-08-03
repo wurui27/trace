@@ -78,3 +78,46 @@ def test_analysis_report_versions_keep_synthesis_unambiguous() -> None:
     failed_synthesis["synthesis"]["output"] = {"unexpected": True}
     with pytest.raises(jsonschema.ValidationError):
         report_schema.validate(failed_synthesis)
+
+
+@pytest.mark.parametrize(
+    "scenario_indexes",
+    [(0,), (1,), (2,), (0, 1), (0, 2), (1, 2), (0, 1, 2)],
+)
+def test_trace_v11_accepts_every_ordered_nonempty_scenario_subset(
+    scenario_indexes: tuple[int, ...],
+) -> None:
+    report_schema = validator(load("contracts/v1/reports/analysis-report.schema.json"))
+    trace_ai = load("contracts/v1/examples/analysis-report.trace-ai.valid.json")
+    trace_ai["scenario_reports"] = [
+        trace_ai["scenario_reports"][index] for index in scenario_indexes
+    ]
+    report_schema.validate(trace_ai)
+
+
+def test_trace_v11_completed_synthesis_requires_full_design_provenance() -> None:
+    report_schema = validator(load("contracts/v1/reports/analysis-report.schema.json"))
+    trace_ai = load("contracts/v1/examples/analysis-report.trace-ai.valid.json")
+    trace_ai["synthesis"] = {
+        "state": "completed",
+        "output": load("contracts/v1/examples/synthesis-output.valid.json"),
+        "synthesis_artifact_id": "88000000-0000-4000-8000-000000000001",
+        "failure_code": None,
+        "provenance": {
+            "provider_protocol": "chat-completions-json-schema-v1",
+            "provider_name": "approved-provider",
+            "model": "approved-model",
+            "prompt_template_version": "1.0.0",
+            "prompt_template_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "normalizer_version": "smartperfetto-normalizer-1",
+            "report_worker_image_digest": "sha256:" + "1" * 64,
+            "projection_artifact_id": "89000000-0000-4000-8000-000000000001",
+            "projection_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "generated_at": "2026-08-03T12:00:00Z",
+            "prompt_tokens": 100,
+            "completion_tokens": 200,
+            "total_tokens": 300,
+            "generation": 1,
+        },
+    }
+    report_schema.validate(trace_ai)
