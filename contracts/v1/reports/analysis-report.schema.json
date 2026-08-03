@@ -1297,12 +1297,12 @@
       "properties": {
         "state": {"enum": ["completed", "failed"]},
         "output": {"oneOf": [{"$ref": "#/$defs/synthesisOutput"}, {"type": "null"}]},
-        "synthesis_artifact_id": {"oneOf": [{"type": "string", "format": "uuid"}, {"type": "null"}]},
+        "synthesis_artifact_id": {"oneOf": [{"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}, {"type": "null"}]},
         "failure_code": {"oneOf": [{"type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$"}, {"type": "null"}]},
         "provenance": {"oneOf": [{"$ref": "#/$defs/synthesisProvenance"}, {"type": "null"}]}
       },
       "allOf": [
-        {"if": {"properties": {"state": {"const": "completed"}}, "required": ["state"]}, "then": {"properties": {"output": {"$ref": "#/$defs/synthesisOutput"}, "synthesis_artifact_id": {"type": "string", "format": "uuid"}, "failure_code": {"type": "null"}, "provenance": {"$ref": "#/$defs/synthesisProvenance"}}}},
+        {"if": {"properties": {"state": {"const": "completed"}}, "required": ["state"]}, "then": {"properties": {"output": {"$ref": "#/$defs/synthesisOutput"}, "synthesis_artifact_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}, "failure_code": {"type": "null"}, "provenance": {"$ref": "#/$defs/synthesisProvenance"}}}},
         {"if": {"properties": {"state": {"const": "failed"}}, "required": ["state"]}, "then": {"properties": {"output": {"type": "null"}, "synthesis_artifact_id": {"type": "null"}, "failure_code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$"}, "provenance": {"type": "null"}}}}
       ]
     },

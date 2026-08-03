@@ -157,3 +157,30 @@ def test_public_synthesis_reference_limits_match_private_output() -> None:
     }
     with pytest.raises(jsonschema.ValidationError):
         report_schema.validate(trace_ai)
+
+
+def test_trace_v11_rejects_uppercase_synthesis_artifact_id() -> None:
+    report_schema = validator(load("contracts/v1/reports/analysis-report.schema.json"))
+    trace_ai = load("contracts/v1/examples/analysis-report.trace-ai.valid.json")
+    trace_ai["synthesis"]["synthesis_artifact_id"] = "AA000000-0000-4000-8000-000000000001"
+    trace_ai["synthesis"]["state"] = "completed"
+    trace_ai["synthesis"]["failure_code"] = None
+    trace_ai["synthesis"]["output"] = load("contracts/v1/examples/synthesis-output.valid.json")
+    trace_ai["synthesis"]["provenance"] = {
+        "provider_protocol": "chat-completions-json-schema-v1",
+        "provider_name": "approved-provider",
+        "model": "approved-model",
+        "prompt_template_version": "1.0.0",
+        "prompt_template_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "normalizer_version": "smartperfetto-normalizer-1",
+        "report_worker_image_digest": "sha256:" + "1" * 64,
+        "projection_artifact_id": "89000000-0000-4000-8000-000000000001",
+        "projection_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+        "generated_at": "2026-08-03T12:00:00Z",
+        "prompt_tokens": 100,
+        "completion_tokens": 200,
+        "total_tokens": 300,
+        "generation": 1,
+    }
+    with pytest.raises(jsonschema.ValidationError):
+        report_schema.validate(trace_ai)

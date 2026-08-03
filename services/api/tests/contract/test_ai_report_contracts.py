@@ -235,3 +235,45 @@ def test_contract_names_are_closed_dashed_names_and_failures_are_redacted() -> N
         assert validate_contract(name, value) == value  # type: ignore[arg-type]
     with pytest.raises(ReportContractError, match="^report contract is invalid$"):
         validate_contract("../../private-document", fixtures["synthesis-output"])  # type: ignore[arg-type]
+
+
+def test_normalized_trace_health_matches_the_closed_bundle_shape() -> None:
+    validator = _validator("reports/normalized-trace-report.schema.json")
+    report = _example("normalized-trace-report.valid.json")
+    trace_health = report["scenario_reports"][0]["trace_health"]
+    trace_health.update(
+        {
+            "target_resolution": {
+                "package_name": "com.example.app",
+                "process_name": "com.example.app",
+                "upid": 17,
+                "pid": 4242,
+                "main_thread_id": 4242,
+            },
+            "measurement_window": {
+                "start_ns": 100000000,
+                "end_ns": 900000000,
+                "coverage": "complete",
+            },
+            "data_loss": {
+                "buffer_overruns": 0,
+                "ftrace_events_lost": 0,
+                "traced_buf_patches_failed": 0,
+                "incomplete_slices": 0,
+                "boundary_truncations": 0,
+            },
+        }
+    )
+    validator.validate(report)
+    del trace_health["target_resolution"]
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(report)
+
+
+def test_contract_boundary_accepts_huge_finite_integers_without_overflow() -> None:
+    from perfpilot_api.reports import validate_contract
+
+    projection = _example("analysis-projection.valid.json")
+    projection["scenarios"][0]["metrics"][0]["numeric_value"] = 10**1000
+    validated = validate_contract("analysis-projection", projection)
+    assert validated["scenarios"][0]["metrics"][0]["numeric_value"] == 10**1000

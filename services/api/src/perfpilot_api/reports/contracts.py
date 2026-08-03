@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Literal
 
 from jsonschema import Draft202012Validator, FormatChecker, validators
-from jsonschema.exceptions import ValidationError
 
 
 ContractName = Literal[
@@ -27,13 +26,26 @@ _CONTRACT_SCHEMAS: dict[ContractName, str] = {
     "synthesis-output": "ai/synthesis-output.schema.json",
 }
 _CONTRACT_ROOT = Path(__file__).resolve().parents[5] / "contracts" / "v1"
+
+
+def _is_finite_number(_checker: object, instance: object) -> bool:
+    if isinstance(instance, bool):
+        return False
+    if isinstance(instance, int):
+        return True
+    if isinstance(instance, float):
+        return math.isfinite(instance)
+    if not isinstance(instance, numbers.Number):
+        return False
+    try:
+        return math.isfinite(instance)
+    except (OverflowError, TypeError, ValueError):
+        return False
+
+
 _FINITE_NUMBER_CHECKER = Draft202012Validator.TYPE_CHECKER.redefine(
     "number",
-    lambda _checker, instance: (
-        isinstance(instance, numbers.Number)
-        and not isinstance(instance, bool)
-        and math.isfinite(instance)
-    ),
+    _is_finite_number,
 )
 _FiniteDraft202012Validator = validators.extend(
     Draft202012Validator,
@@ -70,10 +82,10 @@ def _validator(name: ContractName) -> Draft202012Validator:
 
 
 def validate_contract(name: ContractName, value: object) -> dict[str, object]:
-    copied = json.loads(canonical_json_bytes(value))
     try:
+        copied = json.loads(canonical_json_bytes(value))
         _validator(name).validate(copied)
-    except (ValidationError, ReportContractError):
+    except Exception:
         raise ReportContractError from None
     if not isinstance(copied, dict):
         raise ReportContractError
