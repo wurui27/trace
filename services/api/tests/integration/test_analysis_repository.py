@@ -62,6 +62,7 @@ from perfpilot_api.services.analyses import (
     canonical_memory_analysis_request_hash,
     canonical_trace_analysis_request_hash,
     scenario_job_id,
+    trace_analysis_ready_event_id,
 )
 from perfpilot_api.services.trace_executions import SQLAlchemyTraceExecutionRepository
 from perfpilot_api.services.uploads import (
@@ -1102,6 +1103,43 @@ async def test_trace_status_keeps_optional_pending_when_required_trace_is_ready(
     assert [item.state for item in ready.input_uploads] == ["finalized", "pending"]
     assert ready.input_uploads[0].artifact_id == ARTIFACT_ID
     assert ready.input_uploads[1].upload_id == mapping.upload_id
+
+    for _ in range(2):
+        await analysis_databases.repository.queue_trace_execution(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            now=NOW + timedelta(minutes=1),
+        )
+
+    queued = await analysis_databases.repository.load_view(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=NOW + timedelta(minutes=1),
+    )
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        events = list(
+            (
+                await session.scalars(
+                    select(OutboxEvent).where(
+                        OutboxEvent.global_job_id == ANALYSIS_ID,
+                        OutboxEvent.event_type == "trace_analysis_ready",
+                    )
+                )
+            ).all()
+        )
+    async with analysis_databases.tenant_sessions() as session:
+        analysis = await session.get(Analysis, ANALYSIS_ID)
+
+    assert queued.state == "analyzing"
+    assert [item.state for item in queued.input_uploads] == ["finalized", "pending"]
+    assert job is not None and job.state == "analyzing"
+    assert analysis is not None and analysis.state == "analyzing"
+    assert len(events) == 1
+    assert events[0].id == trace_analysis_ready_event_id(ANALYSIS_ID)
+    assert events[0].subject_type == "analysis"
+    assert events[0].subject_id == ANALYSIS_ID
+    assert events[0].scenario_job_id is None
 
 
 @pytest.mark.asyncio

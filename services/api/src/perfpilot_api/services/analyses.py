@@ -41,7 +41,12 @@ from perfpilot_api.db.tenant.models import (
 )
 from perfpilot_api.db.tenant.router import TenantRouter
 from perfpilot_api.domain.states import ANALYSIS_TERMINAL_STATES, AnalysisState
-from perfpilot_api.domain.transitions import InvalidAggregateState, derive_parent_state
+from perfpilot_api.domain.transitions import (
+    InvalidAggregateState,
+    InvalidTransition,
+    derive_parent_state,
+    transition,
+)
 from perfpilot_api.services.uploads import (
     UploadError,
     UploadIdempotencyConflictError,
@@ -396,6 +401,14 @@ class AnalysisRepository(Protocol):
         analysis_id: UUID,
     ) -> bool: ...
 
+    async def queue_trace_execution(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        now: datetime,
+    ) -> None: ...
+
     async def stage_tenant_scenarios(
         self,
         *,
@@ -454,6 +467,10 @@ def scenario_job_id(analysis_id: UUID, scenario_type: str) -> UUID:
 
 def analysis_queued_event_id(analysis_id: UUID) -> UUID:
     return uuid5(_EVENT_NAMESPACE, f"analysis_queued:{analysis_id}")
+
+
+def trace_analysis_ready_event_id(analysis_id: UUID) -> UUID:
+    return uuid5(_EVENT_NAMESPACE, f"trace_analysis_ready:{analysis_id}")
 
 
 def _prepared_scenarios_from_results(
@@ -1279,12 +1296,20 @@ class AnalysisService:
         except UploadNotFoundError:
             raise AnalysisNotFoundError("analysis upload was not found") from None
         if upload_class == "trace_input":
-            await _repository_call(
+            required_ready = await _repository_call(
                 lambda: self._repository.trace_required_input_ready(
                     team_id=team_id,
                     analysis_id=analysis_id,
                 )
             )
+            if required_ready:
+                await _repository_call(
+                    lambda: self._repository.queue_trace_execution(
+                        team_id=team_id,
+                        analysis_id=analysis_id,
+                        now=self._clock(),
+                    )
+                )
         return slot
 
     async def get_report(
@@ -2578,6 +2603,157 @@ class SQLAlchemyAnalysisRepository:
         return True
 
     @staticmethod
+    def _trace_ready_event_matches(
+        event: OutboxEvent | None,
+        *,
+        event_id: UUID,
+        team_id: UUID,
+        analysis_id: UUID,
+    ) -> bool:
+        return (
+            event is not None
+            and event.id == event_id
+            and event.team_id == team_id
+            and event.global_job_id == analysis_id
+            and event.scenario_job_id is None
+            and event.event_type == "trace_analysis_ready"
+            and event.subject_type == "analysis"
+            and event.subject_id == analysis_id
+            and event.ready_at is not None
+        )
+
+    async def queue_trace_execution(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        now: datetime,
+    ) -> None:
+        if not await self.trace_required_input_ready(
+            team_id=team_id,
+            analysis_id=analysis_id,
+        ):
+            raise AnalysisUnavailableError("trace analysis input is not ready")
+
+        event_id = trace_analysis_ready_event_id(analysis_id)
+        terminal_states = {"completed", "partially_completed", "failed", "canceled"}
+        async with self._control_session_factory() as session:
+            async with session.begin():
+                job = await session.scalar(
+                    select(GlobalJob)
+                    .where(
+                        GlobalJob.id == analysis_id,
+                        GlobalJob.team_id == team_id,
+                    )
+                    .with_for_update()
+                )
+                if job is None:
+                    raise AnalysisNotFoundError("analysis was not found")
+                if job.analysis_mode != "trace_upload":
+                    raise AnalysisUnavailableError("trace analysis state is unavailable")
+
+                event = await session.get(OutboxEvent, event_id)
+                if job.state == "uploading":
+                    if event is not None:
+                        raise AnalysisUnavailableError("trace analysis queue state is unavailable")
+                    try:
+                        transition(job.state, "analyzing")
+                    except InvalidTransition:
+                        raise AnalysisUnavailableError(
+                            "trace analysis queue state is unavailable"
+                        ) from None
+                    session.add(
+                        OutboxEvent(
+                            id=event_id,
+                            team_id=team_id,
+                            global_job_id=analysis_id,
+                            scenario_job_id=None,
+                            event_type="trace_analysis_ready",
+                            subject_type="analysis",
+                            subject_id=analysis_id,
+                            ready_at=now,
+                            published_at=None,
+                            dead_lettered_at=None,
+                            retry_count=0,
+                            version=1,
+                        )
+                    )
+                    changed = await session.scalar(
+                        update(GlobalJob)
+                        .where(
+                            GlobalJob.id == analysis_id,
+                            GlobalJob.team_id == team_id,
+                            GlobalJob.analysis_mode == "trace_upload",
+                            GlobalJob.state == "uploading",
+                            GlobalJob.version == job.version,
+                        )
+                        .values(
+                            state="analyzing",
+                            started_at=job.started_at or now,
+                            completed_at=None,
+                            failure_code=None,
+                            version=GlobalJob.version + 1,
+                            updated_at=now,
+                        )
+                        .returning(GlobalJob.id)
+                    )
+                    if changed is None:
+                        raise StaleTaskVersionError("analysis version is stale")
+                elif job.state == "analyzing" or job.state in terminal_states:
+                    if not self._trace_ready_event_matches(
+                        event,
+                        event_id=event_id,
+                        team_id=team_id,
+                        analysis_id=analysis_id,
+                    ):
+                        raise AnalysisUnavailableError(
+                            "trace analysis queue state is unavailable"
+                        )
+                else:
+                    raise AnalysisUnavailableError("trace analysis queue state is unavailable")
+
+                control_state = job.state
+
+        if control_state in terminal_states:
+            return
+
+        async with self._tenant_router.session(team_id) as session:
+            analysis = await session.scalar(
+                select(Analysis).where(Analysis.id == analysis_id).with_for_update()
+            )
+            if analysis is None or analysis.analysis_mode != "trace_upload":
+                raise AnalysisUnavailableError("trace analysis state is unavailable")
+            if analysis.state == "uploading":
+                try:
+                    transition(analysis.state, "analyzing")
+                except InvalidTransition:
+                    raise AnalysisUnavailableError(
+                        "trace analysis queue state is unavailable"
+                    ) from None
+                changed = await session.scalar(
+                    update(Analysis)
+                    .where(
+                        Analysis.id == analysis_id,
+                        Analysis.analysis_mode == "trace_upload",
+                        Analysis.state == "uploading",
+                        Analysis.version == analysis.version,
+                    )
+                    .values(
+                        state="analyzing",
+                        started_at=analysis.started_at or now,
+                        completed_at=None,
+                        failure_code=None,
+                        version=Analysis.version + 1,
+                        updated_at=now,
+                    )
+                    .returning(Analysis.id)
+                )
+                if changed is None:
+                    raise StaleTaskVersionError("analysis version is stale")
+            elif analysis.state != "analyzing" and analysis.state not in terminal_states:
+                raise AnalysisUnavailableError("trace analysis queue state is unavailable")
+
+    @staticmethod
     def _application_metadata(
         version: ApplicationVersion | None,
     ) -> ApplicationMetadataView | None:
@@ -3531,5 +3707,7 @@ __all__ = [
     "analysis_queued_event_id",
     "canonical_analysis_request_hash",
     "canonical_memory_analysis_request_hash",
+    "canonical_trace_analysis_request_hash",
     "scenario_job_id",
+    "trace_analysis_ready_event_id",
 ]

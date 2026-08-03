@@ -66,6 +66,8 @@ class FakeAnalysisRepository:
         self.trace_calls: list[dict[str, object]] = []
         self.trace_uploading_calls: list[dict[str, object]] = []
         self.trace_readiness_calls: list[dict[str, object]] = []
+        self.trace_queue_calls: list[dict[str, object]] = []
+        self.trace_ready = True
         self.upload_class = "generic"
         self.created_modes: list[str] = []
         self.memory_records: dict[str, tuple[str, Any]] = {}
@@ -207,7 +209,11 @@ class FakeAnalysisRepository:
     async def trace_required_input_ready(self, **kwargs: object) -> bool:
         self.events.append("trace_required_input_ready")
         self.trace_readiness_calls.append(kwargs)
-        return True
+        return self.trace_ready
+
+    async def queue_trace_execution(self, **kwargs: object) -> None:
+        self.events.append("queue_trace_execution")
+        self.trace_queue_calls.append(kwargs)
 
 
 class FakeUploadService:
@@ -452,10 +458,38 @@ async def test_finalize_trace_input_recomputes_required_readiness_after_storage_
         "classify_upload",
         "storage_finalize",
         "trace_required_input_ready",
+        "queue_trace_execution",
     ]
     assert repository.trace_readiness_calls == [
         {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID}
     ]
+    assert repository.trace_queue_calls == [
+        {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID, "now": NOW}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_finalize_optional_trace_input_does_not_queue_before_required_trace_is_ready() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    repository.upload_class = "trace_input"
+    repository.trace_ready = False
+    service = _service(repository, FakeUploadService(events), FakeApkInspector(events))
+
+    await service.finalize_upload(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        upload_id=UPLOAD_ID,
+        caller_sha256_b64=CHECKSUM,
+        caller_size=4,
+    )
+
+    assert events == [
+        "classify_upload",
+        "storage_finalize",
+        "trace_required_input_ready",
+    ]
+    assert repository.trace_queue_calls == []
 
 
 @pytest.mark.asyncio
