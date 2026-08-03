@@ -245,6 +245,23 @@ def test_report_extracts_safe_id_and_recursively_sanitizes_retained_payload() ->
         assert unsafe.casefold() not in serialized.casefold()
 
 
+def test_report_retains_only_the_reviewed_normalization_typed_fields() -> None:
+    payload = _json_fixture("report-completed.json")
+    report = payload["report"]
+    assert isinstance(report, dict)
+    report["dataEnvelopes"] = [{"type": "data-envelope@1", "id": "startup"}]
+    report["diagnostics"] = [{"id": "startup.delay", "severity": "warning"}]
+    report["actions"] = [{"id": "unapproved-action"}]
+    report["unknownPrivateField"] = "must-not-survive"
+
+    response = SmartPerfettoReportResponse.model_validate(payload)
+
+    assert response.sanitized_report["dataEnvelopes"] == report["dataEnvelopes"]
+    assert response.sanitized_report["diagnostics"] == report["diagnostics"]
+    assert "actions" not in response.sanitized_report
+    assert "unknownPrivateField" not in response.sanitized_report
+
+
 def test_report_rejects_arbitrary_absolute_report_url() -> None:
     unsafe_url = "https://objects.invalid/report/private?token=must-not-leak"
     payload = {"success": True, "report": {"reportUrl": unsafe_url}}

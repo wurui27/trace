@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import math
 import re
 from collections.abc import Mapping, Sequence
@@ -39,9 +40,15 @@ class SmartPerfettoNormalizationError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class NormalizedTraceReport:
-    document: dict[str, object] = field(repr=False)
     canonical_bytes: bytes = field(repr=False)
     sha256_b64: str = field(repr=False)
+
+    @property
+    def document(self) -> dict[str, object]:
+        document = json.loads(self.canonical_bytes)
+        if not isinstance(document, dict):
+            raise SmartPerfettoNormalizationError
+        return document
 
 
 def _fail() -> SmartPerfettoNormalizationError:
@@ -191,14 +198,21 @@ def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
         raise _fail()
     claims = _claims(report)
     envelopes: dict[str, Mapping[str, object]] = {}
+    envelope_source_ids: set[str] = set()
     evidence_by_id: dict[str, Mapping[str, object]] = {}
     for raw in _sequence(report.get("dataEnvelopes")):
         envelope = _mapping(raw)
         scenario = envelope.get("scenario")
         source_id = _id(envelope.get("id"))
-        if envelope.get("type") != "data-envelope@1" or scenario not in _SCENARIO_ORDER or scenario in envelopes:
+        if (
+            envelope.get("type") != "data-envelope@1"
+            or scenario not in _SCENARIO_ORDER
+            or scenario in envelopes
+            or source_id in envelope_source_ids
+        ):
             raise _fail()
         envelopes[scenario] = envelope
+        envelope_source_ids.add(source_id)
         for raw_evidence in _sequence(envelope.get("evidence")):
             evidence = _mapping(raw_evidence)
             evidence_id = _id(evidence.get("id"))
@@ -245,6 +259,12 @@ def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
         if claim is None or not claim["accepted"]:
             limitations.append(_limitation(source.analysis_id, diagnostic, source_id))
             continue
+        scenario_evidence_ids = {
+            _id(item.get("id"))
+            for item in map(_mapping, _sequence(envelopes[scenario].get("evidence")))
+        }
+        if not set(claim["evidence"]).issubset(scenario_evidence_ids):
+            raise _fail()
         finding = _finding(source.analysis_id, diagnostic, source_id, claim, source.artifact_id)
         by_scenario[scenario]["findings"].append(finding)  # type: ignore[index]
     for scenario in scenario_reports:
@@ -337,7 +357,10 @@ def _finding(analysis_id: UUID, value: Mapping[str, object], source_id: str, cla
     ceiling = min(_CONFIDENCE[source_confidence], _CONFIDENCE[claim["confidence"]])  # type: ignore[index]
     confidence = next(name for name, rank in _CONFIDENCE.items() if rank == ceiling)
     evidence_ids = sorted(str(_stable_id("evidence", analysis_id, item)) for item in claim["evidence"])  # type: ignore[arg-type]
-    return {"finding_id": str(_stable_id("finding", analysis_id, source_id)), "rule_id": _text(value.get("ruleId"), public=True), "kind": value["kind"], "status": status, "severity": _SEVERITY.get(str(value.get("severity")), "informational"), "confidence": confidence, "confidence_ceiling": confidence, "title": _text(value.get("title")), "summary": _text(value.get("summary")), "evidence_ids": evidence_ids, "exclusions": [], "recommendation": _text(value.get("recommendation"), nullable=True), "retest": _text(value.get("retest"), nullable=True)}
+    severity = value.get("severity")
+    if severity not in _SEVERITY:
+        raise _fail()
+    return {"finding_id": str(_stable_id("finding", analysis_id, source_id)), "rule_id": _text(value.get("ruleId"), public=True), "kind": value["kind"], "status": status, "severity": _SEVERITY[severity], "confidence": confidence, "confidence_ceiling": confidence, "title": _text(value.get("title")), "summary": _text(value.get("summary")), "evidence_ids": evidence_ids, "exclusions": [], "recommendation": _text(value.get("recommendation"), nullable=True), "retest": _text(value.get("retest"), nullable=True)}
 
 
 def _limitation(analysis_id: UUID, value: Mapping[str, object], source_id: str) -> dict[str, object]:
@@ -350,7 +373,6 @@ def normalize_smartperfetto_result(source: LoadedCanonicalResult) -> NormalizedT
         validated = validate_contract("normalized-trace-report", document)
         payload = canonical_json_bytes(validated)
         return NormalizedTraceReport(
-            document=validated,
             canonical_bytes=payload,
             sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii"),
         )
