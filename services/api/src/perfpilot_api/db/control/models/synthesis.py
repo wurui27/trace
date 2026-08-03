@@ -4,7 +4,6 @@ from uuid import UUID
 from sqlalchemy import (
     CheckConstraint,
     DateTime,
-    ForeignKey,
     ForeignKeyConstraint,
     Index,
     Integer,
@@ -52,6 +51,22 @@ class SynthesisExecution(
             "source_execution_id",
             "generation",
             name="uq_synthesis_executions_source_generation",
+        ),
+        UniqueConstraint(
+            "id",
+            "analysis_id",
+            "team_id",
+            name="uq_synthesis_executions_id_analysis_team",
+        ),
+        ForeignKeyConstraint(
+            ("source_execution_id", "analysis_id", "team_id"),
+            (
+                "engine_executions.id",
+                "engine_executions.analysis_id",
+                "engine_executions.team_id",
+            ),
+            name="fk_synthesis_executions_source_execution_owner",
+            ondelete="CASCADE",
         ),
         ForeignKeyConstraint(
             ("analysis_id", "team_id"),
@@ -107,7 +122,12 @@ class SynthesisExecution(
         ),
         CheckConstraint("version > 0", name="ck_synthesis_executions_version_positive"),
         Index("ix_synthesis_executions_analysis_team", "analysis_id", "team_id"),
-        Index("ix_synthesis_executions_source_execution_id", "source_execution_id"),
+        Index(
+            "ix_synthesis_executions_source_execution_owner",
+            "source_execution_id",
+            "analysis_id",
+            "team_id",
+        ),
         Index("ix_synthesis_executions_state_created", "state", "created_at"),
     )
 
@@ -115,7 +135,6 @@ class SynthesisExecution(
     analysis_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
     source_execution_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
-        ForeignKey("engine_executions.id", ondelete="CASCADE"),
         nullable=False,
     )
     tenant_resource_version: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -159,6 +178,16 @@ class AIInvocation(UUIDPrimaryKeyMixin, TimestampMixin, ControlBase):
             name="fk_ai_invocations_analysis_team",
             ondelete="CASCADE",
         ),
+        ForeignKeyConstraint(
+            ("synthesis_execution_id", "analysis_id", "team_id"),
+            (
+                "synthesis_executions.id",
+                "synthesis_executions.analysis_id",
+                "synthesis_executions.team_id",
+            ),
+            name="fk_ai_invocations_synthesis_execution_owner",
+            ondelete="CASCADE",
+        ),
         CheckConstraint(
             "attempt_number IN (1, 2)",
             name="ck_ai_invocations_attempt_number",
@@ -197,12 +226,16 @@ class AIInvocation(UUIDPrimaryKeyMixin, TimestampMixin, ControlBase):
             name="ck_ai_invocations_latency_nonnegative",
         ),
         Index("ix_ai_invocations_analysis_team", "analysis_id", "team_id"),
-        Index("ix_ai_invocations_synthesis_execution_id", "synthesis_execution_id"),
+        Index(
+            "ix_ai_invocations_synthesis_execution_owner",
+            "synthesis_execution_id",
+            "analysis_id",
+            "team_id",
+        ),
     )
 
     synthesis_execution_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
-        ForeignKey("synthesis_executions.id", ondelete="CASCADE"),
         nullable=False,
     )
     team_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)

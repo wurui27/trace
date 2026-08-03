@@ -64,6 +64,11 @@ def _record_columns(*, versioned: bool = False) -> tuple[sa.Column[object], ...]
 
 
 def upgrade() -> None:
+    op.create_unique_constraint(
+        "uq_engine_executions_id_analysis_team",
+        "engine_executions",
+        ["id", "analysis_id", "team_id"],
+    )
     op.add_column("outbox_events", sa.Column("subject_version", sa.Integer(), nullable=True))
     op.create_check_constraint(
         "ck_outbox_events_subject_version_positive",
@@ -174,8 +179,13 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
-            ["source_execution_id"],
-            ["engine_executions.id"],
+            ["source_execution_id", "analysis_id", "team_id"],
+            [
+                "engine_executions.id",
+                "engine_executions.analysis_id",
+                "engine_executions.team_id",
+            ],
+            name="fk_synthesis_executions_source_execution_owner",
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_synthesis_executions"),
@@ -185,6 +195,12 @@ def upgrade() -> None:
             "generation",
             name="uq_synthesis_executions_source_generation",
         ),
+        sa.UniqueConstraint(
+            "id",
+            "analysis_id",
+            "team_id",
+            name="uq_synthesis_executions_id_analysis_team",
+        ),
     )
     op.create_index(
         "ix_synthesis_executions_analysis_team",
@@ -192,9 +208,9 @@ def upgrade() -> None:
         ["analysis_id", "team_id"],
     )
     op.create_index(
-        "ix_synthesis_executions_source_execution_id",
+        "ix_synthesis_executions_source_execution_owner",
         "synthesis_executions",
-        ["source_execution_id"],
+        ["source_execution_id", "analysis_id", "team_id"],
     )
     op.create_index(
         "ix_synthesis_executions_state_created",
@@ -266,8 +282,13 @@ def upgrade() -> None:
             ondelete="CASCADE",
         ),
         sa.ForeignKeyConstraint(
-            ["synthesis_execution_id"],
-            ["synthesis_executions.id"],
+            ["synthesis_execution_id", "analysis_id", "team_id"],
+            [
+                "synthesis_executions.id",
+                "synthesis_executions.analysis_id",
+                "synthesis_executions.team_id",
+            ],
+            name="fk_ai_invocations_synthesis_execution_owner",
             ondelete="CASCADE",
         ),
         sa.PrimaryKeyConstraint("id", name="pk_ai_invocations"),
@@ -283,13 +304,33 @@ def upgrade() -> None:
         ["analysis_id", "team_id"],
     )
     op.create_index(
-        "ix_ai_invocations_synthesis_execution_id",
+        "ix_ai_invocations_synthesis_execution_owner",
         "ai_invocations",
-        ["synthesis_execution_id"],
+        ["synthesis_execution_id", "analysis_id", "team_id"],
     )
 
 
 def downgrade() -> None:
+    connection = op.get_bind()
+    connection.execute(
+        sa.text(
+            "LOCK TABLE ai_invocations, synthesis_executions, outbox_events, "
+            "engine_executions IN ACCESS EXCLUSIVE MODE"
+        )
+    )
+    if (
+        connection.scalar(
+            sa.text(
+                "SELECT 1 FROM synthesis_executions "
+                "UNION ALL SELECT 1 FROM ai_invocations "
+                "UNION ALL SELECT 1 FROM outbox_events "
+                "WHERE event_type IN ('engine_result_ready', 'analysis_synthesis_requested') "
+                "OR subject_version IS NOT NULL LIMIT 1"
+            )
+        )
+        is not None
+    ):
+        raise RuntimeError("synthesis audit downgrade preflight failed")
     op.drop_table("ai_invocations")
     op.drop_table("synthesis_executions")
     op.drop_index(
@@ -303,3 +344,8 @@ def downgrade() -> None:
         type_="check",
     )
     op.drop_column("outbox_events", "subject_version")
+    op.drop_constraint(
+        "uq_engine_executions_id_analysis_team",
+        "engine_executions",
+        type_="unique",
+    )

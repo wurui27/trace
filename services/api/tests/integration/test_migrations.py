@@ -1550,6 +1550,341 @@ def test_control_ai_synthesis_constraints_reject_inconsistent_metadata(
                     connection.execute(invocation_insert, valid_invocation | overrides)
 
 
+def test_synthesis_execution_rejects_source_execution_from_another_analysis_or_team(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    first_team_id = UUID("a4000000-0000-4000-8000-000000000001")
+    second_team_id = UUID("a4000000-0000-4000-8000-000000000002")
+    first_analysis_id = UUID("a4000000-0000-4000-8000-000000000003")
+    second_analysis_id = UUID("a4000000-0000-4000-8000-000000000004")
+    source_execution_id = UUID("a4000000-0000-4000-8000-000000000005")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO teams (id, name, state) VALUES "
+                "(:first_team_id, 'First team', 'active'), "
+                "(:second_team_id, 'Second team', 'active')"
+            ),
+            {"first_team_id": first_team_id, "second_team_id": second_team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) VALUES "
+                "(:first_analysis_id, :first_team_id, 'first', 'trace_upload', 'analyzing', "
+                "ARRAY[]::varchar[]), "
+                "(:second_analysis_id, :second_team_id, 'second', 'trace_upload', 'analyzing', "
+                "ARRAY[]::varchar[])"
+            ),
+            {
+                "first_analysis_id": first_analysis_id,
+                "first_team_id": first_team_id,
+                "second_analysis_id": second_analysis_id,
+                "second_team_id": second_team_id,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO engine_executions "
+                "(id, analysis_id, team_id, engine_id, attempt_number, "
+                "tenant_resource_version, adapter_version, engine_commit_sha, "
+                "engine_image_digest, input_manifest_hash, config_hash, state) VALUES "
+                "(:id, :analysis_id, :team_id, 'smartperfetto', 1, 1, '1.0.0', "
+                "repeat('a', 40), 'sha256:' || repeat('b', 64), repeat('c', 64), "
+                "repeat('d', 64), 'completed')"
+            ),
+            {
+                "id": source_execution_id,
+                "analysis_id": first_analysis_id,
+                "team_id": first_team_id,
+            },
+        )
+        insert = text(
+            "INSERT INTO synthesis_executions "
+            "(id, team_id, analysis_id, source_execution_id, tenant_resource_version, "
+            "generation, state, request_fingerprint, normalizer_version, "
+            "report_worker_image_digest, projection_sha256_b64, provider_protocol, "
+            "provider_name, provider_model, prompt_template_version, "
+            "prompt_template_sha256_b64, attempt_count) VALUES "
+            "(:id, :team_id, :analysis_id, :source_execution_id, 1, 1, 'pending', "
+            "repeat('a', 64), 'normalizer-1', 'sha256:' || repeat('b', 64), "
+            "repeat('A', 44), 'openai-compatible', 'provider', 'model', 'v1', "
+            "repeat('B', 44), 0)"
+        )
+        with pytest.raises(IntegrityError):
+            with connection.begin_nested():
+                connection.execute(
+                    insert,
+                    {
+                        "id": uuid4(),
+                        "team_id": second_team_id,
+                        "analysis_id": second_analysis_id,
+                        "source_execution_id": source_execution_id,
+                    },
+                )
+
+
+def test_ai_invocation_rejects_synthesis_execution_from_another_analysis_or_team(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    first_team_id = UUID("a5000000-0000-4000-8000-000000000001")
+    second_team_id = UUID("a5000000-0000-4000-8000-000000000002")
+    first_analysis_id = UUID("a5000000-0000-4000-8000-000000000003")
+    second_analysis_id = UUID("a5000000-0000-4000-8000-000000000004")
+    source_execution_id = UUID("a5000000-0000-4000-8000-000000000005")
+    synthesis_execution_id = UUID("a5000000-0000-4000-8000-000000000006")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text(
+                "INSERT INTO teams (id, name, state) VALUES "
+                "(:first_team_id, 'First team', 'active'), "
+                "(:second_team_id, 'Second team', 'active')"
+            ),
+            {"first_team_id": first_team_id, "second_team_id": second_team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) VALUES "
+                "(:first_analysis_id, :first_team_id, 'first', 'trace_upload', 'analyzing', "
+                "ARRAY[]::varchar[]), "
+                "(:second_analysis_id, :second_team_id, 'second', 'trace_upload', 'analyzing', "
+                "ARRAY[]::varchar[])"
+            ),
+            {
+                "first_analysis_id": first_analysis_id,
+                "first_team_id": first_team_id,
+                "second_analysis_id": second_analysis_id,
+                "second_team_id": second_team_id,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO engine_executions "
+                "(id, analysis_id, team_id, engine_id, attempt_number, "
+                "tenant_resource_version, adapter_version, engine_commit_sha, "
+                "engine_image_digest, input_manifest_hash, config_hash, state) VALUES "
+                "(:id, :analysis_id, :team_id, 'smartperfetto', 1, 1, '1.0.0', "
+                "repeat('a', 40), 'sha256:' || repeat('b', 64), repeat('c', 64), "
+                "repeat('d', 64), 'completed')"
+            ),
+            {
+                "id": source_execution_id,
+                "analysis_id": first_analysis_id,
+                "team_id": first_team_id,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO synthesis_executions "
+                "(id, team_id, analysis_id, source_execution_id, tenant_resource_version, "
+                "generation, state, request_fingerprint, normalizer_version, "
+                "report_worker_image_digest, projection_sha256_b64, provider_protocol, "
+                "provider_name, provider_model, prompt_template_version, "
+                "prompt_template_sha256_b64, attempt_count) VALUES "
+                "(:id, :team_id, :analysis_id, :source_execution_id, 1, 1, 'pending', "
+                "repeat('a', 64), 'normalizer-1', 'sha256:' || repeat('b', 64), "
+                "repeat('A', 44), 'openai-compatible', 'provider', 'model', 'v1', "
+                "repeat('B', 44), 0)"
+            ),
+            {
+                "id": synthesis_execution_id,
+                "team_id": first_team_id,
+                "analysis_id": first_analysis_id,
+                "source_execution_id": source_execution_id,
+            },
+        )
+        with pytest.raises(IntegrityError):
+            with connection.begin_nested():
+                connection.execute(
+                    text(
+                        "INSERT INTO ai_invocations "
+                        "(id, synthesis_execution_id, team_id, analysis_id, attempt_number, "
+                        "request_fingerprint, provider_protocol, provider_name, provider_model, "
+                        "prompt_template_version, state, started_at) VALUES "
+                        "(:id, :synthesis_execution_id, :team_id, :analysis_id, 1, "
+                        "repeat('a', 64), 'openai-compatible', 'provider', 'model', 'v1', "
+                        "'running', now())"
+                    ),
+                    {
+                        "id": uuid4(),
+                        "synthesis_execution_id": synthesis_execution_id,
+                        "team_id": second_team_id,
+                        "analysis_id": second_analysis_id,
+                    },
+                )
+
+
+def test_control_ai_synthesis_downgrade_succeeds_for_empty_schema(
+    migration_databases: MigrationDatabases,
+) -> None:
+    config = _alembic_config("control", migration_databases.control_url)
+    command.upgrade(config, "head")
+
+    command.downgrade(config, "0007_trace_worker_claims")
+
+    control_inspector = inspect(migration_databases.control_engine)
+    assert {"synthesis_executions", "ai_invocations"}.isdisjoint(
+        control_inspector.get_table_names()
+    )
+    assert "subject_version" not in {
+        column["name"] for column in control_inspector.get_columns("outbox_events")
+    }
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0007_trace_worker_claims"
+        )
+
+
+def test_control_ai_synthesis_downgrade_refuses_audit_records(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    team_id = UUID("a6000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("a6000000-0000-4000-8000-000000000002")
+    source_execution_id = UUID("a6000000-0000-4000-8000-000000000003")
+    synthesis_execution_id = UUID("a6000000-0000-4000-8000-000000000004")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'Downgrade', 'active')"),
+            {"id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                "VALUES (:id, :team_id, 'downgrade', 'trace_upload', 'analyzing', "
+                "ARRAY[]::varchar[])"
+            ),
+            {"id": analysis_id, "team_id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO engine_executions "
+                "(id, analysis_id, team_id, engine_id, attempt_number, "
+                "tenant_resource_version, adapter_version, engine_commit_sha, "
+                "engine_image_digest, input_manifest_hash, config_hash, state) VALUES "
+                "(:id, :analysis_id, :team_id, 'smartperfetto', 1, 1, '1.0.0', "
+                "repeat('a', 40), 'sha256:' || repeat('b', 64), repeat('c', 64), "
+                "repeat('d', 64), 'completed')"
+            ),
+            {
+                "id": source_execution_id,
+                "analysis_id": analysis_id,
+                "team_id": team_id,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO synthesis_executions "
+                "(id, team_id, analysis_id, source_execution_id, tenant_resource_version, "
+                "generation, state, request_fingerprint, normalizer_version, "
+                "report_worker_image_digest, projection_sha256_b64, provider_protocol, "
+                "provider_name, provider_model, prompt_template_version, "
+                "prompt_template_sha256_b64, attempt_count) VALUES "
+                "(:id, :team_id, :analysis_id, :source_execution_id, 1, 1, 'pending', "
+                "repeat('a', 64), 'normalizer-1', 'sha256:' || repeat('b', 64), "
+                "repeat('A', 44), 'openai-compatible', 'provider', 'model', 'v1', "
+                "repeat('B', 44), 0)"
+            ),
+            {
+                "id": synthesis_execution_id,
+                "team_id": team_id,
+                "analysis_id": analysis_id,
+                "source_execution_id": source_execution_id,
+            },
+        )
+        connection.execute(
+            text(
+                "INSERT INTO ai_invocations "
+                "(id, synthesis_execution_id, team_id, analysis_id, attempt_number, "
+                "request_fingerprint, provider_protocol, provider_name, provider_model, "
+                "prompt_template_version, state, started_at) VALUES "
+                "(:id, :synthesis_execution_id, :team_id, :analysis_id, 1, "
+                "repeat('a', 64), 'openai-compatible', 'provider', 'model', 'v1', "
+                "'running', now())"
+            ),
+            {
+                "id": uuid4(),
+                "synthesis_execution_id": synthesis_execution_id,
+                "team_id": team_id,
+                "analysis_id": analysis_id,
+            },
+        )
+
+    with pytest.raises(RuntimeError, match="synthesis audit downgrade preflight failed"):
+        command.downgrade(
+            _alembic_config("control", migration_databases.control_url),
+            "0007_trace_worker_claims",
+        )
+
+    control_inspector = inspect(migration_databases.control_engine)
+    assert {"synthesis_executions", "ai_invocations"} <= set(
+        control_inspector.get_table_names()
+    )
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM synthesis_executions")) == 1
+        assert connection.scalar(text("SELECT count(*) FROM ai_invocations")) == 1
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0008_ai_synthesis"
+        )
+
+
+@pytest.mark.parametrize(
+    ("event_type", "subject_type", "subject_version"),
+    [
+        ("engine_result_ready", "engine_execution", None),
+        ("analysis_synthesis_requested", "synthesis_execution", None),
+        ("analysis_queued", "analysis", 1),
+    ],
+)
+def test_control_ai_synthesis_downgrade_refuses_retained_outbox_authority(
+    event_type: str,
+    subject_type: str,
+    subject_version: int | None,
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    team_id = uuid4()
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'Outbox', 'active')"),
+            {"id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO outbox_events "
+                "(team_id, event_type, subject_type, subject_id, subject_version) VALUES "
+                "(:team_id, :event_type, :subject_type, :subject_id, :subject_version)"
+            ),
+            {
+                "team_id": team_id,
+                "event_type": event_type,
+                "subject_type": subject_type,
+                "subject_id": uuid4(),
+                "subject_version": subject_version,
+            },
+        )
+
+    with pytest.raises(RuntimeError, match="synthesis audit downgrade preflight failed"):
+        command.downgrade(
+            _alembic_config("control", migration_databases.control_url),
+            "0007_trace_worker_claims",
+        )
+
+    control_inspector = inspect(migration_databases.control_engine)
+    assert "subject_version" in {
+        column["name"] for column in control_inspector.get_columns("outbox_events")
+    }
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT count(*) FROM outbox_events")) == 1
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0008_ai_synthesis"
+        )
+
+
 def test_control_orchestration_tables_exclude_tenant_content(
     migration_databases: MigrationDatabases,
 ) -> None:
