@@ -224,6 +224,19 @@ class ActiveLeaseView:
 
 
 @dataclass(frozen=True, slots=True)
+class InputUploadView:
+    state: Literal["awaiting_upload", "pending", "finalized"]
+    artifact_kind: str
+    mime: str
+    size: int
+    sha256_b64: str
+    upload_id: UUID | None
+    artifact_id: UUID | None
+    expires_at: datetime | None
+    finalized_at: datetime | None
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisView:
     analysis_id: UUID
     team_id: UUID
@@ -243,7 +256,7 @@ class AnalysisView:
     failure_code: str | None
     question: str | None = None
     analysis_profile: Literal["auto", "startup", "scroll"] | None = None
-    input_uploads: tuple[UploadSlot, ...] = ()
+    input_uploads: tuple[InputUploadView, ...] = ()
 
 
 MemoryAnalysisView = AnalysisView
@@ -340,6 +353,14 @@ class AnalysisRepository(Protocol):
         now: datetime,
     ) -> AnalysisView: ...
 
+    async def mark_trace_uploading(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        now: datetime,
+    ) -> None: ...
+
     async def require_finalizable(
         self,
         *,
@@ -366,7 +387,14 @@ class AnalysisRepository(Protocol):
         team_id: UUID,
         analysis_id: UUID,
         upload_id: UUID,
-    ) -> Literal["initial_apk", "generic"]: ...
+    ) -> Literal["initial_apk", "trace_input", "generic"]: ...
+
+    async def trace_required_input_ready(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+    ) -> bool: ...
 
     async def stage_tenant_scenarios(
         self,
@@ -869,6 +897,35 @@ class AnalysisService:
             )
         )
 
+    async def create_upload_slot(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        idempotency_key: str,
+        artifact_kind: str,
+        mime: str,
+        size: int,
+        sha256_b64: str,
+    ) -> UploadSlot:
+        slot = await self._upload_service.create_slot(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            idempotency_key=idempotency_key,
+            artifact_kind=artifact_kind,
+            mime=mime,
+            size=size,
+            sha256_b64=sha256_b64,
+        )
+        await _repository_call(
+            lambda: self._repository.mark_trace_uploading(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                now=self._clock(),
+            )
+        )
+        return slot
+
     async def create_device_analysis(
         self,
         *,
@@ -1212,7 +1269,7 @@ class AnalysisService:
                 caller_size=caller_size,
             )
         try:
-            return await self._upload_service.finalize(
+            slot = await self._upload_service.finalize(
                 team_id=team_id,
                 analysis_id=analysis_id,
                 upload_id=upload_id,
@@ -1221,6 +1278,14 @@ class AnalysisService:
             )
         except UploadNotFoundError:
             raise AnalysisNotFoundError("analysis upload was not found") from None
+        if upload_class == "trace_input":
+            await _repository_call(
+                lambda: self._repository.trace_required_input_ready(
+                    team_id=team_id,
+                    analysis_id=analysis_id,
+                )
+            )
+        return slot
 
     async def get_report(
         self,
@@ -1628,6 +1693,50 @@ class SQLAlchemyAnalysisRepository:
             now=now,
         )
 
+    async def mark_trace_uploading(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        now: datetime,
+    ) -> None:
+        async with self._control_session_factory() as session:
+            async with session.begin():
+                job = await session.scalar(
+                    select(GlobalJob)
+                    .where(
+                        GlobalJob.id == analysis_id,
+                        GlobalJob.team_id == team_id,
+                    )
+                    .with_for_update()
+                )
+                if job is None:
+                    raise AnalysisNotFoundError("analysis was not found")
+                if job.analysis_mode != "trace_upload":
+                    return
+                if job.state == "uploading":
+                    return
+                if job.state != "created":
+                    raise AnalysisUnavailableError("analysis upload state is unavailable")
+                changed = await session.scalar(
+                    update(GlobalJob)
+                    .where(
+                        GlobalJob.id == analysis_id,
+                        GlobalJob.team_id == team_id,
+                        GlobalJob.analysis_mode == "trace_upload",
+                        GlobalJob.state == "created",
+                        GlobalJob.version == job.version,
+                    )
+                    .values(
+                        state="uploading",
+                        version=GlobalJob.version + 1,
+                        updated_at=now,
+                    )
+                    .returning(GlobalJob.id)
+                )
+                if changed is None:
+                    raise StaleTaskVersionError("analysis version is stale")
+
     async def reserve_creation(
         self,
         *,
@@ -1922,6 +2031,17 @@ class SQLAlchemyAnalysisRepository:
                 )
                 .order_by(Artifact.created_at.desc())
             )
+            input_artifacts = list(
+                (
+                    await session.scalars(
+                        select(Artifact).where(
+                            Artifact.analysis_id == analysis_id,
+                            Artifact.idempotency_key.like("input-%"),
+                            Artifact.deleted_at.is_(None),
+                        )
+                    )
+                ).all()
+            )
             sample_attempts = list(
                 (
                     await session.scalars(
@@ -1984,6 +2104,82 @@ class SQLAlchemyAnalysisRepository:
                 raise AnalysisUnavailableError("trace analysis state is unavailable") from None
             if list(canonical_manifest) != stored_manifest:
                 raise AnalysisUnavailableError("trace analysis state is unavailable")
+            manifest_by_kind = {
+                str(item["kind"]): item for item in canonical_manifest
+            }
+            artifacts_by_kind: dict[str, Artifact] = {}
+            for input_artifact in input_artifacts:
+                kind = input_artifact.artifact_kind
+                expected = manifest_by_kind.get(kind)
+                if (
+                    expected is None
+                    or kind in artifacts_by_kind
+                    or input_artifact.idempotency_key != f"input-{kind}"
+                    or input_artifact.mime_type != expected["mime"]
+                    or input_artifact.size_bytes != expected["size"]
+                    or input_artifact.sha256_b64 != expected["sha256_b64"]
+                    or input_artifact.request_hash is None
+                    or input_artifact.state not in ("pending", "finalized")
+                    or input_artifact.state == "pending"
+                    and (
+                        input_artifact.version_id is not None
+                        or input_artifact.finalized_at is not None
+                    )
+                    or input_artifact.state == "finalized"
+                    and (
+                        input_artifact.version_id is None
+                        or input_artifact.finalized_at is None
+                    )
+                ):
+                    raise AnalysisUnavailableError("trace analysis input state is unavailable")
+                artifacts_by_kind[kind] = input_artifact
+
+            input_uploads: list[InputUploadView] = []
+            for item in canonical_manifest:
+                kind = str(item["kind"])
+                input_artifact = artifacts_by_kind.get(kind)
+                if input_artifact is None:
+                    input_uploads.append(
+                        InputUploadView(
+                            state="awaiting_upload",
+                            artifact_kind=kind,
+                            mime=str(item["mime"]),
+                            size=int(item["size"]),
+                            sha256_b64=str(item["sha256_b64"]),
+                            upload_id=None,
+                            artifact_id=None,
+                            expires_at=None,
+                            finalized_at=None,
+                        )
+                    )
+                elif input_artifact.state == "pending":
+                    input_uploads.append(
+                        InputUploadView(
+                            state="pending",
+                            artifact_kind=kind,
+                            mime=input_artifact.mime_type,
+                            size=input_artifact.size_bytes,
+                            sha256_b64=input_artifact.sha256_b64,
+                            upload_id=input_artifact.upload_id,
+                            artifact_id=None,
+                            expires_at=input_artifact.expires_at,
+                            finalized_at=None,
+                        )
+                    )
+                else:
+                    input_uploads.append(
+                        InputUploadView(
+                            state="finalized",
+                            artifact_kind=kind,
+                            mime=input_artifact.mime_type,
+                            size=input_artifact.size_bytes,
+                            sha256_b64=input_artifact.sha256_b64,
+                            upload_id=input_artifact.upload_id,
+                            artifact_id=input_artifact.id,
+                            expires_at=None,
+                            finalized_at=input_artifact.finalized_at,
+                        )
+                    )
             return AnalysisView(
                 analysis_id=job.id,
                 team_id=job.team_id,
@@ -2009,7 +2205,7 @@ class SQLAlchemyAnalysisRepository:
                 failure_code=job.failure_code,
                 question=question,
                 analysis_profile=tenant_analysis.analysis_profile,  # type: ignore[arg-type]
-                input_uploads=(),
+                input_uploads=tuple(input_uploads),
             )
 
         children_by_type = {child.scenario_type: child for child in children}
@@ -2288,15 +2484,15 @@ class SQLAlchemyAnalysisRepository:
         team_id: UUID,
         analysis_id: UUID,
         upload_id: UUID,
-    ) -> Literal["initial_apk", "generic"]:
+    ) -> Literal["initial_apk", "trace_input", "generic"]:
         async with self._control_session_factory() as session:
-            exists = await session.scalar(
-                select(GlobalJob.id).where(
+            job = await session.scalar(
+                select(GlobalJob).where(
                     GlobalJob.id == analysis_id,
                     GlobalJob.team_id == team_id,
                 )
             )
-        if exists is None:
+        if job is None:
             raise AnalysisNotFoundError("analysis was not found")
         async with self._tenant_router.session(team_id) as session:
             artifact = await session.scalar(
@@ -2312,7 +2508,74 @@ class SQLAlchemyAnalysisRepository:
             if artifact.artifact_kind != "apk":
                 raise AnalysisUnavailableError("initial APK state is unavailable")
             return "initial_apk"
+        if job.analysis_mode == "trace_upload":
+            if artifact.idempotency_key != f"input-{artifact.artifact_kind}":
+                raise AnalysisUnavailableError("trace input state is unavailable")
+            return "trace_input"
         return "generic"
+
+    async def trace_required_input_ready(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+    ) -> bool:
+        async with self._control_session_factory() as session:
+            exists = await session.scalar(
+                select(GlobalJob.id).where(
+                    GlobalJob.id == analysis_id,
+                    GlobalJob.team_id == team_id,
+                    GlobalJob.analysis_mode == "trace_upload",
+                )
+            )
+        if exists is None:
+            raise AnalysisNotFoundError("analysis was not found")
+
+        async with self._tenant_router.session(team_id) as session:
+            analysis = await session.get(Analysis, analysis_id)
+            artifact = await session.scalar(
+                select(Artifact).where(
+                    Artifact.analysis_id == analysis_id,
+                    Artifact.idempotency_key == "input-trace",
+                    Artifact.artifact_kind == "trace",
+                    Artifact.deleted_at.is_(None),
+                )
+            )
+        if (
+            analysis is None
+            or analysis.analysis_mode != "trace_upload"
+            or analysis.tombstoned_at is not None
+            or analysis.state == "deleted"
+            or not isinstance(analysis.input_manifest, list)
+        ):
+            raise AnalysisUnavailableError("trace analysis state is unavailable")
+        try:
+            manifest = _canonical_trace_inputs(tuple(analysis.input_manifest))
+        except AnalysisInvalidRequestError:
+            raise AnalysisUnavailableError("trace analysis state is unavailable") from None
+        trace_input = next((item for item in manifest if item["kind"] == "trace"), None)
+        if trace_input is None:
+            raise AnalysisUnavailableError("trace analysis state is unavailable")
+        if artifact is None:
+            return False
+        if (
+            artifact.mime_type != trace_input["mime"]
+            or artifact.size_bytes != trace_input["size"]
+            or artifact.sha256_b64 != trace_input["sha256_b64"]
+            or artifact.request_hash is None
+        ):
+            raise AnalysisUnavailableError("trace input state is unavailable")
+        if artifact.state == "pending":
+            if artifact.version_id is not None or artifact.finalized_at is not None:
+                raise AnalysisUnavailableError("trace input state is unavailable")
+            return False
+        if (
+            artifact.state != "finalized"
+            or artifact.version_id is None
+            or artifact.finalized_at is None
+        ):
+            raise AnalysisUnavailableError("trace input state is unavailable")
+        return True
 
     @staticmethod
     def _application_metadata(

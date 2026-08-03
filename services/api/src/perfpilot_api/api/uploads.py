@@ -194,15 +194,31 @@ async def create_upload_slot(
         access="write",
     )
     try:
-        slot = await upload_service.create_slot(
-            team_id=team_id,
-            analysis_id=analysis_id,
-            idempotency_key=idempotency_key,
-            artifact_kind=payload.artifact_kind,
-            mime=payload.mime,
-            size=payload.size,
-            sha256_b64=payload.sha256_b64,
-        )
+        analysis_service: AnalysisService | None = request.app.state.analysis_service
+        if analysis_service is not None:
+            slot = await analysis_service.create_upload_slot(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                idempotency_key=idempotency_key,
+                artifact_kind=payload.artifact_kind,
+                mime=payload.mime,
+                size=payload.size,
+                sha256_b64=payload.sha256_b64,
+            )
+        elif request.app.state.testing:
+            slot = await upload_service.create_slot(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                idempotency_key=idempotency_key,
+                artifact_kind=payload.artifact_kind,
+                mime=payload.mime,
+                size=payload.size,
+                sha256_b64=payload.sha256_b64,
+            )
+        else:
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    except AnalysisError as error:
+        raise analysis_error(error) from None
     except (
         UploadInvalidRequestError,
         UploadNotFoundError,

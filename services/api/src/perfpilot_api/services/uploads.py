@@ -44,6 +44,16 @@ _UPLOADABLE_KINDS = frozenset(
         "trace",
     }
 )
+_TRACE_INPUT_ORDER = (
+    "trace",
+    "memory_evidence",
+    "apk",
+    "source_archive",
+    "mapping",
+    "native_symbols",
+    "log",
+)
+_TRACE_INPUT_KINDS = frozenset(_TRACE_INPUT_ORDER)
 _SLOT_LIFETIME = timedelta(minutes=15)
 _RETENTION_LIFETIME = timedelta(days=30)
 
@@ -265,15 +275,87 @@ class SQLAlchemyUploadRepository:
         analysis_id: UUID,
         *,
         uploadable: bool,
-    ) -> None:
-        statement = select(Analysis.id).where(
+        lock: bool = False,
+    ) -> Analysis:
+        statement = select(Analysis).where(
             Analysis.id == analysis_id,
             Analysis.tombstoned_at.is_(None),
             Analysis.state != "deleted",
         )
         if uploadable:
             statement = statement.where(Analysis.state.in_(("creating", "created", "uploading")))
-        if await session.scalar(statement) is None:
+        if lock:
+            statement = statement.with_for_update()
+        analysis = await session.scalar(statement)
+        if analysis is None:
+            raise UploadNotFoundError("artifact was not found")
+        return analysis
+
+    @staticmethod
+    def _authorize_trace_input(
+        analysis: Analysis,
+        *,
+        idempotency_key: str,
+        descriptor: UploadDescriptor,
+        now: datetime,
+    ) -> None:
+        manifest = analysis.input_manifest
+        if not isinstance(manifest, list) or not 1 <= len(manifest) <= len(_TRACE_INPUT_ORDER):
+            raise UploadUnavailableError("upload service is unavailable")
+        by_kind: dict[str, dict[str, object]] = {}
+        ordered_kinds: list[str] = []
+        for item in manifest:
+            if not isinstance(item, dict) or set(item) != {
+                "kind",
+                "mime",
+                "size",
+                "sha256_b64",
+            }:
+                raise UploadUnavailableError("upload service is unavailable")
+            kind = item.get("kind")
+            mime = item.get("mime")
+            size = item.get("size")
+            checksum = item.get("sha256_b64")
+            if (
+                not isinstance(kind, str)
+                or kind not in _TRACE_INPUT_KINDS
+                or kind in by_kind
+                or not isinstance(mime, str)
+                or _MIME_TYPE.fullmatch(mime) is None
+                or type(size) is not int
+                or not 1 <= size <= _MAX_UPLOAD_BYTES
+                or not isinstance(checksum, str)
+            ):
+                raise UploadUnavailableError("upload service is unavailable")
+            try:
+                canonical_checksum = _canonical_checksum(checksum)
+            except UploadInvalidRequestError:
+                raise UploadUnavailableError("upload service is unavailable") from None
+            by_kind[kind] = {
+                "kind": kind,
+                "mime": mime,
+                "size": size,
+                "sha256_b64": canonical_checksum,
+            }
+            ordered_kinds.append(kind)
+        expected_order = [kind for kind in _TRACE_INPUT_ORDER if kind in by_kind]
+        if "trace" not in by_kind or ordered_kinds != expected_order:
+            raise UploadUnavailableError("upload service is unavailable")
+
+        expected = by_kind.get(descriptor.artifact_kind)
+        actual = {
+            "kind": descriptor.artifact_kind,
+            "mime": descriptor.mime,
+            "size": descriptor.size,
+            "sha256_b64": descriptor.sha256_b64,
+        }
+        if idempotency_key != f"input-{descriptor.artifact_kind}" or expected != actual:
+            raise UploadNotFoundError("artifact was not found")
+        if analysis.state == "created":
+            analysis.state = "uploading"
+            analysis.version += 1
+            analysis.updated_at = now
+        elif analysis.state != "uploading":
             raise UploadNotFoundError("artifact was not found")
 
     async def reserve_slot(
@@ -291,7 +373,19 @@ class SQLAlchemyUploadRepository:
         expires_at: datetime,
     ) -> StoredUpload:
         async with self._session(tenant) as session:
-            await self._require_analysis(session, analysis_id, uploadable=True)
+            analysis = await self._require_analysis(
+                session,
+                analysis_id,
+                uploadable=True,
+                lock=True,
+            )
+            if analysis.analysis_mode == "trace_upload":
+                self._authorize_trace_input(
+                    analysis,
+                    idempotency_key=idempotency_key,
+                    descriptor=descriptor,
+                    now=now,
+                )
             statement = (
                 postgresql_insert(Artifact)
                 .values(

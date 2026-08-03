@@ -98,6 +98,7 @@
       "maxItems": 7,
       "items": {
         "oneOf": [
+          {"$ref": "#/$defs/awaitingInputUpload"},
           {"$ref": "#/$defs/pendingInputUpload"},
           {"$ref": "#/$defs/finalizedInputUpload"}
         ]
@@ -198,6 +199,7 @@
               "maxItems": 7,
               "items": {
                 "oneOf": [
+                  {"$ref": "#/$defs/awaitingInputUpload"},
                   {"$ref": "#/$defs/pendingInputUpload"},
                   {"$ref": "#/$defs/finalizedInputUpload"}
                 ]
@@ -326,6 +328,29 @@
         "log"
       ]
     },
+    "awaitingInputUpload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "artifact_kind",
+        "mime",
+        "size",
+        "sha256_b64"
+      ],
+      "properties": {
+        "state": {"const": "awaiting_upload"},
+        "artifact_kind": {"$ref": "#/$defs/inputKind"},
+        "mime": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
+        },
+        "size": {"type": "integer", "minimum": 1, "maximum": 5368709120},
+        "sha256_b64": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "pendingInputUpload": {
       "type": "object",
       "additionalProperties": false,
@@ -350,21 +375,8 @@
         },
         "size": {"type": "integer", "minimum": 1, "maximum": 5368709120},
         "sha256_b64": {"$ref": "#/$defs/sha256"},
-        "expires_at": {"type": "string", "format": "date-time"},
-        "put_url": {"type": "string", "format": "uri", "pattern": "^https://"},
-        "required_headers": {"$ref": "#/$defs/inputRequiredHeaders"}
-      },
-      "oneOf": [
-        {"required": ["put_url", "required_headers"]},
-        {
-          "not": {
-            "anyOf": [
-              {"required": ["put_url"]},
-              {"required": ["required_headers"]}
-            ]
-          }
-        }
-      ]
+        "expires_at": {"type": "string", "format": "date-time"}
+      }
     },
     "finalizedInputUpload": {
       "type": "object",

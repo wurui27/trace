@@ -63,6 +63,11 @@ from perfpilot_api.services.analyses import (
     canonical_trace_analysis_request_hash,
     scenario_job_id,
 )
+from perfpilot_api.services.uploads import (
+    SQLAlchemyUploadRepository,
+    TenantBucket,
+    UploadDescriptor,
+)
 
 TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 OTHER_TEAM_ID = UUID("10000000-0000-4000-8000-000000000002")
@@ -71,6 +76,8 @@ ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000001")
 OTHER_ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000002")
 ARTIFACT_ID = UUID("40000000-0000-4000-8000-000000000001")
 UPLOAD_ID = UUID("50000000-0000-4000-8000-000000000001")
+MAPPING_ARTIFACT_ID = UUID("40000000-0000-4000-8000-000000000002")
+MAPPING_UPLOAD_ID = UUID("50000000-0000-4000-8000-000000000002")
 APPLICATION_ID = UUID("70000000-0000-4000-8000-000000000001")
 APPLICATION_VERSION_ID = UUID("71000000-0000-4000-8000-000000000001")
 OTHER_APPLICATION_VERSION_ID = UUID("71000000-0000-4000-8000-000000000002")
@@ -521,8 +528,9 @@ async def _create_trace_analysis(
     analysis_id: UUID = ANALYSIS_ID,
     idempotency_key: str = "trace-analysis-create-1",
     question: str | None = "为什么滑动卡顿？",
+    inputs: tuple[dict[str, object], ...] | None = None,
 ):
-    inputs: tuple[dict[str, object], ...] = (
+    canonical_inputs = inputs or (
         {
             "kind": "trace",
             "mime": "application/octet-stream",
@@ -533,7 +541,7 @@ async def _create_trace_analysis(
     request_hash = canonical_trace_analysis_request_hash(
         analysis_profile="auto",
         question=question,
-        inputs=inputs,
+        inputs=canonical_inputs,
     )
     return await database.repository.create_trace_analysis(
         team_id=TEAM_ID,
@@ -543,7 +551,7 @@ async def _create_trace_analysis(
         candidate_analysis_id=analysis_id,
         analysis_profile="auto",
         question=question,
-        inputs=inputs,
+        inputs=canonical_inputs,
         now=NOW,
     )
 
@@ -943,7 +951,28 @@ async def test_trace_creation_persists_tenant_manifest_without_device_side_effec
     assert first.application_version_id is None
     assert first.apk_upload is None
     assert first.scenarios == ()
-    assert first.input_uploads == ()
+    assert [
+        (
+            item.state,
+            item.artifact_kind,
+            item.mime,
+            item.size,
+            item.sha256_b64,
+            item.upload_id,
+            item.artifact_id,
+        )
+        for item in first.input_uploads
+    ] == [
+        (
+            "awaiting_upload",
+            "trace",
+            "application/octet-stream",
+            4,
+            CHECKSUM,
+            None,
+            None,
+        )
+    ]
 
     async with analysis_databases.control_sessions() as session:
         job = await session.get(GlobalJob, ANALYSIS_ID)
@@ -982,6 +1011,96 @@ async def test_trace_creation_persists_tenant_manifest_without_device_side_effec
     ]
     assert analysis.question == "为什么滑动卡顿？"
     assert (artifact_count, scenario_count) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_trace_status_keeps_optional_pending_when_required_trace_is_ready(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    inputs: tuple[dict[str, object], ...] = (
+        {
+            "kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 4,
+            "sha256_b64": CHECKSUM,
+        },
+        {
+            "kind": "mapping",
+            "mime": "text/plain",
+            "size": 4,
+            "sha256_b64": OTHER_CHECKSUM,
+        },
+    )
+    await _create_trace_analysis(analysis_databases, inputs=inputs)
+    upload_repository = SQLAlchemyUploadRepository(
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    )
+    tenant = TenantBucket(team_id=TEAM_ID, bucket="unused", resource_version=1)
+    trace = await upload_repository.reserve_slot(
+        tenant=tenant,
+        analysis_id=ANALYSIS_ID,
+        idempotency_key="input-trace",
+        request_hash="d" * 64,
+        descriptor=UploadDescriptor("trace", "application/octet-stream", 4, CHECKSUM),
+        artifact_id=ARTIFACT_ID,
+        upload_id=UPLOAD_ID,
+        object_key=f"raw/analyses/{ANALYSIS_ID}/inputs/trace/{UPLOAD_ID}",
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    mapping = await upload_repository.reserve_slot(
+        tenant=tenant,
+        analysis_id=ANALYSIS_ID,
+        idempotency_key="input-mapping",
+        request_hash="e" * 64,
+        descriptor=UploadDescriptor("mapping", "text/plain", 4, OTHER_CHECKSUM),
+        artifact_id=MAPPING_ARTIFACT_ID,
+        upload_id=MAPPING_UPLOAD_ID,
+        object_key=f"raw/analyses/{ANALYSIS_ID}/inputs/mapping/{MAPPING_UPLOAD_ID}",
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    await analysis_databases.repository.mark_trace_uploading(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=NOW,
+    )
+
+    pending = await analysis_databases.repository.load_view(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=NOW,
+    )
+    assert pending.state == "uploading"
+    assert [item.state for item in pending.input_uploads] == ["pending", "pending"]
+    assert not await analysis_databases.repository.trace_required_input_ready(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+    )
+
+    finalized = await upload_repository.finalize_upload(
+        tenant=tenant,
+        analysis_id=ANALYSIS_ID,
+        upload_id=trace.upload_id,
+        expected_version=trace.version,
+        storage_version_id="trace-version-1",
+        finalized_at=NOW + timedelta(minutes=1),
+        expires_at=NOW + timedelta(days=30),
+    )
+    assert finalized is not None
+    assert await analysis_databases.repository.trace_required_input_ready(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+    )
+
+    ready = await analysis_databases.repository.load_view(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=NOW + timedelta(minutes=1),
+    )
+    assert [item.state for item in ready.input_uploads] == ["finalized", "pending"]
+    assert ready.input_uploads[0].artifact_id == ARTIFACT_ID
+    assert ready.input_uploads[1].upload_id == mapping.upload_id
 
 
 @pytest.mark.asyncio

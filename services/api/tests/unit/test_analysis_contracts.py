@@ -179,6 +179,51 @@ def _memory_analysis_response(*, question: str | None = None) -> dict[str, objec
     }
 
 
+def _trace_analysis_response(*, input_state: str) -> dict[str, object]:
+    input_upload: dict[str, object] = {
+        "state": input_state,
+        "artifact_kind": "trace",
+        "mime": "application/octet-stream",
+        "size": 4_096,
+        "sha256_b64": _sha(),
+    }
+    if input_state == "pending":
+        input_upload.update(
+            {
+                "upload_id": "41000000-0000-4000-8000-000000000001",
+                "expires_at": "2026-07-28T12:15:00Z",
+            }
+        )
+    return {
+        "schema_version": "1.0",
+        "analysis_id": "31000000-0000-4000-8000-000000000001",
+        "team_id": "21000000-0000-4000-8000-000000000001",
+        "analysis_mode": "trace_upload",
+        "state": "uploading" if input_state == "pending" else "created",
+        "version": 2,
+        "application_version_id": None,
+        "application_metadata": None,
+        "apk_upload": None,
+        "scenarios": [],
+        "sample_verdict_counts": {
+            "valid": 0,
+            "invalid": 0,
+            "pending": 0,
+            "validation_error": 0,
+            "total": 0,
+        },
+        "active_lease": None,
+        "report_available": False,
+        "created_at": "2026-07-28T12:00:00Z",
+        "started_at": None,
+        "completed_at": None,
+        "failure": None,
+        "analysis_profile": "auto",
+        "question": "为什么滑动卡顿？",
+        "input_uploads": [input_upload],
+    }
+
+
 def test_analysis_contract_schemas_are_valid_and_close_declared_objects() -> None:
     schemas = _schemas()
 
@@ -379,6 +424,19 @@ def test_memory_analysis_response_requires_manual_zero_side_effect_invariants() 
     ):
         with pytest.raises(jsonschema.ValidationError):
             validator.validate(mutation)
+
+
+def test_trace_analysis_response_projects_declared_inputs_without_minting_urls() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/analysis-response.schema.json", schemas)
+
+    validator.validate(_trace_analysis_response(input_state="awaiting_upload"))
+    validator.validate(_trace_analysis_response(input_state="pending"))
+
+    unexpected_url = _trace_analysis_response(input_state="pending")
+    unexpected_url["input_uploads"][0]["put_url"] = "https://objects.example/secret"  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(unexpected_url)
 
 
 def test_scenario_execution_manifest_never_claims_server_sample_validity() -> None:

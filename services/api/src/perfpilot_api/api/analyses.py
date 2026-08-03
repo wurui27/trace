@@ -19,6 +19,7 @@ from perfpilot_api.services.analyses import (
     AnalysisView,
     ApkInspectionError,
     ApkInspectionUnavailableError,
+    InputUploadView,
     ReportNotAvailableError,
     SampleVerdictCounts,
     ScenarioView,
@@ -257,6 +258,51 @@ def _apk_upload(slot: UploadSlot) -> dict[str, object]:
     return common
 
 
+def _input_upload(item: InputUploadView) -> dict[str, object]:
+    common: dict[str, object] = {
+        "state": item.state,
+        "artifact_kind": item.artifact_kind,
+        "mime": item.mime,
+        "size": item.size,
+        "sha256_b64": item.sha256_b64,
+    }
+    if item.state == "awaiting_upload":
+        if any(
+            value is not None
+            for value in (
+                item.upload_id,
+                item.artifact_id,
+                item.expires_at,
+                item.finalized_at,
+            )
+        ):
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    elif item.state == "pending":
+        if (
+            item.upload_id is None
+            or item.expires_at is None
+            or item.artifact_id is not None
+            or item.finalized_at is not None
+        ):
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+        common["upload_id"] = str(item.upload_id)
+        common["expires_at"] = _utc(item.expires_at)
+    elif item.state == "finalized":
+        if (
+            item.upload_id is None
+            or item.artifact_id is None
+            or item.expires_at is not None
+            or item.finalized_at is None
+        ):
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+        common["upload_id"] = str(item.upload_id)
+        common["artifact_id"] = str(item.artifact_id)
+        common["finalized_at"] = _utc(item.finalized_at)
+    else:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    return common
+
+
 def analysis_response(view: AnalysisView) -> dict[str, object]:
     if (view.application_version_id is None) != (view.application_metadata is None):
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
@@ -293,6 +339,7 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
             or view.active_lease is not None
             or view.analysis_profile not in ("auto", "startup", "scroll")
             or (view.question is not None and len(view.question) > 2_000)
+            or not view.input_uploads
             or view.sample_verdict_counts.total != 0
         ):
             raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
@@ -345,7 +392,7 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
     elif view.analysis_mode == "trace_upload":
         result["analysis_profile"] = view.analysis_profile
         result["question"] = view.question
-        result["input_uploads"] = [_apk_upload(slot) for slot in view.input_uploads]
+        result["input_uploads"] = [_input_upload(item) for item in view.input_uploads]
     return result
 
 

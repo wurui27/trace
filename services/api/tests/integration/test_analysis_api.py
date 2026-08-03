@@ -19,6 +19,7 @@ from perfpilot_api.services.analyses import (
     AnalysisUnavailableError,
     AnalysisView,
     ApplicationMetadataView,
+    InputUploadView,
     ReportNotAvailableError,
     SampleVerdictCounts,
     ScenarioView,
@@ -276,7 +277,19 @@ def _trace_created_view(*, profile: str, question: str | None) -> AnalysisView:
         failure_code=None,
         question=question,
         analysis_profile=profile,  # type: ignore[arg-type]
-        input_uploads=(),
+        input_uploads=(
+            InputUploadView(
+                state="awaiting_upload",
+                artifact_kind="trace",
+                mime="application/octet-stream",
+                size=4,
+                sha256_b64=CHECKSUM,
+                upload_id=None,
+                artifact_id=None,
+                expires_at=None,
+                finalized_at=None,
+            ),
+        ),
     )
 
 
@@ -404,7 +417,15 @@ def test_create_trace_analysis_returns_direct_parent_without_device_side_effects
     assert response.json()["analysis_mode"] == "trace_upload"
     assert response.json()["analysis_profile"] == "auto"
     assert response.json()["question"] == "为什么滑动卡顿？"
-    assert response.json()["input_uploads"] == []
+    assert response.json()["input_uploads"] == [
+        {
+            "state": "awaiting_upload",
+            "artifact_kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 4,
+            "sha256_b64": CHECKSUM,
+        }
+    ]
     assert response.json()["apk_upload"] is None
     assert response.json()["scenarios"] == []
     assert response.json()["active_lease"] is None

@@ -43,6 +43,8 @@ TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 APPLICATION_ID = UUID("20000000-0000-4000-8000-000000000001")
 APPLICATION_VERSION_ID = UUID("30000000-0000-4000-8000-000000000001")
 ANALYSIS_ID = UUID("40000000-0000-4000-8000-000000000001")
+TRACE_ANALYSIS_ID = UUID("40000000-0000-4000-8000-000000000002")
+OTHER_ANALYSIS_ID = UUID("40000000-0000-4000-8000-000000000099")
 ARTIFACT_ID_1 = UUID("50000000-0000-4000-8000-000000000001")
 ARTIFACT_ID_2 = UUID("50000000-0000-4000-8000-000000000002")
 UPLOAD_ID_1 = UUID("60000000-0000-4000-8000-000000000001")
@@ -52,6 +54,12 @@ CHECKSUM = "iNQmb9TmM40TuEX88olXnVf6kQbc4EZhDbs8WjoWj4E="
 DESCRIPTOR = UploadDescriptor(
     artifact_kind="apk",
     mime="application/vnd.android.package-archive",
+    size=4,
+    sha256_b64=CHECKSUM,
+)
+TRACE_DESCRIPTOR = UploadDescriptor(
+    artifact_kind="trace",
+    mime="application/octet-stream",
     size=4,
     sha256_b64=CHECKSUM,
 )
@@ -192,6 +200,133 @@ async def _reserve(
         now=now,
         expires_at=now + timedelta(minutes=15),
     )
+
+
+async def _seed_trace_analysis(upload_database: UploadDatabase) -> None:
+    async with upload_database.session_factory.begin() as session:
+        session.add(
+            Analysis(
+                id=TRACE_ANALYSIS_ID,
+                application_version_id=None,
+                requested_by_user_id=None,
+                analysis_mode="trace_upload",
+                question="为什么滑动卡顿？",
+                analysis_profile="auto",
+                input_manifest=[
+                    {
+                        "kind": "trace",
+                        "mime": "application/octet-stream",
+                        "size": 4,
+                        "sha256_b64": CHECKSUM,
+                    }
+                ],
+                state="created",
+                version=1,
+            )
+        )
+
+
+async def _reserve_trace(
+    repository: SQLAlchemyUploadRepository,
+    *,
+    analysis_id: UUID = TRACE_ANALYSIS_ID,
+    idempotency_key: str = "input-trace",
+    descriptor: UploadDescriptor = TRACE_DESCRIPTOR,
+    artifact_id: UUID = ARTIFACT_ID_1,
+    upload_id: UUID = UPLOAD_ID_1,
+    object_key: str = "raw/analyses/trace/inputs/trace/upload-1",
+) -> StoredUpload:
+    return await repository.reserve_slot(
+        tenant=TENANT,
+        analysis_id=analysis_id,
+        idempotency_key=idempotency_key,
+        request_hash="c" * 64,
+        descriptor=descriptor,
+        artifact_id=artifact_id,
+        upload_id=upload_id,
+        object_key=object_key,
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=15),
+    )
+
+
+@pytest.mark.asyncio
+async def test_trace_reservation_requires_the_declared_slot_and_moves_tenant_to_uploading(
+    upload_database: UploadDatabase,
+) -> None:
+    await _seed_trace_analysis(upload_database)
+    repository = _repository(upload_database)
+
+    created = await _reserve_trace(repository)
+    replayed = await _reserve_trace(
+        repository,
+        artifact_id=ARTIFACT_ID_2,
+        upload_id=UPLOAD_ID_2,
+        object_key="raw/analyses/trace/inputs/trace/substitution",
+    )
+
+    assert replayed == created
+    assert replayed.object_key == "raw/analyses/trace/inputs/trace/upload-1"
+    async with upload_database.session_factory() as session:
+        analysis = await session.get(Analysis, TRACE_ANALYSIS_ID)
+        artifact_count = await session.scalar(
+            select(func.count()).select_from(Artifact).where(
+                Artifact.analysis_id == TRACE_ANALYSIS_ID
+            )
+        )
+    assert analysis is not None
+    assert (analysis.state, analysis.version) == ("uploading", 2)
+    assert artifact_count == 1
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "wrong_key",
+        "changed_mime",
+        "changed_size",
+        "changed_checksum",
+        "undeclared_kind",
+        "cross_tenant_id",
+    ],
+)
+@pytest.mark.asyncio
+async def test_trace_reservation_rejects_undeclared_or_cross_tenant_inputs_without_writes(
+    upload_database: UploadDatabase,
+    case: str,
+) -> None:
+    await _seed_trace_analysis(upload_database)
+    repository = _repository(upload_database)
+    analysis_id = OTHER_ANALYSIS_ID if case == "cross_tenant_id" else TRACE_ANALYSIS_ID
+    idempotency_key = "trace-copy" if case == "wrong_key" else "input-trace"
+    descriptor = TRACE_DESCRIPTOR
+    if case == "changed_mime":
+        descriptor = UploadDescriptor("trace", "application/zip", 4, CHECKSUM)
+    elif case == "changed_size":
+        descriptor = UploadDescriptor("trace", "application/octet-stream", 5, CHECKSUM)
+    elif case == "changed_checksum":
+        descriptor = UploadDescriptor("trace", "application/octet-stream", 4, "E" * 43 + "=")
+    elif case == "undeclared_kind":
+        descriptor = UploadDescriptor("log", "text/plain", 4, CHECKSUM)
+
+    with pytest.raises(UploadNotFoundError):
+        await _reserve_trace(
+            repository,
+            analysis_id=analysis_id,
+            idempotency_key=idempotency_key,
+            descriptor=descriptor,
+        )
+
+    async with upload_database.session_factory() as session:
+        artifact_count = await session.scalar(
+            select(func.count()).select_from(Artifact).where(
+                Artifact.analysis_id == TRACE_ANALYSIS_ID
+            )
+        )
+        analysis = await session.get(Analysis, TRACE_ANALYSIS_ID)
+    assert artifact_count == 0
+    assert analysis is not None
+    assert (analysis.state, analysis.version) == ("created", 1)
 
 
 @pytest.mark.asyncio

@@ -124,6 +124,22 @@ class FakeUploadService:
         )
 
 
+class FakeAnalysisUploadService:
+    def __init__(self, slot: UploadSlot) -> None:
+        self.slot = slot
+        self.calls: list[dict[str, object]] = []
+
+    async def create_upload_slot(self, **kwargs: object) -> UploadSlot:
+        self.calls.append(kwargs)
+        return replace(
+            self.slot,
+            artifact_kind=kwargs["artifact_kind"],  # type: ignore[arg-type]
+            mime=kwargs["mime"],  # type: ignore[arg-type]
+            size=kwargs["size"],  # type: ignore[arg-type]
+            sha256_b64=kwargs["sha256_b64"],  # type: ignore[arg-type]
+        )
+
+
 def _settings() -> Settings:
     return Settings(
         app_env="test",
@@ -164,6 +180,7 @@ def _proxy_headers(
 def _client(
     auth_service: FakeAuthService,
     upload_service: FakeUploadService,
+    analysis_service: FakeAnalysisUploadService | None = None,
 ) -> TestClient:
     return TestClient(
         create_app(
@@ -171,6 +188,7 @@ def _client(
             settings_override=_settings(),
             auth_service=auth_service,  # type: ignore[arg-type]
             upload_service=upload_service,  # type: ignore[arg-type]
+            analysis_service=analysis_service,  # type: ignore[arg-type]
             proxy_clock=lambda: 1_700_000_000,
         )
     )
@@ -244,6 +262,47 @@ def test_create_upload_slot_returns_only_the_public_pending_contract() -> None:
         )
     ]
     assert "must-never-leave-the-service" not in response.text
+
+
+def test_trace_upload_slot_uses_the_analysis_boundary_instead_of_generic_fallback() -> None:
+    auth_service = FakeAuthService()
+    upload_service = FakeUploadService()
+    analysis_service = FakeAnalysisUploadService(upload_service.pending)
+    target = f"/v1/teams/{TEAM_ID}/analyses/{ANALYSIS_ID}/uploads"
+    body = json.dumps(
+        {
+            "artifact_kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 4,
+            "sha256_b64": CHECKSUM,
+        },
+        separators=(",", ":"),
+    ).encode()
+    headers = _proxy_headers(
+        method="POST",
+        target=target,
+        body=body,
+        request_id="req-trace-upload-create",
+    )
+    headers["Idempotency-Key"] = "input-trace"
+
+    with _client(auth_service, upload_service, analysis_service) as client:
+        response = client.post(target, content=body, headers=headers)
+
+    assert response.status_code == 201
+    assert response.json()["upload"]["artifact_kind"] == "trace"
+    assert upload_service.calls == []
+    assert analysis_service.calls == [
+        {
+            "team_id": TEAM_ID,
+            "analysis_id": ANALYSIS_ID,
+            "idempotency_key": "input-trace",
+            "artifact_kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 4,
+            "sha256_b64": CHECKSUM,
+        }
+    ]
 
 
 @pytest.mark.parametrize("artifact_kind", ["memory_evidence", "screenshot"])

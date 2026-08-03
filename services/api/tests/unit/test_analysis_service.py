@@ -64,6 +64,9 @@ class FakeAnalysisRepository:
         self.fail_calls: list[dict[str, object]] = []
         self.memory_calls: list[dict[str, object]] = []
         self.trace_calls: list[dict[str, object]] = []
+        self.trace_uploading_calls: list[dict[str, object]] = []
+        self.trace_readiness_calls: list[dict[str, object]] = []
+        self.upload_class = "generic"
         self.created_modes: list[str] = []
         self.memory_records: dict[str, tuple[str, Any]] = {}
         self.trace_records: dict[str, tuple[str, Any]] = {}
@@ -193,22 +196,42 @@ class FakeAnalysisRepository:
         self.trace_records[key] = (request_hash, view)
         return view
 
+    async def mark_trace_uploading(self, **kwargs: object) -> None:
+        self.events.append("mark_trace_uploading")
+        self.trace_uploading_calls.append(kwargs)
+
+    async def classify_upload(self, **_: object) -> str:
+        self.events.append("classify_upload")
+        return self.upload_class
+
+    async def trace_required_input_ready(self, **kwargs: object) -> bool:
+        self.events.append("trace_required_input_ready")
+        self.trace_readiness_calls.append(kwargs)
+        return True
+
 
 class FakeUploadService:
     def __init__(self, events: list[str]) -> None:
         self.events = events
         self.create_calls: list[dict[str, object]] = []
         self.finalize_calls: list[dict[str, object]] = []
+        self.finalize_result: Any = _upload_slot(state="finalized")
 
     async def create_slot(self, **kwargs: object) -> Any:
         self.events.append("create_apk_slot")
         self.create_calls.append(kwargs)
-        return _upload_slot(state="pending")
+        return replace(
+            _upload_slot(state="pending"),
+            artifact_kind=kwargs["artifact_kind"],  # type: ignore[arg-type]
+            mime=kwargs["mime"],  # type: ignore[arg-type]
+            size=kwargs["size"],  # type: ignore[arg-type]
+            sha256_b64=kwargs["sha256_b64"],  # type: ignore[arg-type]
+        )
 
     async def finalize(self, **kwargs: object) -> Any:
         self.events.append("storage_finalize")
         self.finalize_calls.append(kwargs)
-        return _upload_slot(state="finalized")
+        return self.finalize_result
 
 
 class FakeApkInspector:
@@ -377,6 +400,62 @@ async def _finalize(service: Any) -> Any:
         caller_sha256_b64=CHECKSUM,
         caller_size=4,
     )
+
+
+@pytest.mark.asyncio
+async def test_create_trace_upload_slot_projects_control_state_after_durable_reservation() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    uploads = FakeUploadService(events)
+    service = _service(repository, uploads, FakeApkInspector(events))
+
+    slot = await service.create_upload_slot(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        idempotency_key="input-trace",
+        artifact_kind="trace",
+        mime="application/octet-stream",
+        size=4,
+        sha256_b64=CHECKSUM,
+    )
+
+    assert slot.artifact_kind == "trace"
+    assert events == ["create_apk_slot", "mark_trace_uploading"]
+    assert repository.trace_uploading_calls == [
+        {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID, "now": NOW}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_finalize_trace_input_recomputes_required_readiness_after_storage_finalize() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    repository.upload_class = "trace_input"
+    uploads = FakeUploadService(events)
+    uploads.finalize_result = replace(
+        _upload_slot(state="finalized"),
+        artifact_kind="trace",
+        mime="application/octet-stream",
+    )
+    service = _service(repository, uploads, FakeApkInspector(events))
+
+    result = await service.finalize_upload(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        upload_id=UPLOAD_ID,
+        caller_sha256_b64=CHECKSUM,
+        caller_size=4,
+    )
+
+    assert result.artifact_kind == "trace"
+    assert events == [
+        "classify_upload",
+        "storage_finalize",
+        "trace_required_input_ready",
+    ]
+    assert repository.trace_readiness_calls == [
+        {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID}
+    ]
 
 
 @pytest.mark.asyncio
