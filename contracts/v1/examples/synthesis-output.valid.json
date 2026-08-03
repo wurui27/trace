@@ -1,0 +1,8 @@
+{
+  "schema_version": "1.0",
+  "executive_summary": "Startup exceeds its existing threshold because a repeated Binder wait overlaps the launch-critical path.",
+  "top_findings": [{"finding_id": "85000000-0000-4000-8000-000000000001", "summary": "The main thread repeatedly waits on Binder during startup.", "recommendation": "Move the dependency lookup off the launch-critical path."}],
+  "recommendations": ["Move the dependency lookup off the launch-critical path."],
+  "retest_plan": [{"mode": "verify_metric", "summary": "Repeat cold launches and compare startup display time.", "metric_ids": ["84000000-0000-4000-8000-000000000001"], "limitation_ids": [], "success_criterion": "meet_existing_threshold", "failure_criterion": "threshold_missed"}],
+  "limitations": []
+}

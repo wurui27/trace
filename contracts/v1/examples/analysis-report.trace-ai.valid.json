@@ -1,0 +1,14 @@
+{
+  "schema_version": "1.1",
+  "analysis_id": "82000000-0000-4000-8000-000000000001",
+  "analysis_mode": "trace_upload",
+  "state": "partially_completed",
+  "report_version": 1,
+  "generated_at": "2026-08-03T12:00:00Z",
+  "scenario_reports": [
+    {"scenario_job_id": "83000000-0000-4000-8000-000000000001", "scenario_type": "startup", "result_state": "failed", "device_group_id": null, "device_group_reason": "not_applicable", "bundle": null, "failure": {"code": "trace_incomplete", "message": "The startup trace is incomplete.", "retryable": false}},
+    {"scenario_job_id": "83000000-0000-4000-8000-000000000002", "scenario_type": "scroll", "result_state": "failed", "device_group_id": null, "device_group_reason": "not_applicable", "bundle": null, "failure": {"code": "trace_incomplete", "message": "The scroll trace is incomplete.", "retryable": false}},
+    {"scenario_job_id": "83000000-0000-4000-8000-000000000003", "scenario_type": "memory_cycle", "result_state": "failed", "device_group_id": null, "device_group_reason": "not_applicable", "bundle": null, "failure": {"code": "trace_incomplete", "message": "The memory trace is incomplete.", "retryable": false}}
+  ],
+  "synthesis": {"state": "failed", "output": null, "synthesis_artifact_id": null, "failure_code": "synthesis_unavailable", "provenance": null}
+}

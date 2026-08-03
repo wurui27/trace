@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import jsonschema
@@ -47,3 +48,33 @@ def test_error_example_rejects_missing_request_id() -> None:
     assert [error.validator for error in errors] == ["required"]
     assert [list(error.absolute_path) for error in errors] == [["error"]]
     assert [error.message for error in errors] == ["'request_id' is a required property"]
+
+
+def test_trace_ai_analysis_report_example_matches_v11_schema() -> None:
+    schema = load("contracts/v1/reports/analysis-report.schema.json")
+    payload = load("contracts/v1/examples/analysis-report.trace-ai.valid.json")
+
+    validator(schema).validate(payload)
+
+
+def test_analysis_report_versions_keep_synthesis_unambiguous() -> None:
+    report_schema = validator(load("contracts/v1/reports/analysis-report.schema.json"))
+    legacy = load("contracts/v1/examples/analysis-report.partial.valid.json")
+    report_schema.validate(legacy)
+    legacy["synthesis"] = None
+    with pytest.raises(jsonschema.ValidationError):
+        report_schema.validate(legacy)
+
+    trace_ai = load("contracts/v1/examples/analysis-report.trace-ai.valid.json")
+    reordered = deepcopy(trace_ai)
+    reordered["scenario_reports"][0], reordered["scenario_reports"][1] = (
+        reordered["scenario_reports"][1],
+        reordered["scenario_reports"][0],
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        report_schema.validate(reordered)
+
+    failed_synthesis = deepcopy(trace_ai)
+    failed_synthesis["synthesis"]["output"] = {"unexpected": True}
+    with pytest.raises(jsonschema.ValidationError):
+        report_schema.validate(failed_synthesis)
