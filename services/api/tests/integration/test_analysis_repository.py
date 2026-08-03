@@ -28,14 +28,15 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from perfpilot_api.db.control.models import (
-    GlobalJob,
     EngineExecution,
+    GlobalJob,
     IdempotencyKey,
     OutboxEvent,
     ScenarioJob,
     Team,
     TeamEngineWorkspace,
     TenantQuota,
+    WorkerClaim,
 )
 from perfpilot_api.db.tenant.models import (
     Analysis,
@@ -69,6 +70,9 @@ from perfpilot_api.services.uploads import (
     SQLAlchemyUploadRepository,
     TenantBucket,
     UploadDescriptor,
+)
+from perfpilot_api.workers.trace_orchestrator import (
+    SQLAlchemyTraceWorkQueueRepository,
 )
 
 TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
@@ -1140,6 +1144,86 @@ async def test_trace_status_keeps_optional_pending_when_required_trace_is_ready(
     assert events[0].subject_type == "analysis"
     assert events[0].subject_id == ANALYSIS_ID
     assert events[0].scenario_job_id is None
+
+    queue_clock = [NOW + timedelta(minutes=2)]
+    claim_ids = iter(
+        (
+            UUID("80000000-0000-4000-8000-000000000001"),
+            UUID("80000000-0000-4000-8000-000000000002"),
+            UUID("80000000-0000-4000-8000-000000000003"),
+        )
+    )
+    claim_tokens = iter(("a" * 32, "b" * 32, "c" * 32))
+    queue = SQLAlchemyTraceWorkQueueRepository(
+        session_factory=analysis_databases.control_sessions,
+        lease_seconds=30,
+        clock=lambda: queue_clock[0],
+        uuid_source=lambda: next(claim_ids),
+        token_source=lambda: next(claim_tokens),
+    )
+
+    competing_claims = await asyncio.gather(
+        queue.claim_next(consumer_id="trace-worker-a"),
+        queue.claim_next(consumer_id="trace-worker-b"),
+    )
+    claimed = [claim for claim in competing_claims if claim is not None]
+    assert len(claimed) == 1
+    first_claim = claimed[0]
+    assert first_claim.analysis_id == ANALYSIS_ID
+    assert "a" * 32 not in repr(first_claim)
+    assert "b" * 32 not in repr(first_claim)
+    assert "c" * 32 not in repr(first_claim)
+
+    queue_clock[0] += timedelta(seconds=31)
+    recovered_claim = await queue.claim_next(consumer_id="trace-worker-c")
+    assert recovered_claim is not None
+    assert recovered_claim.claim_id != first_claim.claim_id
+    async with analysis_databases.control_sessions() as session:
+        stored_claims = list(
+            (
+                await session.scalars(
+                    select(WorkerClaim)
+                    .where(WorkerClaim.global_job_id == ANALYSIS_ID)
+                    .order_by(WorkerClaim.created_at, WorkerClaim.id)
+                )
+            ).all()
+        )
+        event = await session.get(OutboxEvent, events[0].id)
+    assert [claim.state for claim in stored_claims] == ["expired", "active"]
+    assert event is not None
+    assert event.published_at is None
+
+    await queue.reschedule(recovered_claim, delay_seconds=5)
+    async with analysis_databases.control_sessions() as session:
+        event = await session.get(OutboxEvent, events[0].id)
+    assert event is not None
+    assert event.ready_at == queue_clock[0] + timedelta(seconds=5)
+
+    queue_clock[0] += timedelta(seconds=6)
+    second_claim = await queue.claim_next(consumer_id="trace-worker-d")
+    assert second_claim is not None
+    assert second_claim.claim_id != first_claim.claim_id
+    await queue.complete(second_claim)
+
+    async with analysis_databases.control_sessions() as session:
+        stored_claims = list(
+            (
+                await session.scalars(
+                    select(WorkerClaim)
+                    .where(WorkerClaim.global_job_id == ANALYSIS_ID)
+                    .order_by(WorkerClaim.created_at, WorkerClaim.id)
+                )
+            ).all()
+        )
+        event = await session.get(OutboxEvent, events[0].id)
+    assert [claim.state for claim in stored_claims] == [
+        "expired",
+        "completed",
+        "completed",
+    ]
+    assert event is not None
+    assert event.published_at == queue_clock[0]
+    assert await queue.claim_next(consumer_id="trace-worker-e") is None
 
 
 @pytest.mark.asyncio

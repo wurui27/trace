@@ -669,7 +669,7 @@ def test_control_execution_tenant_version_migration_round_trips_empty_table(
     assert tenant_version["default"] is None
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0006_engine_tenant_version"
+            "0007_trace_worker_claims"
         )
 
     command.downgrade(config, "0005_memory_upload_mode")
@@ -772,7 +772,7 @@ def test_control_execution_tenant_version_downgrade_refuses_rows(
 
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0006_engine_tenant_version"
+            "0007_trace_worker_claims"
         )
     assert "tenant_resource_version" in {
         column["name"]
@@ -962,7 +962,7 @@ def test_control_external_engine_downgrade_serializes_with_concurrent_writers(
     )
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0006_engine_tenant_version"
+            "0007_trace_worker_claims"
         )
 
 
@@ -1137,6 +1137,18 @@ def test_partial_indexes_enforce_active_leases_and_ready_outbox_dispatch(
         "ready_atisnotnullandpublished_atisnull"
     )
 
+    worker_claim_index = next(
+        index
+        for index in control_inspector.get_indexes("worker_claims")
+        if index["name"] == "uq_worker_claims_active_global_job"
+    )
+    assert worker_claim_index["unique"] is True
+    assert worker_claim_index["column_names"] == ["global_job_id"]
+    worker_claim_where = worker_claim_index["dialect_options"]["postgresql_where"]
+    assert _normalize_postgresql_predicate(worker_claim_where) == (
+        "state='active'andglobal_job_idisnotnull"
+    )
+
 
 def test_control_orchestration_tables_exclude_tenant_content(
     migration_databases: MigrationDatabases,
@@ -1262,7 +1274,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
 @pytest.mark.parametrize(
     ("tree", "downgrade_revision", "head_revision"),
     [
-        ("control", "0004_external_engine_foundation", "0006_engine_tenant_version"),
+        ("control", "0004_external_engine_foundation", "0007_trace_worker_claims"),
         ("tenant", "0003_analysis_orchestration", "0006_trace_execution_states"),
     ],
 )
@@ -1320,7 +1332,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "control",
             "0004_external_engine_foundation",
-            "0006_engine_tenant_version",
+            "0007_trace_worker_claims",
             "global_jobs",
             "ck_global_jobs_analysis_mode",
         ),

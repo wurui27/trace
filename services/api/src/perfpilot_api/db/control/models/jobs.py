@@ -220,6 +220,12 @@ class WorkerClaim(
         Index("ix_worker_claims_global_job_id", "global_job_id"),
         Index("ix_worker_claims_scenario_job_id", "scenario_job_id"),
         Index("ix_worker_claims_state_expires", "state", "expires_at"),
+        Index(
+            "uq_worker_claims_active_global_job",
+            "global_job_id",
+            unique=True,
+            postgresql_where=text("state = 'active' AND global_job_id IS NOT NULL"),
+        ),
     )
 
     global_job_id: Mapped[UUID | None] = mapped_column(
