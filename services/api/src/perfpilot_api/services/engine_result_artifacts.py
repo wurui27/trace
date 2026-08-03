@@ -5,12 +5,13 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import hmac
 import re
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-from typing import Literal, Protocol, TypeVar
+from datetime import UTC, datetime, timedelta
+from typing import Any, Literal, Protocol, TypeVar
 from uuid import UUID
 
 from sqlalchemy import select, update
@@ -21,10 +22,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from perfpilot_api.db.tenant.models import Analysis, Artifact
 from perfpilot_api.db.tenant.router import TenantRouter
 from perfpilot_api.engines.canonical_results import (
+    CanonicalEngineResult,
     EngineResultValidationError,
+    EngineResultWrite,
+    canonicalize_engine_result,
     result_artifact_id,
 )
-from perfpilot_api.services.uploads import TenantBucket
+from perfpilot_api.services.uploads import BucketResolver, TenantBucket
 
 
 _ARTIFACT_KIND = "engine_result"
@@ -107,6 +111,10 @@ class EngineResultArtifactRepository(Protocol):
         analysis_id: UUID,
         artifact_id: UUID,
     ) -> EngineResultArtifactRecord: ...
+
+
+class EngineResultSink(Protocol):
+    async def write(self, request: EngineResultWrite) -> UUID: ...
 
 
 def _is_aware(value: object) -> bool:
@@ -513,12 +521,346 @@ class SQLAlchemyEngineResultArtifactRepository:
             return self._record(row, analysis_id=analysis_id, artifact_id=artifact_id)
 
 
+def _mapping(value: object) -> Mapping[str, object] | None:
+    return value if isinstance(value, Mapping) else None
+
+
+def _safe_version_id(value: object) -> str | None:
+    return value if _is_storage_version(value) else None
+
+
+def _valid_bucket(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == value.strip()
+        and len(value) <= 255
+        and all(ord(character) >= 32 and ord(character) != 127 for character in value)
+    )
+
+
+class S3EngineResultSink:
+    """Persist one canonical result and pin one verified immutable S3 version."""
+
+    def __init__(
+        self,
+        *,
+        repository: EngineResultArtifactRepository,
+        bucket_resolver: BucketResolver,
+        client: Any,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._repository = repository
+        self._bucket_resolver = bucket_resolver
+        self._client = client
+        self._clock = clock
+
+    @staticmethod
+    async def _dependency(operation: Awaitable[_T]) -> _T:
+        try:
+            return await operation
+        except EngineResultArtifactError:
+            raise
+        except BaseException as error:
+            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            failed = True
+        if failed:
+            raise EngineResultUnavailableError
+        raise AssertionError("unreachable")
+
+    @staticmethod
+    def _now(clock: Callable[[], datetime]) -> datetime:
+        try:
+            now = clock()
+        except BaseException as error:
+            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            failed = True
+        else:
+            failed = False
+        if failed:
+            raise EngineResultUnavailableError
+        if not _is_aware(now):
+            raise EngineResultUnavailableError
+        return now
+
+    @staticmethod
+    def _record_matches(
+        record: object,
+        *,
+        request: EngineResultWrite,
+        canonical: CanonicalEngineResult,
+        object_key: str,
+        now: datetime,
+    ) -> bool:
+        if not isinstance(record, EngineResultArtifactRecord):
+            return False
+        pending = record.state == "pending" and record.version == 1 and record.version_id is None
+        finalized = (
+            record.state == "finalized"
+            and record.version == 2
+            and _safe_version_id(record.version_id) is not None
+        )
+        return (
+            record.artifact_id == request.artifact_id
+            and record.analysis_id == request.analysis_id
+            and record.upload_id == request.artifact_id
+            and record.idempotency_key == f"{_IDEMPOTENCY_PREFIX}{request.execution_id}"
+            and record.request_hash == canonical.request_hash_hex
+            and record.artifact_kind == _ARTIFACT_KIND
+            and record.mime_type == _JSON_MIME
+            and type(record.size_bytes) is int
+            and record.size_bytes == len(canonical.canonical_bytes)
+            and isinstance(record.sha256_b64, str)
+            and hmac.compare_digest(
+                record.sha256_b64,
+                canonical.checksum_sha256_b64,
+            )
+            and isinstance(record.object_key, str)
+            and hmac.compare_digest(record.object_key, object_key)
+            and type(record.version) is int
+            and _is_aware(record.expires_at)
+            and now < record.expires_at <= now + _RETENTION
+            and (pending or finalized)
+        )
+
+    @staticmethod
+    def _verified_metadata(
+        response: object,
+        *,
+        expected_version_id: str,
+        checksum: str,
+        size_bytes: int,
+    ) -> Mapping[str, object]:
+        metadata = _mapping(response)
+        if metadata is None:
+            raise EngineResultUnavailableError
+        returned_version = _safe_version_id(metadata.get("VersionId"))
+        returned_checksum = metadata.get("ChecksumSHA256")
+        if (
+            returned_version != expected_version_id
+            or not isinstance(returned_checksum, str)
+            or not hmac.compare_digest(returned_checksum, checksum)
+            or metadata.get("ContentType") != _JSON_MIME
+            or type(metadata.get("ContentLength")) is not int
+            or metadata.get("ContentLength") != size_bytes
+            or metadata.get("DeleteMarker", False) is not False
+        ):
+            raise EngineResultConflictError
+        return metadata
+
+    @staticmethod
+    def _read_exact_sync(
+        client: Any,
+        *,
+        bucket: str,
+        record: EngineResultArtifactRecord,
+        payload: bytes,
+    ) -> None:
+        version_id = _safe_version_id(record.version_id)
+        if version_id is None:
+            raise EngineResultConflictError
+        response = client.get_object(
+            Bucket=bucket,
+            Key=record.object_key,
+            VersionId=version_id,
+            ChecksumMode="ENABLED",
+        )
+        metadata = _mapping(response)
+        body = None if metadata is None else metadata.get("Body")
+        if body is None:
+            raise EngineResultUnavailableError
+        close = getattr(body, "close", None)
+        if not callable(close):
+            raise EngineResultUnavailableError
+        try:
+            read = getattr(body, "read", None)
+            if not callable(read):
+                raise EngineResultUnavailableError
+            S3EngineResultSink._verified_metadata(
+                response,
+                expected_version_id=version_id,
+                checksum=record.sha256_b64,
+                size_bytes=record.size_bytes,
+            )
+            stored_payload = read()
+        finally:
+            close()
+        if not isinstance(stored_payload, bytes) or not hmac.compare_digest(
+            stored_payload,
+            payload,
+        ):
+            raise EngineResultConflictError
+
+    async def _fence(self, tenant: TenantBucket) -> None:
+        await self._dependency(self._repository.require_resource_version(tenant))
+
+    async def _read_exact(
+        self,
+        *,
+        tenant: TenantBucket,
+        record: EngineResultArtifactRecord,
+        payload: bytes,
+    ) -> None:
+        await self._dependency(
+            asyncio.to_thread(
+                self._read_exact_sync,
+                self._client,
+                bucket=tenant.bucket,
+                record=record,
+                payload=payload,
+            )
+        )
+
+    async def write(self, request: EngineResultWrite) -> UUID:
+        canonical = canonicalize_engine_result(request)
+        now = self._now(self._clock)
+        object_key = _object_key(
+            analysis_id=request.analysis_id,
+            artifact_id=request.artifact_id,
+        )
+
+        tenant = await self._dependency(
+            self._bucket_resolver.active_for_team(request.team_id)
+        )
+        if (
+            not isinstance(tenant, TenantBucket)
+            or tenant.team_id != request.team_id
+            or type(tenant.resource_version) is not int
+            or tenant.resource_version != request.tenant_resource_version
+            or not _valid_bucket(tenant.bucket)
+        ):
+            raise EngineResultUnavailableError
+
+        record = await self._dependency(
+            self._repository.reserve(
+                tenant=tenant,
+                analysis_id=request.analysis_id,
+                execution_id=request.execution_id,
+                artifact_id=request.artifact_id,
+                engine_id=request.engine_id,
+                request_hash=canonical.request_hash_hex,
+                size_bytes=len(canonical.canonical_bytes),
+                sha256_b64=canonical.checksum_sha256_b64,
+                now=now,
+            )
+        )
+        if not self._record_matches(
+            record,
+            request=request,
+            canonical=canonical,
+            object_key=object_key,
+            now=now,
+        ):
+            raise EngineResultConflictError
+
+        await self._fence(tenant)
+        if record.state == "finalized":
+            await self._read_exact(
+                tenant=tenant,
+                record=record,
+                payload=canonical.canonical_bytes,
+            )
+            await self._fence(tenant)
+            return request.artifact_id
+
+        await self._fence(tenant)
+        receipt = await self._dependency(
+            asyncio.to_thread(
+                self._client.put_object,
+                Bucket=tenant.bucket,
+                Key=object_key,
+                Body=canonical.canonical_bytes,
+                ContentType=_JSON_MIME,
+                ChecksumSHA256=canonical.checksum_sha256_b64,
+            )
+        )
+        receipt_mapping = _mapping(receipt)
+        if receipt_mapping is None:
+            raise EngineResultUnavailableError
+        storage_version_id = _safe_version_id(receipt_mapping.get("VersionId"))
+        receipt_checksum = receipt_mapping.get("ChecksumSHA256")
+        if storage_version_id is None or not isinstance(receipt_checksum, str):
+            raise EngineResultUnavailableError
+        if not hmac.compare_digest(receipt_checksum, canonical.checksum_sha256_b64):
+            raise EngineResultConflictError
+
+        head = await self._dependency(
+            asyncio.to_thread(
+                self._client.head_object,
+                Bucket=tenant.bucket,
+                Key=object_key,
+                VersionId=storage_version_id,
+                ChecksumMode="ENABLED",
+            )
+        )
+        self._verified_metadata(
+            head,
+            expected_version_id=storage_version_id,
+            checksum=canonical.checksum_sha256_b64,
+            size_bytes=len(canonical.canonical_bytes),
+        )
+        await self._fence(tenant)
+
+        finalized = await self._dependency(
+            self._repository.finalize(
+                tenant=tenant,
+                analysis_id=request.analysis_id,
+                artifact_id=request.artifact_id,
+                expected_version=record.version,
+                storage_version_id=storage_version_id,
+                now=now,
+                expires_at=record.expires_at,
+            )
+        )
+        if finalized is None:
+            finalized = await self._dependency(
+                self._repository.reload(
+                    tenant=tenant,
+                    analysis_id=request.analysis_id,
+                    artifact_id=request.artifact_id,
+                )
+            )
+            if not self._record_matches(
+                finalized,
+                request=request,
+                canonical=canonical,
+                object_key=object_key,
+                now=now,
+            ) or finalized.state != "finalized":
+                raise EngineResultConflictError
+            await self._fence(tenant)
+            await self._read_exact(
+                tenant=tenant,
+                record=finalized,
+                payload=canonical.canonical_bytes,
+            )
+        elif (
+            not self._record_matches(
+                finalized,
+                request=request,
+                canonical=canonical,
+                object_key=object_key,
+                now=now,
+            )
+            or finalized.state != "finalized"
+            or finalized.version_id != storage_version_id
+        ):
+            raise EngineResultConflictError
+
+        await self._fence(tenant)
+        return request.artifact_id
+
+
 __all__ = [
     "EngineResultArtifactError",
     "EngineResultArtifactRecord",
     "EngineResultArtifactRepository",
     "EngineResultConflictError",
+    "EngineResultSink",
     "EngineResultUnavailableError",
     "EngineResultValidationError",
+    "S3EngineResultSink",
     "SQLAlchemyEngineResultArtifactRepository",
 ]
