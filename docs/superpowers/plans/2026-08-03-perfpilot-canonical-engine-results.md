@@ -501,9 +501,17 @@ checksum and VersionId `repr=False`.
 `TenantRouter.session(tenant.team_id)` and requires
 `session.info["tenant_resource_version"] == tenant.resource_version` on every
 operation. `reserve()` first proves Analysis mode matches engine ID, then uses
-PostgreSQL `insert(Artifact).on_conflict_do_nothing(index_elements=(Artifact.id,))`,
-reloads the deterministic row,
+PostgreSQL `insert(Artifact).on_conflict_do_nothing()` without a conflict target,
+then reloads the deterministic Artifact ID,
 and returns it for full comparison by the sink.
+
+The untargeted conflict handler is required because `artifacts` has independent
+unique indexes for the primary ID, upload ID, object key and analysis idempotency
+key. Concurrent identical inserts can lose on any of those indexes before the
+primary-key arbiter runs. Ignoring every unique conflict and then reloading the
+deterministic Artifact ID makes identical writers converge, while a collision on
+only a non-primary unique key reloads no matching ID (or mismatched metadata) and
+therefore remains a stable integrity conflict.
 
 Insert exact metadata:
 
