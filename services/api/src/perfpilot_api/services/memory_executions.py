@@ -117,6 +117,7 @@ class MemoryAttemptService(Protocol):
         team_id: UUID,
         analysis_id: UUID,
         engine_id: str,
+        tenant_resource_version: int,
         input_manifest_hash: str,
         config_hash: str,
     ) -> EngineExecutionRecord: ...
@@ -719,6 +720,7 @@ class MemoryExecutionService:
                 team_id=team_id,
                 analysis_id=analysis_id,
                 engine_id="android_memory",
+                tenant_resource_version=capture.tenant_resource_version,
                 input_manifest_hash=capture.manifest.sha256_hex(),
                 config_hash=canonical_memory_config_hash(
                     capture_id=capture_id,

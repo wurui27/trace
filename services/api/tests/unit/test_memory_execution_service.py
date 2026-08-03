@@ -107,6 +107,7 @@ def _execution() -> EngineExecutionRecord:
         team_id=TEAM_ID,
         engine_id="android_memory",
         attempt_number=1,
+        tenant_resource_version=7,
         adapter_version="1.0.0",
         engine_commit_sha="a" * 40,
         engine_image_digest="sha256:" + "b" * 64,
@@ -256,6 +257,7 @@ async def test_prepare_claims_manifest_first_and_creates_pinned_attempt() -> Non
             "team_id": TEAM_ID,
             "analysis_id": ANALYSIS_ID,
             "engine_id": "android_memory",
+            "tenant_resource_version": 7,
             "input_manifest_hash": capture.manifest.sha256_hex(),
             "config_hash": canonical_memory_config_hash(
                 capture_id=CAPTURE_ID,

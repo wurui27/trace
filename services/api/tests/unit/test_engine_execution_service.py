@@ -4,7 +4,7 @@ import asyncio
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
@@ -13,6 +13,11 @@ from pydantic import SecretStr
 from perfpilot_api.config import Settings
 from perfpilot_api.engines.android_memory import AndroidMemoryAdapter
 from perfpilot_api.engines.android_memory_worker import LocalAndroidMemoryWorker
+from perfpilot_api.engines.canonical_results import (
+    EngineResultValidationError,
+    EngineResultWrite,
+    canonicalize_engine_result,
+)
 from perfpilot_api.engines.contracts import (
     AdapterDescriptor,
     EngineEvent,
@@ -28,12 +33,17 @@ from perfpilot_api.engines.lock import EngineLock, EnginePin
 from perfpilot_api.engines.registry import AdapterRegistry, AdapterRegistryError
 from perfpilot_api.services.engine_executions import (
     EngineExecutionRecord,
+    EngineExecutionSeed,
     EngineExecutionService,
     FinalizationClaim,
     RetryReservation,
     build_engine_execution_service,
     build_smartperfetto_execution_service,
     result_artifact_id,
+)
+from perfpilot_api.services.engine_result_artifacts import (
+    EngineResultConflictError,
+    EngineResultUnavailableError,
 )
 from perfpilot_api.services.engine_workspaces import EngineWorkspaceRecord
 
@@ -92,6 +102,7 @@ def _record(**overrides: object) -> EngineExecutionRecord:
         "team_id": TEAM_ID,
         "engine_id": "smartperfetto",
         "attempt_number": 1,
+        "tenant_resource_version": 1,
         "adapter_version": "1.0.0",
         "engine_commit_sha": "a" * 40,
         "engine_image_digest": "sha256:" + "b" * 64,
@@ -245,7 +256,19 @@ class FakeAndroidMemoryAdapter(FakeAdapter):
         self.result = EngineResult(
             "android-memory-ai-context-1.2",
             result_state,  # type: ignore[arg-type]
-            {"context_type": "android-memory-ai-context"},
+            {
+                "context_type": "android-memory-ai-context",
+                "schema_version": "1.2",
+                "generator": {"name": "android-memory-ai", "version": "1.2.0"},
+                "analysis_contract": {
+                    "support_level": "limited",
+                    "primary_intent_support_level": "limited",
+                    "privacy": {
+                        "raw_contents_embedded": False,
+                        "local_paths_included": False,
+                    },
+                },
+            },
         )
         self.batch = EngineEventBatch(
             run_ref=EngineRunRef(
@@ -277,10 +300,13 @@ class FakeRepository:
     def __init__(self) -> None:
         self.record = _record()
         self.events: list[str] = []
+        self.allocation_calls: list[dict[str, object]] = []
         self.next_attempt: EngineExecutionRecord | None = None
         self.expired = False
+        self.finalize_failure: BaseException | None = None
 
     async def allocate_attempt(self, **kwargs: object) -> EngineExecutionRecord:
+        self.allocation_calls.append(kwargs)
         self.events.append("allocated")
         return self.record
 
@@ -340,6 +366,10 @@ class FakeRepository:
         terminal_state: str,
         **kwargs: object,
     ) -> EngineExecutionRecord:
+        if self.finalize_failure is not None:
+            failure = self.finalize_failure
+            self.finalize_failure = None
+            raise failure
         self.events.append("finalized")
         self.record = replace(
             self.record,
@@ -409,14 +439,16 @@ class FakeRepository:
 class FakeSink:
     def __init__(self) -> None:
         self.events: list[str] = []
-        self.failure: Exception | None = None
+        self.requests: list[EngineResultWrite] = []
+        self.failure: BaseException | None = None
+        self.returned_id: UUID | None = None
 
-    async def write(self, **kwargs: object) -> UUID:
+    async def write(self, request: EngineResultWrite) -> UUID:
         self.events.append("sink")
+        self.requests.append(request)
         if self.failure is not None:
             raise self.failure
-        assert isinstance(kwargs["result"], EngineResult)
-        return kwargs["artifact_id"]  # type: ignore[return-value]
+        return request.artifact_id if self.returned_id is None else self.returned_id
 
 
 def _lock() -> EngineLock:
@@ -493,6 +525,7 @@ async def test_submit_resolves_workspace_and_persists_only_server_run_reference(
         team_id=TEAM_ID,
         analysis_id=ANALYSIS_ID,
         engine_id="smartperfetto",
+        tenant_resource_version=7,
         input_manifest_hash="c" * 64,
         config_hash="d" * 64,
     )
@@ -512,7 +545,30 @@ async def test_submit_resolves_workspace_and_persists_only_server_run_reference(
     assert adapter.submitted[0].external_workspace_id == "workspace-server-owned"
     assert submitted.state == "running"
     assert submitted.external_session_id == "session-1"
+    seed = repository.allocation_calls[0]["seed"]
+    assert isinstance(seed, EngineExecutionSeed)
+    assert seed.tenant_resource_version == 7
     assert repository.events == ["allocated", "submitted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant_resource_version", [True, 0, -1, 1.0, "1"])
+async def test_create_attempt_requires_an_actual_positive_tenant_resource_version(
+    tenant_resource_version: object,
+) -> None:
+    service, repository, _workspaces, _adapter, _sink = _service()
+
+    with pytest.raises(ValueError, match="tenant resource version is invalid"):
+        await service.create_attempt(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            engine_id="smartperfetto",
+            tenant_resource_version=tenant_resource_version,  # type: ignore[arg-type]
+            input_manifest_hash="c" * 64,
+            config_hash="d" * 64,
+        )
+
+    assert repository.allocation_calls == []
 
 
 @pytest.mark.asyncio
@@ -734,6 +790,177 @@ async def test_completed_event_saves_cursor_then_sinks_before_terminal_cas() -> 
     assert repository.record.raw_result_artifact_id == result_artifact_id(EXECUTION_ID)
     assert repository.events == ["observed:running", "claimed", "finalized"]
     assert sink.events == ["sink"]
+    assert sink.requests == [
+        EngineResultWrite(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            execution_id=EXECUTION_ID,
+            expected_execution_version=4,
+            tenant_resource_version=1,
+            artifact_id=result_artifact_id(EXECUTION_ID),
+            engine_id="smartperfetto",
+            adapter_version="1.0.0",
+            engine_commit_sha="a" * 40,
+            engine_image_digest="sha256:" + "b" * 64,
+            attempt_number=1,
+            input_manifest_hash="c" * 64,
+            config_hash="d" * 64,
+            result=adapter.result,
+        )
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("error", "stable_code", "expected_state", "retry_mode"),
+    [
+        (EngineResultValidationError(), "invalid_output", "failed", None),
+        (
+            EngineResultConflictError(),
+            "result_integrity_mismatch",
+            "failed",
+            None,
+        ),
+        (
+            EngineResultUnavailableError(),
+            "result_persistence_failed",
+            "running",
+            "reconnect",
+        ),
+    ],
+)
+async def test_result_sink_errors_map_to_stable_outcomes(
+    error: Exception,
+    stable_code: str,
+    expected_state: str,
+    retry_mode: str | None,
+) -> None:
+    service, repository, _workspaces, _adapter, sink = _isolated_service()
+    repository.record = replace(
+        repository.record,
+        state="running",
+        external_run_id=f"memory-{EXECUTION_ID.hex}",
+        started_at=NOW,
+        raw_result_artifact_id=result_artifact_id(EXECUTION_ID),
+        version=3,
+    )
+    sink.failure = error
+
+    outcome = await service.step(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+    )
+
+    assert outcome.state == expected_state
+    assert repository.record.stable_error_code == stable_code
+    assert (None if outcome.retry is None else outcome.retry.mode) == retry_mode
+
+
+@pytest.mark.asyncio
+async def test_wrong_sink_artifact_is_a_terminal_integrity_mismatch() -> None:
+    service, repository, _workspaces, _adapter, sink = _isolated_service()
+    repository.record = replace(
+        repository.record,
+        state="running",
+        external_run_id=f"memory-{EXECUTION_ID.hex}",
+        started_at=NOW,
+        raw_result_artifact_id=result_artifact_id(EXECUTION_ID),
+        version=3,
+    )
+    sink.returned_id = uuid4()
+
+    outcome = await service.step(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+    )
+
+    assert outcome.state == "failed"
+    assert repository.record.stable_error_code == "result_integrity_mismatch"
+
+
+@pytest.mark.asyncio
+async def test_unavailable_sink_becomes_terminal_only_after_deadline() -> None:
+    service, repository, _workspaces, _adapter, sink = _isolated_service()
+    repository.expired = True
+    repository.record = replace(
+        repository.record,
+        state="running",
+        external_run_id=f"memory-{EXECUTION_ID.hex}",
+        started_at=NOW,
+        raw_result_artifact_id=result_artifact_id(EXECUTION_ID),
+        version=3,
+    )
+    sink.failure = EngineResultUnavailableError()
+
+    outcome = await service.step(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+    )
+
+    assert outcome.state == "failed"
+    assert outcome.retry is None
+    assert repository.record.stable_error_code == "result_persistence_failed"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [asyncio.CancelledError(), KeyboardInterrupt(), SystemExit()])
+async def test_result_sink_process_control_exceptions_propagate(
+    failure: BaseException,
+) -> None:
+    service, repository, _workspaces, _adapter, sink = _isolated_service()
+    repository.record = replace(
+        repository.record,
+        state="running",
+        external_run_id=f"memory-{EXECUTION_ID.hex}",
+        started_at=NOW,
+        raw_result_artifact_id=result_artifact_id(EXECUTION_ID),
+        version=3,
+    )
+    sink.failure = failure
+
+    with pytest.raises(type(failure)):
+        await service.step(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            execution_id=EXECUTION_ID,
+        )
+
+
+@pytest.mark.asyncio
+async def test_sink_success_before_terminal_cas_retries_identical_canonical_bytes() -> None:
+    service, repository, _workspaces, _adapter, sink = _isolated_service()
+    repository.record = replace(
+        repository.record,
+        state="running",
+        external_run_id=f"memory-{EXECUTION_ID.hex}",
+        started_at=NOW,
+        raw_result_artifact_id=result_artifact_id(EXECUTION_ID),
+        version=3,
+    )
+    repository.finalize_failure = RuntimeError("simulated crash after sink success")
+
+    with pytest.raises(RuntimeError, match="simulated crash"):
+        await service.step(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            execution_id=EXECUTION_ID,
+        )
+    outcome = await service.step(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=EXECUTION_ID,
+    )
+
+    assert outcome.state == "completed"
+    assert len(sink.requests) == 2
+    assert sink.requests[0].artifact_id == sink.requests[1].artifact_id
+    assert (
+        canonicalize_engine_result(sink.requests[0]).canonical_bytes
+        == canonicalize_engine_result(sink.requests[1]).canonical_bytes
+    )
 
 
 @pytest.mark.asyncio

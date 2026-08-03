@@ -114,6 +114,12 @@ execution preparation passes the version it used to authorize every input.
 Network-engine preparation must do the same before production composition enables
 SmartPerfetto execution.
 
+The control migration must not backfill this field from the tenant's current
+resource version. That value cannot prove which generation authorized an older
+execution's inputs. The migration takes an exclusive execution-table lock and
+fails safely when legacy execution rows exist; the foundation has not yet enabled
+production execution, so no provenance needs to be fabricated.
+
 ## Deterministic identity
 
 - `artifact_id` remains `UUIDv5(result namespace, execution_id)` through the
@@ -147,6 +153,11 @@ External report IDs and run IDs never become tenant database keys.
 11. If another writer won, reload the row, read its exact S3 VersionId, and compare
     the bytes in constant time.
 12. Recheck the tenant resource version before returning the artifact UUID.
+
+Canonical validation, defensive payload copying, and byte serialization finish
+before the sink's first asynchronous dependency call. This prevents a mutable
+adapter payload from changing across an `await` boundary. Result Artifacts use
+the existing 30-day internal-artifact retention period.
 
 A finalized identical object is success. A pending identical reservation may be
 repaired. The sink never overwrites a finalized artifact and never treats a new

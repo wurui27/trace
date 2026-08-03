@@ -271,11 +271,11 @@ def test_numeric_models_use_decimal_python_types() -> None:
     assert Metric.__table__.c.numeric_value.type.python_type is Decimal
 
 
-def test_engine_execution_orm_uses_external_run_identifiers() -> None:
+def test_engine_execution_orm_uses_external_run_identifiers_and_tenant_version() -> None:
     from perfpilot_api.db.control.models import EngineExecution
 
     column_names = set(EngineExecution.__table__.columns.keys())
-    assert {"external_session_id", "external_run_id"} <= column_names
+    assert {"external_session_id", "external_run_id", "tenant_resource_version"} <= column_names
     assert {"session_id", "run_id"}.isdisjoint(column_names)
 
     execution = EngineExecution(
@@ -283,6 +283,7 @@ def test_engine_execution_orm_uses_external_run_identifiers() -> None:
         team_id=uuid4(),
         engine_id="smartperfetto",
         attempt_number=1,
+        tenant_resource_version=7,
         adapter_version="1.0.0",
         engine_commit_sha="a" * 40,
         engine_image_digest="sha256:" + "b" * 64,
@@ -294,6 +295,7 @@ def test_engine_execution_orm_uses_external_run_identifiers() -> None:
     )
     assert execution.external_session_id == "session-1"
     assert execution.external_run_id == "run-1"
+    assert execution.tenant_resource_version == 7
 
 
 @pytest.mark.parametrize("tree", ["control", "tenant"])
@@ -426,6 +428,7 @@ def test_control_schema_persists_external_engine_authority(
         "team_id",
         "engine_id",
         "attempt_number",
+        "tenant_resource_version",
         "adapter_version",
         "engine_commit_sha",
         "engine_image_digest",
@@ -465,6 +468,7 @@ def test_control_schema_persists_external_engine_authority(
             "team_id",
             "engine_id",
             "attempt_number",
+            "tenant_resource_version",
             "adapter_version",
             "engine_commit_sha",
             "engine_image_digest",
@@ -536,6 +540,9 @@ def test_control_schema_enforces_external_engine_constraints_and_indexes(
         for constraint in control_inspector.get_check_constraints("engine_executions")
     }
     assert execution_checks["ck_engine_executions_attempt_positive"] == "attempt_number>0"
+    assert execution_checks["ck_engine_executions_tenant_resource_version_positive"] == (
+        "tenant_resource_version>0"
+    )
     execution_state_check = execution_checks["ck_engine_executions_state"]
     assert "state" in execution_state_check
     assert _check_string_literals(execution_state_check) == {
@@ -572,6 +579,191 @@ def test_control_schema_enforces_external_engine_constraints_and_indexes(
         "failed",
     }
     assert workspace_checks["ck_team_engine_workspaces_version_positive"] == "version>0"
+
+
+def test_control_execution_tenant_version_migration_round_trips_empty_table(
+    migration_databases: MigrationDatabases,
+) -> None:
+    config = _alembic_config("control", migration_databases.control_url)
+    command.upgrade(config, "0005_memory_upload_mode")
+    assert "tenant_resource_version" not in {
+        column["name"]
+        for column in inspect(migration_databases.control_engine).get_columns("engine_executions")
+    }
+
+    command.upgrade(config, "head")
+
+    columns = {
+        column["name"]: column
+        for column in inspect(migration_databases.control_engine).get_columns("engine_executions")
+    }
+    tenant_version = columns["tenant_resource_version"]
+    assert tenant_version["type"].__class__.__name__ in {"INTEGER", "Integer"}
+    assert tenant_version["nullable"] is False
+    assert tenant_version["default"] is None
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0006_engine_tenant_version"
+        )
+
+    command.downgrade(config, "0005_memory_upload_mode")
+
+    assert "tenant_resource_version" not in {
+        column["name"]
+        for column in inspect(migration_databases.control_engine).get_columns("engine_executions")
+    }
+
+
+def test_control_execution_tenant_version_upgrade_refuses_legacy_rows(
+    migration_databases: MigrationDatabases,
+) -> None:
+    config = _alembic_config("control", migration_databases.control_url)
+    command.upgrade(config, "0005_memory_upload_mode")
+    team_id = UUID("97000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("97000000-0000-4000-8000-000000000002")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'Legacy', 'active')"),
+            {"id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                "VALUES (:id, :team_id, 'legacy-execution', 'trace_upload', "
+                "'analyzing', ARRAY[]::varchar[])"
+            ),
+            {"id": analysis_id, "team_id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO engine_executions "
+                "(analysis_id, team_id, engine_id, attempt_number, adapter_version, "
+                "engine_commit_sha, engine_image_digest, input_manifest_hash, config_hash, state) "
+                "VALUES (:analysis_id, :team_id, 'smartperfetto', 1, '1.0.0', "
+                "repeat('a', 40), 'sha256:' || repeat('b', 64), repeat('c', 64), "
+                "repeat('d', 64), 'pending')"
+            ),
+            {"analysis_id": analysis_id, "team_id": team_id},
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="engine execution tenant version migration preflight failed",
+    ):
+        command.upgrade(config, "head")
+
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0005_memory_upload_mode"
+        )
+    assert "tenant_resource_version" not in {
+        column["name"]
+        for column in inspect(migration_databases.control_engine).get_columns("engine_executions")
+    }
+
+
+def test_control_execution_tenant_version_downgrade_refuses_rows(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    team_id = UUID("97100000-0000-4000-8000-000000000001")
+    analysis_id = UUID("97100000-0000-4000-8000-000000000002")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO teams (id, name, state) VALUES (:id, 'Current', 'active')"),
+            {"id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO global_jobs "
+                "(id, team_id, idempotency_key, analysis_mode, state, supported_abis) "
+                "VALUES (:id, :team_id, 'current-execution', 'trace_upload', "
+                "'analyzing', ARRAY[]::varchar[])"
+            ),
+            {"id": analysis_id, "team_id": team_id},
+        )
+        connection.execute(
+            text(
+                "INSERT INTO engine_executions "
+                "(analysis_id, team_id, engine_id, attempt_number, tenant_resource_version, "
+                "adapter_version, engine_commit_sha, engine_image_digest, input_manifest_hash, "
+                "config_hash, state) VALUES (:analysis_id, :team_id, 'smartperfetto', 1, 7, "
+                "'1.0.0', repeat('a', 40), 'sha256:' || repeat('b', 64), repeat('c', 64), "
+                "repeat('d', 64), 'pending')"
+            ),
+            {"analysis_id": analysis_id, "team_id": team_id},
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="engine execution tenant version migration preflight failed",
+    ):
+        command.downgrade(
+            _alembic_config("control", migration_databases.control_url),
+            "0005_memory_upload_mode",
+        )
+
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0006_engine_tenant_version"
+        )
+    assert "tenant_resource_version" in {
+        column["name"]
+        for column in inspect(migration_databases.control_engine).get_columns("engine_executions")
+    }
+
+
+@pytest.mark.parametrize("direction", ["upgrade", "downgrade"])
+def test_control_execution_tenant_version_migration_requests_exclusive_lock(
+    direction: str,
+    migration_databases: MigrationDatabases,
+) -> None:
+    config = _alembic_config("control", migration_databases.control_url)
+    command.upgrade(
+        config,
+        "0005_memory_upload_mode"
+        if direction == "upgrade"
+        else "0006_engine_tenant_version",
+    )
+    blocker = migration_databases.control_engine.connect()
+    blocker_transaction = blocker.begin()
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        blocker.execute(text("SELECT 1 FROM engine_executions"))
+        migration_future = executor.submit(
+            command.upgrade if direction == "upgrade" else command.downgrade,
+            config,
+            "0006_engine_tenant_version"
+            if direction == "upgrade"
+            else "0005_memory_upload_mode",
+        )
+        lock_wait_query = text(
+            "SELECT EXISTS ("
+            "SELECT 1 FROM pg_locks AS requested_lock "
+            "JOIN pg_class AS locked_relation ON locked_relation.oid = requested_lock.relation "
+            "WHERE locked_relation.relname = 'engine_executions' "
+            "AND requested_lock.database = "
+            "(SELECT oid FROM pg_database WHERE datname = current_database()) "
+            "AND requested_lock.mode = 'AccessExclusiveLock' "
+            "AND requested_lock.granted = false)"
+        )
+        deadline = monotonic() + 5
+        with migration_databases.control_engine.connect() as observer:
+            while not observer.scalar(lock_wait_query):
+                if monotonic() >= deadline:
+                    pytest.fail(
+                        f"tenant version {direction} did not request the execution table lock"
+                    )
+                sleep(0.02)
+
+        blocker_transaction.commit()
+        migration_future.result(timeout=5)
+    finally:
+        if blocker_transaction.is_active:
+            blocker_transaction.rollback()
+        blocker.close()
+        executor.shutdown(wait=True, cancel_futures=True)
 
 
 def test_control_external_engine_downgrade_refuses_nonempty_metadata(
@@ -613,6 +805,13 @@ def test_control_external_engine_downgrade_refuses_nonempty_metadata(
 
     with migration_databases.control_engine.begin() as connection:
         connection.execute(text("DELETE FROM team_engine_workspaces"))
+
+    command.downgrade(
+        _alembic_config("control", migration_databases.control_url),
+        "0005_memory_upload_mode",
+    )
+
+    with migration_databases.control_engine.begin() as connection:
         connection.execute(
             text(
                 "INSERT INTO engine_executions "
@@ -630,6 +829,10 @@ def test_control_external_engine_downgrade_refuses_nonempty_metadata(
             "0003_analysis_orchestration",
         )
     assert "engine_executions" in inspect(migration_databases.control_engine).get_table_names()
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0005_memory_upload_mode"
+        )
 
 
 def test_control_external_engine_downgrade_serializes_with_concurrent_writers(
@@ -693,7 +896,7 @@ def test_control_external_engine_downgrade_serializes_with_concurrent_writers(
     )
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0005_memory_upload_mode"
+            "0006_engine_tenant_version"
         )
 
 
@@ -993,7 +1196,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
 @pytest.mark.parametrize(
     ("tree", "downgrade_revision", "head_revision"),
     [
-        ("control", "0004_external_engine_foundation", "0005_memory_upload_mode"),
+        ("control", "0004_external_engine_foundation", "0006_engine_tenant_version"),
         ("tenant", "0003_analysis_orchestration", "0004_memory_upload_mode"),
     ],
 )
@@ -1051,7 +1254,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "control",
             "0004_external_engine_foundation",
-            "0005_memory_upload_mode",
+            "0006_engine_tenant_version",
             "global_jobs",
             "ck_global_jobs_analysis_mode",
         ),

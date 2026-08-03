@@ -13,7 +13,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from psycopg import sql
-from sqlalchemy import inspect, select
+from sqlalchemy import func, inspect, select
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -151,9 +151,14 @@ async def execution_database() -> AsyncIterator[ExecutionDatabase]:
             )
 
 
-def _seed(*, engine_id: str = "smartperfetto") -> EngineExecutionSeed:
+def _seed(
+    *,
+    engine_id: str = "smartperfetto",
+    tenant_resource_version: int = 7,
+) -> EngineExecutionSeed:
     return EngineExecutionSeed(
         engine_id=engine_id,
+        tenant_resource_version=tenant_resource_version,
         adapter_version="1.0.0",
         engine_commit_sha="a" * 40,
         engine_image_digest="sha256:" + "b" * 64,
@@ -208,6 +213,25 @@ async def test_attempt_allocation_serializes_and_increments(
 
     assert sorted(record.attempt_number for record in attempts) == [1, 2]
     assert all(record.state == "pending" for record in attempts)
+    assert all(record.tenant_resource_version == 7 for record in attempts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant_resource_version", [True, 0, -1, 1.0, "1"])
+async def test_attempt_allocation_requires_an_actual_positive_tenant_resource_version(
+    tenant_resource_version: object,
+    execution_database: ExecutionDatabase,
+) -> None:
+    with pytest.raises(ValueError, match="tenant resource version is invalid"):
+        await execution_database.repository.allocate_attempt(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            seed=_seed(tenant_resource_version=tenant_resource_version),  # type: ignore[arg-type]
+            now=NOW,
+        )
+
+    async with execution_database.sessions() as session:
+        assert await session.scalar(select(func.count()).select_from(EngineExecution)) == 0
 
 
 @pytest.mark.asyncio
@@ -437,6 +461,8 @@ async def test_concurrent_capacity_retry_reserves_one_next_attempt(
     assert reservations[0].next_attempt == reservations[1].next_attempt
     assert reservations[0].next_attempt is not None
     assert reservations[0].next_attempt.attempt_number == 2
+    assert reservations[0].current_attempt.tenant_resource_version == 7
+    assert reservations[0].next_attempt.tenant_resource_version == 7
     async with execution_database.sessions() as session:
         job = await session.get(GlobalJob, ANALYSIS_ID)
         rows = list(
@@ -448,6 +474,7 @@ async def test_concurrent_capacity_retry_reserves_one_next_attempt(
         )
     assert job is not None and job.retry_count == 1
     assert [(row.attempt_number, row.state) for row in rows] == [(1, "failed"), (2, "pending")]
+    assert [row.tenant_resource_version for row in rows] == [7, 7]
 
 
 @pytest.mark.asyncio

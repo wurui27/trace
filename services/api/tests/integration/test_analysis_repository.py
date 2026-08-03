@@ -647,6 +647,7 @@ def _engine_execution(**overrides: object) -> EngineExecution:
         "team_id": TEAM_ID,
         "engine_id": "smartperfetto",
         "attempt_number": 1,
+        "tenant_resource_version": 1,
         "adapter_version": "1.0.0",
         "engine_commit_sha": "a" * 40,
         "engine_image_digest": "sha256:" + "b" * 64,

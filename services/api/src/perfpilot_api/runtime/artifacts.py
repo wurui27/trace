@@ -19,6 +19,10 @@ from perfpilot_api.services.apk_inspection import (
     S3VersionedObjectReader,
     SQLAlchemyApkArtifactLocator,
 )
+from perfpilot_api.services.engine_result_artifacts import (
+    S3EngineResultSink,
+    SQLAlchemyEngineResultArtifactRepository,
+)
 from perfpilot_api.storage.s3 import S3ArtifactStore
 
 
@@ -103,6 +107,7 @@ async def _close_owned_components(
 @dataclass(slots=True)
 class ArtifactRuntime:
     upload_service: Any
+    engine_result_sink: S3EngineResultSink
     apk_inspector: S3ApkInspector | None
     tenant_router: Any = field(repr=False)
     s3_client: Any = field(repr=False)
@@ -162,6 +167,13 @@ async def build_artifact_runtime(
         bucket_resolver = bucket_resolver_factory(session_factory=control_session_factory)
         upload_repository = upload_repository_factory(tenant_router=tenant_router)
         s3_client = create_s3_client(settings=settings)
+        engine_result_sink = S3EngineResultSink(
+            repository=SQLAlchemyEngineResultArtifactRepository(
+                tenant_router=tenant_router,
+            ),
+            bucket_resolver=bucket_resolver,
+            client=s3_client,
+        )
         artifact_store = S3ArtifactStore(client=s3_client)
         upload_service = upload_core.UploadService(
             repository=upload_repository,
@@ -182,6 +194,7 @@ async def build_artifact_runtime(
             )
         runtime = ArtifactRuntime(
             upload_service=upload_service,
+            engine_result_sink=engine_result_sink,
             apk_inspector=apk_inspector,
             tenant_router=tenant_router,
             s3_client=s3_client,

@@ -168,6 +168,8 @@ async def test_artifact_runtime_builds_authoritative_dependencies_with_sigv4(
     route_repository = object()
     bucket_resolver = object()
     repository = object()
+    result_repository = object()
+    result_sink = object()
     artifact_store = object()
     upload_service = object()
     apk_locator = object()
@@ -201,6 +203,16 @@ async def test_artifact_runtime_builds_authoritative_dependencies_with_sigv4(
         "SQLAlchemyUploadRepository",
         lambda **kwargs: events.append(("upload_repository", kwargs)) or repository,
         raising=False,
+    )
+    monkeypatch.setattr(
+        artifact_runtime,
+        "SQLAlchemyEngineResultArtifactRepository",
+        lambda **kwargs: events.append(("result_repository", kwargs)) or result_repository,
+    )
+    monkeypatch.setattr(
+        artifact_runtime,
+        "S3EngineResultSink",
+        lambda **kwargs: events.append(("result_sink", kwargs)) or result_sink,
     )
     monkeypatch.setattr(
         artifact_runtime,
@@ -243,6 +255,7 @@ async def test_artifact_runtime_builds_authoritative_dependencies_with_sigv4(
     )
 
     assert runtime.upload_service is upload_service
+    assert runtime.engine_result_sink is result_sink
     assert runtime.apk_inspector is apk_inspector
     assert ("route_repository", {"session_factory": session_factory}) in events
     assert (
@@ -250,6 +263,15 @@ async def test_artifact_runtime_builds_authoritative_dependencies_with_sigv4(
         {"session_factory": session_factory},
     ) in events
     assert ("upload_repository", {"tenant_router": router}) in events
+    assert ("result_repository", {"tenant_router": router}) in events
+    assert (
+        "result_sink",
+        {
+            "repository": result_repository,
+            "bucket_resolver": bucket_resolver,
+            "client": s3_client,
+        },
+    ) in events
     assert ("apk_locator", {"tenant_router": router, "bucket_resolver": bucket_resolver}) in events
     assert ("object_reader", {"client": s3_client}) in events
     assert (
@@ -315,6 +337,17 @@ async def test_artifact_runtime_can_omit_local_apk_inspector(
         lambda **kwargs: object(),
         raising=False,
     )
+    result_sink = object()
+    monkeypatch.setattr(
+        artifact_runtime,
+        "SQLAlchemyEngineResultArtifactRepository",
+        lambda **kwargs: object(),
+    )
+    monkeypatch.setattr(
+        artifact_runtime,
+        "S3EngineResultSink",
+        lambda **kwargs: result_sink,
+    )
     monkeypatch.setattr(
         artifact_runtime,
         "create_s3_client",
@@ -339,6 +372,7 @@ async def test_artifact_runtime_can_omit_local_apk_inspector(
     )
 
     assert runtime.apk_inspector is None
+    assert runtime.engine_result_sink is result_sink
     await runtime.close()
 
 
@@ -430,6 +464,7 @@ async def test_artifact_runtime_close_finishes_after_cancellation_and_can_retry(
 
     runtime = artifact_runtime.ArtifactRuntime(
         upload_service=object(),
+        engine_result_sink=object(),  # type: ignore[arg-type]
         apk_inspector=object(),
         tenant_router=FakeRouter(),
         s3_client=FakeClient(),
@@ -474,6 +509,7 @@ async def test_artifact_runtime_close_attempts_all_steps_and_redacts_cleanup_err
 
     runtime = artifact_runtime.ArtifactRuntime(
         upload_service=object(),
+        engine_result_sink=object(),  # type: ignore[arg-type]
         apk_inspector=object(),
         tenant_router=FakeRouter(),
         s3_client=FakeClient(),

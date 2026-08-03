@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0",
+  "result_type": "canonical-engine-result",
+  "artifact_id": "5f9cc3e2-5d41-5db9-8964-38dc5cd819b4",
+  "analysis_id": "00000000-0000-4000-8000-000000000002",
+  "execution_id": "00000000-0000-4000-8000-000000000102",
+  "tenant_resource_version": 1,
+  "engine": {
+    "engine_id": "android_memory",
+    "adapter_version": "1.0.0",
+    "source_contract": "android-memory-ai-context-1.2",
+    "source_commit_sha": "d5514972ced78c3faa7fc17589c1ea9231645056",
+    "image_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+  },
+  "attempt": {
+    "number": 1,
+    "input_manifest_hash": "5555555555555555555555555555555555555555555555555555555555555555",
+    "config_hash": "6666666666666666666666666666666666666666666666666666666666666666"
+  },
+  "result": {
+    "state": "completed",
+    "payload_sha256": "3960e8b9c6487d4c1a61d45fcbad511c048d721ff76047dac45ba89802eb7907",
+    "payload": {
+      "context_type": "android-memory-ai-context",
+      "schema_version": "1.2",
+      "generator": {
+        "name": "android-memory-ai",
+        "version": "1.2.0"
+      },
+      "analysis_contract": {
+        "support_level": "limited",
+        "primary_intent_support_level": "limited",
+        "privacy": {
+          "raw_contents_embedded": false,
+          "local_paths_included": false
+        }
+      }
+    }
+  }
+}

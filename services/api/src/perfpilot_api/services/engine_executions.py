@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Literal, Protocol
-from uuid import UUID, uuid5
+from uuid import UUID
 
 import httpx
 from sqlalchemy import func, select
@@ -20,13 +20,17 @@ from perfpilot_api.engines.contracts import (
     EngineAdapter,
     EngineEventBatch,
     EngineInput,
-    EngineResult,
     EngineRetryDirective,
     EngineRunRef,
     EngineStatus,
     EngineStepOutcome,
     ExecutionStateValue,
     SubmitConfig,
+)
+from perfpilot_api.engines.canonical_results import (
+    EngineResultValidationError,
+    EngineResultWrite,
+    result_artifact_id,
 )
 from perfpilot_api.engines.errors import EngineAdapterError
 from perfpilot_api.engines.lock import EngineLock, EnginePin
@@ -42,9 +46,12 @@ from perfpilot_api.services.engine_workspaces import (
     EngineWorkspaceService,
     SQLAlchemyEngineWorkspaceRepository,
 )
+from perfpilot_api.services.engine_result_artifacts import (
+    EngineResultConflictError,
+    EngineResultSink,
+)
 
 
-_RESULT_NAMESPACE = UUID("a1c50ce0-6144-553e-8721-18f466991f32")
 _STABLE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _CANONICAL_CURSOR = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _TERMINAL_STATES = {"completed", "insufficient_data", "failed", "canceled"}
@@ -75,6 +82,7 @@ class EngineExecutionOwnershipError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class EngineExecutionSeed:
     engine_id: str
+    tenant_resource_version: int
     adapter_version: str
     engine_commit_sha: str
     engine_image_digest: str
@@ -89,6 +97,7 @@ class EngineExecutionRecord:
     team_id: UUID
     engine_id: str
     attempt_number: int
+    tenant_resource_version: int
     adapter_version: str
     engine_commit_sha: str
     engine_image_digest: str
@@ -119,19 +128,6 @@ class RetryReservation:
     next_attempt: EngineExecutionRecord | None
 
 
-class EngineResultSink(Protocol):
-    async def write(
-        self,
-        *,
-        team_id: UUID,
-        analysis_id: UUID,
-        execution_id: UUID,
-        artifact_id: UUID,
-        engine_id: str,
-        result: EngineResult,
-    ) -> UUID: ...
-
-
 class EngineExecutionRepository(Protocol):
     async def allocate_attempt(
         self,
@@ -151,13 +147,15 @@ class EngineExecutionRepository(Protocol):
     ) -> EngineExecutionRecord: ...
 
 
-def result_artifact_id(execution_id: UUID) -> UUID:
-    return uuid5(_RESULT_NAMESPACE, str(execution_id))
-
-
 def _validate_stable_code(value: str) -> str:
     if _STABLE_CODE.fullmatch(value) is None:
         raise ValueError("stable engine error code is invalid")
+    return value
+
+
+def _validate_tenant_resource_version(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("tenant resource version is invalid")
     return value
 
 
@@ -181,6 +179,7 @@ class SQLAlchemyEngineExecutionRepository:
             team_id=row.team_id,
             engine_id=row.engine_id,
             attempt_number=row.attempt_number,
+            tenant_resource_version=row.tenant_resource_version,
             adapter_version=row.adapter_version,
             engine_commit_sha=row.engine_commit_sha,
             engine_image_digest=row.engine_image_digest,
@@ -247,6 +246,7 @@ class SQLAlchemyEngineExecutionRepository:
         seed: EngineExecutionSeed,
         now: datetime,
     ) -> EngineExecutionRecord:
+        _validate_tenant_resource_version(seed.tenant_resource_version)
         async with self._session_factory.begin() as session:
             job = await self._job(
                 session,
@@ -273,6 +273,7 @@ class SQLAlchemyEngineExecutionRepository:
                 team_id=team_id,
                 engine_id=seed.engine_id,
                 attempt_number=(latest or 0) + 1,
+                tenant_resource_version=seed.tenant_resource_version,
                 adapter_version=seed.adapter_version,
                 engine_commit_sha=seed.engine_commit_sha,
                 engine_image_digest=seed.engine_image_digest,
@@ -671,6 +672,7 @@ class SQLAlchemyEngineExecutionRepository:
                 team_id=row.team_id,
                 engine_id=row.engine_id,
                 attempt_number=row.attempt_number + 1,
+                tenant_resource_version=row.tenant_resource_version,
                 adapter_version=row.adapter_version,
                 engine_commit_sha=row.engine_commit_sha,
                 engine_image_digest=row.engine_image_digest,
@@ -738,9 +740,11 @@ class EngineExecutionService:
         team_id: UUID,
         analysis_id: UUID,
         engine_id: str,
+        tenant_resource_version: int,
         input_manifest_hash: str,
         config_hash: str,
     ) -> EngineExecutionRecord:
+        _validate_tenant_resource_version(tenant_resource_version)
         adapter = self._registry.require(engine_id)
         pin = self._pin(engine_id)
         if pin.image_digest is None:
@@ -750,6 +754,7 @@ class EngineExecutionService:
             analysis_id=analysis_id,
             seed=EngineExecutionSeed(
                 engine_id=engine_id,
+                tenant_resource_version=tenant_resource_version,
                 adapter_version=adapter.descriptor.adapter_version,
                 engine_commit_sha=pin.commit,
                 engine_image_digest=pin.image_digest,
@@ -1001,17 +1006,46 @@ class EngineExecutionService:
             result = await adapter.fetch_result(self._run_ref(claimed))
         except EngineAdapterError as error:
             return await self._handle_adapter_error(claimed, error)
+        write = EngineResultWrite(
+            team_id=claimed.team_id,
+            analysis_id=claimed.analysis_id,
+            execution_id=claimed.id,
+            expected_execution_version=claimed.version,
+            tenant_resource_version=claimed.tenant_resource_version,
+            artifact_id=claimed.raw_result_artifact_id,
+            engine_id=claimed.engine_id,  # type: ignore[arg-type]
+            adapter_version=claimed.adapter_version,
+            engine_commit_sha=claimed.engine_commit_sha,
+            engine_image_digest=claimed.engine_image_digest,
+            attempt_number=claimed.attempt_number,
+            input_manifest_hash=claimed.input_manifest_hash,
+            config_hash=claimed.config_hash,
+            result=result,
+        )
         try:
-            written_id = await self._result_sink.write(
+            written_id = await self._result_sink.write(write)
+            if written_id != claimed.raw_result_artifact_id:
+                raise EngineResultConflictError
+        except EngineResultValidationError:
+            failed = await self._repository.fail(
                 team_id=claimed.team_id,
                 analysis_id=claimed.analysis_id,
                 execution_id=claimed.id,
-                artifact_id=claimed.raw_result_artifact_id,
-                engine_id=claimed.engine_id,
-                result=result,
+                expected_version=claimed.version,
+                stable_error_code="invalid_output",
+                now=self._now(),
             )
-            if written_id != claimed.raw_result_artifact_id:
-                raise ValueError("result sink returned another artifact")
+            return EngineStepOutcome(failed.id, failed.state, None)
+        except EngineResultConflictError:
+            failed = await self._repository.fail(
+                team_id=claimed.team_id,
+                analysis_id=claimed.analysis_id,
+                execution_id=claimed.id,
+                expected_version=claimed.version,
+                stable_error_code="result_integrity_mismatch",
+                now=self._now(),
+            )
+            return EngineStepOutcome(failed.id, failed.state, None)
         except Exception:
             if await self._repository.deadline_expired(
                 team_id=claimed.team_id,

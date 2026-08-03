@@ -76,6 +76,10 @@ class EngineExecution(
         ),
         CheckConstraint("attempt_number > 0", name="ck_engine_executions_attempt_positive"),
         CheckConstraint(
+            "tenant_resource_version > 0",
+            name="ck_engine_executions_tenant_resource_version_positive",
+        ),
+        CheckConstraint(
             "state IN ('pending', 'running', 'awaiting_user', 'completed', "
             "'insufficient_data', 'failed', 'canceled')",
             name="ck_engine_executions_state",
@@ -105,6 +109,7 @@ class EngineExecution(
     team_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
     engine_id: Mapped[str] = mapped_column(String(64), nullable=False)
     attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    tenant_resource_version: Mapped[int] = mapped_column(Integer, nullable=False)
     adapter_version: Mapped[str] = mapped_column(String(32), nullable=False)
     engine_commit_sha: Mapped[str] = mapped_column(String(40), nullable=False)
     engine_image_digest: Mapped[str] = mapped_column(String(71), nullable=False)
