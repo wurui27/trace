@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import subprocess
 from copy import deepcopy
 from itertools import product
@@ -9,7 +8,8 @@ from pathlib import Path
 import pytest
 import yaml
 
-WORKFLOW_PATH = Path(__file__).resolve().parents[4] / ".github" / "workflows" / "ci.yml"
+REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
+WORKFLOW_PATH = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
 
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 SETUP_PYTHON_ACTION = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
@@ -26,6 +26,7 @@ def _assert_workflow_policy(workflow: dict[str, object]) -> None:
     for job_name, job in jobs.items():
         assert isinstance(job, dict)
         assert "continue-on-error" not in job, job_name
+        assert "defaults" not in job, job_name
         assert "permissions" not in job, job_name
 
         steps = job["steps"]
@@ -33,6 +34,7 @@ def _assert_workflow_policy(workflow: dict[str, object]) -> None:
         for step_index, step in enumerate(steps):
             assert isinstance(step, dict)
             assert "continue-on-error" not in step, (job_name, step_index)
+            assert "shell" not in step, (job_name, step_index)
 
     for job_name in PREREQUISITE_JOBS:
         job = jobs[job_name]
@@ -50,6 +52,42 @@ def _assert_workflow_policy(workflow: dict[str, object]) -> None:
     assert "defaults" not in web
     for step_index, step in enumerate(web["steps"]):
         assert "working-directory" not in step, ("web", step_index)
+
+
+def _assert_checkout_policy(workflow: dict[str, object]) -> None:
+    jobs = workflow["jobs"]
+    assert isinstance(jobs, dict)
+    for job_name in PREREQUISITE_JOBS:
+        job = jobs[job_name]
+        assert isinstance(job, dict)
+        steps = job["steps"]
+        assert isinstance(steps, list)
+
+        platform_checkout = steps[0]
+        assert platform_checkout.get("uses") == CHECKOUT_ACTION, job_name
+        assert platform_checkout.get("with") == {
+            "persist-credentials": "false"
+        }, job_name
+
+        checkout_steps = [
+            step
+            for step in steps
+            if str(step.get("uses", "")).startswith("actions/checkout@")
+        ]
+        expected_checkout_count = 2 if job_name == "python-tests" else 1
+        assert len(checkout_steps) == expected_checkout_count, job_name
+
+    tests_steps = jobs["python-tests"]["steps"]
+    assert tests_steps[1] == {
+        "name": "Checkout Android memory analyzer",
+        "uses": CHECKOUT_ACTION,
+        "with": {
+            "repository": "Gracker/Android-App-Memory-Analysis",
+            "ref": "d5514972ced78c3faa7fc17589c1ea9231645056",
+            "path": ".ci/android-memory",
+            "persist-credentials": "false",
+        },
+    }
 
 
 def _assert_workflow_paths(workflow_paths: list[Path]) -> None:
@@ -103,6 +141,10 @@ def test_actual_workflow_satisfies_strict_policy(workflow: dict[str, object]) ->
     _assert_workflow_policy(workflow)
 
 
+def test_actual_workflow_satisfies_checkout_policy(workflow: dict[str, object]) -> None:
+    _assert_checkout_policy(workflow)
+
+
 def test_workflow_directory_contains_only_ci_workflow() -> None:
     workflow_paths = sorted(
         path
@@ -151,6 +193,21 @@ def test_workflow_directory_contains_only_ci_workflow() -> None:
             id="web-step-working-directory",
         ),
         pytest.param(
+            ("jobs", "ci-gate", "steps", 0, "shell"),
+            "true {0}",
+            id="gate-step-shell",
+        ),
+        pytest.param(
+            ("jobs", "ci-gate", "defaults"),
+            {"run": {"shell": "true {0}"}},
+            id="gate-job-shell-default",
+        ),
+        pytest.param(
+            ("jobs", "python-quality", "steps", 3, "shell"),
+            "true {0}",
+            id="prerequisite-run-step-shell",
+        ),
+        pytest.param(
             ("jobs", "python-tests", "if"),
             "${{ false }}",
             id="prerequisite-job-if",
@@ -177,6 +234,33 @@ def test_policy_rejects_execution_weakening(
 
     with pytest.raises(AssertionError):
         _assert_workflow_policy(weakened)
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        pytest.param(
+            ("jobs", "python-quality", "steps", 0, "with", "ref"),
+            "main",
+            id="quality-checkout-ref",
+        ),
+        pytest.param(
+            ("jobs", "web", "steps", 0, "with", "repository"),
+            "attacker/example",
+            id="web-checkout-repository",
+        ),
+    ],
+)
+def test_checkout_policy_rejects_platform_override(
+    workflow: dict[str, object],
+    path: tuple[str | int, ...],
+    value: object,
+) -> None:
+    weakened = deepcopy(workflow)
+    _set_nested(weakened, path, value)
+
+    with pytest.raises(AssertionError):
+        _assert_checkout_policy(weakened)
 
 
 def test_policy_rejects_a_second_workflow_file() -> None:
@@ -354,13 +438,20 @@ def test_ci_gate_passes_only_when_every_required_job_succeeds(
     }
 
     for results in product(("success", "failure", "cancelled", "skipped"), repeat=3):
-        environment = os.environ.copy()
-        environment.update(dict(zip(result_variables, results, strict=True)))
+        environment = dict(zip(result_variables, results, strict=True))
         completed = subprocess.run(
-            ["bash", "-e", "-u", "-o", "pipefail", "-c", gate_step["run"]],
+            ["/bin/bash", "-e", "-u", "-o", "pipefail", "-c", gate_step["run"]],
             check=False,
+            cwd=REPOSITORY_ROOT,
             env=environment,
+            stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            timeout=5,
         )
-        assert (completed.returncode == 0) is all(result == "success" for result in results)
+        assert (completed.returncode == 0) is all(
+            result == "success" for result in results
+        ), (
+            f"results={results!r}, returncode={completed.returncode}, "
+            f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
+        )

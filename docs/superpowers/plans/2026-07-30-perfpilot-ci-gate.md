@@ -46,7 +46,10 @@ Load `.github/workflows/ci.yml` with `yaml.BaseLoader` and assert:
 3. Concurrency cancels obsolete runs.
 4. Jobs are exactly `python-quality`, `python-tests`, `web`, and `ci-gate`.
 5. Every reusable action is pinned to the fixed full commit SHA above.
-6. Every checkout step disables credential persistence.
+6. Each prerequisite job starts with the platform checkout pinned to the fixed
+   SHA and an exact `with: {persist-credentials: false}` mapping. Quality and
+   Web have exactly one checkout; tests have exactly two, with the fixed Android
+   upstream checkout second.
 7. `python-quality` runs `uv sync --locked --all-packages` and Ruff through
    `uv run --locked`.
 8. `python-tests` checks out the pinned Android repository into
@@ -56,14 +59,15 @@ Load `.github/workflows/ci.yml` with `yaml.BaseLoader` and assert:
 9. `web` runs `npm ci`, `npm run lint`, and `npm test` from the repository root.
 10. `ci-gate` uses `always()`, needs all three jobs, and fails unless every
     dependency succeeded.
-11. No job or step sets `continue-on-error`; the three prerequisite jobs and
-    their steps have no `if`, while only the `ci-gate` job may use the exact
+11. No job or step sets `continue-on-error`, no job defines `defaults`, and no
+    step overrides `shell`. The three prerequisite jobs and their steps have no
+    `if`, while only the `ci-gate` job may use the exact
     `if: ${{ always() }}` expression and its step has no `if`.
 12. No job defines `permissions`, so a job cannot override the exact top-level
     `contents: read` policy.
 13. `python-quality`, `python-tests`, and `web` have no `needs` and therefore
     remain independent.
-14. The workflow has no top-level `defaults`, the `web` job has no `defaults`,
+14. The workflow has no top-level `defaults`; Web runs from the repository root,
     and no Web step sets `working-directory`.
 15. `.github/workflows` contains exactly one workflow YAML file: `ci.yml`.
 
