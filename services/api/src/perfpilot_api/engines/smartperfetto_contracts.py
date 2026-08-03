@@ -53,6 +53,7 @@ _SupportedSceneType = Literal[
 ]
 
 _REPORT_URL = re.compile(r"^/api/reports/([A-Za-z0-9][A-Za-z0-9._:-]{0,127})$")
+_OPAQUE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]*$")
 _SIGNED_HTTP_URL = re.compile(
     r"(?i)https?://[^\s]+[?&](?:x-amz-signature|x-goog-signature|signature|sig|token)="
 )
@@ -91,6 +92,9 @@ _ALLOWED_REPORT_KEYS = {
     "analysisPlan",
     "uncertaintyFlags",
     "resultContract",
+}
+_ALLOWED_STABLE_REPORT_KEYS = (_ALLOWED_REPORT_KEYS - {"reportUrl", "reportError"}) | {
+    "reportId"
 }
 _MAX_REPORT_DEPTH = 12
 _MAX_REPORT_COLLECTION_ITEMS = 512
@@ -296,6 +300,42 @@ def _sanitize_report(report: Mapping[str, object]) -> tuple[dict[str, object], s
     return sanitized, report_id
 
 
+def validate_sanitized_report_payload(payload: object) -> dict[str, object]:
+    """Validate that a stable report payload is a sanitizer fixed point."""
+
+    if not isinstance(payload, Mapping) or set(payload) != {"reportId", "report"}:
+        raise ValueError("report contract invalid")
+    report_id = payload.get("reportId")
+    report = payload.get("report")
+    if (
+        not isinstance(report_id, str)
+        or len(report_id) > 255
+        or _OPAQUE_ID_PATTERN.fullmatch(report_id) is None
+        or not isinstance(report, Mapping)
+        or "reportError" in report
+        or not set(report).issubset(_ALLOWED_STABLE_REPORT_KEYS)
+    ):
+        raise ValueError("report contract invalid")
+    if report.get("reportId") != report_id:
+        raise ValueError("report contract invalid")
+    sanitized = _sanitize_nested(report, depth=0)
+    if not isinstance(sanitized, dict) or sanitized != report:
+        raise ValueError("report contract invalid")
+    try:
+        encoded = json.dumps(
+            sanitized,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+            allow_nan=False,
+        ).encode("utf-8")
+    except (TypeError, ValueError):
+        raise ValueError("report contract invalid") from None
+    if len(encoded) > _MAX_SANITIZED_REPORT_BYTES:
+        raise ValueError("report contract invalid")
+    return {"reportId": report_id, "report": sanitized}
+
+
 class SmartPerfettoReportResponse(_FrozenConsumerModel):
     success: Literal[True]
     sanitized_report: dict[str, object] = Field(alias="report")
@@ -333,4 +373,5 @@ __all__ = [
     "SmartPerfettoTraceUploadResponse",
     "SmartPerfettoWorkspaceCreateResponse",
     "SmartPerfettoWorkspaceListResponse",
+    "validate_sanitized_report_payload",
 ]
