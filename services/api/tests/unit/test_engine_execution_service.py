@@ -28,6 +28,7 @@ from perfpilot_api.engines.lock import EngineLock, EnginePin
 from perfpilot_api.engines.registry import AdapterRegistry, AdapterRegistryError
 from perfpilot_api.services.engine_executions import (
     EngineExecutionRecord,
+    EngineExecutionSeed,
     EngineExecutionService,
     FinalizationClaim,
     RetryReservation,
@@ -92,6 +93,7 @@ def _record(**overrides: object) -> EngineExecutionRecord:
         "team_id": TEAM_ID,
         "engine_id": "smartperfetto",
         "attempt_number": 1,
+        "tenant_resource_version": 1,
         "adapter_version": "1.0.0",
         "engine_commit_sha": "a" * 40,
         "engine_image_digest": "sha256:" + "b" * 64,
@@ -277,10 +279,12 @@ class FakeRepository:
     def __init__(self) -> None:
         self.record = _record()
         self.events: list[str] = []
+        self.allocation_calls: list[dict[str, object]] = []
         self.next_attempt: EngineExecutionRecord | None = None
         self.expired = False
 
     async def allocate_attempt(self, **kwargs: object) -> EngineExecutionRecord:
+        self.allocation_calls.append(kwargs)
         self.events.append("allocated")
         return self.record
 
@@ -493,6 +497,7 @@ async def test_submit_resolves_workspace_and_persists_only_server_run_reference(
         team_id=TEAM_ID,
         analysis_id=ANALYSIS_ID,
         engine_id="smartperfetto",
+        tenant_resource_version=7,
         input_manifest_hash="c" * 64,
         config_hash="d" * 64,
     )
@@ -512,7 +517,30 @@ async def test_submit_resolves_workspace_and_persists_only_server_run_reference(
     assert adapter.submitted[0].external_workspace_id == "workspace-server-owned"
     assert submitted.state == "running"
     assert submitted.external_session_id == "session-1"
+    seed = repository.allocation_calls[0]["seed"]
+    assert isinstance(seed, EngineExecutionSeed)
+    assert seed.tenant_resource_version == 7
     assert repository.events == ["allocated", "submitted"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant_resource_version", [True, 0, -1, 1.0, "1"])
+async def test_create_attempt_requires_an_actual_positive_tenant_resource_version(
+    tenant_resource_version: object,
+) -> None:
+    service, repository, _workspaces, _adapter, _sink = _service()
+
+    with pytest.raises(ValueError, match="tenant resource version is invalid"):
+        await service.create_attempt(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            engine_id="smartperfetto",
+            tenant_resource_version=tenant_resource_version,  # type: ignore[arg-type]
+            input_manifest_hash="c" * 64,
+            config_hash="d" * 64,
+        )
+
+    assert repository.allocation_calls == []
 
 
 @pytest.mark.asyncio

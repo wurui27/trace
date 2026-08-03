@@ -75,6 +75,7 @@ class EngineExecutionOwnershipError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class EngineExecutionSeed:
     engine_id: str
+    tenant_resource_version: int
     adapter_version: str
     engine_commit_sha: str
     engine_image_digest: str
@@ -89,6 +90,7 @@ class EngineExecutionRecord:
     team_id: UUID
     engine_id: str
     attempt_number: int
+    tenant_resource_version: int
     adapter_version: str
     engine_commit_sha: str
     engine_image_digest: str
@@ -161,6 +163,12 @@ def _validate_stable_code(value: str) -> str:
     return value
 
 
+def _validate_tenant_resource_version(value: int) -> int:
+    if type(value) is not int or value < 1:
+        raise ValueError("tenant resource version is invalid")
+    return value
+
+
 def _validate_cursor(value: str | None) -> int | None:
     if value is None:
         return None
@@ -181,6 +189,7 @@ class SQLAlchemyEngineExecutionRepository:
             team_id=row.team_id,
             engine_id=row.engine_id,
             attempt_number=row.attempt_number,
+            tenant_resource_version=row.tenant_resource_version,
             adapter_version=row.adapter_version,
             engine_commit_sha=row.engine_commit_sha,
             engine_image_digest=row.engine_image_digest,
@@ -247,6 +256,7 @@ class SQLAlchemyEngineExecutionRepository:
         seed: EngineExecutionSeed,
         now: datetime,
     ) -> EngineExecutionRecord:
+        _validate_tenant_resource_version(seed.tenant_resource_version)
         async with self._session_factory.begin() as session:
             job = await self._job(
                 session,
@@ -273,6 +283,7 @@ class SQLAlchemyEngineExecutionRepository:
                 team_id=team_id,
                 engine_id=seed.engine_id,
                 attempt_number=(latest or 0) + 1,
+                tenant_resource_version=seed.tenant_resource_version,
                 adapter_version=seed.adapter_version,
                 engine_commit_sha=seed.engine_commit_sha,
                 engine_image_digest=seed.engine_image_digest,
@@ -671,6 +682,7 @@ class SQLAlchemyEngineExecutionRepository:
                 team_id=row.team_id,
                 engine_id=row.engine_id,
                 attempt_number=row.attempt_number + 1,
+                tenant_resource_version=row.tenant_resource_version,
                 adapter_version=row.adapter_version,
                 engine_commit_sha=row.engine_commit_sha,
                 engine_image_digest=row.engine_image_digest,
@@ -738,9 +750,11 @@ class EngineExecutionService:
         team_id: UUID,
         analysis_id: UUID,
         engine_id: str,
+        tenant_resource_version: int,
         input_manifest_hash: str,
         config_hash: str,
     ) -> EngineExecutionRecord:
+        _validate_tenant_resource_version(tenant_resource_version)
         adapter = self._registry.require(engine_id)
         pin = self._pin(engine_id)
         if pin.image_digest is None:
@@ -750,6 +764,7 @@ class EngineExecutionService:
             analysis_id=analysis_id,
             seed=EngineExecutionSeed(
                 engine_id=engine_id,
+                tenant_resource_version=tenant_resource_version,
                 adapter_version=adapter.descriptor.adapter_version,
                 engine_commit_sha=pin.commit,
                 engine_image_digest=pin.image_digest,

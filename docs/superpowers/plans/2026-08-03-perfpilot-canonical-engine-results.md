@@ -388,8 +388,10 @@ argument.
 
 - [ ] **Step 3: Add the safe control migration**
 
-Use revision `0006_engine_execution_tenant_resource_version`, down revision
-`0005_memory_upload_mode`. Upgrade and downgrade both execute:
+Use revision `0006_engine_tenant_version`, down revision
+`0005_memory_upload_mode`. The shortened revision stays within Alembic's default
+32-character `version_num` column without mutating Alembic's internal schema.
+Upgrade and downgrade both execute:
 
 ```sql
 LOCK TABLE engine_executions IN ACCESS EXCLUSIVE MODE
