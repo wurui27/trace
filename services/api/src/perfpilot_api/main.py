@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from uuid import uuid4
 
+import httpx
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -21,6 +22,7 @@ from perfpilot_api.api.admin_teams import router as admin_teams_router
 from perfpilot_api.api.analyses import router as analyses_router
 from perfpilot_api.api.health import router as health_router
 from perfpilot_api.api.me import router as me_router
+from perfpilot_api.api.memory_captures import router as memory_captures_router
 from perfpilot_api.api.members import router as members_router
 from perfpilot_api.api.uploads import router as uploads_router
 from perfpilot_api.config import Settings, get_settings
@@ -35,6 +37,14 @@ from perfpilot_api.errors import (
     internal_server_error_handler,
     request_validation_error_handler,
 )
+from perfpilot_api.engines.android_memory import AndroidMemoryAdapter
+from perfpilot_api.engines.android_memory_stager import AndroidMemoryStager
+from perfpilot_api.engines.android_memory_worker import (
+    AndroidMemoryWorker,
+    LocalAndroidMemoryWorker,
+    OciAndroidMemoryWorker,
+)
+from perfpilot_api.engines.registry import AdapterRegistry
 from perfpilot_api.security.proxy_signature import (
     InMemoryReplayStore,
     RedisReplayStore,
@@ -52,11 +62,20 @@ from perfpilot_api.services.analyses import (
     SQLAlchemyAnalysisRepository,
 )
 from perfpilot_api.services.provisioning import AdminTeamService
-from perfpilot_api.services.uploads import UploadService
+from perfpilot_api.services.internal_artifacts import (
+    S3InternalArtifactSink,
+    SQLAlchemyInternalArtifactRepository,
+)
+from perfpilot_api.services.memory_analyses import (
+    MemoryCaptureService,
+    SQLAlchemyMemoryCaptureRepository,
+)
+from perfpilot_api.services.uploads import SQLAlchemyTenantBucketResolver, UploadService
 
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
 _CONTROL_FLOW_EXCEPTIONS = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+_ANDROID_MEMORY_PINNED_COMMIT = "d5514972ced78c3faa7fc17589c1ea9231645056"
 
 
 def _prefer_control_flow_error(
@@ -141,6 +160,8 @@ def create_app(
     admin_team_service: AdminTeamService | None = None,
     upload_service: UploadService | None = None,
     analysis_service: AnalysisService | None = None,
+    memory_capture_service: MemoryCaptureService | None = None,
+    android_memory_worker: AndroidMemoryWorker | None = None,
     apk_inspector: ApkInspector | None = None,
     replay_store: ReplayStore | None = None,
     proxy_clock: Callable[[], float] = time.time,
@@ -166,11 +187,20 @@ def create_app(
     resolved_admin_team_service = admin_team_service
     resolved_upload_service = upload_service
     resolved_analysis_service = analysis_service
+    resolved_memory_capture_service = memory_capture_service
+    resolved_android_memory_worker = android_memory_worker
+    active_android_memory_worker: AndroidMemoryWorker | None = None
+    owned_android_memory_artifact_client: httpx.AsyncClient | None = None
+    engine_adapter_registry = AdapterRegistry(())
     resolved_replay_store = replay_store
     artifact_runtime_required = (
         not testing
         and settings.app_env == "production"
-        and (resolved_upload_service is None or resolved_analysis_service is None)
+        and (
+            resolved_upload_service is None
+            or resolved_analysis_service is None
+            or resolved_memory_capture_service is None
+        )
     )
     if not testing and (resolved_auth_service is None or resolved_replay_store is None):
         owned_redis = redis.from_url(settings.redis_url.get_secret_value())
@@ -206,9 +236,75 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
-        nonlocal owned_artifact_runtime, resolved_analysis_service, resolved_upload_service
+        nonlocal owned_artifact_runtime
+        nonlocal resolved_analysis_service
+        nonlocal resolved_android_memory_worker
+        nonlocal resolved_memory_capture_service
+        nonlocal resolved_upload_service
+        nonlocal active_android_memory_worker
+        nonlocal engine_adapter_registry
+        nonlocal owned_android_memory_artifact_client
         lifespan_error: BaseException | None = None
         try:
+            if settings.android_memory_enabled:
+                if settings.app_env == "production" and (
+                    resolved_android_memory_worker is None
+                    or getattr(resolved_android_memory_worker, "isolation", None) != "oci"
+                    or settings.android_memory_image_reference is None
+                    or getattr(resolved_android_memory_worker, "image_reference", None)
+                    != settings.android_memory_image_reference
+                ):
+                    raise RuntimeError(
+                        "An externally isolated Android Memory worker is unavailable"
+                    )
+                if resolved_android_memory_worker is None:
+                    if settings.android_memory_backend == "local":
+                        resolved_android_memory_worker = LocalAndroidMemoryWorker(
+                            python_binary=settings.android_memory_python_binary,
+                            repository_root=settings.android_memory_checkout_root,
+                            run_root=settings.android_memory_run_root / "worker",
+                            runtime_commit=_ANDROID_MEMORY_PINNED_COMMIT,
+                            max_output_bytes=settings.android_memory_max_output_bytes,
+                        )
+                    else:
+                        image_reference = settings.android_memory_image_reference
+                        if image_reference is None:
+                            raise RuntimeError(
+                                "An externally isolated Android Memory worker is unavailable"
+                            )
+                        resolved_android_memory_worker = OciAndroidMemoryWorker(
+                            container_runtime=settings.android_memory_container_runtime,
+                            image_reference=image_reference,
+                            run_root=settings.android_memory_run_root / "worker",
+                            max_output_bytes=settings.android_memory_max_output_bytes,
+                            pids_limit=settings.android_memory_pids_limit,
+                            memory_bytes=settings.android_memory_memory_bytes,
+                            cpu_limit=settings.android_memory_cpu_limit,
+                            tmpfs_bytes=settings.android_memory_tmpfs_bytes,
+                        )
+                active_android_memory_worker = resolved_android_memory_worker
+                owned_android_memory_artifact_client = httpx.AsyncClient(follow_redirects=False)
+                adapter = AndroidMemoryAdapter(
+                    stager=AndroidMemoryStager(
+                        client=owned_android_memory_artifact_client,
+                        workspace_root=settings.android_memory_run_root / "staging",
+                        max_files=settings.android_memory_max_files,
+                        max_file_bytes=settings.android_memory_max_file_bytes,
+                        max_total_bytes=settings.android_memory_max_total_bytes,
+                    ),
+                    worker=active_android_memory_worker,
+                    max_timeout_seconds=settings.android_memory_timeout_seconds,
+                )
+                engine_adapter_registry = AdapterRegistry((adapter,))
+                lifespan_app.state.engine_adapter_registry = engine_adapter_registry
+                lifespan_app.state.android_memory_worker = active_android_memory_worker
+                lifespan_app.state.android_memory_artifact_client = (
+                    owned_android_memory_artifact_client
+                )
+                image_reference = settings.android_memory_image_reference
+                lifespan_app.state.android_memory_image_digest = (
+                    None if image_reference is None else image_reference.rpartition("@")[2]
+                )
             if settings.app_env == "production" and apk_inspector is None:
                 raise RuntimeError("An externally isolated APK inspector is unavailable")
             if artifact_runtime_required:
@@ -225,7 +321,9 @@ def create_app(
                 if resolved_analysis_service is None:
                     resolved_inspector = apk_inspector
                     if settings.app_env != "production":
-                        resolved_inspector = resolved_inspector or owned_artifact_runtime.apk_inspector
+                        resolved_inspector = (
+                            resolved_inspector or owned_artifact_runtime.apk_inspector
+                        )
                     if resolved_inspector is None:
                         raise RuntimeError("An externally isolated APK inspector is unavailable")
                     resolved_analysis_service = AnalysisService(
@@ -237,12 +335,34 @@ def create_app(
                         apk_inspector=resolved_inspector,
                     )
                     lifespan_app.state.analysis_service = resolved_analysis_service
+                if resolved_memory_capture_service is None:
+                    resolved_memory_capture_service = MemoryCaptureService(
+                        repository=SQLAlchemyMemoryCaptureRepository(
+                            tenant_router=owned_artifact_runtime.tenant_router,
+                        ),
+                        manifest_sink=S3InternalArtifactSink(
+                            repository=SQLAlchemyInternalArtifactRepository(
+                                tenant_router=owned_artifact_runtime.tenant_router,
+                            ),
+                            bucket_resolver=SQLAlchemyTenantBucketResolver(
+                                session_factory=control_session_factory,
+                            ),
+                            client=owned_artifact_runtime.s3_client,
+                        ),
+                    )
+                    lifespan_app.state.memory_capture_service = resolved_memory_capture_service
             yield
         except BaseException as error:
             lifespan_error = error
         finally:
             cleanup_error: BaseException | None = None
             cleanup_steps = (
+                active_android_memory_worker.shutdown
+                if active_android_memory_worker is not None
+                else None,
+                owned_android_memory_artifact_client.aclose
+                if owned_android_memory_artifact_client is not None
+                else None,
                 owned_artifact_runtime.close if owned_artifact_runtime is not None else None,
                 owned_redis.aclose if owned_redis is not None else None,
                 owned_engine.dispose if owned_engine is not None else None,
@@ -269,6 +389,11 @@ def create_app(
     app.state.admin_team_service = resolved_admin_team_service
     app.state.upload_service = resolved_upload_service
     app.state.analysis_service = resolved_analysis_service
+    app.state.memory_capture_service = resolved_memory_capture_service
+    app.state.engine_adapter_registry = engine_adapter_registry
+    app.state.android_memory_worker = None
+    app.state.android_memory_artifact_client = None
+    app.state.android_memory_image_digest = None
     app.state.proxy_replay_store = resolved_replay_store or InMemoryReplayStore(clock=proxy_clock)
     app.state.proxy_clock = proxy_clock
     identity_required = (
@@ -295,6 +420,7 @@ def create_app(
     app.include_router(members_router)
     app.include_router(analyses_router)
     app.include_router(uploads_router)
+    app.include_router(memory_captures_router)
     return app
 
 

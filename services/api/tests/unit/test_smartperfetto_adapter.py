@@ -22,13 +22,12 @@ from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
 
 TEAM_WORKSPACE = "pp-11111111-2222-5333-8444-555555555555"
 ANALYSIS_ID = UUID("c1000000-0000-4000-8000-000000000001")
+EXECUTION_ID = UUID("c1000000-0000-4000-8000-000000000002")
 ARTIFACT_ID = UUID("c2000000-0000-4000-8000-000000000001")
 TRACE_BYTES = b"PERFETTO-SYNTHETIC-TRACE"
 SIGNED_URL = "https://objects.example/private-trace?signature=signed-secret-marker"
 _FIXTURE_ROOT = (
-    Path(__file__).resolve().parents[1]
-    / "fixtures"
-    / "smartperfetto_workspace_agent_v1"
+    Path(__file__).resolve().parents[1] / "fixtures" / "smartperfetto_workspace_agent_v1"
 )
 
 
@@ -69,6 +68,7 @@ def _config(
     timeout_seconds: int = 60,
 ) -> SubmitConfig:
     return SubmitConfig(
+        execution_id=EXECUTION_ID,
         analysis_id=ANALYSIS_ID,
         profile=profile,  # type: ignore[arg-type]
         question=question,
@@ -224,8 +224,14 @@ async def test_submit_streams_verified_trace_then_uploads_and_analyzes() -> None
         f"/api/workspaces/{TEAM_WORKSPACE}/agent/analyze",
     ]
     upload = engine_requests[0]
+    for request in engine_requests:
+        rendered = " ".join(
+            (str(request.url), repr(request.headers), request.content.decode("latin-1"))
+        )
+        assert str(EXECUTION_ID) not in rendered
+        assert EXECUTION_ID.hex not in rendered
     assert 'name="file"' in upload.content.decode("latin-1")
-    assert "filename=\"perfpilot-trace-" in upload.content.decode("latin-1")
+    assert 'filename="perfpilot-trace-' in upload.content.decode("latin-1")
     assert TRACE_BYTES in upload.content
     assert "upload-url" not in upload.url.path
     assert "signed-secret-marker" not in upload.content.decode("latin-1")
@@ -371,9 +377,7 @@ async def test_auto_previews_allowlisted_scenes_then_returns_the_deep_dive_run()
     assert json.loads(analyze_requests[1].content) == _json_fixture(
         "analyze-smart-deep-dive-request.json"
     )
-    assert requests[2].url.path.endswith(
-        "/agent/runs/run-session-synthetic-001-1/stream"
-    )
+    assert requests[2].url.path.endswith("/agent/runs/run-session-synthetic-001-1/stream")
     assert run_ref.external_session_id == "session-deep-dive"
     assert run_ref.external_run_id == "run-deep-dive"
     assert run_ref.external_workspace_id == TEAM_WORKSPACE
@@ -526,9 +530,7 @@ async def test_preview_cancellation_closes_stream_and_best_effort_cancels_sessio
         await _close(engine_client, artifact_client)
 
     assert stream.closed
-    assert cancel_paths == [
-        f"/api/workspaces/{TEAM_WORKSPACE}/agent/session-synthetic-001/cancel"
-    ]
+    assert cancel_paths == [f"/api/workspaces/{TEAM_WORKSPACE}/agent/session-synthetic-001/cancel"]
 
 
 def _run_ref(
@@ -566,9 +568,7 @@ async def test_stream_replays_only_strictly_new_events_and_refreshes_cursor() ->
     finally:
         await _close(engine_client, artifact_client)
 
-    assert requests[0].url.path.endswith(
-        "/agent/runs/run-session-synthetic-001-1/stream"
-    )
+    assert requests[0].url.path.endswith("/agent/runs/run-session-synthetic-001-1/stream")
     assert requests[0].headers["Accept"] == "text/event-stream"
     assert requests[0].headers["Last-Event-ID"] == "1"
     assert [event.event_id for event in batch.events] == ["2", "3"]
@@ -593,9 +593,7 @@ class ClosingStream(httpx.AsyncByteStream):
 
 @pytest.mark.asyncio
 async def test_stream_stops_at_batch_limit_and_closes_response() -> None:
-    stream = ClosingStream(
-        [(_FIXTURE_ROOT / "progress-stream.sse").read_bytes()]
-    )
+    stream = ClosingStream([(_FIXTURE_ROOT / "progress-stream.sse").read_bytes()])
 
     def engine_handler(_: httpx.Request) -> httpx.Response:
         return httpx.Response(200, stream=stream)
@@ -684,9 +682,7 @@ async def test_stream_uses_recovered_run_id_after_one_resume() -> None:
             return httpx.Response(200, json=_json_fixture("resume-success.json"))
         if request.url.path.endswith("/run-session-synthetic-001-1/stream"):
             return httpx.Response(404, json={"success": False, "code": "NOT_FOUND"})
-        if request.url.path.endswith(
-            "/run-session-synthetic-001-2-recovered/stream"
-        ):
+        if request.url.path.endswith("/run-session-synthetic-001-2-recovered/stream"):
             return httpx.Response(
                 200,
                 content=(_FIXTURE_ROOT / "progress-stream.sse").read_bytes(),

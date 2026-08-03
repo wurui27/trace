@@ -47,7 +47,7 @@ class ApkInput(BaseModel):
     sha256_b64: str = Field(pattern=_SHA256_PATTERN)
 
 
-class CreateAnalysisRequest(BaseModel):
+class CreateDeviceAnalysisRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     schema_version: Literal["1.0"]
@@ -58,6 +58,21 @@ class CreateAnalysisRequest(BaseModel):
         Literal["memory_cycle"],
     ]
     apk: ApkInput
+
+
+class CreateMemoryAnalysisRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    analysis_mode: Literal["memory_upload"]
+    application_version_id: UUID
+    question: str | None = None
+
+
+CreateAnalysisRequest = Annotated[
+    CreateDeviceAnalysisRequest | CreateMemoryAnalysisRequest,
+    Field(discriminator="analysis_mode"),
+]
 
 
 def get_analysis_service(request: Request) -> AnalysisService:
@@ -209,14 +224,29 @@ def _apk_upload(slot: UploadSlot) -> dict[str, object]:
 
 
 def analysis_response(view: AnalysisView) -> dict[str, object]:
-    if view.apk_upload is None:
+    if (view.application_version_id is None) != (view.application_metadata is None):
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
-    if (
-        view.analysis_mode != "device"
-        or tuple(item.scenario_type for item in view.scenarios)
-        != ("cold_start", "scroll", "memory_cycle")
-        or (view.application_version_id is None) != (view.application_metadata is None)
-    ):
+    if view.analysis_mode == "device":
+        if (
+            view.apk_upload is None
+            or view.question is not None
+            or tuple(item.scenario_type for item in view.scenarios)
+            != ("cold_start", "scroll", "memory_cycle")
+        ):
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    elif view.analysis_mode == "memory_upload":
+        if (
+            view.application_version_id is None
+            or view.application_metadata is None
+            or view.apk_upload is not None
+            or view.scenarios
+            or view.active_lease is not None
+            or view.report_available
+            or (view.question is not None and len(view.question) > 2_000)
+            or view.sample_verdict_counts.total != 0
+        ):
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    else:
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
     metadata = view.application_metadata
     application_metadata: dict[str, object] | None = None
@@ -239,7 +269,7 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
             "state": "active",
             "expires_at": _utc(view.active_lease.expires_at),
         }
-    return {
+    result: dict[str, object] = {
         "schema_version": "1.0",
         "analysis_id": str(view.analysis_id),
         "team_id": str(view.team_id),
@@ -250,7 +280,7 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
             str(view.application_version_id) if view.application_version_id is not None else None
         ),
         "application_metadata": application_metadata,
-        "apk_upload": _apk_upload(view.apk_upload),
+        "apk_upload": _apk_upload(view.apk_upload) if view.apk_upload is not None else None,
         "scenarios": [_scenario(item) for item in view.scenarios],
         "sample_verdict_counts": _verdicts(view.sample_verdict_counts),
         "active_lease": active_lease,
@@ -260,6 +290,9 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
         "completed_at": (_utc(view.completed_at) if view.completed_at is not None else None),
         "failure": _failure(view.failure_code),
     }
+    if view.analysis_mode == "memory_upload":
+        result["question"] = view.question
+    return result
 
 
 router = APIRouter(
@@ -290,15 +323,24 @@ async def create_analysis(
         access="write",
     )
     try:
-        view = await analysis_service.create_device_analysis(
-            team_id=team_id,
-            requested_by_user_id=principal.user_id,
-            idempotency_key=idempotency_key,
-            scenarios=payload.scenarios,
-            apk_mime=payload.apk.mime,
-            apk_size=payload.apk.size,
-            apk_sha256_b64=payload.apk.sha256_b64,
-        )
+        if payload.analysis_mode == "memory_upload":
+            view = await analysis_service.create_memory_analysis(
+                team_id=team_id,
+                requested_by_user_id=principal.user_id,
+                idempotency_key=idempotency_key,
+                application_version_id=payload.application_version_id,
+                question=payload.question,
+            )
+        else:
+            view = await analysis_service.create_device_analysis(
+                team_id=team_id,
+                requested_by_user_id=principal.user_id,
+                idempotency_key=idempotency_key,
+                scenarios=payload.scenarios,
+                apk_mime=payload.apk.mime,
+                apk_size=payload.apk.size,
+                apk_sha256_b64=payload.apk.sha256_b64,
+            )
     except Exception as error:
         if not isinstance(
             error,

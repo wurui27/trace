@@ -513,9 +513,47 @@ async def test_download_uses_only_the_finalized_fixed_version_for_five_minutes()
     assert location.version_id == "download-fixed-version"
     assert store.received["expires_in_seconds"] == 300
     assert authorization.expires_at == NOW + timedelta(minutes=5)
+    assert authorization.tenant_resource_version == 1
+    assert authorization.artifact_version == 2
+    assert authorization.artifact_kind == "apk"
+    assert authorization.mime == "application/vnd.android.package-archive"
+    assert authorization.size == 4
+    assert authorization.sha256_b64 == CHECKSUM
     rendered = repr(authorization)
     assert "download-secret" not in rendered
     assert "download-fixed-version" not in rendered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("resource_version", "artifact_version"),
+    [(2, 2), (1, 3)],
+)
+async def test_download_fails_closed_when_expected_route_or_artifact_version_changes(
+    resource_version: int,
+    artifact_version: int,
+) -> None:
+    from perfpilot_api.services.uploads import UploadUnavailableError
+
+    repository = RecordingRepository(
+        _stored_upload(
+            state="finalized",
+            version=2,
+            version_id="download-fixed-version",
+            finalized_at=NOW - timedelta(minutes=1),
+            expires_at=NOW + timedelta(days=29),
+        )
+    )
+    store = RecordingStore(repository)
+
+    with pytest.raises(UploadUnavailableError, match="unavailable"):
+        await _service(repository, store).download(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            artifact_id=ARTIFACT_ID,
+            expected_tenant_resource_version=resource_version,
+            expected_artifact_version=artifact_version,
+        )
 
 
 @pytest.mark.asyncio
@@ -599,6 +637,55 @@ async def test_create_slot_rejects_noncanonical_or_unapproved_descriptors(
         await service.create_slot(**request)  # type: ignore[arg-type]
 
     assert repository.events == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("artifact_kind", ["memory_evidence", "screenshot"])
+async def test_memory_input_kinds_can_reserve_uploads(artifact_kind: str) -> None:
+    repository = RecordingRepository(
+        _stored_upload(
+            artifact_kind=artifact_kind,
+            mime="application/octet-stream",
+            size=128,
+        )
+    )
+    store = RecordingStore(repository)
+
+    slot = await _service(repository, store).create_slot(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        idempotency_key=f"memory-{artifact_kind}",
+        artifact_kind=artifact_kind,
+        mime="application/octet-stream",
+        size=128,
+        sha256_b64=CHECKSUM,
+    )
+
+    assert slot.artifact_kind == artifact_kind
+    assert repository.received["descriptor"].artifact_kind == artifact_kind
+    assert store.events == ["presigned"]
+
+
+@pytest.mark.asyncio
+async def test_memory_capture_manifest_cannot_reserve_a_public_upload() -> None:
+    from perfpilot_api.services.uploads import UploadInvalidRequestError
+
+    repository = RecordingRepository()
+    store = RecordingStore(repository)
+
+    with pytest.raises(UploadInvalidRequestError):
+        await _service(repository, store).create_slot(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            idempotency_key="memory-capture-manifest",
+            artifact_kind="memory_capture_manifest",
+            mime="application/octet-stream",
+            size=128,
+            sha256_b64=CHECKSUM,
+        )
+
+    assert repository.events == []
+    assert store.events == []
 
 
 @pytest.mark.asyncio

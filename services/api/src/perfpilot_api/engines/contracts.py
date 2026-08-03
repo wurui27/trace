@@ -61,6 +61,7 @@ class EngineInput:
 
 @dataclass(frozen=True, slots=True)
 class SubmitConfig:
+    execution_id: UUID
     analysis_id: UUID
     profile: AnalysisProfile
     question: str | None

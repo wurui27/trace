@@ -37,7 +37,9 @@ _UPLOADABLE_KINDS = frozenset(
         "capture_manifest",
         "log",
         "mapping",
+        "memory_evidence",
         "native_symbols",
+        "screenshot",
         "source_archive",
         "trace",
     }
@@ -129,6 +131,12 @@ class UploadSlot:
 @dataclass(frozen=True, slots=True)
 class DownloadAuthorization:
     artifact_id: UUID
+    tenant_resource_version: int
+    artifact_version: int
+    artifact_kind: str
+    mime: str
+    size: int
+    sha256_b64: str
     url: str = field(repr=False)
     expires_at: datetime
 
@@ -671,9 +679,16 @@ class UploadService:
         team_id: UUID,
         analysis_id: UUID,
         artifact_id: UUID,
+        expected_tenant_resource_version: int | None = None,
+        expected_artifact_version: int | None = None,
     ) -> DownloadAuthorization:
         now = self._clock()
         tenant = await _call_available(lambda: self._bucket_resolver.active_for_team(team_id))
+        if expected_tenant_resource_version is not None and (
+            type(expected_tenant_resource_version) is not int
+            or tenant.resource_version != expected_tenant_resource_version
+        ):
+            raise UploadUnavailableError("upload service is unavailable")
         stored = await _call_available(
             lambda: self._repository.load_download(
                 tenant=tenant,
@@ -684,6 +699,11 @@ class UploadService:
         )
         if stored.state != "finalized" or stored.version_id is None:
             raise UploadNotFoundError("artifact was not found")
+        if expected_artifact_version is not None and (
+            type(expected_artifact_version) is not int
+            or stored.version != expected_artifact_version
+        ):
+            raise UploadUnavailableError("upload service is unavailable")
         authorization = await _call_available(
             lambda: self._artifact_store.authorize_get(
                 location=ObjectLocation(
@@ -696,6 +716,12 @@ class UploadService:
         )
         return DownloadAuthorization(
             artifact_id=stored.artifact_id,
+            tenant_resource_version=tenant.resource_version,
+            artifact_version=stored.version,
+            artifact_kind=stored.artifact_kind,
+            mime=stored.mime,
+            size=stored.size,
+            sha256_b64=stored.sha256_b64,
             url=authorization.url,
             expires_at=now + timedelta(seconds=authorization.expires_in_seconds),
         )

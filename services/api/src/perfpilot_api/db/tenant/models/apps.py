@@ -153,7 +153,7 @@ class Analysis(
     __tablename__ = "analyses"
     __table_args__ = (
         CheckConstraint(
-            "analysis_mode IN ('device', 'trace_upload')",
+            "analysis_mode IN ('device', 'trace_upload', 'memory_upload')",
             name="ck_analyses_mode",
         ),
         CheckConstraint(
@@ -184,6 +184,7 @@ class Analysis(
     )
     requested_by_user_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     analysis_mode: Mapped[str] = mapped_column(String(32), nullable=False)
+    question: Mapped[str | None] = mapped_column(String(2000))
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

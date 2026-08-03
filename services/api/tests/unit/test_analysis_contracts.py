@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -42,6 +43,20 @@ def _validator(
         registry=_registry(schemas),
         format_checker=jsonschema.Draft202012Validator.FORMAT_CHECKER,
     )
+
+
+def _ecmascript_pattern_matches(pattern: str, value: str) -> bool:
+    script = (
+        "const [pattern, value] = process.argv.slice(1); "
+        'process.stdout.write(String(new RegExp(pattern, "u").test(value)));'
+    )
+    completed = subprocess.run(
+        ["node", "-e", script, pattern, value],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    return completed.stdout == "true"
 
 
 def _walk_schema(value: object) -> Iterator[dict[str, object]]:
@@ -126,6 +141,44 @@ def _pending_analysis_response(*, include_authorization: bool) -> dict[str, obje
     }
 
 
+def _memory_analysis_response(*, question: str | None = None) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "analysis_id": "31000000-0000-4000-8000-000000000001",
+        "team_id": "21000000-0000-4000-8000-000000000001",
+        "analysis_mode": "memory_upload",
+        "state": "created",
+        "version": 2,
+        "application_version_id": "71000000-0000-4000-8000-000000000001",
+        "application_metadata": {
+            "package_name": "dev.perfpilot.memory",
+            "version_name": "1.0",
+            "version_code": 1,
+            "launch_activity": "dev.perfpilot.memory.MainActivity",
+            "min_sdk": 28,
+            "target_sdk": 35,
+            "supported_abis": ["arm64-v8a"],
+            "has_native_libraries": False,
+        },
+        "apk_upload": None,
+        "scenarios": [],
+        "sample_verdict_counts": {
+            "valid": 0,
+            "invalid": 0,
+            "pending": 0,
+            "validation_error": 0,
+            "total": 0,
+        },
+        "active_lease": None,
+        "report_available": False,
+        "created_at": "2026-07-28T12:00:00Z",
+        "started_at": None,
+        "completed_at": None,
+        "failure": None,
+        "question": question,
+    }
+
+
 def test_analysis_contract_schemas_are_valid_and_close_declared_objects() -> None:
     schemas = _schemas()
 
@@ -164,6 +217,54 @@ def test_device_create_request_has_one_server_parsed_apk_and_fixed_scenario_orde
             validator.validate(mutation)
 
 
+def test_memory_create_request_is_closed_without_raw_question_length_limit() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/create-request.schema.json", schemas)
+    payload = {
+        "schema_version": "1.0",
+        "analysis_mode": "memory_upload",
+        "application_version_id": "71000000-0000-4000-8000-000000000001",
+        "question": " " * 2_001,
+    }
+    validator.validate(payload)
+    validator.validate({key: value for key, value in payload.items() if key != "question"})
+    validator.validate({**payload, "question": None})
+    validator.validate({**payload, "question": " \n" + "x" * 2_000 + "\t "})
+
+    for mutation in (
+        {**payload, "apk": {}},
+        {**payload, "scenarios": []},
+        {**payload, "unexpected": True},
+        {**payload, "question": " \n" + "x" * 2_001 + "\t "},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(mutation)
+
+
+def test_memory_question_whitespace_matches_python_strip_across_regex_runtimes() -> None:
+    schemas = _schemas()
+    schema = schemas["contracts/v1/analyses/create-request.schema.json"]
+    memory_branch = schema["oneOf"][1]  # type: ignore[index]
+    pattern = memory_branch["properties"]["question"]["oneOf"][0]["pattern"]  # type: ignore[index]
+    assert isinstance(pattern, str)
+    validator = _validator("contracts/v1/analyses/create-request.schema.json", schemas)
+    payload = {
+        "schema_version": "1.0",
+        "analysis_mode": "memory_upload",
+        "application_version_id": "71000000-0000-4000-8000-000000000001",
+    }
+    byte_order_marks = "\ufeff" * 2_001
+    information_separators = "\u001c" * 2_001
+
+    assert byte_order_marks.strip() == byte_order_marks
+    assert information_separators.strip() == ""
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate({**payload, "question": byte_order_marks})
+    validator.validate({**payload, "question": information_separators})
+    assert not _ecmascript_pattern_matches(pattern, byte_order_marks)
+    assert _ecmascript_pattern_matches(pattern, information_separators)
+
+
 def test_pending_analysis_query_may_omit_but_not_split_upload_authorization() -> None:
     schemas = _schemas()
     validator = _validator("contracts/v1/analyses/analysis-response.schema.json", schemas)
@@ -174,6 +275,35 @@ def test_pending_analysis_query_may_omit_but_not_split_upload_authorization() ->
     del missing_headers["apk_upload"]["required_headers"]  # type: ignore[index]
     with pytest.raises(jsonschema.ValidationError):
         validator.validate(missing_headers)
+
+    for mutation in (
+        {**_pending_analysis_response(include_authorization=False), "question": None},
+        {**_pending_analysis_response(include_authorization=False), "apk_upload": None},
+        {**_pending_analysis_response(include_authorization=False), "scenarios": []},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(mutation)
+
+
+def test_memory_analysis_response_requires_manual_zero_side_effect_invariants() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/analysis-response.schema.json", schemas)
+    payload = _memory_analysis_response(question="retained objects")
+    validator.validate(payload)
+    validator.validate(_memory_analysis_response(question=None))
+
+    for mutation in (
+        {
+            **payload,
+            "apk_upload": _pending_analysis_response(include_authorization=False)["apk_upload"],
+        },
+        {**payload, "scenarios": [object()]},
+        {**payload, "application_metadata": None},
+        {**payload, "question": "x" * 2_001},
+        {key: value for key, value in payload.items() if key != "question"},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(mutation)
 
 
 def test_scenario_execution_manifest_never_claims_server_sample_validity() -> None:

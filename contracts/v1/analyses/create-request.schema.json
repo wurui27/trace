@@ -1,25 +1,52 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/analyses/create-request.schema.json",
-  "$comment": "Idempotency-Key is an HTTP header and is intentionally absent from this body. APK identity and application metadata are server-derived only after immutable upload finalization.",
-  "type": "object",
-  "additionalProperties": false,
-  "required": ["schema_version", "analysis_mode", "scenarios", "apk"],
-  "properties": {
-    "schema_version": {"const": "1.0"},
-    "analysis_mode": {"const": "device"},
-    "scenarios": {
-      "type": "array",
-      "minItems": 3,
-      "maxItems": 3,
-      "prefixItems": [
-        {"const": "cold_start"},
-        {"const": "scroll"},
-        {"const": "memory_cycle"}
-      ],
-      "items": false
+  "$comment": "Idempotency-Key is an HTTP header and is intentionally absent from this closed, analysis_mode-discriminated body. Device APK identity is server-derived after immutable upload finalization; memory_upload binds an existing routed-tenant ApplicationVersion.",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "analysis_mode", "scenarios", "apk"],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "analysis_mode": {"const": "device"},
+        "scenarios": {
+          "type": "array",
+          "minItems": 3,
+          "maxItems": 3,
+          "prefixItems": [
+            {"const": "cold_start"},
+            {"const": "scroll"},
+            {"const": "memory_cycle"}
+          ],
+          "items": false
+        },
+        "apk": {"$ref": "#/$defs/apkInput"}
+      }
     },
-    "apk": {
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "analysis_mode", "application_version_id"],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "analysis_mode": {"const": "memory_upload"},
+        "application_version_id": {"type": "string", "format": "uuid"},
+        "question": {
+          "oneOf": [
+            {
+              "type": "string",
+              "pattern": "^(?:[\\u0009-\\u000D\\u001C-\\u001F\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028-\\u2029\\u202F\\u205F\\u3000]*|[\\u0009-\\u000D\\u001C-\\u001F\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028-\\u2029\\u202F\\u205F\\u3000]*[^\\u0009-\\u000D\\u001C-\\u001F\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028-\\u2029\\u202F\\u205F\\u3000](?:(?:.|\\n|\\r|\\u2028|\\u2029){0,1998}[^\\u0009-\\u000D\\u001C-\\u001F\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028-\\u2029\\u202F\\u205F\\u3000])?[\\u0009-\\u000D\\u001C-\\u001F\\u0020\\u0085\\u00A0\\u1680\\u2000-\\u200A\\u2028-\\u2029\\u202F\\u205F\\u3000]*)$",
+              "$comment": "The explicit boundary set matches Python str.strip whitespace exactly (including U+001C-U+001F and excluding U+FEFF). Blank input remains unlimited because the service normalizes it to null; otherwise trimmed content is limited to 2000 Unicode characters, including newlines."
+            },
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "apkInput": {
       "type": "object",
       "additionalProperties": false,
       "required": ["artifact_kind", "mime", "size", "sha256_b64"],
@@ -33,9 +60,7 @@
         },
         "sha256_b64": {"$ref": "#/$defs/sha256"}
       }
-    }
-  },
-  "$defs": {
+    },
     "sha256": {
       "type": "string",
       "minLength": 44,

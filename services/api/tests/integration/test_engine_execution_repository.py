@@ -15,12 +15,18 @@ from alembic.config import Config
 from psycopg import sql
 from sqlalchemy import inspect, select
 from sqlalchemy.engine import URL, make_url
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
 from perfpilot_api.db.control.models import EngineExecution, GlobalJob, Team
 from perfpilot_api.engines.contracts import EngineRunRef
 from perfpilot_api.services.engine_executions import (
     EngineExecutionNotFoundError,
+    EngineExecutionOwnershipError,
     EngineExecutionSeed,
     SQLAlchemyEngineExecutionRepository,
     StaleEngineExecutionVersionError,
@@ -30,6 +36,8 @@ from perfpilot_api.services.engine_executions import (
 TEAM_ID = UUID("d1000000-0000-4000-8000-000000000001")
 OTHER_TEAM_ID = UUID("d1000000-0000-4000-8000-000000000002")
 ANALYSIS_ID = UUID("d2000000-0000-4000-8000-000000000001")
+MEMORY_ANALYSIS_ID = UUID("d2000000-0000-4000-8000-000000000002")
+DEVICE_ANALYSIS_ID = UUID("d2000000-0000-4000-8000-000000000003")
 EXECUTION_NAMESPACE_RESULT = UUID("a1c50ce0-6144-553e-8721-18f466991f32")
 NOW = datetime(2026, 7, 29, 8, 0, tzinfo=UTC)
 _POSTGRES_URL_ENV = "PERFPILOT_TEST_POSTGRES_URL"
@@ -76,9 +84,7 @@ async def execution_database() -> AsyncIterator[ExecutionDatabase]:
     database_name = f"perfpilot_engine_execution_{uuid4().hex}"
     with psycopg.connect(_conninfo(admin_url), autocommit=True) as connection:
         connection.execute(
-            sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(
-                sql.Identifier(database_name)
-            )
+            sql.SQL("CREATE DATABASE {} TEMPLATE template0").format(sql.Identifier(database_name))
         )
     database_url = admin_url.set(database=database_name)
     engine: AsyncEngine | None = None
@@ -94,17 +100,41 @@ async def execution_database() -> AsyncIterator[ExecutionDatabase]:
                 )
             )
             await session.flush()
-            session.add(
-                GlobalJob(
-                    id=ANALYSIS_ID,
-                    team_id=TEAM_ID,
-                    idempotency_key="trace-analysis",
-                    analysis_mode="trace_upload",
-                    state="analyzing",
-                    retry_count=0,
-                    max_retries=2,
-                    started_at=NOW,
-                    version=1,
+            session.add_all(
+                (
+                    GlobalJob(
+                        id=ANALYSIS_ID,
+                        team_id=TEAM_ID,
+                        idempotency_key="trace-analysis",
+                        analysis_mode="trace_upload",
+                        state="analyzing",
+                        retry_count=0,
+                        max_retries=2,
+                        started_at=NOW,
+                        version=1,
+                    ),
+                    GlobalJob(
+                        id=MEMORY_ANALYSIS_ID,
+                        team_id=TEAM_ID,
+                        idempotency_key="memory-analysis",
+                        analysis_mode="memory_upload",
+                        state="analyzing",
+                        retry_count=0,
+                        max_retries=2,
+                        started_at=NOW,
+                        version=1,
+                    ),
+                    GlobalJob(
+                        id=DEVICE_ANALYSIS_ID,
+                        team_id=TEAM_ID,
+                        idempotency_key="device-analysis",
+                        analysis_mode="device",
+                        state="analyzing",
+                        retry_count=0,
+                        max_retries=2,
+                        started_at=NOW,
+                        version=1,
+                    ),
                 )
             )
         yield ExecutionDatabase(
@@ -117,15 +147,13 @@ async def execution_database() -> AsyncIterator[ExecutionDatabase]:
             await engine.dispose()
         with psycopg.connect(_conninfo(admin_url), autocommit=True) as connection:
             connection.execute(
-                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(
-                    sql.Identifier(database_name)
-                )
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database_name))
             )
 
 
-def _seed() -> EngineExecutionSeed:
+def _seed(*, engine_id: str = "smartperfetto") -> EngineExecutionSeed:
     return EngineExecutionSeed(
-        engine_id="smartperfetto",
+        engine_id=engine_id,
         adapter_version="1.0.0",
         engine_commit_sha="a" * 40,
         engine_image_digest="sha256:" + "b" * 64,
@@ -142,6 +170,10 @@ def _run_ref(*, run_id: str = "run-1", cursor: str | None = None) -> EngineRunRe
         cursor,
         "workspace-1",
     )
+
+
+def _memory_run_ref(*, run_id: str, cursor: str | None = None) -> EngineRunRef:
+    return EngineRunRef("android_memory", None, run_id, cursor, None)
 
 
 async def _running(database: ExecutionDatabase):
@@ -179,6 +211,34 @@ async def test_attempt_allocation_serializes_and_increments(
 
 
 @pytest.mark.asyncio
+async def test_allocation_accepts_only_the_analysis_engine_pair(
+    execution_database: ExecutionDatabase,
+) -> None:
+    memory = await execution_database.repository.allocate_attempt(
+        team_id=TEAM_ID,
+        analysis_id=MEMORY_ANALYSIS_ID,
+        seed=_seed(engine_id="android_memory"),
+        now=NOW,
+    )
+
+    assert memory.engine_id == "android_memory"
+    assert memory.engine_image_digest == "sha256:" + "b" * 64
+    for analysis_id, engine_id in (
+        (ANALYSIS_ID, "android_memory"),
+        (MEMORY_ANALYSIS_ID, "smartperfetto"),
+        (DEVICE_ANALYSIS_ID, "smartperfetto"),
+        (DEVICE_ANALYSIS_ID, "android_memory"),
+    ):
+        with pytest.raises(EngineExecutionNotFoundError):
+            await execution_database.repository.allocate_attempt(
+                team_id=TEAM_ID,
+                analysis_id=analysis_id,
+                seed=_seed(engine_id=engine_id),
+                now=NOW,
+            )
+
+
+@pytest.mark.asyncio
 async def test_submit_reference_is_scoped_and_version_protected(
     execution_database: ExecutionDatabase,
 ) -> None:
@@ -212,6 +272,51 @@ async def test_submit_reference_is_scoped_and_version_protected(
             team_id=OTHER_TEAM_ID,
             analysis_id=ANALYSIS_ID,
             execution_id=pending.id,
+        )
+
+
+@pytest.mark.asyncio
+async def test_memory_submit_accepts_null_workspace_and_session_and_fences_run_identity(
+    execution_database: ExecutionDatabase,
+) -> None:
+    pending = await execution_database.repository.allocate_attempt(
+        team_id=TEAM_ID,
+        analysis_id=MEMORY_ANALYSIS_ID,
+        seed=_seed(engine_id="android_memory"),
+        now=NOW,
+    )
+    running = await execution_database.repository.mark_submitted(
+        team_id=TEAM_ID,
+        analysis_id=MEMORY_ANALYSIS_ID,
+        execution_id=pending.id,
+        expected_version=pending.version,
+        run_ref=_memory_run_ref(run_id=f"memory-{pending.id.hex}"),
+        now=NOW,
+    )
+    observed = await execution_database.repository.persist_observation(
+        team_id=TEAM_ID,
+        analysis_id=MEMORY_ANALYSIS_ID,
+        execution_id=running.id,
+        expected_version=running.version,
+        run_ref=_memory_run_ref(run_id=f"memory-{pending.id.hex}", cursor="1"),
+        target_state="running",
+        stable_error_code=None,
+        now=NOW,
+    )
+
+    assert observed.external_workspace_id is None
+    assert observed.external_session_id is None
+    assert observed.external_run_id == f"memory-{pending.id.hex}"
+    with pytest.raises(EngineExecutionOwnershipError):
+        await execution_database.repository.persist_observation(
+            team_id=TEAM_ID,
+            analysis_id=MEMORY_ANALYSIS_ID,
+            execution_id=running.id,
+            expected_version=observed.version,
+            run_ref=_memory_run_ref(run_id="memory-22222222222222222222222222222222", cursor="2"),
+            target_state="running",
+            stable_error_code=None,
+            now=NOW,
         )
 
 
@@ -343,6 +448,50 @@ async def test_concurrent_capacity_retry_reserves_one_next_attempt(
         )
     assert job is not None and job.retry_count == 1
     assert [(row.attempt_number, row.state) for row in rows] == [(1, "failed"), (2, "pending")]
+
+
+@pytest.mark.asyncio
+async def test_engine_timeout_retries_stop_at_job_limit(
+    execution_database: ExecutionDatabase,
+) -> None:
+    current = await _running(execution_database)
+    created_attempts: list[int] = []
+
+    for attempt_number in (2, 3):
+        reservation = await execution_database.repository.reserve_retry(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            execution_id=current.id,
+            stable_error_code="engine_timeout",
+            now=NOW,
+            deadline_seconds=1800,
+        )
+        assert reservation.next_attempt is not None
+        created_attempts.append(reservation.next_attempt.attempt_number)
+        pending = reservation.next_attempt
+        current = await execution_database.repository.mark_submitted(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            execution_id=pending.id,
+            expected_version=pending.version,
+            run_ref=_run_ref(run_id=f"run-{attempt_number}"),
+            now=NOW,
+        )
+
+    exhausted = await execution_database.repository.reserve_retry(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        execution_id=current.id,
+        stable_error_code="engine_timeout",
+        now=NOW,
+        deadline_seconds=1800,
+    )
+    async with execution_database.sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+
+    assert created_attempts == [2, 3]
+    assert exhausted.next_attempt is None
+    assert job is not None and job.retry_count == job.max_retries == 2
 
 
 def test_control_execution_schema_has_no_payload_or_request_material() -> None:

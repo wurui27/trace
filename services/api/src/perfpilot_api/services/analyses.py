@@ -26,6 +26,7 @@ from perfpilot_api.db.control.models import (
     IdempotencyKey,
     OutboxEvent,
     ScenarioJob,
+    Team,
     TenantQuota,
 )
 from perfpilot_api.db.tenant.models import (
@@ -212,7 +213,7 @@ class ActiveLeaseView:
 class AnalysisView:
     analysis_id: UUID
     team_id: UUID
-    analysis_mode: Literal["device", "trace_upload"]
+    analysis_mode: Literal["device", "trace_upload", "memory_upload"]
     state: str
     version: int
     application_version_id: UUID | None
@@ -226,6 +227,10 @@ class AnalysisView:
     started_at: datetime | None
     completed_at: datetime | None
     failure_code: str | None
+    question: str | None = None
+
+
+MemoryAnalysisView = AnalysisView
 
 
 @dataclass(frozen=True, slots=True)
@@ -247,6 +252,19 @@ class ApkInspector(Protocol):
 
 
 class AnalysisRepository(Protocol):
+    async def create_memory_analysis(
+        self,
+        *,
+        team_id: UUID,
+        requested_by_user_id: UUID,
+        idempotency_key: str,
+        request_hash: str,
+        candidate_analysis_id: UUID,
+        application_version_id: UUID,
+        question: str | None,
+        now: datetime,
+    ) -> MemoryAnalysisView: ...
+
     async def reserve_creation(
         self,
         *,
@@ -452,6 +470,25 @@ def canonical_analysis_request_hash(
     return hashlib.sha256(payload).hexdigest()
 
 
+def canonical_memory_analysis_request_hash(
+    *,
+    application_version_id: UUID,
+    question: str | None,
+) -> str:
+    payload = json.dumps(
+        {
+            "analysis_mode": "memory_upload",
+            "application_version_id": str(application_version_id),
+            "question": question,
+            "schema_version": "1.0",
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
 def _canonical_json_bytes(value: object) -> bytes:
     try:
         return json.dumps(
@@ -575,6 +612,11 @@ def _validate_report_contract(schema_name: str, value: object) -> None:
         raise AnalysisUnavailableError("analysis report contract is invalid") from None
 
 
+def _validate_idempotency_key(idempotency_key: str) -> None:
+    if _IDEMPOTENCY_KEY.fullmatch(idempotency_key) is None:
+        raise AnalysisInvalidRequestError("analysis request is invalid")
+
+
 def _validate_create_request(
     *,
     idempotency_key: str,
@@ -583,6 +625,7 @@ def _validate_create_request(
     apk_size: int,
     apk_sha256_b64: str,
 ) -> None:
+    _validate_idempotency_key(idempotency_key)
     checksum_valid = False
     try:
         decoded = base64.b64decode(apk_sha256_b64, validate=True)
@@ -592,8 +635,7 @@ def _validate_create_request(
     except (binascii.Error, ValueError):
         pass
     if (
-        _IDEMPOTENCY_KEY.fullmatch(idempotency_key) is None
-        or scenarios != _SCENARIOS
+        scenarios != _SCENARIOS
         or apk_mime != _APK_MIME
         or type(apk_size) is not int
         or not 1 <= apk_size <= 5 * 1024 * 1024 * 1024
@@ -659,6 +701,38 @@ class AnalysisService:
         self._apk_inspector = apk_inspector
         self._clock = clock
         self._uuid_source = uuid_source
+
+    async def create_memory_analysis(
+        self,
+        *,
+        team_id: UUID,
+        requested_by_user_id: UUID,
+        idempotency_key: str,
+        application_version_id: UUID,
+        question: str | None,
+    ) -> MemoryAnalysisView:
+        _validate_idempotency_key(idempotency_key)
+        normalized_question = question.strip() if question is not None else None
+        if normalized_question == "":
+            normalized_question = None
+        if normalized_question is not None and len(normalized_question) > 2_000:
+            raise AnalysisInvalidRequestError("analysis request is invalid")
+        request_hash = canonical_memory_analysis_request_hash(
+            application_version_id=application_version_id,
+            question=normalized_question,
+        )
+        return await _repository_call(
+            lambda: self._repository.create_memory_analysis(
+                team_id=team_id,
+                requested_by_user_id=requested_by_user_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                candidate_analysis_id=self._uuid_source(),
+                application_version_id=application_version_id,
+                question=normalized_question,
+                now=self._clock(),
+            )
+        )
 
     async def create_device_analysis(
         self,
@@ -1045,6 +1119,7 @@ class SQLAlchemyAnalysisRepository:
         team_id: UUID,
         idempotency_key: str,
         request_hash: str,
+        analysis_mode: Literal["device", "memory_upload"],
     ) -> CreationReservation:
         if not hmac.compare_digest(key.request_hash, request_hash):
             raise AnalysisIdempotencyConflictError(
@@ -1055,13 +1130,297 @@ class SQLAlchemyAnalysisRepository:
             or key.response_resource_id != job.id
             or job.team_id != team_id
             or job.idempotency_key != idempotency_key
-            or job.analysis_mode != "device"
+            or job.analysis_mode != analysis_mode
         ):
             raise AnalysisUnavailableError("analysis creation state is unavailable")
         return CreationReservation(
             analysis_id=job.id,
             state=job.state,
             version=job.version,
+        )
+
+    async def _find_creation(
+        self,
+        session: AsyncSession,
+        *,
+        team_id: UUID,
+        idempotency_key: str,
+        request_hash: str,
+        analysis_mode: Literal["device", "memory_upload"],
+    ) -> CreationReservation | None:
+        existing = await session.scalar(
+            select(IdempotencyKey)
+            .where(
+                IdempotencyKey.operation == _CREATE_OPERATION,
+                IdempotencyKey.scope_type == "team",
+                IdempotencyKey.scope_id == team_id,
+                IdempotencyKey.key == idempotency_key,
+            )
+            .with_for_update()
+        )
+        if existing is None:
+            return None
+        job = (
+            await session.get(GlobalJob, existing.response_resource_id)
+            if existing.response_resource_id is not None
+            else None
+        )
+        return self._reservation(
+            existing,
+            job,
+            team_id=team_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            analysis_mode=analysis_mode,
+        )
+
+    async def _lock_creation_scope_and_recheck(
+        self,
+        session: AsyncSession,
+        *,
+        team_id: UUID,
+        idempotency_key: str,
+        request_hash: str,
+        analysis_mode: Literal["device", "memory_upload"],
+    ) -> tuple[CreationReservation | None, TenantQuota | None]:
+        locked_team_id = await session.scalar(
+            select(Team.id).where(Team.id == team_id).with_for_update()
+        )
+        if locked_team_id is None:
+            raise AnalysisUnavailableError("team state is unavailable")
+        quota = None
+        if analysis_mode == "device":
+            quota = await session.scalar(
+                select(TenantQuota).where(TenantQuota.team_id == team_id).with_for_update()
+            )
+            if quota is None:
+                raise AnalysisUnavailableError("team quota is unavailable")
+        existing = await self._find_creation(
+            session,
+            team_id=team_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            analysis_mode=analysis_mode,
+        )
+        return existing, quota
+
+    async def _reserve_memory_creation(
+        self,
+        *,
+        team_id: UUID,
+        idempotency_key: str,
+        request_hash: str,
+        candidate_analysis_id: UUID,
+        now: datetime,
+    ) -> CreationReservation:
+        async with self._control_session_factory() as session:
+            async with session.begin():
+                existing = await self._find_creation(
+                    session,
+                    team_id=team_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    analysis_mode="memory_upload",
+                )
+                if existing is not None:
+                    return existing
+
+                existing, _ = await self._lock_creation_scope_and_recheck(
+                    session,
+                    team_id=team_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    analysis_mode="memory_upload",
+                )
+                if existing is not None:
+                    return existing
+
+                job = GlobalJob(
+                    id=candidate_analysis_id,
+                    team_id=team_id,
+                    idempotency_key=idempotency_key,
+                    analysis_mode="memory_upload",
+                    state="creating",
+                    input_artifact_id=None,
+                    required_abi=None,
+                    min_api_level=None,
+                    attempt_count=0,
+                    valid_sample_count=0,
+                    invalid_sample_count=0,
+                    retry_count=0,
+                    max_retries=3,
+                    device_migration_allowed=False,
+                    version=1,
+                )
+                key = IdempotencyKey(
+                    team_id=team_id,
+                    key=idempotency_key,
+                    operation=_CREATE_OPERATION,
+                    scope_type="team",
+                    scope_id=team_id,
+                    request_hash=request_hash,
+                    state="pending",
+                    response_resource_id=candidate_analysis_id,
+                    expires_at=now + _CREATE_IDEMPOTENCY_TTL,
+                    version=1,
+                )
+                session.add_all((job, key))
+                await session.flush()
+                return CreationReservation(
+                    analysis_id=job.id,
+                    state=job.state,
+                    version=job.version,
+                )
+
+    async def _complete_memory_creation(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        idempotency_key: str,
+        request_hash: str,
+        expected_version: int,
+        now: datetime,
+    ) -> None:
+        async with self._control_session_factory() as session:
+            async with session.begin():
+                job = await session.scalar(
+                    select(GlobalJob)
+                    .where(
+                        GlobalJob.id == analysis_id,
+                        GlobalJob.team_id == team_id,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    job is None
+                    or job.analysis_mode != "memory_upload"
+                    or job.idempotency_key != idempotency_key
+                ):
+                    raise AnalysisUnavailableError("analysis creation state is unavailable")
+                if job.state == "creating":
+                    if job.version != expected_version:
+                        raise StaleTaskVersionError("analysis version is stale")
+                    changed = await session.scalar(
+                        update(GlobalJob)
+                        .where(
+                            GlobalJob.id == analysis_id,
+                            GlobalJob.team_id == team_id,
+                            GlobalJob.version == expected_version,
+                            GlobalJob.state.in_(("creating",)),
+                        )
+                        .values(
+                            state="created",
+                            version=GlobalJob.version + 1,
+                            updated_at=now,
+                        )
+                        .returning(GlobalJob.id)
+                    )
+                    if changed is None:
+                        raise StaleTaskVersionError("analysis version is stale")
+
+                key = await session.scalar(
+                    select(IdempotencyKey)
+                    .where(
+                        IdempotencyKey.operation == _CREATE_OPERATION,
+                        IdempotencyKey.scope_type == "team",
+                        IdempotencyKey.scope_id == team_id,
+                        IdempotencyKey.key == idempotency_key,
+                    )
+                    .with_for_update()
+                )
+                if (
+                    key is None
+                    or key.response_resource_id != analysis_id
+                    or not hmac.compare_digest(key.request_hash, request_hash)
+                ):
+                    raise AnalysisUnavailableError("analysis creation state is unavailable")
+                if key.state == "completed":
+                    return
+                if key.state != "pending":
+                    raise AnalysisUnavailableError("analysis creation state is unavailable")
+                key_changed = await session.scalar(
+                    update(IdempotencyKey)
+                    .where(
+                        IdempotencyKey.id == key.id,
+                        IdempotencyKey.version == key.version,
+                        IdempotencyKey.state.in_(("pending",)),
+                    )
+                    .values(
+                        state="completed",
+                        version=IdempotencyKey.version + 1,
+                        updated_at=now,
+                    )
+                    .returning(IdempotencyKey.id)
+                )
+                if key_changed is None:
+                    raise StaleTaskVersionError("idempotency version is stale")
+
+    async def create_memory_analysis(
+        self,
+        *,
+        team_id: UUID,
+        requested_by_user_id: UUID,
+        idempotency_key: str,
+        request_hash: str,
+        candidate_analysis_id: UUID,
+        application_version_id: UUID,
+        question: str | None,
+        now: datetime,
+    ) -> MemoryAnalysisView:
+        async with self._tenant_router.session(team_id) as session:
+            application_version = await session.scalar(
+                select(ApplicationVersion)
+                .join(Application, Application.id == ApplicationVersion.application_id)
+                .where(ApplicationVersion.id == application_version_id)
+                .with_for_update()
+            )
+            if application_version is None:
+                raise AnalysisNotFoundError("application version was not found")
+
+            reservation = await self._reserve_memory_creation(
+                team_id=team_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                candidate_analysis_id=candidate_analysis_id,
+                now=now,
+            )
+            await session.execute(
+                postgresql_insert(Analysis)
+                .values(
+                    id=reservation.analysis_id,
+                    application_version_id=application_version_id,
+                    requested_by_user_id=requested_by_user_id,
+                    analysis_mode="memory_upload",
+                    question=question,
+                    state="created",
+                    version=1,
+                )
+                .on_conflict_do_nothing(index_elements=(Analysis.id,))
+            )
+            tenant_analysis = await session.get(Analysis, reservation.analysis_id)
+            if (
+                tenant_analysis is None
+                or tenant_analysis.analysis_mode != "memory_upload"
+                or tenant_analysis.application_version_id != application_version_id
+                or tenant_analysis.question != question
+                or tenant_analysis.tombstoned_at is not None
+                or tenant_analysis.state == "deleted"
+            ):
+                raise AnalysisUnavailableError("tenant analysis state is unavailable")
+
+        await self._complete_memory_creation(
+            team_id=team_id,
+            analysis_id=reservation.analysis_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+            expected_version=reservation.version,
+            now=now,
+        )
+        return await self.load_view(
+            team_id=team_id,
+            analysis_id=reservation.analysis_id,
+            now=now,
         )
 
     async def reserve_creation(
@@ -1075,59 +1434,27 @@ class SQLAlchemyAnalysisRepository:
     ) -> CreationReservation:
         async with self._control_session_factory() as session:
             async with session.begin():
-                existing = await session.scalar(
-                    select(IdempotencyKey)
-                    .where(
-                        IdempotencyKey.operation == _CREATE_OPERATION,
-                        IdempotencyKey.scope_type == "team",
-                        IdempotencyKey.scope_id == team_id,
-                        IdempotencyKey.key == idempotency_key,
-                    )
-                    .with_for_update()
+                existing = await self._find_creation(
+                    session,
+                    team_id=team_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    analysis_mode="device",
                 )
                 if existing is not None:
-                    job = (
-                        await session.get(GlobalJob, existing.response_resource_id)
-                        if existing.response_resource_id is not None
-                        else None
-                    )
-                    return self._reservation(
-                        existing,
-                        job,
-                        team_id=team_id,
-                        idempotency_key=idempotency_key,
-                        request_hash=request_hash,
-                    )
+                    return existing
 
-                quota = await session.scalar(
-                    select(TenantQuota).where(TenantQuota.team_id == team_id).with_for_update()
+                existing, quota = await self._lock_creation_scope_and_recheck(
+                    session,
+                    team_id=team_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                    analysis_mode="device",
                 )
+                if existing is not None:
+                    return existing
                 if quota is None:
                     raise AnalysisUnavailableError("team quota is unavailable")
-
-                existing = await session.scalar(
-                    select(IdempotencyKey)
-                    .where(
-                        IdempotencyKey.operation == _CREATE_OPERATION,
-                        IdempotencyKey.scope_type == "team",
-                        IdempotencyKey.scope_id == team_id,
-                        IdempotencyKey.key == idempotency_key,
-                    )
-                    .with_for_update()
-                )
-                if existing is not None:
-                    job = (
-                        await session.get(GlobalJob, existing.response_resource_id)
-                        if existing.response_resource_id is not None
-                        else None
-                    )
-                    return self._reservation(
-                        existing,
-                        job,
-                        team_id=team_id,
-                        idempotency_key=idempotency_key,
-                        request_hash=request_hash,
-                    )
 
                 reserved = await session.scalar(
                     select(func.count(GlobalJob.id)).where(
@@ -1374,7 +1701,11 @@ class SQLAlchemyAnalysisRepository:
 
         async with self._tenant_router.session(team_id) as session:
             tenant_analysis = await session.get(Analysis, analysis_id)
-            if tenant_analysis is None or tenant_analysis.tombstoned_at is not None:
+            if (
+                tenant_analysis is None
+                or tenant_analysis.tombstoned_at is not None
+                or tenant_analysis.state == "deleted"
+            ):
                 raise AnalysisUnavailableError("tenant analysis state is unavailable")
             artifact = await session.scalar(
                 select(Artifact)
@@ -1478,9 +1809,44 @@ class SQLAlchemyAnalysisRepository:
         if children_by_type:
             raise AnalysisUnavailableError("analysis child state is unavailable")
 
+        if job.analysis_mode != tenant_analysis.analysis_mode:
+            raise AnalysisUnavailableError("tenant analysis state is unavailable")
         application_metadata = self._application_metadata(application_version)
         if tenant_analysis.application_version_id is not None and application_metadata is None:
             raise AnalysisUnavailableError("application metadata is unavailable")
+        if job.analysis_mode == "memory_upload":
+            if (
+                tenant_analysis.application_version_id is None
+                or application_metadata is None
+                or artifact is not None
+                or children
+                or tenant_scenarios
+                or sample_attempts
+                or report_versions
+                or lease is not None
+            ):
+                raise AnalysisUnavailableError("memory analysis state is unavailable")
+            return AnalysisView(
+                analysis_id=job.id,
+                team_id=job.team_id,
+                analysis_mode="memory_upload",
+                state=job.state,
+                version=job.version,
+                application_version_id=tenant_analysis.application_version_id,
+                application_metadata=application_metadata,
+                apk_upload=None,
+                scenarios=(),
+                sample_verdict_counts=aggregate,
+                active_lease=None,
+                report_available=False,
+                created_at=job.created_at,
+                started_at=job.started_at,
+                completed_at=job.completed_at,
+                failure_code=job.failure_code,
+                question=tenant_analysis.question,
+            )
+        if job.analysis_mode == "device" and tenant_analysis.question is not None:
+            raise AnalysisUnavailableError("tenant analysis state is unavailable")
         apk_upload = self._stored_upload(artifact)
         if apk_upload is None:
             raise AnalysisUnavailableError("analysis artifact state is unavailable")
@@ -1518,6 +1884,7 @@ class SQLAlchemyAnalysisRepository:
             started_at=job.started_at,
             completed_at=job.completed_at,
             failure_code=job.failure_code,
+            question=tenant_analysis.question,
         )
 
     async def require_finalizable(
@@ -2634,6 +3001,7 @@ __all__ = [
     "AnalysisView",
     "ApplicationMetadataView",
     "CreationReservation",
+    "MemoryAnalysisView",
     "ReportNotAvailableError",
     "SQLAlchemyAnalysisRepository",
     "SampleVerdictCounts",
@@ -2641,5 +3009,6 @@ __all__ = [
     "StaleTaskVersionError",
     "analysis_queued_event_id",
     "canonical_analysis_request_hash",
+    "canonical_memory_analysis_request_hash",
     "scenario_job_id",
 ]

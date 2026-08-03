@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Literal, Protocol
@@ -16,6 +17,7 @@ from perfpilot_api.db.control.models import EngineExecution, GlobalJob
 from perfpilot_api.config import Settings
 from perfpilot_api.engines.contracts import (
     AnalysisProfile,
+    EngineAdapter,
     EngineEventBatch,
     EngineInput,
     EngineResult,
@@ -47,6 +49,15 @@ _STABLE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
 _CANONICAL_CURSOR = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _TERMINAL_STATES = {"completed", "insufficient_data", "failed", "canceled"}
 _OBSERVABLE_STATES = {"running", "awaiting_user"}
+_ANALYSIS_ENGINE_PAIRS = {
+    "trace_upload": "smartperfetto",
+    "memory_upload": "android_memory",
+}
+_NEW_ATTEMPT_CODES = frozenset({"capacity_exceeded", "worker_unavailable", "engine_timeout"})
+_TERMINAL_ADAPTER_CODES = frozenset(
+    {"integrity_mismatch", "incompatible_contract", "privacy_violation"}
+)
+_MEMORY_RUN_ID = re.compile(r"memory-[0-9a-f]{32}\Z")
 
 
 class EngineExecutionNotFoundError(RuntimeError):
@@ -243,7 +254,7 @@ class SQLAlchemyEngineExecutionRepository:
                 analysis_id=analysis_id,
                 for_update=True,
             )
-            if job.analysis_mode != "trace_upload" or job.state in {
+            if _ANALYSIS_ENGINE_PAIRS.get(job.analysis_mode) != seed.engine_id or job.state in {
                 "completed",
                 "partially_completed",
                 "failed",
@@ -304,7 +315,10 @@ class SQLAlchemyEngineExecutionRepository:
         run_ref: EngineRunRef,
         now: datetime,
     ) -> EngineExecutionRecord:
-        workspace_id, session_id, run_id = self._validate_submitted_ref(run_ref)
+        workspace_id, session_id, run_id = self._validate_submitted_ref(
+            run_ref,
+            execution_id=execution_id,
+        )
         async with self._session_factory.begin() as session:
             row = await self._execution(
                 session,
@@ -315,6 +329,8 @@ class SQLAlchemyEngineExecutionRepository:
             )
             if row.version != expected_version or row.state != "pending":
                 raise StaleEngineExecutionVersionError("engine execution version is stale")
+            if row.engine_id != run_ref.engine_id:
+                raise EngineExecutionOwnershipError("engine route ownership changed")
             transition_engine_state(row.state, "running")
             row.external_workspace_id = workspace_id
             row.external_session_id = session_id
@@ -328,17 +344,30 @@ class SQLAlchemyEngineExecutionRepository:
             return self._record(row)
 
     @staticmethod
-    def _validate_submitted_ref(run_ref: EngineRunRef) -> tuple[str, str, str]:
-        if run_ref.engine_id != "smartperfetto":
-            raise EngineExecutionOwnershipError("engine route ownership changed")
+    def _validate_submitted_ref(
+        run_ref: EngineRunRef,
+        *,
+        execution_id: UUID,
+    ) -> tuple[str | None, str | None, str]:
         try:
-            workspace_id = validate_external_id(run_ref.external_workspace_id or "")
-            session_id = validate_external_id(run_ref.external_session_id or "")
             run_id = validate_external_id(run_ref.external_run_id or "")
+            if run_ref.engine_id == "smartperfetto":
+                workspace_id = validate_external_id(run_ref.external_workspace_id or "")
+                session_id = validate_external_id(run_ref.external_session_id or "")
+            elif run_ref.engine_id == "android_memory":
+                if (
+                    run_ref.external_workspace_id is not None
+                    or run_ref.external_session_id is not None
+                    or _MEMORY_RUN_ID.fullmatch(run_id) is None
+                    or run_id != f"memory-{execution_id.hex}"
+                ):
+                    raise EngineExecutionOwnershipError("engine route ownership changed")
+                workspace_id = None
+                session_id = None
+            else:
+                raise EngineExecutionOwnershipError("engine route ownership changed")
         except EngineAdapterError:
-            raise EngineExecutionOwnershipError(
-                "engine route ownership changed"
-            ) from None
+            raise EngineExecutionOwnershipError("engine route ownership changed") from None
         return workspace_id, session_id, run_id
 
     async def persist_observation(
@@ -358,7 +387,10 @@ class SQLAlchemyEngineExecutionRepository:
         if stable_error_code is not None:
             _validate_stable_code(stable_error_code)
         new_cursor = _validate_cursor(run_ref.cursor)
-        workspace_id, session_id, run_id = self._validate_submitted_ref(run_ref)
+        workspace_id, session_id, run_id = self._validate_submitted_ref(
+            run_ref,
+            execution_id=execution_id,
+        )
         async with self._session_factory.begin() as session:
             row = await self._execution(
                 session,
@@ -377,6 +409,7 @@ class SQLAlchemyEngineExecutionRepository:
                 row.engine_id != run_ref.engine_id
                 or row.external_workspace_id != workspace_id
                 or row.external_session_id != session_id
+                or (row.engine_id == "android_memory" and row.external_run_id != run_id)
             ):
                 raise EngineExecutionOwnershipError("engine route ownership changed")
             current_cursor = _validate_cursor(row.last_event_cursor)
@@ -665,9 +698,7 @@ class SQLAlchemyEngineExecutionRepository:
                 analysis_id=analysis_id,
                 for_update=False,
             )
-            return now >= (job.started_at or job.created_at) + timedelta(
-                seconds=deadline_seconds
-            )
+            return now >= (job.started_at or job.created_at) + timedelta(seconds=deadline_seconds)
 
 
 class EngineExecutionService:
@@ -745,17 +776,21 @@ class EngineExecutionService:
             execution_id=execution_id,
         )
         adapter = self._registry.require(record.engine_id)
-        workspace = await self._workspace_service.ensure_workspace(team_id=team_id)
-        if workspace.external_workspace_id is None:
-            raise EngineExecutionOwnershipError("workspace is not active")
+        external_workspace_id: str | None = None
+        if adapter.descriptor.resource_profile == "network_service":
+            workspace = await self._workspace_service.ensure_workspace(team_id=team_id)
+            if workspace.external_workspace_id is None:
+                raise EngineExecutionOwnershipError("workspace is not active")
+            external_workspace_id = workspace.external_workspace_id
         try:
             run_ref = await adapter.submit(
                 inputs,
                 SubmitConfig(
+                    execution_id=record.id,
                     analysis_id=analysis_id,
                     profile=profile,
                     question=question,
-                    external_workspace_id=workspace.external_workspace_id,
+                    external_workspace_id=external_workspace_id,
                     timeout_seconds=timeout_seconds,
                 ),
             )
@@ -881,7 +916,7 @@ class EngineExecutionService:
         record: EngineExecutionRecord,
         status: EngineStatus,
     ) -> EngineStepOutcome:
-        if status.state == "completed":
+        if status.state in {"completed", "insufficient_data"}:
             observed = await self._observe(record, status.run_ref, "running", None)
             return await self._finalize(observed)
         if status.state == "awaiting_user":
@@ -1018,7 +1053,17 @@ class EngineExecutionService:
         record: EngineExecutionRecord,
         error: EngineAdapterError,
     ) -> EngineStepOutcome:
-        if error.retryable and error.stable_code == "capacity_exceeded":
+        if error.stable_code in _TERMINAL_ADAPTER_CODES:
+            failed = await self._repository.fail(
+                team_id=record.team_id,
+                analysis_id=record.analysis_id,
+                execution_id=record.id,
+                expected_version=record.version,
+                stable_error_code=error.stable_code,
+                now=self._now(),
+            )
+            return EngineStepOutcome(failed.id, failed.state, None)
+        if error.stable_code in _NEW_ATTEMPT_CODES:
             reservation = await self._repository.reserve_retry(
                 team_id=record.team_id,
                 analysis_id=record.analysis_id,
@@ -1106,11 +1151,20 @@ class EngineExecutionService:
         )
         if record.state in _TERMINAL_STATES:
             return EngineStepOutcome(record.id, record.state, None)
-        if (
-            record.external_workspace_id is not None
-            and record.external_session_id is not None
-        ):
-            adapter = self._registry.require(record.engine_id)
+        adapter = self._registry.require(record.engine_id)
+        has_submitted_route = record.external_run_id is not None and (
+            (
+                adapter.descriptor.resource_profile == "network_service"
+                and record.external_workspace_id is not None
+                and record.external_session_id is not None
+            )
+            or (
+                adapter.descriptor.resource_profile == "isolated_worker"
+                and record.external_workspace_id is None
+                and record.external_session_id is None
+            )
+        )
+        if has_submitted_route:
             try:
                 await adapter.cancel(self._run_ref(record))
             except EngineAdapterError as error:
@@ -1167,10 +1221,33 @@ def build_smartperfetto_execution_service(
         SQLAlchemyEngineWorkspaceRepository(control_session_factory),
         transport,
     )
+    return build_engine_execution_service(
+        control_session_factory=control_session_factory,
+        workspace_service=workspace_service,
+        adapters=(adapter,),
+        engine_lock=engine_lock,
+        result_sink=result_sink,
+        now=now or (lambda: datetime.now(UTC)),
+    )
+
+
+def build_engine_execution_service(
+    *,
+    control_session_factory: async_sessionmaker[AsyncSession],
+    workspace_service: EngineWorkspaceService,
+    adapters: Iterable[EngineAdapter | None],
+    engine_lock: EngineLock,
+    result_sink: EngineResultSink,
+    now: Callable[[], datetime] | None = None,
+) -> EngineExecutionService:
+    """Compose execution orchestration from only explicitly supplied adapters."""
+
+    if result_sink is None:
+        raise ValueError("engine result sink is required")
     return EngineExecutionService(
         repository=SQLAlchemyEngineExecutionRepository(control_session_factory),
         workspace_service=workspace_service,
-        registry=AdapterRegistry((adapter,)),
+        registry=AdapterRegistry(adapter for adapter in adapters if adapter is not None),
         engine_lock=engine_lock,
         result_sink=result_sink,
         now=now or (lambda: datetime.now(UTC)),
@@ -1189,6 +1266,7 @@ __all__ = [
     "RetryReservation",
     "SQLAlchemyEngineExecutionRepository",
     "StaleEngineExecutionVersionError",
+    "build_engine_execution_service",
     "build_smartperfetto_execution_service",
     "result_artifact_id",
 ]
