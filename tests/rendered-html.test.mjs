@@ -124,4 +124,6 @@ test("server-renders the live analysis route without demo findings", async () =>
   assert.match(html, /正在读取分析状态/);
   assert.doesNotMatch(html, /首页启动慢/);
   assert.doesNotMatch(html, /Acme Gallery/);
+  assert.doesNotMatch(html, /执行摘要/);
+  assert.doesNotMatch(html, /重新生成 AI 建议/);
 });

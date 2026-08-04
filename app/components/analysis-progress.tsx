@@ -1,23 +1,18 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
+import { AnalysisReportView } from "./analysis-report";
 import {
   createPerfPilotClient,
   PerfPilotApiError,
+  type AnalysisReport,
   type AnalysisResponse,
+  type AnalysisStage,
   type AnalysisState,
   type PerfPilotClient,
   type TraceInputKind,
 } from "../lib/perfpilot-api";
-
-const TERMINAL_STATES = new Set<AnalysisState>([
-  "completed",
-  "partially_completed",
-  "failed",
-  "canceled",
-  "deleted",
-]);
 
 const stateCopy: Record<
   AnalysisState,
@@ -60,7 +55,7 @@ const stateCopy: Record<
   },
   completed: {
     title: "分析已完成",
-    description: "SmartPerfetto 结果已完成并安全归档。",
+    description: "SmartPerfetto 证据与 PerfPilot 建议已经生成并安全归档。",
     tone: "success",
   },
   partially_completed: {
@@ -127,20 +122,36 @@ function wait(milliseconds: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+export interface AnalysisDetailSnapshot {
+  readonly teamId: string;
+  readonly analysis: AnalysisResponse;
+  readonly report: AnalysisReport | null;
+  readonly reportLoadFailed: boolean;
+}
+
 export type AnalysisLoader = (
   analysisId: string,
   signal: AbortSignal,
-  onAnalysis: (analysis: AnalysisResponse) => void,
+  onSnapshot: (snapshot: AnalysisDetailSnapshot) => void,
+) => Promise<void>;
+
+export type SynthesisRerunner = (
+  teamId: string,
+  analysisId: string,
+  idempotencyKey: string,
+  signal: AbortSignal,
 ) => Promise<void>;
 
 export function createAnalysisLoader(
   client: PerfPilotClient = createPerfPilotClient(),
+  sleep: (milliseconds: number, signal: AbortSignal) => Promise<void> = wait,
 ): AnalysisLoader {
-  return async (analysisId, signal, onAnalysis) => {
+  return async (analysisId, signal, onSnapshot) => {
     await client.csrf(signal);
     const me = await client.me(signal);
     let teamId: string | null = null;
     let current: AnalysisResponse | null = null;
+    let report: AnalysisReport | null = null;
     for (const membership of me.memberships) {
       try {
         current = await client.analysis(membership.team.id, analysisId, signal);
@@ -155,13 +166,27 @@ export function createAnalysisLoader(
     if (current === null || teamId === null) {
       throw new PerfPilotApiError("resource_not_found", "分析不存在", false, null);
     }
-    onAnalysis(current);
+
+    const publish = async (): Promise<void> => {
+      let reportLoadFailed = false;
+      if (current?.report_available) {
+        try {
+          report = await client.report(teamId, analysisId, signal);
+        } catch {
+          if (signal.aborted) throw signal.reason;
+          reportLoadFailed = true;
+        }
+      }
+      onSnapshot({ teamId, analysis: current as AnalysisResponse, report, reportLoadFailed });
+    };
+
+    await publish();
     let delay = 2_000;
-    while (!TERMINAL_STATES.has(current.state)) {
-      await wait(delay, signal);
+    while (current.stages.some((stage) => stage.state === "pending" || stage.state === "running")) {
+      await sleep(delay, signal);
       try {
         current = await client.analysis(teamId, analysisId, signal);
-        onAnalysis(current);
+        await publish();
         delay = 2_000;
       } catch (error) {
         if (!(error instanceof PerfPilotApiError) || !error.retryable) throw error;
@@ -171,40 +196,64 @@ export function createAnalysisLoader(
   };
 }
 
-const defaultLoader = createAnalysisLoader();
+export function createSynthesisRerunner(
+  client: PerfPilotClient = createPerfPilotClient(),
+): SynthesisRerunner {
+  return async (teamId, analysisId, idempotencyKey, signal) => {
+    await client.csrf(signal);
+    await client.createSynthesisRun(teamId, analysisId, idempotencyKey, signal);
+  };
+}
+
+const defaultClient = createPerfPilotClient();
+const defaultLoader = createAnalysisLoader(defaultClient);
+const defaultRerunner = createSynthesisRerunner(defaultClient);
 
 interface AnalysisProgressProps {
   readonly analysisId: string;
   readonly loader?: AnalysisLoader;
+  readonly rerunner?: SynthesisRerunner;
+  readonly randomUUID?: () => string;
 }
 
 interface AnalysisSnapshot {
   readonly requestKey: string;
-  readonly analysis: AnalysisResponse | null;
+  readonly detail: AnalysisDetailSnapshot | null;
   readonly failed: boolean;
 }
 
 export function AnalysisProgress({
   analysisId,
   loader = defaultLoader,
+  rerunner = defaultRerunner,
+  randomUUID = () => crypto.randomUUID(),
 }: AnalysisProgressProps) {
   const [snapshot, setSnapshot] = useState<AnalysisSnapshot | null>(null);
   const [attempt, setAttempt] = useState(0);
+  const [retrying, setRetrying] = useState(false);
+  const retryController = useRef<AbortController | null>(null);
   const requestKey = `${analysisId}:${attempt}`;
 
   useEffect(() => {
     const controller = new AbortController();
-    void loader(analysisId, controller.signal, (analysis) => {
+    void loader(analysisId, controller.signal, (detail) => {
       if (!controller.signal.aborted) {
-        setSnapshot({ requestKey, analysis, failed: false });
+        setSnapshot({ requestKey, detail, failed: false });
       }
     }).catch(() => {
       if (!controller.signal.aborted) {
-        setSnapshot({ requestKey, analysis: null, failed: true });
+        setSnapshot({ requestKey, detail: null, failed: true });
       }
     });
     return () => controller.abort();
   }, [analysisId, loader, requestKey]);
+
+  useEffect(() => {
+    return () => {
+      retryController.current?.abort();
+      retryController.current = null;
+    };
+  }, [analysisId]);
 
   const current = snapshot?.requestKey === requestKey ? snapshot : null;
 
@@ -219,7 +268,7 @@ export function AnalysisProgress({
       </section>
     );
   }
-  if (current?.analysis == null) {
+  if (current?.detail == null) {
     return (
       <section className="analysis-load-state" role="status" aria-live="polite">
         <span className="analysis-loading-dot" aria-hidden="true" />
@@ -228,18 +277,75 @@ export function AnalysisProgress({
       </section>
     );
   }
-  return <AnalysisProgressView analysis={current.analysis} />;
+  const detail = current.detail;
+  const retrySynthesis = async (): Promise<void> => {
+    if (retrying) return;
+    retryController.current?.abort();
+    const controller = new AbortController();
+    retryController.current = controller;
+    setRetrying(true);
+    try {
+      await rerunner(
+        detail.teamId,
+        analysisId,
+        randomUUID(),
+        controller.signal,
+      );
+      if (!controller.signal.aborted) setAttempt((value) => value + 1);
+    } finally {
+      if (!controller.signal.aborted) setRetrying(false);
+    }
+  };
+  return (
+    <AnalysisProgressView
+      analysis={detail.analysis}
+      report={detail.report}
+      reportLoadFailed={detail.reportLoadFailed}
+      onRetrySynthesis={retrySynthesis}
+      retrying={retrying}
+    />
+  );
 }
 
-export function AnalysisProgressView({ analysis }: { readonly analysis: AnalysisResponse }) {
+const stageCopy: Record<
+  AnalysisStage["stage"],
+  { readonly label: string; readonly description: string }
+> = {
+  input_validation: { label: "文件校验", description: "确认大小、类型与 SHA-256。" },
+  smartperfetto: { label: "SmartPerfetto", description: "分析 Trace 中的关键性能路径。" },
+  perfpilot_ai: { label: "PerfPilot AI", description: "提炼结论并生成优化建议。" },
+  report: { label: "报告完成", description: "归档可追溯的指标、证据与结论。" },
+};
+
+function stageClass(stage: AnalysisStage): string {
+  if (stage.state === "completed") return "is-complete";
+  if (stage.state === "running") return "is-current";
+  if (stage.state === "failed") return "is-failed";
+  if (stage.state === "canceled") return "is-canceled";
+  if (stage.state === "not_requested") return "is-not-requested";
+  return "";
+}
+
+interface AnalysisProgressViewProps {
+  readonly analysis: AnalysisResponse;
+  readonly report?: AnalysisReport | null;
+  readonly reportLoadFailed?: boolean;
+  readonly onRetrySynthesis?: () => void | Promise<void>;
+  readonly retrying?: boolean;
+}
+
+export function AnalysisProgressView({
+  analysis,
+  report = null,
+  reportLoadFailed = false,
+  onRetrySynthesis = () => undefined,
+  retrying = false,
+}: AnalysisProgressViewProps) {
   const copy = stateCopy[analysis.state];
-  const traceReady = analysis.input_uploads.some(
-    (input) => input.artifact_kind === "trace" && input.state === "finalized",
-  );
-  const engineDone = TERMINAL_STATES.has(analysis.state);
 
   return (
-    <article className="analysis-progress-card">
+    <div className="analysis-detail-stack">
+      <article className="analysis-progress-card">
       <header className="analysis-progress-header">
         <div>
           <p className="page-eyebrow">TRACE ANALYSIS</p>
@@ -267,18 +373,18 @@ export function AnalysisProgressView({ analysis }: { readonly analysis: Analysis
       <section className="analysis-stage-section" aria-labelledby="analysis-stage-title">
         <h2 id="analysis-stage-title">处理进度</h2>
         <ol className="analysis-stage-list">
-          <li className={traceReady ? "is-complete" : "is-current"}>
-            <span aria-hidden="true" />
-            <div><strong>文件校验</strong><p>确认大小、类型与 SHA-256。</p></div>
-          </li>
-          <li className={engineDone ? "is-complete" : traceReady ? "is-current" : ""}>
-            <span aria-hidden="true" />
-            <div><strong>SmartPerfetto 解析</strong><p>分析 Trace 中的关键性能路径。</p></div>
-          </li>
-          <li className={analysis.report_available ? "is-complete" : engineDone ? "is-current" : ""}>
-            <span aria-hidden="true" />
-            <div><strong>结果归档</strong><p>保留可追溯的原始结果与报告状态。</p></div>
-          </li>
+          {analysis.stages.map((stage) => {
+            const content = stageCopy[stage.stage];
+            return (
+              <li className={stageClass(stage)} key={stage.stage}>
+                <span aria-hidden="true" />
+                <div>
+                  <strong>{content.label}</strong>
+                  <p>{stage.failure?.message ?? content.description}</p>
+                </div>
+              </li>
+            );
+          })}
         </ol>
       </section>
 
@@ -315,6 +421,24 @@ export function AnalysisProgressView({ analysis }: { readonly analysis: Analysis
           <span>{analysis.failure.retryable ? "可以重试" : "需要检查输入或服务配置"}</span>
         </section>
       ) : null}
-    </article>
+      </article>
+      {report ? (
+        <AnalysisReportView
+          report={report}
+          onRetrySynthesis={onRetrySynthesis}
+          retrying={retrying}
+        />
+      ) : analysis.report_available && reportLoadFailed ? (
+        <section className="analysis-report-load-state is-error" role="alert">
+          <h2>报告暂时无法读取</h2>
+          <p>分析状态仍来自当前团队数据库，请稍后重新加载。</p>
+        </section>
+      ) : analysis.report_available ? (
+        <section className="analysis-report-load-state" role="status">
+          <h2>正在读取报告</h2>
+          <p>正在校验最新报告版本。</p>
+        </section>
+      ) : null}
+    </div>
   );
 }
