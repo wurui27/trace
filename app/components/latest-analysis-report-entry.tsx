@@ -147,9 +147,11 @@ export const LatestAnalysisReportEntry = memo(function LatestAnalysisReportEntry
       ? "SmartPerfetto 已完成"
       : `SmartPerfetto ${analysis.source_analysis.rounds} 轮`;
   const aiLabel =
-    completedAiRounds === undefined
-      ? "PerfPilot AI 已完成"
-      : `PerfPilot AI ${completedAiRounds}/3`;
+    report.synthesis.state === "failed"
+      ? "PerfPilot AI 未完成"
+      : completedAiRounds === undefined
+        ? "PerfPilot AI 已完成"
+        : `PerfPilot AI ${completedAiRounds}/3`;
   const reportState = report.state === "completed" ? "完整报告" : "部分结论";
 
   return (

@@ -9,6 +9,7 @@ import { Dashboard } from "../app/components/dashboard";
 import type { LatestReportLoader } from "../app/components/latest-analysis-report-entry";
 import type {
   AnalysisListItem,
+  AnalysisReport,
   AnalysisResponse,
   PerfPilotClient,
 } from "../app/lib/perfpilot-api";
@@ -45,6 +46,79 @@ const completed: AnalysisResponse = {
   stages: active.stages.map((stage) => ({ ...stage, state: "completed" })),
 };
 
+const latestAnalysis: AnalysisListItem = {
+  ...completed,
+  created_at: active.created_at,
+};
+
+const latestReport: AnalysisReport = {
+  schema_version: "1.1",
+  analysis_id: latestAnalysis.analysis_id,
+  analysis_mode: "trace_upload",
+  state: "partially_completed",
+  report_version: 1,
+  generated_at: "2026-08-04T08:05:00Z",
+  scenario_reports: [
+    {
+      scenario_job_id: "scenario-1",
+      scenario_type: "startup",
+      result_state: "completed",
+      device_group_id: null,
+      device_group_reason: null,
+      bundle: {
+        metrics: [
+          {
+            metric_id: "metric-startup",
+            name: "startup.startup_analysis_get_startups.dur_ms",
+            status: "available",
+            numeric_value: 481.772461,
+            unit: "ms",
+            definition: "启动耗时",
+            threshold: null,
+          },
+          {
+            metric_id: "metric-main",
+            name: "startup.startup_analysis_main_thread_slices.total_dur_ms",
+            status: "available",
+            numeric_value: 215.5005,
+            unit: "ms",
+            definition: "主线程总耗时",
+            threshold: null,
+          },
+        ],
+        findings: [
+          {
+            finding_id: "finding-1",
+            title: "Compose 首帧重组过重",
+            summary: "主线程存在 61ms 的重组热点。",
+            severity: "critical",
+            confidence: "high",
+            evidence_ids: ["evidence-1"],
+          },
+        ],
+        evidence: [
+          {
+            evidence_id: "evidence-1",
+            source: "perfetto.startup",
+            query_id: "query-1",
+            interval_start_ns: 1,
+            interval_end_ns: 2,
+            fields: {},
+          },
+        ],
+      },
+      failure: null,
+    },
+  ],
+  synthesis: {
+    state: "failed",
+    output: null,
+    synthesis_artifact_id: null,
+    failure_code: "ai_not_configured",
+    provenance: null,
+  },
+};
+
 interface TestDashboardProps {
   readonly client: PerfPilotClient;
   readonly pollDelay: (milliseconds: number, signal: AbortSignal) => Promise<void>;
@@ -74,6 +148,37 @@ function clientWithActive(
 }
 
 describe("Dashboard analysis coordinator", () => {
+  it("fills the dashboard result slots from the latest real report", async () => {
+    const client = clientWithActive({
+      activeAnalyses: vi.fn().mockResolvedValue({
+        schema_version: "1.0",
+        analyses: [],
+      }),
+    });
+    const latestReportLoader: LatestReportLoader = vi.fn().mockResolvedValue({
+      teamId: "team-1",
+      analysis: latestAnalysis,
+      report: latestReport,
+    });
+
+    render(
+      <TestDashboard
+        client={client}
+        pollDelay={() => new Promise<void>(() => undefined)}
+        latestReportLoader={latestReportLoader}
+      />,
+    );
+
+    expect(
+      (await screen.findAllByText("Compose 首帧重组过重")).length,
+    ).toBeGreaterThanOrEqual(1);
+    expect(screen.getByText("481.8 ms")).toBeInTheDocument();
+    expect(screen.getByText("215.5 ms")).toBeInTheDocument();
+    expect(screen.getByText("AI 建议 未完成")).toBeInTheDocument();
+    expect(screen.getByText("PerfPilot AI 未完成")).toBeInTheDocument();
+    expect(screen.queryByText("暂无分析结论")).not.toBeInTheDocument();
+  });
+
   it("restores the active task and refreshes reports when polling reaches completion", async () => {
     let releasePoll: (() => void) | undefined;
     const pollDelay = vi.fn(
