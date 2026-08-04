@@ -141,7 +141,13 @@ class SQLAlchemySynthesisWorkQueue:
                 completed_at=None, retry_count=event.retry_count, report_id=None, version=1))
             return SynthesisWorkClaim(claim_id, event.id, synthesis.team_id, synthesis.analysis_id, synthesis.id, consumer_id, token, expires)
 
-    async def _owned(self, session: AsyncSession, claim: SynthesisWorkClaim) -> tuple[WorkerClaim, OutboxEvent]:
+    async def _owned(
+        self,
+        session: AsyncSession,
+        claim: SynthesisWorkClaim,
+        *,
+        allow_terminal: bool = False,
+    ) -> tuple[WorkerClaim, OutboxEvent]:
         now = self._clock()
         row = await session.scalar(select(WorkerClaim).where(WorkerClaim.id == claim.claim_id, WorkerClaim.event_id == claim.event_id, WorkerClaim.global_job_id == claim.analysis_id, WorkerClaim.consumer_id == claim.consumer_id).with_for_update())
         event = await session.scalar(select(OutboxEvent).where(OutboxEvent.id == claim.event_id, OutboxEvent.team_id == claim.team_id, OutboxEvent.global_job_id == claim.analysis_id).with_for_update())
@@ -153,9 +159,8 @@ class SQLAlchemySynthesisWorkQueue:
         if (row is None or event is None or row.state != "active" or row.expires_at <= now or not hmac.compare_digest(row.token_digest, self._digest(claim.token))
                 or event.event_type != "analysis_synthesis_requested" or event.subject_type != "synthesis_execution" or event.subject_id != claim.synthesis_execution_id):
             raise SynthesisClaimLostError("synthesis claim was lost")
-        if (
-            synthesis is None
-            or synthesis.state not in {"pending", "running"}
+        if synthesis is None or (
+            not allow_terminal and synthesis.state not in {"pending", "running"}
         ):
             raise SynthesisClaimLostError("synthesis work authority was lost")
         return row, event
@@ -169,7 +174,7 @@ class SQLAlchemySynthesisWorkQueue:
     async def complete(self, claim: SynthesisWorkClaim) -> None:
         now = self._clock()
         async with self._sessions.begin() as session:
-            row, event = await self._owned(session, claim)
+            row, event = await self._owned(session, claim, allow_terminal=True)
             row.state, row.completed_at, row.version, row.updated_at = "completed", now, row.version + 1, now
             event.published_at, event.version, event.updated_at = now, event.version + 1, now
 
