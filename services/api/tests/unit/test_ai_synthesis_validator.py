@@ -90,6 +90,31 @@ def test_rejects_top_finding_evidence_that_does_not_support_the_finding() -> Non
         _validate(candidate, projection)
 
 
+def test_rejects_recommendation_evidence_unrelated_to_cited_finding() -> None:
+    projection_document = _projection_document()
+    scenario = projection_document["scenarios"][0]
+    scenario["evidence"].append(  # type: ignore[index]
+        {
+            "evidence_id": UNKNOWN_ID,
+            "source": "perfetto.other",
+            "query_id": "other.v1",
+            "interval_start_ns": None,
+            "interval_end_ns": None,
+            "artifact_id": None,
+            "fields": {},
+        }
+    )
+    projection = AIProjection(
+        canonical_bytes=canonical_json_bytes(projection_document),
+        sha256_b64="Y2hlY2tzdW0=",
+    )
+    candidate = _candidate()
+    candidate["recommendations"][0]["evidence_ids"] = [UNKNOWN_ID]  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
+
+
 def test_rejects_recommendation_without_actionable_finding_or_evidence() -> None:
     candidate = _candidate()
     recommendation = candidate["recommendations"][0]  # type: ignore[index]

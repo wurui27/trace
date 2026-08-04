@@ -238,6 +238,17 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
             for finding_id in finding_ids
         ):
             raise SynthesisValidationError
+        recommendation_evidence = set(evidence_ids)
+        supported_evidence = set().union(
+            *(index.finding_evidence[finding_id] for finding_id in finding_ids)
+        )
+        if not recommendation_evidence.issubset(supported_evidence) or any(
+            not recommendation_evidence.intersection(
+                index.finding_evidence[finding_id]
+            )
+            for finding_id in finding_ids
+        ):
+            raise SynthesisValidationError
 
     for retest in retest_plan:
         if not isinstance(retest, dict):
