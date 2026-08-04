@@ -51,6 +51,7 @@ def test_projection_is_allowlisted_and_uses_only_authoritative_question() -> Non
     "private_value",
     [
         "https://objects.invalid/a?X-Amz-Signature=secret",
+        "https://storage.googleapis.com/a?X-Goog-Signature=secret",
         "https://user:secret@objects.invalid/a",
         "postgresql://user:secret@db.invalid/app",
         "s3://private-bucket/customer/trace",
@@ -62,6 +63,7 @@ def test_projection_is_allowlisted_and_uses_only_authoritative_question() -> Non
         "/srv/private/customer.trace",
         r"C:\\private\\customer.trace",
         "%2Fsrv%2Fprivate%2Fcustomer.trace",
+        "%EF%BC%8Fsrv%EF%BC%8Fprivate%EF%BC%8Fcustomer.trace",
         "../private/customer.trace",
     ],
 )
@@ -89,6 +91,8 @@ def test_recursive_scanner_rejects_cycles_and_private_keys() -> None:
         reject_private_json(cycle)
     with pytest.raises(ProjectionPrivacyError, match="^projection contains private data$"):
         reject_private_json({"/private/path": "safe"})
+    with pytest.raises(ProjectionPrivacyError, match="^projection contains private data$"):
+        reject_private_json({"password": "hunter2"})
 
 
 @pytest.mark.parametrize("question", ["", " \t ", "x" * 2001])

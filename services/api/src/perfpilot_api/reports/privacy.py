@@ -14,7 +14,7 @@ _MAX_NODES = 200_000
 _MAX_STRING_CHARS = 2_000
 _PRIVATE_PATTERNS = (
     re.compile(r"https?://[^/\s]+@", re.IGNORECASE),
-    re.compile(r"https?://[^\s?#]+[^\s]*[?&](?:x-amz-(?:signature|credential)|signature|token)=[^\s&]+", re.IGNORECASE),
+    re.compile(r"https?://[^\s?#]+[^\s]*[?&](?:x-(?:amz|goog)-(?:signature|credential)|signature|token)=[^\s&]+", re.IGNORECASE),
     re.compile(r"(?:postgres(?:ql)?|mysql|mongodb(?:\+[^:]+)?|redis)://", re.IGNORECASE),
     re.compile(r"(?:s3|gs)://", re.IGNORECASE),
     re.compile(r"\b(?:bearer|basic)\s+\S+", re.IGNORECASE),
@@ -24,6 +24,17 @@ _PRIVATE_PATTERNS = (
     re.compile(r"\b[A-Za-z]:[\\/]"),
     re.compile(r"(?:^|[\\/])\.\.(?:[\\/]|$)"),
 )
+_PRIVATE_KEYS = {
+    "accesskey",
+    "accesstoken",
+    "apikey",
+    "authorization",
+    "credential",
+    "password",
+    "privatekey",
+    "secret",
+    "token",
+}
 
 
 class ProjectionPrivacyError(ValueError):
@@ -31,15 +42,24 @@ class ProjectionPrivacyError(ValueError):
         super().__init__("projection contains private data")
 
 
-def _private_text(value: str) -> bool:
-    normalized = unicodedata.normalize("NFKC", value)
-    decoded = normalized
+def _decoded_text(value: str) -> str:
+    decoded = unicodedata.normalize("NFKC", value)
     for _ in range(8):
-        candidate = unquote(decoded)
+        candidate = unicodedata.normalize("NFKC", unquote(decoded))
         if candidate == decoded:
             break
         decoded = candidate
+    return decoded
+
+
+def _private_text(value: str) -> bool:
+    decoded = _decoded_text(value)
     return any(pattern.search(decoded) is not None for pattern in _PRIVATE_PATTERNS)
+
+
+def _private_key(value: str) -> bool:
+    normalized = re.sub(r"[^a-z0-9]", "", _decoded_text(value).casefold())
+    return normalized in _PRIVATE_KEYS
 
 
 def reject_private_json(value: object) -> None:
@@ -71,6 +91,8 @@ def reject_private_json(value: object) -> None:
             try:
                 for key, nested in item.items():
                     if type(key) is not str:
+                        raise ProjectionPrivacyError
+                    if _private_key(key):
                         raise ProjectionPrivacyError
                     visit(key, depth + 1)
                     visit(nested, depth + 1)
