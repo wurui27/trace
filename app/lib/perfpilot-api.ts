@@ -5,12 +5,28 @@ const MAX_JSON_BYTES = 10 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
-const TERMINAL_STATES = new Set([
+const ANALYSIS_STATES = new Set<AnalysisState>([
+  "creating",
+  "created",
+  "uploading",
+  "queued",
+  "scheduled",
+  "running",
+  "analyzing",
   "completed",
   "partially_completed",
   "failed",
   "canceled",
   "deleted",
+]);
+const ACTIVE_ANALYSIS_STATES = new Set<AnalysisState>([
+  "creating",
+  "created",
+  "uploading",
+  "queued",
+  "scheduled",
+  "running",
+  "analyzing",
 ]);
 
 export type TraceInputKind =
@@ -54,6 +70,21 @@ export interface AnalysisStage {
   readonly stage: "input_validation" | "smartperfetto" | "perfpilot_ai" | "report";
   readonly state: AnalysisStageState;
   readonly failure: AnalysisFailure | null;
+}
+
+export interface AnalysisAiRound {
+  readonly round: 1 | 2 | 3;
+  readonly role: "extract" | "review" | "finalize";
+  readonly state: "pending" | "running" | "completed" | "failed";
+  readonly attempts: number;
+}
+
+export interface AnalysisSource {
+  readonly engine: "smartperfetto";
+  readonly rounds: number | null;
+  readonly verification: "passed" | "failed" | "unknown";
+  readonly session_id: string | null;
+  readonly run_id: string | null;
 }
 
 export interface ReportMetric {
@@ -195,6 +226,8 @@ export interface AnalysisResponse {
   readonly question: string | null;
   readonly state: AnalysisState;
   readonly version: number;
+  readonly created_at?: string;
+  readonly cancel_requested_at?: string | null;
   readonly report_available: boolean;
   readonly stages: readonly AnalysisStage[];
   readonly input_uploads: ReadonlyArray<{
@@ -207,6 +240,17 @@ export interface AnalysisResponse {
     readonly artifact_id?: string;
   }>;
   readonly failure: AnalysisFailure | null;
+  readonly ai_rounds?: readonly AnalysisAiRound[];
+  readonly source_analysis?: AnalysisSource;
+}
+
+export interface AnalysisListItem extends AnalysisResponse {
+  readonly created_at: string;
+}
+
+export interface AnalysisListResponse {
+  readonly schema_version: "1.0";
+  readonly analyses: readonly AnalysisListItem[];
 }
 
 export interface MeResponse {
@@ -215,6 +259,26 @@ export interface MeResponse {
     readonly team: { readonly id: string; readonly name: string };
     readonly role: string;
   }>;
+}
+
+export type LocalDeviceState =
+  | "connected"
+  | "disconnected"
+  | "multiple"
+  | "unauthorized"
+  | "unavailable";
+
+export interface LocalDeviceStatusResponse {
+  readonly schema_version: "1.0";
+  readonly state: LocalDeviceState;
+  readonly device: {
+    readonly serial: string;
+    readonly manufacturer: string;
+    readonly model: string;
+    readonly name: string;
+    readonly os: string;
+    readonly api_level: number | null;
+  } | null;
 }
 
 interface UploadSlot {
@@ -262,6 +326,7 @@ export class PerfPilotApiError extends Error {
 
 export interface PerfPilotClient {
   readonly fetcher: typeof globalThis.fetch;
+  device(signal?: AbortSignal): Promise<LocalDeviceStatusResponse>;
   csrf(signal?: AbortSignal): Promise<string>;
   me(signal?: AbortSignal): Promise<MeResponse>;
   createTrace(
@@ -286,7 +351,18 @@ export interface PerfPilotClient {
     signal?: AbortSignal,
   ): Promise<UploadSlot>;
   putInput(slot: UploadSlot, input: InputDescriptor, signal?: AbortSignal): Promise<void>;
+  analyses(teamId: string, limit?: number, signal?: AbortSignal): Promise<AnalysisListResponse>;
+  activeAnalyses(
+    teamId: string,
+    limit?: number,
+    signal?: AbortSignal,
+  ): Promise<AnalysisListResponse>;
   analysis(teamId: string, analysisId: string, signal?: AbortSignal): Promise<AnalysisResponse>;
+  cancelAnalysis(
+    teamId: string,
+    analysisId: string,
+    signal?: AbortSignal,
+  ): Promise<AnalysisResponse>;
   report(teamId: string, analysisId: string, signal?: AbortSignal): Promise<AnalysisReport>;
   createSynthesisRun(
     teamId: string,
@@ -418,6 +494,25 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function validUploadUrl(value: string): boolean {
+  try {
+    const url = new URL(value);
+    if (url.username || url.password || url.hash) return false;
+    if (url.protocol === "https:") return true;
+    const loopback =
+      url.hostname === "localhost" ||
+      url.hostname === "127.0.0.1" ||
+      url.hostname === "[::1]";
+    return (
+      url.protocol === "http:" &&
+      loopback &&
+      url.pathname.startsWith("/local/v1/uploads/")
+    );
+  } catch {
+    return false;
+  }
+}
+
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   const allowedKeys = new Set(allowed);
   return Object.keys(value).every((key) => allowedKeys.has(key));
@@ -469,6 +564,42 @@ function validStages(value: unknown): value is AnalysisStage[] {
         STAGE_STATES.includes(item.state as AnalysisStageState) &&
         (item.failure === null || validFailure(item.failure)),
     )
+  );
+}
+
+const AI_ROUND_ROLES: readonly AnalysisAiRound["role"][] = [
+  "extract",
+  "review",
+  "finalize",
+];
+
+function validAiRounds(value: unknown): value is AnalysisAiRound[] {
+  return (
+    Array.isArray(value) &&
+    value.length === 3 &&
+    value.every(
+      (item, index) =>
+        object(item) &&
+        exactKeys(item, ["round", "role", "state", "attempts"]) &&
+        item.round === index + 1 &&
+        item.role === AI_ROUND_ROLES[index] &&
+        ["pending", "running", "completed", "failed"].includes(String(item.state)) &&
+        Number.isSafeInteger(item.attempts) &&
+        Number(item.attempts) >= 0,
+    )
+  );
+}
+
+function validAnalysisSource(value: unknown): value is AnalysisSource {
+  return (
+    object(value) &&
+    exactKeys(value, ["engine", "rounds", "verification", "session_id", "run_id"]) &&
+    value.engine === "smartperfetto" &&
+    (value.rounds === null ||
+      (Number.isSafeInteger(value.rounds) && Number(value.rounds) >= 0)) &&
+    ["passed", "failed", "unknown"].includes(String(value.verification)) &&
+    (value.session_id === null || typeof value.session_id === "string") &&
+    (value.run_id === null || typeof value.run_id === "string")
   );
 }
 
@@ -808,7 +939,55 @@ function synthesisRunResponse(value: unknown): SynthesisRunResponse {
   return value as unknown as SynthesisRunResponse;
 }
 
+function localDeviceResponse(value: unknown): LocalDeviceStatusResponse {
+  const states: readonly LocalDeviceState[] = [
+    "connected",
+    "disconnected",
+    "multiple",
+    "unauthorized",
+    "unavailable",
+  ];
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "state", "device"]) ||
+    value.schema_version !== "1.0" ||
+    !states.includes(value.state as LocalDeviceState)
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  if (value.state !== "connected") {
+    if (value.device !== null) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    return value as unknown as LocalDeviceStatusResponse;
+  }
+  if (
+    !object(value.device) ||
+    !exactKeys(value.device, [
+      "serial",
+      "manufacturer",
+      "model",
+      "name",
+      "os",
+      "api_level",
+    ]) ||
+    typeof value.device.serial !== "string" ||
+    typeof value.device.manufacturer !== "string" ||
+    typeof value.device.model !== "string" ||
+    typeof value.device.name !== "string" ||
+    typeof value.device.os !== "string" ||
+    (value.device.api_level !== null && !Number.isSafeInteger(value.device.api_level))
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as LocalDeviceStatusResponse;
+}
+
 function analysisResponse(value: unknown): AnalysisResponse {
+  const hasAiRounds = object(value) && "ai_rounds" in value;
+  const hasSource = object(value) && "source_analysis" in value;
+  const createdAt = object(value) ? value.created_at : undefined;
+  const cancelRequestedAt = object(value) ? value.cancel_requested_at : undefined;
   if (
     !object(value) ||
     value.schema_version !== "1.0" ||
@@ -817,14 +996,64 @@ function analysisResponse(value: unknown): AnalysisResponse {
     typeof value.team_id !== "string" ||
     !["auto", "startup", "scroll"].includes(String(value.analysis_profile)) ||
     !Array.isArray(value.input_uploads) ||
-    typeof value.state !== "string" ||
+    !ANALYSIS_STATES.has(value.state as AnalysisState) ||
     typeof value.version !== "number" ||
     typeof value.report_available !== "boolean" ||
-    !validStages(value.stages)
+    (createdAt !== undefined &&
+      (typeof createdAt !== "string" ||
+        createdAt.length > 64 ||
+        Number.isNaN(Date.parse(createdAt)))) ||
+    (cancelRequestedAt !== undefined &&
+      cancelRequestedAt !== null &&
+      (typeof cancelRequestedAt !== "string" ||
+        cancelRequestedAt.length > 64 ||
+        Number.isNaN(Date.parse(cancelRequestedAt)))) ||
+    !validStages(value.stages) ||
+    hasAiRounds !== hasSource ||
+    (hasAiRounds && !validAiRounds(value.ai_rounds)) ||
+    (hasSource && !validAnalysisSource(value.source_analysis))
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
   return value as unknown as AnalysisResponse;
+}
+
+function analysisListResponse(
+  value: unknown,
+  context: {
+    readonly teamId: string;
+    readonly limit: number;
+    readonly filter: "report" | "active";
+  },
+): AnalysisListResponse {
+  const { teamId, limit, filter } = context;
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "analyses"]) ||
+    value.schema_version !== "1.0" ||
+    !Array.isArray(value.analyses) ||
+    value.analyses.length > limit
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  const ids = new Set<string>();
+  for (const rawAnalysis of value.analyses) {
+    const parsed = analysisResponse(rawAnalysis);
+    const createdAt = object(rawAnalysis) ? rawAnalysis.created_at : null;
+    if (
+      parsed.team_id !== teamId ||
+      (filter === "report" && !parsed.report_available) ||
+      (filter === "active" && !ACTIVE_ANALYSIS_STATES.has(parsed.state)) ||
+      typeof createdAt !== "string" ||
+      createdAt.length > 64 ||
+      Number.isNaN(Date.parse(createdAt)) ||
+      ids.has(parsed.analysis_id)
+    ) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    ids.add(parsed.analysis_id);
+  }
+  return value as unknown as AnalysisListResponse;
 }
 
 function uploadSlot(value: unknown): UploadSlot {
@@ -901,6 +1130,9 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
 
   return {
     fetcher,
+    async device(signal) {
+      return localDeviceResponse(await requestJson("/api/v1/device", {}, signal));
+    },
     async csrf(signal) {
       const payload = await requestJson("/api/v1/auth/csrf", {}, signal);
       if (!object(payload) || payload.schema_version !== "1.0" || typeof payload.csrf_token !== "string") {
@@ -980,7 +1212,7 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         upload.size !== input.size ||
         upload.sha256_b64 !== input.sha256_b64 ||
         typeof upload.put_url !== "string" ||
-        !upload.put_url.startsWith("https://") ||
+        !validUploadUrl(upload.put_url) ||
         !object(upload.required_headers)
       ) {
         throw new PerfPilotApiError("invalid_upload_authorization", "上传授权无效", false, null);
@@ -1029,6 +1261,45 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         ),
       );
     },
+    async analyses(teamId, limit = 1, signal) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+        throw new PerfPilotApiError("invalid_api_request", "请求参数无效", false, null);
+      }
+      return analysisListResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/analyses?report_available=true&limit=${limit}`,
+          {},
+          signal,
+        ),
+        { teamId, limit, filter: "report" },
+      );
+    },
+    async activeAnalyses(teamId, limit = 1, signal) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 20) {
+        throw new PerfPilotApiError("invalid_api_request", "请求参数无效", false, null);
+      }
+      return analysisListResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/analyses?status=active&limit=${limit}`,
+          {},
+          signal,
+        ),
+        { teamId, limit, filter: "active" },
+      );
+    },
+    async cancelAnalysis(teamId, analysisId, signal) {
+      const canceled = analysisResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/cancel`,
+          { method: "POST" },
+          signal,
+        ),
+      );
+      if (canceled.analysis_id !== analysisId || canceled.team_id !== teamId) {
+        throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+      }
+      return canceled;
+    },
     async report(teamId, analysisId, signal) {
       const report = analysisReportResponse(
         await requestJson(
@@ -1076,29 +1347,12 @@ async function mapConcurrent<T, R>(
   return results;
 }
 
-function defaultSleep(milliseconds: number, signal?: AbortSignal): Promise<void> {
-  return new Promise((resolve, reject) => {
-    aborted(signal);
-    const cancel = () => {
-      clearTimeout(timeout);
-      reject(signal?.reason ?? new DOMException("操作已取消", "AbortError"));
-    };
-    const finish = () => {
-      signal?.removeEventListener("abort", cancel);
-      resolve();
-    };
-    const timeout = setTimeout(finish, milliseconds);
-    signal?.addEventListener("abort", cancel, { once: true });
-  });
-}
-
 export type TraceSubmissionPhase =
   | "session"
   | "hashing"
   | "creating"
   | "uploading"
-  | "analyzing"
-  | "completed";
+  | "submitted";
 
 export interface SubmitTraceInput {
   readonly profile: TraceProfile;
@@ -1119,13 +1373,12 @@ export interface SubmittedTraceAnalysis {
   readonly analysis: AnalysisResponse;
 }
 
-export async function submitTraceAnalysis(
+export async function enqueueTraceAnalysis(
   submission: SubmitTraceInput,
   dependencies: SubmitTraceDependencies = {},
 ): Promise<SubmittedTraceAnalysis> {
   const client = dependencies.client ?? createPerfPilotClient();
   const randomUUID = dependencies.randomUUID ?? (() => crypto.randomUUID());
-  const sleep = dependencies.sleep ?? defaultSleep;
   const { signal, onProgress } = submission;
   if (!["auto", "startup", "scroll"].includes(submission.profile)) {
     throw new PerfPilotApiError("invalid_profile", "请选择分析重点", false, null);
@@ -1196,21 +1449,9 @@ export async function submitTraceAnalysis(
     await client.finalizeInput(teamId, created.analysis_id, input, slot.upload.upload_id, signal);
   });
 
-  onProgress?.("analyzing", created.analysis_id);
-  let current = await client.analysis(teamId, created.analysis_id, signal);
-  let retryDelay = 2_000;
-  while (!TERMINAL_STATES.has(current.state)) {
-    await sleep(retryDelay, signal);
-    try {
-      current = await client.analysis(teamId, created.analysis_id, signal);
-      retryDelay = 2_000;
-    } catch (error) {
-      if (!(error instanceof PerfPilotApiError) || !error.retryable) {
-        throw error;
-      }
-      retryDelay = Math.min(retryDelay * 2, 15_000);
-    }
-  }
-  onProgress?.("completed");
+  const current = await client.analysis(teamId, created.analysis_id, signal);
+  onProgress?.("submitted", created.analysis_id);
   return { teamId, analysis: current };
 }
+
+export const submitTraceAnalysis = enqueueTraceAnalysis;

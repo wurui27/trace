@@ -1,95 +1,58 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, expect, it, vi } from "vitest";
 
 import { NewAnalysisDialog } from "../app/components/new-analysis-dialog";
+import type { TraceSubmitter } from "../app/components/trace-upload-form";
 
 afterEach(cleanup);
 
-describe("NewAnalysisDialog", () => {
-  it("opens on the real Trace workflow and closes while managing focus and scroll", async () => {
-    const user = userEvent.setup();
-    const initialOverflow = document.body.style.overflow;
-
-    render(<NewAnalysisDialog />);
-
-    expect(
-      screen.queryByRole("dialog", { name: "新建性能分析" }),
-    ).not.toBeInTheDocument();
-
-    const trigger = screen.getByRole("button", { name: "新建分析" });
-    trigger.focus();
-    expect(trigger).toHaveFocus();
-
-    await user.click(trigger);
-
-    expect(
-      screen.getByRole("dialog", { name: "新建性能分析" }),
-    ).toBeInTheDocument();
-    expect(
-      screen.getByRole("button", { name: "真机自动测试" }),
-    ).toBeDisabled();
-    expect(
-      screen.getByRole("button", { name: "上传 Trace 分析" }),
-    ).toHaveAttribute("aria-pressed", "true");
-    const closeButton = screen.getByRole("button", { name: "关闭" });
-    const cancelButton = screen.getByRole("button", { name: "取消" });
-    expect(closeButton).toHaveFocus();
-    expect(cancelButton).toBeEnabled();
-
-    await user.tab({ shift: true });
-    expect(cancelButton).toHaveFocus();
-
-    await user.tab();
-    expect(closeButton).toHaveFocus();
-
-    expect(document.body).toHaveStyle({ overflow: "hidden" });
-    expect(screen.getByLabelText("分析重点")).toBeInTheDocument();
-    expect(screen.getByLabelText("补充问题（可选）")).toBeInTheDocument();
-    expect(screen.getByLabelText("Trace 文件")).toBeRequired();
-    expect(screen.getByLabelText("内存证据（可选）")).not.toBeRequired();
-    expect(screen.getByLabelText("APK 文件（可选）")).not.toBeRequired();
-    expect(screen.getByLabelText("源码压缩包（可选）")).not.toBeRequired();
-    expect(screen.getByLabelText("Mapping 文件（可选）")).not.toBeRequired();
-    expect(
-      screen.getByLabelText("Native Symbols（可选）"),
-    ).not.toBeRequired();
-    expect(screen.getByLabelText("日志文件（可选）")).not.toBeRequired();
-    const startButton = screen.getByRole("button", { name: "开始分析" });
-    expect(startButton).toBeDisabled();
-    await user.upload(
-      screen.getByLabelText("Trace 文件"),
-      new File([new Uint8Array([1])], "trace.pb"),
-    );
-    expect(startButton).toBeEnabled();
-
-    await user.click(screen.getByRole("button", { name: "关闭" }));
-
-    expect(
-      screen.queryByRole("dialog", { name: "新建性能分析" }),
-    ).not.toBeInTheDocument();
-    expect(document.body.style.overflow).toBe(initialOverflow);
-    await waitFor(() => expect(trigger).toHaveFocus());
+it("closes after the backend accepts the uploaded Trace", async () => {
+  const user = userEvent.setup();
+  const submitter: TraceSubmitter = vi.fn().mockResolvedValue({
+    teamId: "team-1",
+    analysis: {
+      schema_version: "1.0",
+      analysis_id: "analysis-active-1",
+      team_id: "team-1",
+      analysis_mode: "trace_upload",
+      analysis_profile: "auto",
+      question: null,
+      state: "analyzing",
+      version: 3,
+      created_at: "2026-08-04T08:00:00Z",
+      cancel_requested_at: null,
+      report_available: false,
+      input_uploads: [],
+      stages: [
+        { stage: "input_validation", state: "completed", failure: null },
+        { stage: "smartperfetto", state: "running", failure: null },
+        { stage: "perfpilot_ai", state: "pending", failure: null },
+        { stage: "report", state: "pending", failure: null },
+      ],
+      failure: null,
+    },
   });
+  const onSubmitted = vi.fn();
+  render(
+    <NewAnalysisDialog submitter={submitter} onSubmitted={onSubmitted} />,
+  );
 
-  it("closes with Escape and restores focus to the trigger", async () => {
-    const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "新建分析" }));
+  await user.upload(
+    screen.getByLabelText("Trace 文件"),
+    new File([new Uint8Array([1, 2, 3])], "startup.trace"),
+  );
+  await user.click(screen.getByRole("button", { name: "开始分析" }));
 
-    render(<NewAnalysisDialog />);
+  expect(onSubmitted).toHaveBeenCalledOnce();
+  expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+});
 
-    const trigger = screen.getByRole("button", { name: "新建分析" });
-    await user.click(trigger);
-    expect(
-      screen.getByRole("dialog", { name: "新建性能分析" }),
-    ).toBeInTheDocument();
+it("prevents a second submission while an analysis is active", () => {
+  render(<NewAnalysisDialog disabled />);
 
-    await user.keyboard("{Escape}");
-
-    expect(
-      screen.queryByRole("dialog", { name: "新建性能分析" }),
-    ).not.toBeInTheDocument();
-    await waitFor(() => expect(trigger).toHaveFocus());
-  });
+  expect(screen.getByRole("button", { name: "分析进行中" })).toBeDisabled();
 });

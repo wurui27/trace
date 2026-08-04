@@ -10,9 +10,20 @@ import {
 } from "react";
 import { Smartphone, Upload, X } from "lucide-react";
 
-import { TraceUploadForm } from "./trace-upload-form";
+import type { SubmittedTraceAnalysis } from "../lib/perfpilot-api";
+import { TraceUploadForm, type TraceSubmitter } from "./trace-upload-form";
 
-export function NewAnalysisDialog() {
+interface NewAnalysisDialogProps {
+  readonly disabled?: boolean;
+  readonly submitter?: TraceSubmitter;
+  readonly onSubmitted?: (result: SubmittedTraceAnalysis) => void;
+}
+
+export function NewAnalysisDialog({
+  disabled = false,
+  submitter,
+  onSubmitted,
+}: NewAnalysisDialogProps = {}) {
   const [isOpen, setIsOpen] = useState(false);
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
@@ -23,6 +34,14 @@ export function NewAnalysisDialog() {
   const closeDialog = useCallback(() => {
     setIsOpen(false);
   }, []);
+
+  const handleSubmitted = useCallback(
+    (result: SubmittedTraceAnalysis) => {
+      closeDialog();
+      onSubmitted?.(result);
+    },
+    [closeDialog, onSubmitted],
+  );
 
   useEffect(() => {
     if (!isOpen) return;
@@ -84,8 +103,9 @@ export function NewAnalysisDialog() {
         type="button"
         className="new-analysis-button"
         onClick={() => setIsOpen(true)}
+        disabled={disabled}
       >
-        新建分析
+        {disabled ? "分析进行中" : "新建分析"}
       </button>
 
       {isOpen ? (
@@ -149,7 +169,11 @@ export function NewAnalysisDialog() {
               </button>
             </div>
 
-            <TraceUploadForm onCancel={closeDialog} />
+            <TraceUploadForm
+              submitter={submitter}
+              onCancel={closeDialog}
+              onSubmitted={handleSubmitted}
+            />
           </div>
         </div>
       ) : null}

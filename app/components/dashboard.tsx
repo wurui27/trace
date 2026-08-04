@@ -1,73 +1,258 @@
-import Link from "next/link";
-import { ArrowRight } from "lucide-react";
+"use client";
 
-import type {
-  DashboardData,
-  MetricState,
-  Severity,
-} from "../lib/performance-data";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+
+import {
+  createPerfPilotClient,
+  PerfPilotApiError,
+  type AnalysisResponse,
+  type AnalysisState,
+  type PerfPilotClient,
+  type SubmittedTraceAnalysis,
+} from "../lib/perfpilot-api";
+import { ActiveAnalysisTaskCard } from "./active-analysis-task-card";
 import { NewAnalysisDialog } from "./new-analysis-dialog";
+import {
+  LatestAnalysisReportEntry,
+  type LatestReportLoader,
+  type LatestReportSnapshot,
+} from "./latest-analysis-report-entry";
 
-interface DashboardProps {
-  readonly data: DashboardData;
+const activeStates = new Set<AnalysisState>([
+  "creating",
+  "created",
+  "uploading",
+  "queued",
+  "scheduled",
+  "running",
+  "analyzing",
+]);
+
+function wait(milliseconds: number, signal: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(signal.reason);
+      return;
+    }
+    const cancel = () => {
+      window.clearTimeout(timer);
+      reject(signal.reason);
+    };
+    const finish = () => {
+      signal.removeEventListener("abort", cancel);
+      resolve();
+    };
+    const timer = window.setTimeout(finish, milliseconds);
+    signal.addEventListener("abort", cancel, { once: true });
+  });
 }
 
-const metricStateLabels: Record<MetricState, string> = {
-  measured: "已测得",
-  missing: "未采集",
-  failed: "查询失败",
-};
+interface DashboardProps {
+  readonly client?: PerfPilotClient;
+  readonly pollDelay?: (milliseconds: number, signal: AbortSignal) => Promise<void>;
+  readonly latestReportLoader?: LatestReportLoader;
+  readonly confirmCancel?: () => boolean;
+}
 
-const priorityLabels: Record<Severity, string> = {
-  critical: "高优先级",
-  warning: "中优先级",
-  healthy: "已通过",
-};
+const defaultClient = createPerfPilotClient();
 
-export function Dashboard({ data }: DashboardProps) {
-  const focusProblems = data.problems.slice(0, 3);
-  const conclusionTitle = `发现 ${focusProblems.length} 个需要关注的问题`;
+const emptySecondaryMetrics = [
+  { id: "smoothness", label: "页面流畅度" },
+  { id: "main-thread", label: "主线程响应" },
+  { id: "memory", label: "内存稳定性" },
+  { id: "cpu", label: "CPU 与调度" },
+] as const;
+
+export function Dashboard({
+  client = defaultClient,
+  pollDelay = wait,
+  latestReportLoader,
+  confirmCancel = () =>
+    window.confirm("确定取消当前分析吗？这会停止 SmartPerfetto 和后续 AI 分析。"),
+}: DashboardProps = {}) {
+  const [teamId, setTeamId] = useState<string | null>(null);
+  const [currentAnalysis, setCurrentAnalysis] = useState<AnalysisResponse | null>(null);
+  const [stale, setStale] = useState(false);
+  const [canceling, setCanceling] = useState(false);
+  const [cancelError, setCancelError] = useState<string | null>(null);
+  const [reportRefreshToken, setReportRefreshToken] = useState(0);
+  const [, setLatestSnapshot] = useState<LatestReportSnapshot | null>(null);
+  const cancelController = useRef<AbortController | null>(null);
+  const activeAnalysisId = useMemo(
+    () =>
+      currentAnalysis && activeStates.has(currentAnalysis.state)
+        ? currentAnalysis.analysis_id
+        : null,
+    [currentAnalysis],
+  );
+
+  useEffect(() => {
+    const controller = new AbortController();
+    void (async () => {
+      await client.csrf(controller.signal);
+      const me = await client.me(controller.signal);
+      const resolvedTeamId = me.memberships[0]?.team.id;
+      if (!resolvedTeamId) return;
+      const active = await client.activeAnalyses(resolvedTeamId, 1, controller.signal);
+      if (controller.signal.aborted) return;
+      setTeamId(resolvedTeamId);
+      setCurrentAnalysis(active.analyses[0] ?? null);
+      setStale(false);
+    })().catch(() => {
+      if (!controller.signal.aborted) setStale(true);
+    });
+    return () => controller.abort();
+  }, [client]);
+
+  useEffect(() => {
+    if (teamId === null || activeAnalysisId === null) return;
+    const controller = new AbortController();
+    void (async () => {
+      let delay = 2_000;
+      while (!controller.signal.aborted) {
+        await pollDelay(delay, controller.signal);
+        try {
+          const next = await client.analysis(
+            teamId,
+            activeAnalysisId,
+            controller.signal,
+          );
+          if (controller.signal.aborted) return;
+          setCurrentAnalysis(next);
+          setStale(false);
+          delay = 2_000;
+          if (!activeStates.has(next.state)) {
+            if (next.report_available) {
+              setReportRefreshToken((value) => value + 1);
+            }
+            return;
+          }
+        } catch (error) {
+          if (controller.signal.aborted) return;
+          if (!(error instanceof PerfPilotApiError) || !error.retryable) {
+            setStale(true);
+            return;
+          }
+          setStale(true);
+          delay = Math.min(delay * 2, 15_000);
+        }
+      }
+    })().catch(() => {
+      if (!controller.signal.aborted) setStale(true);
+    });
+    return () => controller.abort();
+  }, [activeAnalysisId, client, pollDelay, teamId]);
+
+  useEffect(() => {
+    if (currentAnalysis?.state !== "canceled") return;
+    const timer = window.setTimeout(() => {
+      setCurrentAnalysis((value) =>
+        value?.analysis_id === currentAnalysis.analysis_id ? null : value,
+      );
+    }, 3_000);
+    return () => window.clearTimeout(timer);
+  }, [currentAnalysis]);
+
+  useEffect(
+    () => () => {
+      cancelController.current?.abort();
+    },
+    [],
+  );
+
+  const handleSubmitted = useCallback((result: SubmittedTraceAnalysis) => {
+    setTeamId(result.teamId);
+    setCurrentAnalysis(result.analysis);
+    setStale(false);
+    setCancelError(null);
+  }, []);
+
+  const handleLatestSnapshot = useCallback(
+    (snapshot: LatestReportSnapshot | null) => setLatestSnapshot(snapshot),
+    [],
+  );
+
+  const handleCancel = useCallback(() => {
+    if (
+      teamId === null ||
+      currentAnalysis === null ||
+      !activeStates.has(currentAnalysis.state) ||
+      !confirmCancel()
+    ) {
+      return;
+    }
+    const controller = new AbortController();
+    cancelController.current?.abort();
+    cancelController.current = controller;
+    setCanceling(true);
+    setCancelError(null);
+    void client
+      .cancelAnalysis(teamId, currentAnalysis.analysis_id, controller.signal)
+      .then((next) => {
+        if (controller.signal.aborted) return;
+        setCurrentAnalysis(next);
+        if (next.report_available) setReportRefreshToken((value) => value + 1);
+      })
+      .catch(() => {
+        if (!controller.signal.aborted) {
+          setCancelError("取消请求未被服务端接受，请稍后重试。");
+        }
+      })
+      .finally(() => {
+        if (cancelController.current === controller) {
+          cancelController.current = null;
+          setCanceling(false);
+        }
+      });
+  }, [client, confirmCancel, currentAnalysis, teamId]);
 
   return (
     <div className="dashboard">
       <header className="page-header">
         <div className="page-header-copy">
-          <p className="page-eyebrow">
-            {data.app.name} · {data.app.version}
-          </p>
+          <p className="page-eyebrow">PerfPilot</p>
           <h1>性能总览</h1>
           <p className="page-subtitle">
-            快速了解当前版本的关键性能、用户影响与复现质量。
+            新建分析后，这里只展示真实采集和分析产生的结果。
           </p>
         </div>
-        <NewAnalysisDialog />
+        <NewAnalysisDialog
+          disabled={activeAnalysisId !== null}
+          onSubmitted={handleSubmitted}
+        />
       </header>
 
-      <section className="conclusion-hero" aria-labelledby="conclusion-title">
+      {currentAnalysis ? (
+        <ActiveAnalysisTaskCard
+          analysis={currentAnalysis}
+          canceling={canceling}
+          stale={stale}
+          cancelError={cancelError}
+          onCancel={handleCancel}
+        />
+      ) : null}
+
+      <LatestAnalysisReportEntry
+        loader={latestReportLoader}
+        refreshToken={reportRefreshToken}
+        onSnapshot={handleLatestSnapshot}
+      />
+
+      <section
+        className="conclusion-hero conclusion-hero-empty"
+        aria-labelledby="conclusion-title"
+      >
         <div className="conclusion-heading">
           <p className="section-label">本次结论</p>
-          <h2 id="conclusion-title">{conclusionTitle}</h2>
+          <h2 id="conclusion-title">等待首次分析</h2>
         </div>
-        <ul className="conclusion-problem-list">
-          {focusProblems.map((problem) => (
-            <li key={problem.id}>
-              <Link
-                className="conclusion-problem-link"
-                href={`/problems/${problem.id}`}
-              >
-                <span className="conclusion-problem-copy">
-                  <strong>{problem.title}</strong>
-                  <span>{problem.impactLabel}</span>
-                </span>
-                <ArrowRight aria-hidden="true" />
-              </Link>
-            </li>
-          ))}
-        </ul>
-        <Link className="all-problems-link" href="/problems">
-          查看问题
-          <ArrowRight aria-hidden="true" />
-        </Link>
+        <div className="conclusion-empty-copy">
+          <strong>暂无分析结论</strong>
+          <p>完成一次 Trace 分析后，这里会显示最需要关注的问题。</p>
+        </div>
+        <span className="all-problems-link is-disabled" aria-disabled="true">
+          暂无问题
+        </span>
       </section>
 
       <section className="core-overview" aria-labelledby="core-overview-title">
@@ -75,60 +260,43 @@ export function Dashboard({ data }: DashboardProps) {
           <h2 id="core-overview-title">核心表现</h2>
         </header>
 
-        <div className="core-overview-panel">
+        <div className="core-overview-panel is-empty">
           <article className="startup-overview">
             <header className="metric-heading">
               <div>
                 <p className="metric-category">主要指标</p>
                 <h3>启动体验</h3>
               </div>
-              <span
-                className={`metric-state metric-state-${data.startup.state}`}
-              >
-                {metricStateLabels[data.startup.state]}
-              </span>
+              <span className="metric-state metric-state-missing">未分析</span>
             </header>
 
             <div className="startup-result">
-              <p className="startup-value">{data.startup.value}</p>
+              <p className="startup-value empty-metric-value">—</p>
               <p className="startup-target">
-                目标 <strong>{data.startup.target}</strong>
+                目标 <strong>—</strong>
               </p>
             </div>
-            <p className="metric-context">{data.startup.context}</p>
+            <p className="metric-context">暂无启动数据</p>
 
             <dl className="startup-breakdown">
-              <div className="startup-breakdown-item">
-                <dt>冷启动</dt>
-                <dd>{data.startup.cold}</dd>
-              </div>
-              <div className="startup-breakdown-item">
-                <dt>温启动</dt>
-                <dd>{data.startup.warm}</dd>
-              </div>
-              <div className="startup-breakdown-item">
-                <dt>热启动</dt>
-                <dd>{data.startup.hot}</dd>
-              </div>
+              {(["冷启动", "温启动", "热启动"] as const).map((label) => (
+                <div className="startup-breakdown-item" key={label}>
+                  <dt>{label}</dt>
+                  <dd>—</dd>
+                </div>
+              ))}
             </dl>
           </article>
 
           <div className="secondary-metrics" aria-label="其他核心指标">
-            {data.secondaryMetrics.map((metric) => (
+            {emptySecondaryMetrics.map((metric) => (
               <article className="secondary-metric" key={metric.id}>
                 <header className="secondary-metric-heading">
                   <h3>{metric.label}</h3>
-                  <span
-                    className={`metric-state metric-state-${metric.state}`}
-                  >
-                    {metricStateLabels[metric.state]}
-                  </span>
+                  <span className="metric-state metric-state-missing">未分析</span>
                 </header>
-                <p className="secondary-metric-value">
-                  <span>{metric.value}</span>{" "}
-                  <span className="secondary-metric-unit">{metric.unit}</span>
-                </p>
-                <p className="metric-context">{metric.context}</p>
+                <p className="secondary-metric-value empty-metric-value">—</p>
+                <p className="metric-context">暂无数据</p>
               </article>
             ))}
           </div>
@@ -140,49 +308,29 @@ export function Dashboard({ data }: DashboardProps) {
           <h2 id="focus-title">本次重点</h2>
         </header>
         <div className="focus-card-grid">
-          {focusProblems.map((problem) => (
-            <article className="focus-card" key={problem.id}>
-              <div className="focus-card-meta">
-                <span
-                  className={`priority-label priority-${problem.severity}`}
-                >
-                  {priorityLabels[problem.severity]}
-                </span>
-                <span className="problem-status">{problem.status}</span>
-              </div>
-              <h3>{problem.title}</h3>
-              <p className="focus-card-summary">{problem.summary}</p>
-              <div className="focus-card-footer">
-                <span className="confidence">
-                  可信度 {problem.confidence}%
-                </span>
-                <Link
-                  className="focus-card-link"
-                  href={`/problems/${problem.id}`}
-                  aria-label={`查看${problem.title}详情`}
-                >
-                  查看详情
-                  <ArrowRight aria-hidden="true" />
-                </Link>
-              </div>
-            </article>
-          ))}
+          <article className="focus-card focus-card-empty">
+            <span className="problem-status">等待分析</span>
+            <h3>暂无重点问题</h3>
+            <p className="focus-card-summary">
+              分析完成后，优先级最高的问题和优化方向会显示在这里。
+            </p>
+          </article>
         </div>
       </section>
 
       <section
-        className="data-credibility"
+        className="data-credibility is-empty"
         aria-labelledby="credibility-title"
       >
         <div className="credibility-copy">
           <h2 id="credibility-title">数据可信度</h2>
-          <p>结论可在相同设备、构建和场景下复现。</p>
+          <p>完成首次采集后生成可信度信息。</p>
         </div>
         <ul className="credibility-facts">
-          <li>{data.credibility.runs} 轮有效采集</li>
-          <li>{data.credibility.deviceConsistency}</li>
-          <li>{data.credibility.thermalState}</li>
-          <li>{data.credibility.failures} 次采样失败</li>
+          <li>有效采集 —</li>
+          <li>设备一致性 —</li>
+          <li>温控状态 —</li>
+          <li>采样失败 —</li>
         </ul>
       </section>
     </div>

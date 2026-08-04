@@ -109,6 +109,86 @@ function reportPayload(): Record<string, unknown> {
 }
 
 describe("PerfPilot browser API", () => {
+  it("lists only validated report-bearing analyses for the requested team", async () => {
+    const latest = {
+      ...analysis("completed"),
+      report_available: true,
+      created_at: "2026-08-04T08:00:00+00:00",
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", analyses: [latest] }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", analyses: [] }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          schema_version: "1.0",
+          analyses: [{ ...latest, created_at: undefined }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          schema_version: "1.0",
+          analyses: [{ ...latest, team_id: "another-team" }],
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          schema_version: "1.0",
+          analyses: [{ ...latest, report_available: false }],
+        }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.analyses(TEAM_ID, 1)).resolves.toEqual({
+      schema_version: "1.0",
+      analyses: [latest],
+    });
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      `/api/v1/teams/${TEAM_ID}/analyses?report_available=true&limit=1`,
+      expect.objectContaining({ credentials: "same-origin", redirect: "error" }),
+    );
+    await expect(client.analyses(TEAM_ID, 1)).resolves.toEqual({
+      schema_version: "1.0",
+      analyses: [],
+    });
+    await expect(client.analyses(TEAM_ID, 1)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.analyses(TEAM_ID, 1)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.analyses(TEAM_ID, 1)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
+  it("reads the current local ADB device instead of dashboard fixture data", async () => {
+    const payload = {
+      schema_version: "1.0",
+      state: "connected",
+      device: {
+        serial: "0123456789ABCDEF",
+        manufacturer: "UNISOC",
+        model: "uis7870_2h10_car_c200_6",
+        name: "UNISOC uis7870_2h10_car_c200_6",
+        os: "Android 13",
+        api_level: 33,
+      },
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(payload));
+
+    await expect(createPerfPilotClient({ fetcher }).device()).resolves.toEqual(payload);
+    expect(fetcher).toHaveBeenCalledWith(
+      "/api/v1/device",
+      expect.objectContaining({ credentials: "same-origin", redirect: "error" }),
+    );
+  });
+
   it("hashes streams incrementally without calling File.arrayBuffer", async () => {
     const file = new File([new Uint8Array([1, 2, 3])], "trace.pb");
     Object.defineProperty(file, "arrayBuffer", {
@@ -122,7 +202,7 @@ describe("PerfPilot browser API", () => {
     );
   });
 
-  it("creates exact slots uploads directly finalizes and polls one Trace analysis", async () => {
+  it("returns after upload acceptance without polling the Trace to a terminal state", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     let statusReads = 0;
     const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
@@ -203,6 +283,7 @@ describe("PerfPilot browser API", () => {
       type: "text/plain",
     });
 
+    const sleep = vi.fn(async () => undefined);
     const result = await submitTraceAnalysis(
       {
         profile: "scroll",
@@ -215,11 +296,11 @@ describe("PerfPilot browser API", () => {
       {
         client,
         randomUUID: () => "trace-analysis-fixed",
-        sleep: async () => undefined,
+        sleep,
       },
     );
 
-    expect(result.analysis.state).toBe("completed");
+    expect(result.analysis.state).toBe("analyzing");
     expect(result.analysis.analysis_id).toBe(ANALYSIS_ID);
     const create = calls.find(
       (call) => call.url.endsWith("/analyses") && call.init.method === "POST",
@@ -252,7 +333,8 @@ describe("PerfPilot browser API", () => {
       }),
     );
     expect(puts[0].init.credentials).toBe("omit");
-    expect(statusReads).toBe(2);
+    expect(statusReads).toBe(1);
+    expect(sleep).not.toHaveBeenCalled();
     const statusCalls = calls.filter((call) => call.url.endsWith(`/analyses/${ANALYSIS_ID}`));
     expect(
       statusCalls.every(
@@ -261,13 +343,129 @@ describe("PerfPilot browser API", () => {
     ).toBe(true);
   });
 
+  it("queries the active analysis and sends an authenticated cancel request", async () => {
+    const active = {
+      ...analysis("analyzing"),
+      created_at: "2026-08-04T08:00:00+00:00",
+      cancel_requested_at: null,
+    };
+    const canceled = {
+      ...active,
+      state: "canceled",
+      cancel_requested_at: "2026-08-04T08:01:00+00:00",
+      stages: active.stages.map((stage) =>
+        stage.state === "completed" ? stage : { ...stage, state: "canceled" },
+      ),
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", analyses: [active] }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", csrf_token: "csrf-cancel" }),
+      )
+      .mockResolvedValueOnce(Response.json(canceled, { status: 202 }));
+    const client = createPerfPilotClient({ fetcher });
+    const activeClient = client as typeof client & {
+      activeAnalyses(
+        teamId: string,
+        limit?: number,
+      ): Promise<{ schema_version: "1.0"; analyses: readonly AnalysisResponse[] }>;
+      cancelAnalysis(teamId: string, analysisId: string): Promise<AnalysisResponse>;
+    };
+
+    await expect(activeClient.activeAnalyses(TEAM_ID, 1)).resolves.toEqual({
+      schema_version: "1.0",
+      analyses: [active],
+    });
+    await client.csrf();
+    await expect(
+      activeClient.cancelAnalysis(TEAM_ID, ANALYSIS_ID),
+    ).resolves.toMatchObject({ state: "canceled" });
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      1,
+      `/api/v1/teams/${TEAM_ID}/analyses?status=active&limit=1`,
+      expect.objectContaining({ credentials: "same-origin", redirect: "error" }),
+    );
+    const cancelCall = fetcher.mock.calls[2];
+    expect(cancelCall?.[0]).toBe(
+      `/api/v1/teams/${TEAM_ID}/analyses/${ANALYSIS_ID}/cancel`,
+    );
+    expect(cancelCall?.[1]?.method).toBe("POST");
+    expect(new Headers(cancelCall?.[1]?.headers).get("x-csrf-token")).toBe(
+      "csrf-cancel",
+    );
+  });
+
+  it("accepts local loopback upload authorization without allowing remote plain HTTP", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response(null, { status: 200 }),
+    );
+    const client = createPerfPilotClient({ fetcher });
+    const input = {
+      kind: "trace" as const,
+      file: new File([new Uint8Array([1, 2, 3])], "local.trace"),
+      mime: "application/octet-stream",
+      size: 3,
+      sha256_b64: "A5BYxvLAy0ksUzsKTRTvd8wPeKvMztUofYShogEc+4E=",
+    };
+    const upload = {
+      schema_version: "1.0" as const,
+      upload: {
+        state: "pending" as const,
+        upload_id: "local-upload",
+        artifact_kind: "trace" as const,
+        mime: input.mime,
+        size: input.size,
+        sha256_b64: input.sha256_b64,
+        put_url: "http://localhost:8000/local/v1/uploads/local-upload?token=local-token",
+        required_headers: {
+          "Content-Type": input.mime,
+          "x-amz-checksum-sha256": input.sha256_b64,
+        },
+      },
+    };
+
+    await expect(client.putInput(upload, input)).resolves.toBeUndefined();
+    expect(fetcher).toHaveBeenCalledTimes(1);
+
+    const remote = structuredClone(upload);
+    remote.upload.put_url =
+      "http://192.0.2.10:8000/local/v1/uploads/local-upload?token=local-token";
+    await expect(client.putInput(remote, input)).rejects.toMatchObject({
+      code: "invalid_upload_authorization",
+    });
+    expect(fetcher).toHaveBeenCalledTimes(1);
+  });
+
   it("reads the exact four server stages and rejects a reordered stage list", async () => {
     const valid = analysis("completed");
+    const local = {
+      ...valid,
+      ai_rounds: [
+        { round: 1, role: "extract", state: "completed", attempts: 1 },
+        { round: 2, role: "review", state: "completed", attempts: 1 },
+        { round: 3, role: "finalize", state: "completed", attempts: 1 },
+      ],
+      source_analysis: {
+        engine: "smartperfetto",
+        rounds: 53,
+        verification: "passed",
+        session_id: "agent-session-1",
+        run_id: "run-session-1",
+      },
+    };
     const fetcher = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(Response.json(valid))
       .mockResolvedValueOnce(
         Response.json({ ...valid, stages: [...valid.stages].reverse() }),
+      )
+      .mockResolvedValueOnce(Response.json(local))
+      .mockResolvedValueOnce(
+        Response.json({ ...local, ai_rounds: [...local.ai_rounds].reverse() }),
       );
     const client = createPerfPilotClient({ fetcher });
 
@@ -278,6 +476,17 @@ describe("PerfPilot browser API", () => {
         { stage: "perfpilot_ai", state: "completed" },
         { stage: "report", state: "completed" },
       ],
+    });
+    await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      ai_rounds: [
+        { round: 1, role: "extract", state: "completed" },
+        { round: 2, role: "review", state: "completed" },
+        { round: 3, role: "finalize", state: "completed" },
+      ],
+      source_analysis: { engine: "smartperfetto", rounds: 53 },
     });
     await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
       code: "invalid_api_response",

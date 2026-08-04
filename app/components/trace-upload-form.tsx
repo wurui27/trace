@@ -4,8 +4,8 @@ import { useEffect, useRef, useState, type FormEvent } from "react";
 import { ShieldCheck } from "lucide-react";
 
 import {
+  enqueueTraceAnalysis,
   PerfPilotApiError,
-  submitTraceAnalysis,
   type SubmitTraceInput,
   type SubmittedTraceAnalysis,
   type TraceInputKind,
@@ -20,6 +20,7 @@ export type TraceSubmitter = (
 interface TraceUploadFormProps {
   readonly submitter?: TraceSubmitter;
   readonly onCancel?: () => void;
+  readonly onSubmitted?: (result: SubmittedTraceAnalysis) => void;
 }
 
 const phaseText: Record<TraceSubmissionPhase, string> = {
@@ -27,24 +28,8 @@ const phaseText: Record<TraceSubmissionPhase, string> = {
   hashing: "正在校验文件完整性…",
   creating: "正在创建分析任务…",
   uploading: "正在安全上传文件…",
-  analyzing: "SmartPerfetto 正在分析",
-  completed: "分析流程已结束",
+  submitted: "任务已提交，正在切换到后台分析…",
 };
-
-const stateText = {
-  completed: "分析已完成",
-  partially_completed: "分析完成，部分证据不足",
-  failed: "分析未能完成",
-  canceled: "分析已取消",
-  deleted: "分析已删除",
-  analyzing: "SmartPerfetto 正在分析",
-  running: "SmartPerfetto 正在分析",
-  creating: "正在创建分析任务",
-  created: "等待上传",
-  uploading: "正在上传",
-  queued: "等待分析",
-  scheduled: "等待分析",
-} as const;
 
 function errorText(error: unknown): string {
   if (error instanceof PerfPilotApiError) {
@@ -56,7 +41,11 @@ function errorText(error: unknown): string {
       team_required: "当前账号尚未加入可用团队。",
       object_upload_failed: "文件上传失败，请重试。",
       upload_authorization_expired: "上传授权已过期，请重新提交。",
+      invalid_upload_authorization: "上传授权无效，请重新提交。",
       network_unavailable: "网络连接不可用，请稍后重试。",
+      proxy_configuration_invalid: "本地分析服务未配置或未启动，请先启动本地服务。",
+      upstream_unavailable: "本地分析服务当前不可用，请确认服务已启动。",
+      upstream_timeout: "本地分析服务响应超时，请稍后重试。",
     };
     return messages[error.code] ?? "分析暂时无法启动，请稍后重试。";
   }
@@ -64,8 +53,9 @@ function errorText(error: unknown): string {
 }
 
 export function TraceUploadForm({
-  submitter = submitTraceAnalysis,
+  submitter = enqueueTraceAnalysis,
   onCancel,
+  onSubmitted,
 }: TraceUploadFormProps) {
   const [profile, setProfile] = useState<TraceProfile>("auto");
   const [question, setQuestion] = useState("");
@@ -73,9 +63,8 @@ export function TraceUploadForm({
   const [phase, setPhase] = useState<TraceSubmissionPhase | null>(null);
   const [phaseDetail, setPhaseDetail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<SubmittedTraceAnalysis | null>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const busy = phase !== null && result === null && error === null;
+  const busy = phase !== null && error === null;
 
   useEffect(
     () => () => {
@@ -95,7 +84,6 @@ export function TraceUploadForm({
       return next;
     });
     setError(null);
-    setResult(null);
   };
 
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
@@ -107,7 +95,6 @@ export function TraceUploadForm({
     abortRef.current?.abort();
     abortRef.current = controller;
     setError(null);
-    setResult(null);
     setPhase("session");
     setPhaseDetail(null);
     try {
@@ -125,9 +112,9 @@ export function TraceUploadForm({
           setPhaseDetail(detail ?? null);
         },
       });
-      setResult(submitted);
-      setPhase("completed");
+      setPhase(null);
       setPhaseDetail(null);
+      onSubmitted?.(submitted);
     } catch (caught) {
       if (controller.signal.aborted) {
         setPhase(null);
@@ -149,7 +136,7 @@ export function TraceUploadForm({
     onCancel?.();
   };
 
-  const disabled = busy || result !== null;
+  const disabled = busy;
 
   return (
     <form
@@ -270,7 +257,7 @@ export function TraceUploadForm({
           </div>
         </div>
 
-        {phase && !result ? (
+        {phase ? (
           <div className="trace-upload-status" role="status" aria-live="polite">
             <span className="trace-upload-status-dot" aria-hidden="true" />
             <span>
@@ -280,14 +267,6 @@ export function TraceUploadForm({
           </div>
         ) : null}
         {error ? <p className="trace-upload-error" role="alert">{error}</p> : null}
-        {result ? (
-          <div className="trace-upload-result" role="status" aria-live="polite">
-            <strong>{stateText[result.analysis.state]}</strong>
-            <span>分析编号</span>
-            <code>{result.analysis.analysis_id}</code>
-            <a href={`/analyses/${result.analysis.analysis_id}`}>查看分析进度</a>
-          </div>
-        ) : null}
       </div>
 
       <footer className="new-analysis-dialog-footer">
@@ -304,7 +283,7 @@ export function TraceUploadForm({
             className="primary-action"
             disabled={!files.trace || disabled}
           >
-            {busy ? "处理中…" : result ? "已提交" : "开始分析"}
+            {busy ? "处理中…" : "开始分析"}
           </button>
         </div>
       </footer>
