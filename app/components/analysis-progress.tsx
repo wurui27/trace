@@ -1,6 +1,8 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
+import { ArrowUpRight } from "lucide-react";
+import Link from "next/link";
 
 import { AnalysisReportView } from "./analysis-report";
 import {
@@ -423,11 +425,23 @@ export function AnalysisProgressView({
       ) : null}
       </article>
       {report ? (
-        <AnalysisReportView
-          report={report}
-          onRetrySynthesis={onRetrySynthesis}
-          retrying={retrying}
-        />
+        <>
+          <section className="analysis-report-entry" aria-label="最终报告入口">
+            <div>
+              <strong>最终性能报告已生成</strong>
+              <p>在独立页面查看完整证据、AI 结论、优化建议与复测计划。</p>
+            </div>
+            <Link href={`/analyses/${analysis.analysis_id}/report`}>
+              打开完整报告
+              <ArrowUpRight aria-hidden="true" />
+            </Link>
+          </section>
+          <AnalysisReportView
+            report={report}
+            onRetrySynthesis={onRetrySynthesis}
+            retrying={retrying}
+          />
+        </>
       ) : analysis.report_available && reportLoadFailed ? (
         <section className="analysis-report-load-state is-error" role="alert">
           <h2>报告暂时无法读取</h2>

@@ -31,6 +31,17 @@ const confidenceLabels = {
   low: "低可信",
   none: "无可信度",
 } as const;
+const primaryMetricLimit = 8;
+
+function plainReportText(value: string): string {
+  return value
+    .replace(/\[([^\]]+)\]\([^\s)]+\)/g, "$1")
+    .replace(/(\*\*|__)(.*?)\1/g, "$2")
+    .replace(/`{1,3}([^`\n]+)`{1,3}/g, "$1")
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    .replace(/~~(.*?)~~/g, "$1")
+    .trim();
+}
 
 function metricValue(metric: ReportMetric): string | null {
   if (metric.status !== "available" || metric.numeric_value === null) return null;
@@ -53,8 +64,7 @@ function evidenceCopy(evidence: ReportEvidence): string {
     evidence.interval_start_ns === null || evidence.interval_end_ns === null
       ? null
       : `${evidence.interval_start_ns} 至 ${evidence.interval_end_ns} ns`;
-  const fields = Object.keys(evidence.fields).length > 0 ? JSON.stringify(evidence.fields) : null;
-  return [evidence.source, evidence.query_id, interval, fields].filter(Boolean).join(" · ");
+  return [evidence.source, evidence.query_id, interval].filter(Boolean).join(" · ");
 }
 
 export function AnalysisReportView({
@@ -68,6 +78,12 @@ export function AnalysisReportView({
   const metrics = bundles.flatMap(({ scenario, bundle }) =>
     bundle.metrics.map((metric) => ({ scenario, metric })),
   );
+  const availableMetrics = metrics.flatMap(({ scenario, metric }) => {
+    const value = metricValue(metric);
+    return value === null ? [] : [{ scenario, metric, value }];
+  });
+  const primaryMetrics = availableMetrics.slice(0, primaryMetricLimit);
+  const additionalMetrics = availableMetrics.slice(primaryMetricLimit);
   const coreFindings = bundles.flatMap(({ bundle }) => bundle.findings);
   const findingsById = new Map(coreFindings.map((finding) => [finding.finding_id, finding]));
   const evidenceById = new Map(
@@ -133,7 +149,7 @@ export function AnalysisReportView({
         <section className="analysis-report-section analysis-report-summary" aria-labelledby="report-summary-title">
           <p className="section-label">PERFPILOT CONCLUSION</p>
           <h2 id="report-summary-title">执行摘要</h2>
-          <p>{output.executive_summary}</p>
+          <p>{plainReportText(output.executive_summary)}</p>
         </section>
       ) : null}
 
@@ -146,20 +162,30 @@ export function AnalysisReportView({
           <span>{visibleFindings.length} 项</span>
         </div>
 
-        {metrics.some(({ metric }) => metricValue(metric) !== null) ? (
-          <dl className="analysis-report-metrics" aria-label="场景指标">
-            {metrics.flatMap(({ scenario, metric }) => {
-              const value = metricValue(metric);
-              return value === null
-                ? []
-                : [
+        {availableMetrics.length > 0 ? (
+          <>
+            <dl className="analysis-report-metrics" aria-label="关键场景指标">
+              {primaryMetrics.map(({ scenario, metric, value }) => (
+                <div key={metric.metric_id}>
+                  <dt>{scenarioLabels[scenario]} · {plainReportText(metric.definition)}</dt>
+                  <dd>{value}</dd>
+                </div>
+              ))}
+            </dl>
+            {additionalMetrics.length > 0 ? (
+              <details className="analysis-report-metric-details">
+                <summary>另有 {additionalMetrics.length} 项原始指标</summary>
+                <dl className="analysis-report-metrics" aria-label="其余场景指标">
+                  {additionalMetrics.map(({ scenario, metric, value }) => (
                     <div key={metric.metric_id}>
-                      <dt>{scenarioLabels[scenario]} · {metric.definition}</dt>
+                      <dt>{scenarioLabels[scenario]} · {plainReportText(metric.definition)}</dt>
                       <dd>{value}</dd>
-                    </div>,
-                  ];
-            })}
-          </dl>
+                    </div>
+                  ))}
+                </dl>
+              </details>
+            ) : null}
+          </>
         ) : null}
 
         {visibleFindings.length > 0 ? (
@@ -170,9 +196,9 @@ export function AnalysisReportView({
                   <span className={`is-${finding.severity}`}>{severityLabels[finding.severity]}</span>
                   <span>{confidenceLabels[finding.confidence]}</span>
                 </div>
-                <h3>{finding.title}</h3>
-                <p>{finding.summary}</p>
-                {userImpact ? <p className="analysis-user-impact">用户影响：{userImpact}</p> : null}
+                <h3>{plainReportText(finding.title)}</h3>
+                <p>{plainReportText(finding.summary)}</p>
+                {userImpact ? <p className="analysis-user-impact">用户影响：{plainReportText(userImpact)}</p> : null}
                 {evidenceIds.length > 0 ? (
                   <div className="analysis-reference-list" aria-label="关联证据">
                     {evidenceIds.map((evidenceId, index) => (
@@ -191,10 +217,16 @@ export function AnalysisReportView({
 
         {visibleEvidence.length > 0 ? (
           <div className="analysis-report-evidence" aria-label="问题证据">
-            {visibleEvidence.map((evidence) => (
+            {visibleEvidence.map((evidence, index) => (
               <div id={`evidence-${evidence.evidence_id}`} key={evidence.evidence_id}>
-                <strong>证据</strong>
+                <strong>证据 {index + 1}</strong>
                 <p>{evidenceCopy(evidence)}</p>
+                {Object.keys(evidence.fields).length > 0 ? (
+                  <details>
+                    <summary>查看原始字段</summary>
+                    <pre>{JSON.stringify(evidence.fields, null, 2)}</pre>
+                  </details>
+                ) : null}
               </div>
             ))}
           </div>
@@ -212,9 +244,9 @@ export function AnalysisReportView({
                   {recommendation.priority.toUpperCase()}
                 </span>
                 <div>
-                  <h3>{recommendation.title}</h3>
-                  <p>{recommendation.action}</p>
-                  <p className="analysis-expected-effect">预期效果：{recommendation.expected_effect}</p>
+                  <h3>{plainReportText(recommendation.title)}</h3>
+                  <p>{plainReportText(recommendation.action)}</p>
+                  <p className="analysis-expected-effect">预期效果：{plainReportText(recommendation.expected_effect)}</p>
                   <div className="analysis-reference-list" aria-label="建议依据">
                     {recommendation.finding_ids.map((findingId) => (
                       <a href={`#finding-${findingId}`} key={findingId}>关联问题</a>
@@ -240,7 +272,7 @@ export function AnalysisReportView({
                 <span>{index + 1}</span>
                 <div>
                   <strong>{scenarioLabels[item.scenario_type]}</strong>
-                  <p>{item.steps}</p>
+                  <p>{plainReportText(item.steps)}</p>
                   <small>
                     {item.mode === "verify_metric" ? "验证现有指标与阈值" : "补齐缺失证据"}
                   </small>
@@ -256,7 +288,7 @@ export function AnalysisReportView({
         <h2 id="report-limitations-title">限制与缺失证据</h2>
         {limitations.length > 0 ? (
           <ul className="analysis-limitation-list">
-            {limitations.map((limitation, index) => <li key={`${limitation}-${index}`}>{limitation}</li>)}
+            {limitations.map((limitation, index) => <li key={`${limitation}-${index}`}>{plainReportText(limitation)}</li>)}
           </ul>
         ) : (
           <p className="analysis-report-empty">当前报告未标记限制。</p>

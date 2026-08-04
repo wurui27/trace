@@ -213,6 +213,20 @@ describe("AnalysisProgress", () => {
     expect(screen.queryByText("首页启动慢")).not.toBeInTheDocument();
   });
 
+  it("offers a direct entry to the dedicated final report", () => {
+    render(
+      <AnalysisProgressView
+        analysis={analysis("completed", "analysis-live-1")}
+        report={failedReport()}
+      />,
+    );
+
+    expect(screen.getByRole("link", { name: "打开完整报告" })).toHaveAttribute(
+      "href",
+      "/analyses/analysis-live-1/report",
+    );
+  });
+
   it("uses a fresh idempotency key and resumes loading after an AI-only rerun", async () => {
     const user = userEvent.setup();
     let loadCount = 0;

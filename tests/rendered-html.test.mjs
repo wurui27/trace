@@ -22,7 +22,7 @@ async function render(path = "/") {
   );
 }
 
-test("server-renders the PerfPilot dashboard", async () => {
+test("server-renders a clean PerfPilot dashboard without demo analysis data", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -37,82 +37,63 @@ test("server-renders the PerfPilot dashboard", async () => {
     html,
     /<meta[^>]+property="og:image"[^>]+content="http:\/\/localhost\/og\.png"/,
   );
+  assert.match(
+    html,
+    /<link[^>]+rel="icon"[^>]+href="(?:http:\/\/localhost)?\/favicon\.svg"/,
+  );
   assert.match(html, /PerfPilot/);
-  assert.match(html, /发现 3 个需要关注的问题/);
-  assert.match(html, /启动体验/);
-  assert.match(html, /数据可信度/);
+  assert.match(html, /最新分析报告/);
+  assert.match(html, /正在读取最新报告/);
+  assert.match(html, /新建分析/);
+  assert.match(html, /尚未选择应用/);
+  assert.match(html, /ray_wu/);
+  assert.doesNotMatch(html, /林墨/);
+  for (const placeholder of [
+    "本次结论",
+    "等待首次分析",
+    "核心表现",
+    "启动体验",
+    "页面流畅度",
+    "主线程响应",
+    "内存稳定性",
+    "CPU 与调度",
+    "本次重点",
+    "暂无重点问题",
+    "数据可信度",
+  ]) {
+    assert.ok(
+      html.includes(placeholder),
+      `expected empty dashboard to retain "${placeholder}"`,
+    );
+  }
+  assert.doesNotMatch(html, /928295d3-a73a-5c53-93e5-e24debb21b6c/);
+  assert.doesNotMatch(html, /Acme Gallery/);
+  assert.doesNotMatch(html, /Pixel 8/);
+  assert.doesNotMatch(html, /1\.42 s/);
+  assert.doesNotMatch(html, /发现 3 个需要关注的问题/);
+  assert.doesNotMatch(html, /首页启动慢/);
 });
 
-test("server-renders a performance problem evidence detail", async () => {
+test("does not expose old demo performance-problem details", async () => {
   const response = await render("/problems/startup-main-thread");
-  assert.equal(response.status, 200);
-
-  const html = await response.text();
-  const expectedEvidenceStages = [
-    "确认症状",
-    "锁定场景窗口",
-    "确认线程状态",
-    "追踪依赖",
-    "排除系统条件",
-  ];
-
-  for (const text of [
-    "首页启动慢",
-    "用户平均要多等待 217 ms 才看到首页",
-    "影响首屏 217 ms",
-    "结论",
-    "5 个有效样本",
-    "复现 4 / 5 轮",
-    "CV 4.8%",
-    "证据链",
-    "确认症状",
-    "锁定场景窗口",
-    "确认线程状态",
-    "追踪依赖",
-    "排除系统条件",
-    "优化建议",
-    "源码位置",
-    "验收标准",
-    "同条件复测",
-  ]) {
-    assert.ok(html.includes(text), `expected HTML to contain "${text}"`);
-  }
-
-  const visibleEvidenceStages = Array.from(
-    html.matchAll(/<h3\b[^>]*>([^<]+)<\/h3>/g),
-    (match) => match[1],
-  ).filter((heading) => expectedEvidenceStages.includes(heading));
-  assert.deepEqual(visibleEvidenceStages, expectedEvidenceStages);
-
-  const perfettoButtons = Array.from(
-    html.matchAll(
-      /<button\b[^>]*aria-label="在 Perfetto 中查看：([^"]+)（待接入）"[^>]*>/g,
-    ),
-  );
-  assert.equal(perfettoButtons.length, 5);
-  assert.deepEqual(
-    perfettoButtons.map((match) => match[1]),
-    expectedEvidenceStages,
-  );
-  assert.equal(
-    new Set(perfettoButtons.map((match) => match[1])).size,
-    perfettoButtons.length,
-  );
-  for (const [buttonTag] of perfettoButtons) {
-    assert.match(buttonTag, /\sdisabled(?:=""|(?=\s|>))/);
-  }
-
-  const retestButton = html.match(
-    /<button\b[^>]*aria-describedby="[^"]+"[^>]*>/,
-  );
-  assert.ok(retestButton, "expected a retest button with aria-describedby");
-  assert.match(retestButton[0], /\sdisabled(?:=""|(?=\s|>))/);
+  assert.equal(response.status, 404);
 });
 
 test("returns 404 for an unknown performance problem", async () => {
   const response = await render("/problems/not-a-real-problem");
 
   assert.equal(response.status, 404);
+});
+
+test("keeps unfinished navigation pages free of demo application data", async () => {
+  for (const path of ["/tests", "/scenarios", "/problems", "/comparisons"]) {
+    const response = await render(path);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, /尚未选择应用/);
+    assert.doesNotMatch(html, /Acme Gallery/);
+    assert.doesNotMatch(html, /Pixel 8/);
+  }
 });
 
 test("server-renders the live analysis route without demo findings", async () => {
@@ -126,4 +107,15 @@ test("server-renders the live analysis route without demo findings", async () =>
   assert.doesNotMatch(html, /Acme Gallery/);
   assert.doesNotMatch(html, /执行摘要/);
   assert.doesNotMatch(html, /重新生成 AI 建议/);
+});
+
+test("server-renders the dedicated final report route without demo content", async () => {
+  const response = await render("/analyses/analysis-live-1/report");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /正在读取最终报告/);
+  assert.match(html, /返回分析进度/);
+  assert.doesNotMatch(html, /首页启动慢/);
+  assert.doesNotMatch(html, /Acme Gallery/);
 });

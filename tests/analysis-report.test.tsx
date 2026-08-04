@@ -18,12 +18,19 @@ const EVIDENCE_IDS = Array.from(
   { length: 6 },
   (_, index) => `86000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
 );
+const METRIC_IDS = Array.from(
+  { length: 10 },
+  (_, index) => `84000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+);
 
 function report(synthesisState: "completed" | "failed" = "completed"): AnalysisReport {
   const findings: ReportFinding[] = FINDING_IDS.map((findingId, index) => ({
     finding_id: findingId,
     title: `真实问题 ${index + 1}`,
-    summary: index === 0 ? "主线程包含 <em>同步等待</em>。" : `来自内核的问题 ${index + 1}。`,
+    summary:
+      index === 0
+        ? "**描述**：主线程包含 `<em>同步等待</em>`。"
+        : `来自内核的问题 ${index + 1}。`,
     severity: index === 0 ? "critical" : "warning",
     confidence: "high",
     evidence_ids: [EVIDENCE_IDS[index]],
@@ -51,17 +58,17 @@ function report(synthesisState: "completed" | "failed" = "completed"): AnalysisR
         device_group_id: null,
         device_group_reason: "not_applicable",
         bundle: {
-          metrics: [
-            {
-              metric_id: "84000000-0000-4000-8000-000000000001",
+          metrics: METRIC_IDS.map((metricId, index) =>
+            ({
+              metric_id: metricId,
               name: "startup.time_to_initial_display_ms",
               status: "available",
-              numeric_value: 812.4,
+              numeric_value: index === 0 ? 812.4 : 100 + index,
               unit: "ms",
-              definition: "首帧显示耗时",
+              definition: index === 0 ? "首帧显示耗时" : `辅助指标 ${index + 1}`,
               threshold: { operator: "lte", value: 700, unit: "ms" },
-            },
-          ],
+            }),
+          ),
           findings,
           evidence,
         },
@@ -74,7 +81,7 @@ function report(synthesisState: "completed" | "failed" = "completed"): AnalysisR
             state: "completed",
             output: {
               schema_version: "1.0",
-              executive_summary: "启动耗时超过现有阈值，主要证据指向主线程同步等待。",
+              executive_summary: "**启动耗时**超过现有阈值，主要证据指向主线程同步等待。",
               top_findings: FINDING_IDS.map((findingId, index) => ({
                 finding_id: findingId,
                 evidence_ids: [EVIDENCE_IDS[index]],
@@ -164,6 +171,7 @@ describe("AnalysisReportView", () => {
       "限制与缺失证据",
     ]);
     expect(screen.getByText("812.4 ms")).toBeInTheDocument();
+    expect(screen.getByText("另有 2 项原始指标").closest("details")).not.toHaveAttribute("open");
     expect(screen.getByText("真实问题 1")).toBeInTheDocument();
     expect(screen.getByText("真实问题 5")).toBeInTheDocument();
     expect(screen.queryByText("真实问题 6")).not.toBeInTheDocument();
@@ -179,7 +187,9 @@ describe("AnalysisReportView", () => {
     expect(document.getElementById(`evidence-${EVIDENCE_IDS[0]}`)).toBeInTheDocument();
     expect(container.querySelector(`a[href="#evidence-${EVIDENCE_IDS[0]}"]`)).toBeInTheDocument();
     expect(container.querySelector("em")).not.toBeInTheDocument();
-    expect(screen.getByText("主线程包含 <em>同步等待</em>。")).toBeInTheDocument();
+    expect(screen.getByText("启动耗时超过现有阈值，主要证据指向主线程同步等待。")).toBeInTheDocument();
+    expect(screen.getByText("描述：主线程包含 <em>同步等待</em>。")).toBeInTheDocument();
+    expect(screen.getAllByText("查看原始字段")[0].closest("details")).not.toHaveAttribute("open");
   });
 
   it("keeps core evidence visible and offers one retry when synthesis failed", async () => {
