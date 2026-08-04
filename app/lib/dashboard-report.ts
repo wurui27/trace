@@ -129,8 +129,13 @@ function genericFamilyMetric(
       : [/(?:^|[._])(?:memory|pss|rss|heap)(?:[._]|$)/i];
   return (
     metrics.find(
-      (metric) =>
-        availableMetric(metric) && patterns.some((pattern) => pattern.test(metric.name)),
+      (metric) => {
+        const leafName = metric.name.split(".").at(-1) ?? metric.name;
+        return (
+          availableMetric(metric) &&
+          patterns.some((pattern) => pattern.test(leafName))
+        );
+      },
     ) ?? null
   );
 }

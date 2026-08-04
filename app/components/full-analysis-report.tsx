@@ -178,8 +178,16 @@ export function FullAnalysisReport({
             </div>
             <div>
               <dt>AI 复核</dt>
-              <dd>{completedAiRounds} 轮 PerfPilot AI 已完成</dd>
-              <span>提取、复核、定稿</span>
+              <dd>
+                {report.synthesis.state === "completed"
+                  ? `${completedAiRounds} 轮 PerfPilot AI 已完成`
+                  : "PerfPilot AI 未完成"}
+              </dd>
+              <span>
+                {report.synthesis.state === "completed"
+                  ? "提取、复核、定稿"
+                  : "SmartPerfetto 基础报告仍可查看"}
+              </span>
             </div>
             <div>
               <dt>报告版本</dt>

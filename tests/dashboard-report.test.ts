@@ -304,4 +304,69 @@ describe("projectDashboardReport", () => {
       projection.secondaryMetrics.find((item) => item.id === "memory"),
     ).toMatchObject({ state: "missing", value: "—" });
   });
+
+  it("does not treat a VSync metric from the memory analysis namespace as memory usage", () => {
+    const base = snapshot();
+    const scenario = base.report.scenario_reports[0];
+    const vsync = metric(
+      "scroll.memory_analysis_get_vsync_period.detected_refresh_rate_hz",
+      60,
+      "value",
+      "检测 VSync 周期：detected_refresh_rate_hz",
+    );
+    const withVsync: LatestReportSnapshot = {
+      ...base,
+      report: {
+        ...base.report,
+        scenario_reports: [
+          {
+            ...scenario,
+            bundle: scenario.bundle
+              ? { ...scenario.bundle, metrics: [vsync, ...scenario.bundle.metrics] }
+              : null,
+          },
+        ],
+      },
+    };
+
+    expect(
+      projectDashboardReport(withVsync).secondaryMetrics.find(
+        (item) => item.id === "memory",
+      ),
+    ).toMatchObject({ state: "missing", value: "—" });
+
+    const rssGrowth = metric(
+      "scroll.memory_analysis_memory_growth_summary.rss_growth_pct",
+      3.2,
+      "%",
+      "RSS/Swap 增长趋势：rss_growth_pct",
+    );
+    const withMemory: LatestReportSnapshot = {
+      ...withVsync,
+      report: {
+        ...withVsync.report,
+        scenario_reports: [
+          {
+            ...scenario,
+            bundle: scenario.bundle
+              ? {
+                  ...scenario.bundle,
+                  metrics: [vsync, rssGrowth, ...scenario.bundle.metrics],
+                }
+              : null,
+          },
+        ],
+      },
+    };
+
+    expect(
+      projectDashboardReport(withMemory).secondaryMetrics.find(
+        (item) => item.id === "memory",
+      ),
+    ).toMatchObject({
+      state: "measured",
+      value: "3.2 %",
+      context: "RSS/Swap 增长趋势：rss_growth_pct",
+    });
+  });
 });

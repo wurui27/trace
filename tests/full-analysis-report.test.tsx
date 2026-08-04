@@ -119,4 +119,53 @@ describe("FullAnalysisReport", () => {
       "/analyses/analysis-live-1",
     );
   });
+
+  it("does not describe a failed AI stage as completed", async () => {
+    const partialAnalysis: AnalysisResponse = {
+      ...analysis,
+      state: "partially_completed",
+      stages: analysis.stages.map((stage) =>
+        stage.stage === "perfpilot_ai"
+          ? {
+              ...stage,
+              state: "failed",
+              failure: {
+                code: "ai_projection_private_data",
+                message: "AI 投影已阻止",
+                retryable: false,
+              },
+            }
+          : stage,
+      ),
+      ai_rounds: analysis.ai_rounds?.map((round) => ({
+        ...round,
+        state: "pending",
+        attempts: 0,
+      })),
+    };
+    const partialReport: AnalysisReport = {
+      ...report,
+      state: "partially_completed",
+      synthesis: {
+        state: "failed",
+        output: null,
+        synthesis_artifact_id: null,
+        failure_code: "ai_projection_private_data",
+        provenance: null,
+      },
+    };
+    const loader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({
+        teamId: "team-1",
+        analysis: partialAnalysis,
+        report: partialReport,
+        reportLoadFailed: false,
+      });
+    });
+
+    render(<FullAnalysisReport analysisId="analysis-live-1" loader={loader} />);
+
+    expect(await screen.findByText("PerfPilot AI 未完成")).toBeVisible();
+    expect(screen.queryByText("0 轮 PerfPilot AI 已完成")).not.toBeInTheDocument();
+  });
 });
