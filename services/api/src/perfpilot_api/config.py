@@ -96,7 +96,10 @@ def _is_unsafe_ai_host(host: str | None) -> bool:
     try:
         address = ip_address(normalized_host)
     except ValueError:
-        return False
+        try:
+            address = ip_address(inet_aton(normalized_host))
+        except OSError:
+            return False
     return (
         address.is_loopback
         or address.is_unspecified
