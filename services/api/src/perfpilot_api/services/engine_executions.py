@@ -7,13 +7,13 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Literal, Protocol
-from uuid import UUID
+from uuid import UUID, uuid5
 
 import httpx
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from perfpilot_api.db.control.models import EngineExecution, GlobalJob
+from perfpilot_api.db.control.models import EngineExecution, GlobalJob, OutboxEvent
 from perfpilot_api.config import Settings
 from perfpilot_api.engines.contracts import (
     AnalysisProfile,
@@ -65,6 +65,7 @@ _TERMINAL_ADAPTER_CODES = frozenset(
     {"integrity_mismatch", "incompatible_contract", "privacy_violation"}
 )
 _MEMORY_RUN_ID = re.compile(r"memory-[0-9a-f]{32}\Z")
+_SYNTHESIS_EVENT_NAMESPACE = UUID("d4fa0d89-2a62-584a-9f04-79ba674512b9")
 
 
 class EngineExecutionNotFoundError(RuntimeError):
@@ -77,6 +78,12 @@ class StaleEngineExecutionVersionError(RuntimeError):
 
 class EngineExecutionOwnershipError(RuntimeError):
     """A refreshed route no longer belongs to this execution."""
+
+
+def engine_result_ready_event_id(execution_id: UUID) -> UUID:
+    if not isinstance(execution_id, UUID):
+        raise ValueError("engine execution id is invalid")
+    return uuid5(_SYNTHESIS_EVENT_NAMESPACE, f"engine_result_ready:{execution_id}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,6 +499,7 @@ class SQLAlchemyEngineExecutionRepository:
         expected_version: int,
         artifact_id: UUID | None,
         terminal_state: Literal["completed", "insufficient_data"],
+        schedule_synthesis: bool = False,
         now: datetime,
     ) -> EngineExecutionRecord:
         if artifact_id is None:
@@ -504,7 +512,20 @@ class SQLAlchemyEngineExecutionRepository:
                 execution_id=execution_id,
                 for_update=True,
             )
+            if schedule_synthesis and row.engine_id != "smartperfetto":
+                raise ValueError("only SmartPerfetto executions can schedule synthesis")
+            if schedule_synthesis:
+                job = await self._job(
+                    session,
+                    team_id=team_id,
+                    analysis_id=analysis_id,
+                    for_update=True,
+                )
+                if job.analysis_mode != "trace_upload":
+                    raise ValueError("only SmartPerfetto trace executions can schedule synthesis")
             if row.state in _TERMINAL_STATES:
+                if schedule_synthesis:
+                    await self._ensure_result_ready_event(session, row=row, now=now)
                 return self._record(row)
             if (
                 row.version != expected_version
@@ -518,8 +539,40 @@ class SQLAlchemyEngineExecutionRepository:
             row.completed_at = now
             row.version += 1
             row.updated_at = now
+            if schedule_synthesis:
+                await self._ensure_result_ready_event(session, row=row, now=now)
             await session.flush()
             return self._record(row)
+
+    @staticmethod
+    async def _ensure_result_ready_event(
+        session: AsyncSession, *, row: EngineExecution, now: datetime
+    ) -> None:
+        if (
+            row.engine_id != "smartperfetto"
+            or row.raw_result_artifact_id is None
+            or row.state not in {"completed", "insufficient_data"}
+        ):
+            raise EngineExecutionOwnershipError("synthesis result authority changed")
+        event_id = engine_result_ready_event_id(row.id)
+        event = await session.get(OutboxEvent, event_id)
+        if event is None:
+            session.add(OutboxEvent(
+                id=event_id, team_id=row.team_id, global_job_id=row.analysis_id,
+                scenario_job_id=None, event_type="engine_result_ready",
+                subject_type="engine_execution", subject_id=row.id,
+                subject_version=row.version, ready_at=now, published_at=None,
+                dead_lettered_at=None, retry_count=0, version=1,
+            ))
+            await session.flush()
+            return
+        if (
+            event.team_id != row.team_id or event.global_job_id != row.analysis_id
+            or event.scenario_job_id is not None or event.event_type != "engine_result_ready"
+            or event.subject_type != "engine_execution" or event.subject_id != row.id
+            or event.subject_version != row.version
+        ):
+            raise EngineExecutionOwnershipError("synthesis event authority changed")
 
     async def fail(
         self,
@@ -729,6 +782,7 @@ class EngineExecutionService:
         now: Callable[[], datetime],
         deadline_seconds: int = 1_800,
         reconnect_after_seconds: int = 5,
+        schedule_synthesis: bool = False,
     ) -> None:
         if result_sink is None:
             raise ValueError("engine result sink is required")
@@ -740,6 +794,7 @@ class EngineExecutionService:
         self._now = now
         self._deadline_seconds = deadline_seconds
         self._reconnect_after_seconds = reconnect_after_seconds
+        self._schedule_synthesis = schedule_synthesis
 
     def _pin(self, engine_id: str) -> EnginePin:
         if engine_id == "smartperfetto":
@@ -1092,6 +1147,7 @@ class EngineExecutionService:
             expected_version=claimed.version,
             artifact_id=claimed.raw_result_artifact_id,
             terminal_state=result.state,
+            schedule_synthesis=self._schedule_synthesis and claimed.engine_id == "smartperfetto",
             now=self._now(),
         )
         return EngineStepOutcome(completed.id, completed.state, None)
@@ -1276,6 +1332,7 @@ def build_smartperfetto_execution_service(
         engine_lock=engine_lock,
         result_sink=result_sink,
         now=now or (lambda: datetime.now(UTC)),
+        schedule_synthesis=settings.ai_enabled,
     )
 
 
@@ -1287,6 +1344,7 @@ def build_engine_execution_service(
     engine_lock: EngineLock,
     result_sink: EngineResultSink,
     now: Callable[[], datetime] | None = None,
+    schedule_synthesis: bool = False,
 ) -> EngineExecutionService:
     """Compose execution orchestration from only explicitly supplied adapters."""
 
@@ -1299,6 +1357,7 @@ def build_engine_execution_service(
         engine_lock=engine_lock,
         result_sink=result_sink,
         now=now or (lambda: datetime.now(UTC)),
+        schedule_synthesis=schedule_synthesis,
     )
 
 
@@ -1316,5 +1375,6 @@ __all__ = [
     "StaleEngineExecutionVersionError",
     "build_engine_execution_service",
     "build_smartperfetto_execution_service",
+    "engine_result_ready_event_id",
     "result_artifact_id",
 ]

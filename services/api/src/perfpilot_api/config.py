@@ -403,6 +403,9 @@ class Settings(BaseSettings):
         if self.app_env != "production":
             return self
 
+        if self.smartperfetto_enabled and not self.ai_enabled:
+            raise _production_validation_error(_INVALID_PRODUCTION_AI)
+
         if self.ai_enabled and (
             not _is_valid_ai_base_url(self.ai_base_url, production=True)
             or not self.ai_credential_reference.get_secret_value().strip()
