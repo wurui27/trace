@@ -1,0 +1,20 @@
+{
+  "id": "chatcmpl-local-refusal",
+  "object": "chat.completion",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "",
+        "refusal": "Request refused"
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 120,
+    "completion_tokens": 0,
+    "total_tokens": 120
+  }
+}

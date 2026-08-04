@@ -16,6 +16,7 @@ from perfpilot_api.services.analyses import (
     AnalysisQueueLimitError,
     AnalysisService,
     AnalysisUnavailableError,
+    AnalysisStageView,
     AnalysisView,
     ApkInspectionError,
     ApkInspectionUnavailableError,
@@ -24,6 +25,8 @@ from perfpilot_api.services.analyses import (
     SampleVerdictCounts,
     ScenarioView,
     StaleTaskVersionError,
+    SynthesisRunService,
+    SynthesisRunView,
 )
 from perfpilot_api.services.auth import (
     AuthService,
@@ -112,6 +115,18 @@ CreateAnalysisRequest = Annotated[
 
 def get_analysis_service(request: Request) -> AnalysisService:
     service: AnalysisService | None = request.app.state.analysis_service
+    if service is None:
+        raise ApiError(
+            code="service_unavailable",
+            message="服务暂时不可用",
+            status_code=503,
+            retryable=True,
+        )
+    return service
+
+
+def get_synthesis_run_service(request: Request) -> SynthesisRunService:
+    service: SynthesisRunService | None = request.app.state.synthesis_run_service
     if service is None:
         raise ApiError(
             code="service_unavailable",
@@ -230,6 +245,14 @@ def _scenario(item: ScenarioView) -> dict[str, object]:
     }
 
 
+def _analysis_stage(item: AnalysisStageView) -> dict[str, object]:
+    return {
+        "stage": item.stage,
+        "state": item.state,
+        "failure": _failure(item.failure_code),
+    }
+
+
 def _apk_upload(slot: UploadSlot) -> dict[str, object]:
     common: dict[str, object] = {
         "state": slot.state,
@@ -312,6 +335,7 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
             or view.question is not None
             or view.analysis_profile is not None
             or view.input_uploads
+            or view.stages
             or tuple(item.scenario_type for item in view.scenarios)
             != ("cold_start", "scroll", "memory_cycle")
         ):
@@ -327,6 +351,7 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
             or (view.question is not None and len(view.question) > 2_000)
             or view.analysis_profile is not None
             or view.input_uploads
+            or view.stages
             or view.sample_verdict_counts.total != 0
         ):
             raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
@@ -341,6 +366,8 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
             or (view.question is not None and len(view.question) > 2_000)
             or not view.input_uploads
             or view.sample_verdict_counts.total != 0
+            or tuple(item.stage for item in view.stages)
+            != ("input_validation", "smartperfetto", "perfpilot_ai", "report")
         ):
             raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
     else:
@@ -393,7 +420,17 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
         result["analysis_profile"] = view.analysis_profile
         result["question"] = view.question
         result["input_uploads"] = [_input_upload(item) for item in view.input_uploads]
+        result["stages"] = [_analysis_stage(item) for item in view.stages]
     return result
+
+
+def synthesis_run_response(view: SynthesisRunView) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "analysis_id": str(view.analysis_id),
+        "generation": view.generation,
+        "state": view.state,
+    }
 
 
 router = APIRouter(
@@ -525,9 +562,51 @@ async def get_analysis_report(
     return report
 
 
+@router.post("/{analysis_id}/synthesis-runs", status_code=201)
+async def create_synthesis_run(
+    team_id: UUID,
+    analysis_id: UUID,
+    request: Request,
+    response: Response,
+    idempotency_key: Annotated[
+        str,
+        Header(alias="Idempotency-Key", pattern=_IDEMPOTENCY_KEY_PATTERN),
+    ],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    synthesis_run_service: Annotated[
+        SynthesisRunService,
+        Depends(get_synthesis_run_service),
+    ],
+) -> dict[str, object]:
+    if len(request.headers.getlist("idempotency-key")) != 1:
+        raise ApiError("request_validation_failed", "请求参数校验失败", 422, False)
+    await _authorize_team(
+        request=request,
+        auth_service=auth_service,
+        team_id=team_id,
+        access="write",
+    )
+    try:
+        view = await synthesis_run_service.create(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            idempotency_key=idempotency_key,
+        )
+    except (
+        AnalysisInvalidRequestError,
+        AnalysisNotFoundError,
+        AnalysisIdempotencyConflictError,
+        AnalysisUnavailableError,
+    ) as error:
+        raise analysis_error(error) from None
+    response.headers["cache-control"] = "no-store"
+    return synthesis_run_response(view)
+
+
 __all__ = [
     "analysis_error",
     "analysis_response",
     "get_analysis_service",
+    "get_synthesis_run_service",
     "router",
 ]

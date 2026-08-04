@@ -1,0 +1,22 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/ai/synthesis-output.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "executive_summary", "top_findings", "recommendations", "retest_plan", "limitations"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "executive_summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "top_findings": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/topFinding"}},
+    "recommendations": {"type": "array", "maxItems": 10, "uniqueItems": true, "items": {"$ref": "#/$defs/recommendation"}},
+    "retest_plan": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/retestItem"}},
+    "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}}
+  },
+  "$defs": {
+    "uuid": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "topFinding": {"type": "object", "additionalProperties": false, "required": ["finding_id", "evidence_ids", "user_impact"], "properties": {"finding_id": {"$ref": "#/$defs/uuid"}, "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "user_impact": {"type": "string", "minLength": 1, "maxLength": 2000}}},
+    "recommendation": {"type": "object", "additionalProperties": false, "required": ["priority", "title", "action", "expected_effect", "finding_ids", "evidence_ids"], "properties": {"priority": {"enum": ["p0", "p1", "p2", "p3"]}, "title": {"type": "string", "minLength": 1, "maxLength": 2000}, "action": {"type": "string", "minLength": 1, "maxLength": 2000}, "expected_effect": {"type": "string", "minLength": 1, "maxLength": 2000}, "finding_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}}},
+    "limitation": {"type": "object", "additionalProperties": false, "required": ["limitation_id", "summary"], "properties": {"limitation_id": {"$ref": "#/$defs/uuid"}, "summary": {"type": "string", "minLength": 1, "maxLength": 2000}}},
+    "retestItem": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "verify_metric"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "limitation_ids": {"type": "array", "maxItems": 0}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"enum": ["meet_existing_threshold", "improve_from_baseline"]}, "failure_condition": {"const": "threshold_missed"}}}, {"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "collect_evidence"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "maxItems": 0}, "limitation_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"const": "evidence_collected"}, "failure_condition": {"const": "evidence_missing"}}}]}
+  }
+}

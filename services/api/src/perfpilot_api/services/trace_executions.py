@@ -297,6 +297,7 @@ class TraceExecutionService:
         upload_service: UploadService,
         engine_service: TraceEngineExecutionService,
         timeout_seconds: int = 1_800,
+        schedule_synthesis: bool = False,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         if type(timeout_seconds) is not int or not 1 <= timeout_seconds <= 3_600:
@@ -305,6 +306,7 @@ class TraceExecutionService:
         self._upload_service = upload_service
         self._engine_service = engine_service
         self._timeout_seconds = timeout_seconds
+        self._schedule_synthesis = schedule_synthesis
         self._clock = clock
 
     def _validate_analysis(
@@ -604,6 +606,9 @@ class TraceExecutionService:
         ]
         failure_code: str | None = None
         if outcome.retry is not None or observed.state in ("pending", "running", "awaiting_user"):
+            target_state = "analyzing"
+        elif observed.state in {"completed", "insufficient_data"} and self._schedule_synthesis:
+            # The report stage now owns the terminal parent projection.
             target_state = "analyzing"
         elif observed.state == "completed":
             target_state = "completed"

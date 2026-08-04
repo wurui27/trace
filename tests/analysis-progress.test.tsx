@@ -1,19 +1,28 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   AnalysisProgress,
   AnalysisProgressView,
+  createAnalysisLoader,
 } from "../app/components/analysis-progress";
-import type { AnalysisResponse, AnalysisState } from "../app/lib/perfpilot-api";
+import type {
+  AnalysisReport,
+  AnalysisResponse,
+  AnalysisStage,
+  AnalysisState,
+  PerfPilotClient,
+} from "../app/lib/perfpilot-api";
 
 afterEach(cleanup);
 
 function analysis(
   state: AnalysisState,
   analysisId = "analysis-live-1",
+  stages: readonly AnalysisStage[] = stageList(state),
 ): AnalysisResponse {
   return {
     schema_version: "1.0",
@@ -34,10 +43,51 @@ function analysis(
         sha256_b64: "A".repeat(43) + "=",
       },
     ],
+    stages,
     failure:
       state === "failed"
         ? { code: "engine_failed", message: "任务未能完成", retryable: false }
         : null,
+  };
+}
+
+function stageList(state: AnalysisState): readonly AnalysisStage[] {
+  const finished = ["completed", "partially_completed", "failed", "canceled"].includes(state);
+  return [
+    { stage: "input_validation", state: "completed", failure: null },
+    { stage: "smartperfetto", state: finished ? "completed" : "running", failure: null },
+    {
+      stage: "perfpilot_ai",
+      state: state === "completed" ? "completed" : finished ? "failed" : "pending",
+      failure:
+        state === "failed"
+          ? { code: "synthesis_failed", message: "AI 建议生成失败", retryable: true }
+          : null,
+    },
+    {
+      stage: "report",
+      state: state === "completed" ? "completed" : finished ? "completed" : "pending",
+      failure: null,
+    },
+  ];
+}
+
+function failedReport(): AnalysisReport {
+  return {
+    schema_version: "1.1",
+    analysis_id: "analysis-live-1",
+    analysis_mode: "trace_upload",
+    state: "partially_completed",
+    report_version: 1,
+    generated_at: "2026-08-04T08:00:00Z",
+    scenario_reports: [],
+    synthesis: {
+      state: "failed",
+      output: null,
+      synthesis_artifact_id: null,
+      failure_code: "synthesis_unavailable",
+      provenance: null,
+    },
   };
 }
 
@@ -69,9 +119,14 @@ describe("AnalysisProgress", () => {
   });
 
   it("does not show the previous analysis while a new route is loading", async () => {
-    const loader = vi.fn(async (analysisId: string, _signal, onAnalysis) => {
+    const loader = vi.fn(async (analysisId: string, _signal, onSnapshot) => {
       if (analysisId === "analysis-old") {
-        onAnalysis(analysis("completed", analysisId));
+        onSnapshot({
+          teamId: "team-1",
+          analysis: analysis("completed", analysisId),
+          report: null,
+          reportLoadFailed: false,
+        });
         return;
       }
       await new Promise<void>(() => undefined);
@@ -85,5 +140,109 @@ describe("AnalysisProgress", () => {
 
     expect(screen.getByRole("heading", { name: "正在读取分析状态" })).toBeInTheDocument();
     expect(screen.queryByText("analysis-old")).not.toBeInTheDocument();
+  });
+
+  it("renders the exact four server stages without inferring from the parent state", () => {
+    const stages: readonly AnalysisStage[] = [
+      { stage: "input_validation", state: "completed", failure: null },
+      {
+        stage: "smartperfetto",
+        state: "failed",
+        failure: { code: "trace_invalid", message: "Trace 数据不完整", retryable: false },
+      },
+      { stage: "perfpilot_ai", state: "not_requested", failure: null },
+      { stage: "report", state: "pending", failure: null },
+    ];
+
+    render(<AnalysisProgressView analysis={analysis("completed", "analysis-live-1", stages)} />);
+
+    expect(screen.getByText("文件校验")).toBeInTheDocument();
+    expect(screen.getByText("SmartPerfetto")).toBeInTheDocument();
+    expect(screen.getByText("PerfPilot AI")).toBeInTheDocument();
+    expect(screen.getByText("报告完成")).toBeInTheDocument();
+    expect(screen.getByText("Trace 数据不完整")).toBeInTheDocument();
+    expect(screen.getByText("SmartPerfetto").closest("li")).toHaveClass("is-failed");
+    expect(screen.getByText("报告完成").closest("li")).not.toHaveClass("is-complete");
+  });
+
+  it("polls until all server stages settle and retains the prior report during rerun", async () => {
+    const running = analysis("completed", "analysis-live-1", [
+      { stage: "input_validation", state: "completed", failure: null },
+      { stage: "smartperfetto", state: "completed", failure: null },
+      { stage: "perfpilot_ai", state: "running", failure: null },
+      { stage: "report", state: "pending", failure: null },
+    ]);
+    const complete = analysis("completed");
+    const oldReport = failedReport();
+    const newReport = { ...failedReport(), report_version: 2 };
+    const client = {
+      csrf: vi.fn(async () => "csrf"),
+      me: vi.fn(async () => ({
+        schema_version: "1.0" as const,
+        memberships: [{ team: { id: "team-1", name: "Ray" }, role: "owner" }],
+      })),
+      analysis: vi.fn().mockResolvedValueOnce(running).mockResolvedValueOnce(complete),
+      report: vi.fn().mockResolvedValueOnce(oldReport).mockResolvedValueOnce(newReport),
+    } as unknown as PerfPilotClient;
+    const updates: Array<{ report: AnalysisReport | null; analysis: AnalysisResponse }> = [];
+
+    await createAnalysisLoader(client, async () => undefined)(
+      "analysis-live-1",
+      new AbortController().signal,
+      (snapshot) => updates.push(snapshot),
+    );
+
+    expect(client.analysis).toHaveBeenCalledTimes(2);
+    expect(client.report).toHaveBeenCalledTimes(2);
+    expect(updates.map((item) => item.report?.report_version)).toEqual([1, 2]);
+  });
+
+  it("does not substitute fixture findings when the real report cannot load", async () => {
+    const loader = vi.fn(async (_analysisId: string, _signal, onSnapshot) => {
+      onSnapshot({
+        teamId: "team-1",
+        analysis: analysis("completed"),
+        report: null,
+        reportLoadFailed: true,
+      });
+    });
+
+    render(<AnalysisProgress analysisId="analysis-live-1" loader={loader} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("报告暂时无法读取");
+    expect(screen.queryByText("首页启动慢")).not.toBeInTheDocument();
+  });
+
+  it("uses a fresh idempotency key and resumes loading after an AI-only rerun", async () => {
+    const user = userEvent.setup();
+    let loadCount = 0;
+    const loader = vi.fn(async (_analysisId: string, _signal, onSnapshot) => {
+      loadCount += 1;
+      onSnapshot({
+        teamId: "team-1",
+        analysis: analysis("partially_completed"),
+        report: failedReport(),
+        reportLoadFailed: false,
+      });
+    });
+    const rerunner = vi.fn(async () => undefined);
+
+    render(
+      <AnalysisProgress
+        analysisId="analysis-live-1"
+        loader={loader}
+        rerunner={rerunner}
+        randomUUID={() => "rerun-uuid-1"}
+      />,
+    );
+    await user.click(await screen.findByRole("button", { name: "重新生成 AI 建议" }));
+
+    expect(rerunner).toHaveBeenCalledWith(
+      "team-1",
+      "analysis-live-1",
+      "rerun-uuid-1",
+      expect.any(AbortSignal),
+    );
+    expect(loadCount).toBe(2);
   });
 });

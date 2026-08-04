@@ -82,6 +82,8 @@ _ALLOWED_REPORT_KEYS = {
     "resultSnapshotId",
     "claimSupport",
     "claimVerificationResult",
+    "dataEnvelopes",
+    "diagnostics",
     "identityResolutions",
     "findings",
     "hypotheses",

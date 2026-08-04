@@ -68,6 +68,12 @@ class EngineExecution(
             "attempt_number",
             name="uq_engine_executions_analysis_engine_attempt",
         ),
+        UniqueConstraint(
+            "id",
+            "analysis_id",
+            "team_id",
+            name="uq_engine_executions_id_analysis_team",
+        ),
         ForeignKeyConstraint(
             ("analysis_id", "team_id"),
             ("global_jobs.id", "global_jobs.team_id"),

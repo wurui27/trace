@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/reports/analysis-report.schema.json",
-  "$comment": "AnalysisReport v1 is an immutable parent view. Device scenarios are always ordered cold_start, scroll, memory_cycle. A failed sibling cannot remove a completed sibling or its bundle.",
+  "$comment": "AnalysisReport is an immutable parent view. Version 1.0 preserves legacy device and single-scenario Trace reports; version 1.1 adds explicit Trace synthesis.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,7 +15,7 @@
   ],
   "properties": {
     "schema_version": {
-      "const": "1.0"
+      "enum": ["1.0", "1.1"]
     },
     "analysis_id": {
       "type": "string",
@@ -50,6 +50,9 @@
       "items": {
         "$ref": "#/$defs/scenarioReport"
       }
+    },
+    "synthesis": {
+      "$ref": "#/$defs/synthesis"
     }
   },
   "allOf": [
@@ -118,29 +121,69 @@
         }
       },
       "else": {
-        "properties": {
-          "scenario_reports": {
-            "minItems": 1,
-            "maxItems": 1,
-            "items": {
-              "allOf": [
-                {
-                  "$ref": "#/$defs/scenarioReport"
-                },
-                {
-                  "properties": {
-                    "scenario_type": {
-                      "enum": [
-                        "startup",
-                        "scroll"
-                      ]
-                    }
-                  }
-                }
-              ]
+        "if": {"properties": {"schema_version": {"const": "1.0"}}, "required": ["schema_version"]},
+        "then": {
+          "properties": {
+            "scenario_reports": {
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {
+                "allOf": [
+                  {"$ref": "#/$defs/scenarioReport"},
+                  {"properties": {"scenario_type": {"enum": ["startup", "scroll"]}}}
+                ]
+              }
             }
           }
         }
+      }
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "1.0"}}, "required": ["schema_version"]},
+      "then": {"properties": {"synthesis": false}}
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "1.1"}}, "required": ["schema_version"]},
+      "then": {
+        "required": ["synthesis"],
+        "properties": {
+          "analysis_mode": {"const": "trace_upload"},
+          "scenario_reports": {
+            "oneOf": [
+              {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}], "items": false},
+              {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/scrollScenarioReport"}], "items": false},
+              {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false},
+              {"minItems": 2, "maxItems": 2, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}, {"$ref": "#/$defs/scrollScenarioReport"}], "items": false},
+              {"minItems": 2, "maxItems": 2, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}, {"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false},
+              {"minItems": 2, "maxItems": 2, "prefixItems": [{"$ref": "#/$defs/scrollScenarioReport"}, {"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false},
+              {"minItems": 3, "maxItems": 3, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}, {"$ref": "#/$defs/scrollScenarioReport"}, {"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.1"}, "state": {"const": "completed"}},
+        "required": ["schema_version", "state"]
+      },
+      "then": {
+        "properties": {
+          "synthesis": {"properties": {"state": {"const": "completed"}}},
+          "scenario_reports": {"items": {"properties": {"result_state": {"const": "completed"}}}}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.1"}, "state": {"const": "partially_completed"}},
+        "required": ["schema_version", "state"]
+      },
+      "then": {
+        "anyOf": [
+          {"properties": {"synthesis": {"properties": {"state": {"const": "failed"}}}}},
+          {"properties": {"scenario_reports": {"contains": {"properties": {"result_state": {"enum": ["failed", "canceled"]}}, "required": ["result_state"]}, "minContains": 1}}}
+        ]
       }
     },
     {
@@ -150,9 +193,8 @@
             "const": "completed"
           }
         },
-        "required": [
-          "state"
-        ]
+        "required": ["state"],
+        "not": {"properties": {"schema_version": {"const": "1.1"}}, "required": ["schema_version"]}
       },
       "then": {
         "properties": {
@@ -175,9 +217,8 @@
             "const": "partially_completed"
           }
         },
-        "required": [
-          "state"
-        ]
+        "required": ["state"],
+        "not": {"properties": {"schema_version": {"const": "1.1"}}, "required": ["schema_version"]}
       },
       "then": {
         "properties": {
@@ -1249,6 +1290,63 @@
         }
       ]
     },
+    "synthesis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "output", "synthesis_artifact_id", "failure_code", "provenance"],
+      "properties": {
+        "state": {"enum": ["completed", "failed"]},
+        "output": {"oneOf": [{"$ref": "#/$defs/synthesisOutput"}, {"type": "null"}]},
+        "synthesis_artifact_id": {"oneOf": [{"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}, {"type": "null"}]},
+        "failure_code": {"oneOf": [{"type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$"}, {"type": "null"}]},
+        "provenance": {"oneOf": [{"$ref": "#/$defs/synthesisProvenance"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {"if": {"properties": {"state": {"const": "completed"}}, "required": ["state"]}, "then": {"properties": {"output": {"$ref": "#/$defs/synthesisOutput"}, "synthesis_artifact_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}, "failure_code": {"type": "null"}, "provenance": {"$ref": "#/$defs/synthesisProvenance"}}}},
+        {"if": {"properties": {"state": {"const": "failed"}}, "required": ["state"]}, "then": {"properties": {"output": {"type": "null"}, "synthesis_artifact_id": {"type": "null"}, "failure_code": {"type": "string", "pattern": "^[a-z][a-z0-9_]{0,95}$"}, "provenance": {"type": "null"}}}}
+      ]
+    },
+    "synthesisProvenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider_protocol", "provider_name", "model", "prompt_template_version", "prompt_template_sha256_b64", "normalizer_version", "report_worker_image_digest", "projection_artifact_id", "projection_sha256_b64", "generated_at", "prompt_tokens", "completion_tokens", "total_tokens", "generation"],
+      "properties": {
+        "provider_protocol": {"type": "string", "minLength": 1, "maxLength": 128},
+        "provider_name": {"type": "string", "minLength": 1, "maxLength": 128},
+        "model": {"type": "string", "minLength": 1, "maxLength": 256},
+        "prompt_template_version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "prompt_template_sha256_b64": {"$ref": "#/$defs/sha256"},
+        "normalizer_version": {"type": "string", "minLength": 1, "maxLength": 128},
+        "report_worker_image_digest": {"type": "string", "pattern": "^sha256:[a-f0-9]{64}$"},
+        "projection_artifact_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+        "projection_sha256_b64": {"$ref": "#/$defs/sha256"},
+        "generated_at": {"type": "string", "format": "date-time"},
+        "prompt_tokens": {"type": "integer", "minimum": 0},
+        "completion_tokens": {"type": "integer", "minimum": 0},
+        "total_tokens": {"type": "integer", "minimum": 0},
+        "generation": {"type": "integer", "minimum": 1}
+      }
+    },
+    "synthesisOutput": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "executive_summary", "top_findings", "recommendations", "retest_plan", "limitations"],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "executive_summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "top_findings": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisFinding"}},
+        "recommendations": {"type": "array", "maxItems": 10, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisRecommendation"}},
+        "retest_plan": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisRetest"}},
+        "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisLimitation"}}
+      }
+    },
+    "synthesisFinding": {"type": "object", "additionalProperties": false, "required": ["finding_id", "evidence_ids", "user_impact"], "properties": {"finding_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}, "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}, "user_impact": {"type": "string", "minLength": 1, "maxLength": 2000}}},
+    "synthesisRecommendation": {"type": "object", "additionalProperties": false, "required": ["priority", "title", "action", "expected_effect", "finding_ids", "evidence_ids"], "properties": {"priority": {"enum": ["p0", "p1", "p2", "p3"]}, "title": {"type": "string", "minLength": 1, "maxLength": 2000}, "action": {"type": "string", "minLength": 1, "maxLength": 2000}, "expected_effect": {"type": "string", "minLength": 1, "maxLength": 2000}, "finding_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}, "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}}},
+    "synthesisLimitation": {"type": "object", "additionalProperties": false, "required": ["limitation_id", "summary"], "properties": {"limitation_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}, "summary": {"type": "string", "minLength": 1, "maxLength": 2000}}},
+    "synthesisRetest": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "verify_metric"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}, "limitation_ids": {"type": "array", "maxItems": 0}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"enum": ["meet_existing_threshold", "improve_from_baseline"]}, "failure_condition": {"const": "threshold_missed"}}}, {"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "collect_evidence"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "maxItems": 0}, "limitation_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"const": "evidence_collected"}, "failure_condition": {"const": "evidence_missing"}}}]},
+    "startupScenarioReport": {"allOf": [{"$ref": "#/$defs/scenarioReport"}, {"properties": {"scenario_type": {"const": "startup"}}}]},
+    "scrollScenarioReport": {"allOf": [{"$ref": "#/$defs/scenarioReport"}, {"properties": {"scenario_type": {"const": "scroll"}}}]},
+    "memoryCycleScenarioReport": {"allOf": [{"$ref": "#/$defs/scenarioReport"}, {"properties": {"scenario_type": {"const": "memory_cycle"}}}]},
     "scenarioReport": {
       "type": "object",
       "additionalProperties": false,
@@ -1513,7 +1611,6 @@
         },
         "trace_capabilities": {
           "type": "array",
-          "minItems": 1,
           "items": {
             "$ref": "#/$defs/traceCapability"
           }

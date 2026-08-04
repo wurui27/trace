@@ -22,7 +22,89 @@ function analysis(state: AnalysisResponse["state"]): AnalysisResponse {
     version: 1,
     report_available: false,
     input_uploads: [],
+    stages: [
+      { stage: "input_validation", state: "completed", failure: null },
+      { stage: "smartperfetto", state: "completed", failure: null },
+      {
+        stage: "perfpilot_ai",
+        state: state === "completed" ? "completed" : "running",
+        failure: null,
+      },
+      {
+        stage: "report",
+        state: state === "completed" ? "completed" : "pending",
+        failure: null,
+      },
+    ],
     failure: null,
+  };
+}
+
+function reportPayload(): Record<string, unknown> {
+  return {
+    schema_version: "1.1",
+    analysis_id: ANALYSIS_ID,
+    analysis_mode: "trace_upload",
+    state: "completed",
+    report_version: 2,
+    generated_at: "2026-08-04T08:00:00Z",
+    scenario_reports: [
+      {
+        scenario_job_id: "83000000-0000-4000-8000-000000000001",
+        scenario_type: "startup",
+        result_state: "completed",
+        device_group_id: null,
+        device_group_reason: "not_applicable",
+        bundle: {
+          schema_version: "1.0",
+          bundle_id: "84000000-0000-4000-8000-000000000001",
+          scenario_job_id: "83000000-0000-4000-8000-000000000001",
+          scenario_type: "startup",
+          bundle_state: "complete",
+          valid_measurement: true,
+          validity_reasons: [],
+          sample_ids: [],
+          generated_at: "2026-08-04T08:00:00Z",
+          metrics: [],
+          findings: [],
+          evidence: [],
+          artifacts: [],
+          trace_health: {},
+          trace_capabilities: [],
+          provenance: {},
+        },
+        failure: null,
+      },
+    ],
+    synthesis: {
+      state: "completed",
+      output: {
+        schema_version: "1.0",
+        executive_summary: "启动阶段存在可优化的主线程等待。",
+        top_findings: [],
+        recommendations: [],
+        retest_plan: [],
+        limitations: [],
+      },
+      synthesis_artifact_id: "88000000-0000-4000-8000-000000000001",
+      failure_code: null,
+      provenance: {
+        provider_protocol: "chat-completions-json-schema-v1",
+        provider_name: "approved-provider",
+        model: "approved-model",
+        prompt_template_version: "1.0.0",
+        prompt_template_sha256_b64: "c".repeat(44),
+        normalizer_version: "smartperfetto-normalizer-1",
+        report_worker_image_digest: `sha256:${"1".repeat(64)}`,
+        projection_artifact_id: "89000000-0000-4000-8000-000000000001",
+        projection_sha256_b64: "c".repeat(44),
+        generated_at: "2026-08-04T08:00:00Z",
+        prompt_tokens: 10,
+        completion_tokens: 20,
+        total_tokens: 30,
+        generation: 2,
+      },
+    },
   };
 }
 
@@ -177,5 +259,141 @@ describe("PerfPilot browser API", () => {
         (call) => new Headers(call.init.headers).get("x-csrf-token") === "csrf-1",
       ),
     ).toBe(true);
+  });
+
+  it("reads the exact four server stages and rejects a reordered stage list", async () => {
+    const valid = analysis("completed");
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(valid))
+      .mockResolvedValueOnce(
+        Response.json({ ...valid, stages: [...valid.stages].reverse() }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      stages: [
+        { stage: "input_validation", state: "completed" },
+        { stage: "smartperfetto", state: "completed" },
+        { stage: "perfpilot_ai", state: "completed" },
+        { stage: "report", state: "completed" },
+      ],
+    });
+    await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
+  it("reads an AnalysisReport 1.1 and creates an idempotent AI-only rerun", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/v1/auth/csrf") {
+        return Response.json({ schema_version: "1.0", csrf_token: "csrf-report" });
+      }
+      if (url.endsWith("/report")) return Response.json(reportPayload());
+      if (url.endsWith("/synthesis-runs")) {
+        return Response.json(
+          {
+            schema_version: "1.0",
+            analysis_id: ANALYSIS_ID,
+            generation: 3,
+            state: "queued",
+          },
+          { status: 201 },
+        );
+      }
+      throw new Error(`undeclared request: ${url}`);
+    });
+    const client = createPerfPilotClient({ fetcher });
+
+    await client.csrf();
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      schema_version: "1.1",
+      report_version: 2,
+      synthesis: { state: "completed" },
+    });
+    await expect(
+      client.createSynthesisRun(TEAM_ID, ANALYSIS_ID, "ai-rerun-fixed"),
+    ).resolves.toEqual({
+      schema_version: "1.0",
+      analysis_id: ANALYSIS_ID,
+      generation: 3,
+      state: "queued",
+    });
+
+    const reportCall = calls.find((call) => call.url.endsWith("/report"));
+    expect(reportCall?.url).toBe(
+      `/api/v1/teams/${TEAM_ID}/analyses/${ANALYSIS_ID}/report`,
+    );
+    expect(reportCall?.init.credentials).toBe("same-origin");
+    expect(reportCall?.init.redirect).toBe("error");
+    const rerunCall = calls.find((call) => call.url.endsWith("/synthesis-runs"));
+    expect(rerunCall?.init.method).toBe("POST");
+    expect(rerunCall?.init.body).toBeUndefined();
+    expect(rerunCall?.init.credentials).toBe("same-origin");
+    expect(rerunCall?.init.redirect).toBe("error");
+    expect(new Headers(rerunCall?.init.headers).get("x-csrf-token")).toBe("csrf-report");
+    expect(new Headers(rerunCall?.init.headers).get("idempotency-key")).toBe(
+      "ai-rerun-fixed",
+    );
+  });
+
+  it("rejects unknown or transport-private report fields", async () => {
+    const unknown = { ...reportPayload(), unexpected: true };
+    const privateReport = structuredClone(reportPayload());
+    const synthesis = privateReport.synthesis as Record<string, unknown>;
+    synthesis.provider_endpoint = "https://provider.example/v1/chat/completions";
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(unknown))
+      .mockResolvedValueOnce(Response.json(privateReport));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
+  it("rejects a report or rerun response for a different analysis", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ ...reportPayload(), analysis_id: "other-analysis" }),
+      )
+      .mockResolvedValueOnce(Response.json({ schema_version: "1.0", csrf_token: "csrf" }))
+      .mockResolvedValueOnce(
+        Response.json({
+          schema_version: "1.0",
+          analysis_id: "other-analysis",
+          generation: 2,
+          state: "queued",
+        }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await client.csrf();
+    await expect(
+      client.createSynthesisRun(TEAM_ID, ANALYSIS_ID, "rerun-identity"),
+    ).rejects.toMatchObject({ code: "invalid_api_response" });
+  });
+
+  it("rejects oversized report responses before parsing", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      new Response("{}", {
+        headers: { "content-length": String(10 * 1024 * 1024 + 1) },
+      }),
+    );
+
+    await expect(
+      createPerfPilotClient({ fetcher }).report(TEAM_ID, ANALYSIS_ID),
+    ).rejects.toMatchObject({ code: "invalid_api_response" });
   });
 });

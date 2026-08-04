@@ -221,6 +221,16 @@ def _trace_analysis_response(*, input_state: str) -> dict[str, object]:
         "analysis_profile": "auto",
         "question": "为什么滑动卡顿？",
         "input_uploads": [input_upload],
+        "stages": [
+            {
+                "stage": "input_validation",
+                "state": "running" if input_state == "pending" else "pending",
+                "failure": None,
+            },
+            {"stage": "smartperfetto", "state": "pending", "failure": None},
+            {"stage": "perfpilot_ai", "state": "pending", "failure": None},
+            {"stage": "report", "state": "pending", "failure": None},
+        ],
     }
 
 
@@ -437,6 +447,16 @@ def test_trace_analysis_response_projects_declared_inputs_without_minting_urls()
     unexpected_url["input_uploads"][0]["put_url"] = "https://objects.example/secret"  # type: ignore[index]
     with pytest.raises(jsonschema.ValidationError):
         validator.validate(unexpected_url)
+
+    wrong_order = _trace_analysis_response(input_state="pending")
+    wrong_order["stages"] = list(reversed(wrong_order["stages"]))  # type: ignore[arg-type]
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(wrong_order)
+
+    missing_stages = _trace_analysis_response(input_state="pending")
+    del missing_stages["stages"]
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(missing_stages)
 
 
 def test_scenario_execution_manifest_never_claims_server_sample_validity() -> None:

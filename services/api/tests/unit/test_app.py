@@ -97,6 +97,106 @@ def test_production_rejects_development_secrets() -> None:
         Settings(app_env="production")
 
 
+def test_ai_settings_have_bounded_development_defaults() -> None:
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_enabled is False
+    assert settings.ai_base_url.get_secret_value() == "http://127.0.0.1:4010/v1/"
+    assert settings.ai_provider_name == "development-fake"
+    assert settings.ai_model == "fake-json-model"
+    assert settings.ai_credential_reference.get_secret_value() == (
+        "development-only-ai-credential-reference"
+    )
+    assert (
+        settings.ai_connect_timeout_seconds,
+        settings.ai_read_timeout_seconds,
+        settings.ai_write_timeout_seconds,
+        settings.ai_pool_timeout_seconds,
+    ) == (5.0, 60.0, 30.0, 5.0)
+    assert settings.ai_max_projection_bytes == 256 * 1024
+    assert settings.ai_max_response_bytes == 128 * 1024
+
+
+def test_ai_size_limits_parse_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PERFPILOT_AI_MAX_PROJECTION_BYTES", "65536")
+    monkeypatch.setenv("PERFPILOT_AI_MAX_RESPONSE_BYTES", "32768")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_max_projection_bytes == 65536
+    assert settings.ai_max_response_bytes == 32768
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ai_max_projection_bytes", True),
+        ("ai_max_projection_bytes", 65536.0),
+        ("ai_max_response_bytes", False),
+        ("ai_max_response_bytes", 32768.0),
+    ],
+)
+def test_ai_size_limits_reject_non_integer_python_values(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://api.example.com/v1/",
+        "https://api.example.com/v1",
+        "https://user:password@api.example.com/v1/",
+        "https://api.example.com/v1/?private=value",
+        "https://api.example.com/v1/#private-value",
+        "https://localhost/v1/",
+        "https://127.0.0.1/v1/",
+        "https://127.1/v1/",
+        "https://127.0.1/v1/",
+        "https://2130706433/v1/",
+        "https://0x7f000001/v1/",
+        "https://0.0.0.0/v1/",
+        "https://169.254.1.2/v1/",
+        "https://224.0.0.1/v1/",
+        "https://10.0.0.1/v1/",
+        "https://172.16.0.1/v1/",
+        "https://192.168.0.1/v1/",
+        "https://100.64.0.1/v1/",
+        "https://[fc00::1]/v1/",
+        "https://[::ffff:127.0.0.1]/v1/",
+    ],
+)
+def test_production_enabled_ai_rejects_unsafe_base_url_without_leaking_it(
+    base_url: str,
+) -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        _production_settings(
+            ai_enabled=True,
+            ai_base_url=base_url,
+            ai_credential_reference="vault://private-ai-token",
+        )
+
+    rendered = str(exc_info.value)
+    assert base_url not in rendered
+    assert "private-ai-token" not in rendered
+    assert base_url not in repr(exc_info.value)
+
+
+def test_production_enabled_ai_preserves_valid_api_root_path() -> None:
+    settings = _production_settings(
+        ai_enabled=True,
+        ai_base_url="https://provider.example.com/openai/v1/",
+        ai_credential_reference="vault://ai-token",
+    )
+
+    assert settings.ai_base_url.get_secret_value() == "https://provider.example.com/openai/v1/"
+
+
 def _production_settings(
     *,
     include_apkanalyzer_binary: bool = True,

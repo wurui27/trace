@@ -4,6 +4,7 @@ import base64
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -339,6 +340,27 @@ def _service(
         clock=lambda: NOW,
         uuid_source=candidates.__next__,
     )
+
+
+def test_trace_stage_projection_uses_latest_engine_synthesis_and_existing_report() -> None:
+    from perfpilot_api.services.analyses import _trace_stages
+
+    stages = _trace_stages(
+        job=SimpleNamespace(state="partially_completed", failure_code=None),
+        engine=SimpleNamespace(state="completed", stable_error_code=None),
+        synthesis=SimpleNamespace(
+            state="running",
+            stable_error_code=None,
+        ),
+        report_available=True,
+    )
+
+    assert [(stage.stage, stage.state) for stage in stages] == [
+        ("input_validation", "completed"),
+        ("smartperfetto", "completed"),
+        ("perfpilot_ai", "running"),
+        ("report", "completed"),
+    ]
 
 
 async def _create(service: Any, *, checksum: str = CHECKSUM) -> Any:

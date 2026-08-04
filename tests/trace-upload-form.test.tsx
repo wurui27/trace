@@ -26,6 +26,12 @@ it("submits the selected Trace profile and question and shows the real analysis 
         version: 3,
         report_available: false,
         input_uploads: [],
+        stages: [
+          { stage: "input_validation" as const, state: "completed" as const, failure: null },
+          { stage: "smartperfetto" as const, state: "running" as const, failure: null },
+          { stage: "perfpilot_ai" as const, state: "pending" as const, failure: null },
+          { stage: "report" as const, state: "pending" as const, failure: null },
+        ],
         failure: null,
       },
     };

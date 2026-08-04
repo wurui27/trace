@@ -1,4 +1,7 @@
 import asyncio
+import hashlib
+import json
+import os
 import re
 import secrets
 import time
@@ -25,6 +28,7 @@ from perfpilot_api.api.me import router as me_router
 from perfpilot_api.api.memory_captures import router as memory_captures_router
 from perfpilot_api.api.members import router as members_router
 from perfpilot_api.api.uploads import router as uploads_router
+from perfpilot_api.ai.prompt import load_synthesis_prompt
 from perfpilot_api.config import Settings, get_settings
 from perfpilot_api.db.control.session import (
     create_control_engine,
@@ -60,6 +64,11 @@ from perfpilot_api.services.analyses import (
     AnalysisService,
     ApkInspector,
     SQLAlchemyAnalysisRepository,
+    SynthesisRunConfiguration,
+    SynthesisRunService,
+)
+from perfpilot_api.services.synthesis_executions import (
+    SQLAlchemySynthesisExecutionRepository,
 )
 from perfpilot_api.services.provisioning import AdminTeamService
 from perfpilot_api.services.internal_artifacts import (
@@ -160,6 +169,7 @@ def create_app(
     admin_team_service: AdminTeamService | None = None,
     upload_service: UploadService | None = None,
     analysis_service: AnalysisService | None = None,
+    synthesis_run_service: SynthesisRunService | None = None,
     memory_capture_service: MemoryCaptureService | None = None,
     android_memory_worker: AndroidMemoryWorker | None = None,
     apk_inspector: ApkInspector | None = None,
@@ -187,6 +197,7 @@ def create_app(
     resolved_admin_team_service = admin_team_service
     resolved_upload_service = upload_service
     resolved_analysis_service = analysis_service
+    resolved_synthesis_run_service = synthesis_run_service
     resolved_memory_capture_service = memory_capture_service
     resolved_android_memory_worker = android_memory_worker
     active_android_memory_worker: AndroidMemoryWorker | None = None
@@ -238,6 +249,7 @@ def create_app(
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
         nonlocal owned_artifact_runtime
         nonlocal resolved_analysis_service
+        nonlocal resolved_synthesis_run_service
         nonlocal resolved_android_memory_worker
         nonlocal resolved_memory_capture_service
         nonlocal resolved_upload_service
@@ -335,6 +347,47 @@ def create_app(
                         apk_inspector=resolved_inspector,
                     )
                     lifespan_app.state.analysis_service = resolved_analysis_service
+                if resolved_synthesis_run_service is None and settings.ai_enabled:
+                    raw_digest = os.getenv("PERFPILOT_REPORT_WORKER_IMAGE_DIGEST", "")
+                    if re.fullmatch(r"sha256:[a-f0-9]{64}", raw_digest) is None:
+                        raise RuntimeError("AI synthesis runtime metadata is unavailable")
+                    prompt = load_synthesis_prompt()
+                    inference_payload = json.dumps(
+                        {
+                            "connect_timeout": settings.ai_connect_timeout_seconds,
+                            "max_response_bytes": settings.ai_max_response_bytes,
+                            "model": settings.ai_model,
+                            "pool_timeout": settings.ai_pool_timeout_seconds,
+                            "provider": settings.ai_provider_name,
+                            "read_timeout": settings.ai_read_timeout_seconds,
+                            "write_timeout": settings.ai_write_timeout_seconds,
+                        },
+                        ensure_ascii=True,
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ).encode("ascii")
+                    resolved_synthesis_run_service = SynthesisRunService(
+                        control_session_factory=control_session_factory,
+                        tenant_router=owned_artifact_runtime.tenant_router,
+                        execution_repository=SQLAlchemySynthesisExecutionRepository(
+                            control_session_factory
+                        ),
+                        configuration=SynthesisRunConfiguration(
+                            normalizer_version="smartperfetto-normalizer-1",
+                            prompt_template_version=prompt.version,
+                            prompt_template_sha256_b64=prompt.sha256_b64,
+                            report_worker_image_digest=raw_digest,
+                            provider_name=settings.ai_provider_name,
+                            model=settings.ai_model,
+                            inference_config_hash=hashlib.sha256(
+                                inference_payload
+                            ).hexdigest(),
+                        ),
+                    )
+                    lifespan_app.state.synthesis_run_service = (
+                        resolved_synthesis_run_service
+                    )
                 if resolved_memory_capture_service is None:
                     resolved_memory_capture_service = MemoryCaptureService(
                         repository=SQLAlchemyMemoryCaptureRepository(
@@ -389,6 +442,7 @@ def create_app(
     app.state.admin_team_service = resolved_admin_team_service
     app.state.upload_service = resolved_upload_service
     app.state.analysis_service = resolved_analysis_service
+    app.state.synthesis_run_service = resolved_synthesis_run_service
     app.state.memory_capture_service = resolved_memory_capture_service
     app.state.engine_adapter_registry = engine_adapter_registry
     app.state.android_memory_worker = None

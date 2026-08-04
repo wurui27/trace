@@ -31,6 +31,10 @@ class OutboxEvent(
     __tablename__ = "outbox_events"
     __table_args__ = (
         CheckConstraint("retry_count >= 0", name="ck_outbox_events_retry_count"),
+        CheckConstraint(
+            "subject_version IS NULL OR subject_version > 0",
+            name="ck_outbox_events_subject_version_positive",
+        ),
         CheckConstraint("version > 0", name="ck_outbox_events_version_positive"),
         Index("ix_outbox_events_team_id", "team_id"),
         Index("ix_outbox_events_global_job_id", "global_job_id"),
@@ -40,6 +44,24 @@ class OutboxEvent(
             "ready_at",
             "created_at",
             postgresql_where=text("ready_at IS NOT NULL AND published_at IS NULL"),
+        ),
+        Index(
+            "uq_outbox_events_engine_result_ready_subject",
+            "subject_id",
+            unique=True,
+            postgresql_where=text(
+                "event_type = 'engine_result_ready' "
+                "AND subject_type = 'engine_execution'"
+            ),
+        ),
+        Index(
+            "uq_outbox_events_analysis_synthesis_requested_subject",
+            "subject_id",
+            unique=True,
+            postgresql_where=text(
+                "event_type = 'analysis_synthesis_requested' "
+                "AND subject_type = 'synthesis_execution'"
+            ),
         ),
         Index(
             "uq_outbox_events_analysis_queued_subject",
@@ -65,6 +87,7 @@ class OutboxEvent(
     event_type: Mapped[str] = mapped_column(String(96), nullable=False)
     subject_type: Mapped[str] = mapped_column(String(64), nullable=False)
     subject_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    subject_version: Mapped[int | None] = mapped_column(Integer)
     ready_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     dead_lettered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

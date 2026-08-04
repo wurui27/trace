@@ -36,6 +36,151 @@ export type AnalysisState =
   | "canceled"
   | "deleted";
 
+export type AnalysisStageState =
+  | "pending"
+  | "running"
+  | "completed"
+  | "failed"
+  | "canceled"
+  | "not_requested";
+
+export interface AnalysisFailure {
+  readonly code: string;
+  readonly message: string;
+  readonly retryable: boolean;
+}
+
+export interface AnalysisStage {
+  readonly stage: "input_validation" | "smartperfetto" | "perfpilot_ai" | "report";
+  readonly state: AnalysisStageState;
+  readonly failure: AnalysisFailure | null;
+}
+
+export interface ReportMetric {
+  readonly metric_id: string;
+  readonly name: string;
+  readonly status: "available" | "insufficient_data" | "unavailable" | "invalid_capture";
+  readonly numeric_value: number | null;
+  readonly unit: string | null;
+  readonly definition: string;
+  readonly threshold: {
+    readonly operator: "gt" | "gte" | "lt" | "lte" | "eq";
+    readonly value: number;
+    readonly unit: string;
+  } | null;
+}
+
+export interface ReportFinding {
+  readonly finding_id: string;
+  readonly title: string;
+  readonly summary: string;
+  readonly severity: "critical" | "warning" | "healthy" | "informational";
+  readonly confidence: "high" | "medium" | "low" | "none";
+  readonly evidence_ids: readonly string[];
+}
+
+export interface ReportEvidence {
+  readonly evidence_id: string;
+  readonly source: string;
+  readonly query_id: string;
+  readonly interval_start_ns: number | null;
+  readonly interval_end_ns: number | null;
+  readonly fields: Readonly<Record<string, unknown>>;
+}
+
+export interface ReportScenario {
+  readonly scenario_job_id: string;
+  readonly scenario_type: "startup" | "scroll" | "memory_cycle";
+  readonly result_state: "completed" | "failed" | "canceled";
+  readonly device_group_id: string | null;
+  readonly device_group_reason: string | null;
+  readonly bundle: {
+    readonly metrics: readonly ReportMetric[];
+    readonly findings: readonly ReportFinding[];
+    readonly evidence: readonly ReportEvidence[];
+  } | null;
+  readonly failure: AnalysisFailure | null;
+}
+
+export interface SynthesisOutput {
+  readonly schema_version: "1.0";
+  readonly executive_summary: string;
+  readonly top_findings: ReadonlyArray<{
+    readonly finding_id: string;
+    readonly evidence_ids: readonly string[];
+    readonly user_impact: string;
+  }>;
+  readonly recommendations: ReadonlyArray<{
+    readonly priority: "p0" | "p1" | "p2" | "p3";
+    readonly title: string;
+    readonly action: string;
+    readonly expected_effect: string;
+    readonly finding_ids: readonly string[];
+    readonly evidence_ids: readonly string[];
+  }>;
+  readonly retest_plan: ReadonlyArray<{
+    readonly mode: "verify_metric" | "collect_evidence";
+    readonly scenario_type: "startup" | "scroll" | "memory_cycle";
+    readonly metric_ids: readonly string[];
+    readonly limitation_ids: readonly string[];
+    readonly steps: string;
+    readonly success_condition:
+      | "meet_existing_threshold"
+      | "improve_from_baseline"
+      | "evidence_collected";
+    readonly failure_condition: "threshold_missed" | "evidence_missing";
+  }>;
+  readonly limitations: ReadonlyArray<{
+    readonly limitation_id: string;
+    readonly summary: string;
+  }>;
+}
+
+export interface SynthesisProvenance {
+  readonly provider_protocol: string;
+  readonly provider_name: string;
+  readonly model: string;
+  readonly prompt_template_version: string;
+  readonly normalizer_version: string;
+  readonly generated_at: string;
+  readonly prompt_tokens: number;
+  readonly completion_tokens: number;
+  readonly total_tokens: number;
+  readonly generation: number;
+}
+
+export interface AnalysisReport {
+  readonly schema_version: "1.1";
+  readonly analysis_id: string;
+  readonly analysis_mode: "trace_upload";
+  readonly state: "completed" | "partially_completed" | "failed" | "canceled";
+  readonly report_version: number;
+  readonly generated_at: string;
+  readonly scenario_reports: readonly ReportScenario[];
+  readonly synthesis:
+    | {
+        readonly state: "completed";
+        readonly output: SynthesisOutput;
+        readonly synthesis_artifact_id: string;
+        readonly failure_code: null;
+        readonly provenance: SynthesisProvenance;
+      }
+    | {
+        readonly state: "failed";
+        readonly output: null;
+        readonly synthesis_artifact_id: null;
+        readonly failure_code: string;
+        readonly provenance: null;
+      };
+}
+
+export interface SynthesisRunResponse {
+  readonly schema_version: "1.0";
+  readonly analysis_id: string;
+  readonly generation: number;
+  readonly state: "queued";
+}
+
 export interface TraceFileSelection {
   readonly kind: TraceInputKind;
   readonly file: File;
@@ -51,6 +196,7 @@ export interface AnalysisResponse {
   readonly state: AnalysisState;
   readonly version: number;
   readonly report_available: boolean;
+  readonly stages: readonly AnalysisStage[];
   readonly input_uploads: ReadonlyArray<{
     readonly state: "awaiting_upload" | "pending" | "finalized";
     readonly artifact_kind: TraceInputKind;
@@ -60,11 +206,7 @@ export interface AnalysisResponse {
     readonly upload_id?: string;
     readonly artifact_id?: string;
   }>;
-  readonly failure: {
-    readonly code: string;
-    readonly message: string;
-    readonly retryable: boolean;
-  } | null;
+  readonly failure: AnalysisFailure | null;
 }
 
 export interface MeResponse {
@@ -145,6 +287,13 @@ export interface PerfPilotClient {
   ): Promise<UploadSlot>;
   putInput(slot: UploadSlot, input: InputDescriptor, signal?: AbortSignal): Promise<void>;
   analysis(teamId: string, analysisId: string, signal?: AbortSignal): Promise<AnalysisResponse>;
+  report(teamId: string, analysisId: string, signal?: AbortSignal): Promise<AnalysisReport>;
+  createSynthesisRun(
+    teamId: string,
+    analysisId: string,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<SynthesisRunResponse>;
 }
 
 interface ClientOptions {
@@ -269,6 +418,396 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
+function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
+  const allowedKeys = new Set(allowed);
+  return Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+function stringArray(value: unknown, maximum: number, minimum = 0): value is string[] {
+  return (
+    Array.isArray(value) &&
+    value.length >= minimum &&
+    value.length <= maximum &&
+    value.every((item) => typeof item === "string")
+  );
+}
+
+function validFailure(value: unknown): value is AnalysisFailure {
+  return (
+    object(value) &&
+    exactKeys(value, ["code", "message", "retryable"]) &&
+    typeof value.code === "string" &&
+    typeof value.message === "string" &&
+    typeof value.retryable === "boolean"
+  );
+}
+
+const STAGE_ORDER: readonly AnalysisStage["stage"][] = [
+  "input_validation",
+  "smartperfetto",
+  "perfpilot_ai",
+  "report",
+];
+const STAGE_STATES: readonly AnalysisStageState[] = [
+  "pending",
+  "running",
+  "completed",
+  "failed",
+  "canceled",
+  "not_requested",
+];
+
+function validStages(value: unknown): value is AnalysisStage[] {
+  return (
+    Array.isArray(value) &&
+    value.length === STAGE_ORDER.length &&
+    value.every(
+      (item, index) =>
+        object(item) &&
+        exactKeys(item, ["stage", "state", "failure"]) &&
+        item.stage === STAGE_ORDER[index] &&
+        STAGE_STATES.includes(item.state as AnalysisStageState) &&
+        (item.failure === null || validFailure(item.failure)),
+    )
+  );
+}
+
+const PRIVATE_TRANSPORT_KEYS = new Set([
+  "credential_reference",
+  "endpoint",
+  "object_key",
+  "provider_endpoint",
+  "put_url",
+  "required_headers",
+  "signed_url",
+  "version_id",
+]);
+
+function containsPrivateTransportData(value: unknown): boolean {
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (typeof current === "string") {
+      if (/x-amz-(?:algorithm|credential|signature)=/i.test(current)) return true;
+      continue;
+    }
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    if (!object(current)) continue;
+    for (const [key, nested] of Object.entries(current)) {
+      if (PRIVATE_TRANSPORT_KEYS.has(key.toLowerCase())) return true;
+      pending.push(nested);
+    }
+  }
+  return false;
+}
+
+function validReportMetric(value: unknown): boolean {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "metric_id",
+      "name",
+      "status",
+      "numeric_value",
+      "unit",
+      "definition",
+      "threshold",
+      "sample_ids",
+    ]) &&
+    typeof value.metric_id === "string" &&
+    typeof value.name === "string" &&
+    ["available", "insufficient_data", "unavailable", "invalid_capture"].includes(
+      String(value.status),
+    ) &&
+    (value.numeric_value === null || typeof value.numeric_value === "number") &&
+    (value.unit === null || typeof value.unit === "string") &&
+    typeof value.definition === "string"
+  );
+}
+
+function validReportFinding(value: unknown): boolean {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "finding_id",
+      "rule_id",
+      "kind",
+      "status",
+      "severity",
+      "confidence",
+      "confidence_ceiling",
+      "title",
+      "summary",
+      "evidence_ids",
+      "exclusions",
+      "recommendation",
+      "retest",
+    ]) &&
+    typeof value.finding_id === "string" &&
+    typeof value.title === "string" &&
+    typeof value.summary === "string" &&
+    ["critical", "warning", "healthy", "informational"].includes(String(value.severity)) &&
+    ["high", "medium", "low", "none"].includes(String(value.confidence)) &&
+    stringArray(value.evidence_ids, 20)
+  );
+}
+
+function validReportEvidence(value: unknown): boolean {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "evidence_id",
+      "source",
+      "query_id",
+      "interval_start_ns",
+      "interval_end_ns",
+      "artifact_id",
+      "fields",
+    ]) &&
+    typeof value.evidence_id === "string" &&
+    typeof value.source === "string" &&
+    typeof value.query_id === "string" &&
+    (value.interval_start_ns === null || typeof value.interval_start_ns === "number") &&
+    (value.interval_end_ns === null || typeof value.interval_end_ns === "number") &&
+    object(value.fields)
+  );
+}
+
+function validReportBundle(value: unknown): boolean {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "schema_version",
+      "bundle_id",
+      "scenario_job_id",
+      "scenario_type",
+      "bundle_state",
+      "valid_measurement",
+      "validity_reasons",
+      "sample_ids",
+      "generated_at",
+      "metrics",
+      "findings",
+      "evidence",
+      "artifacts",
+      "trace_health",
+      "trace_capabilities",
+      "provenance",
+    ]) &&
+    Array.isArray(value.metrics) &&
+    value.metrics.every(validReportMetric) &&
+    Array.isArray(value.findings) &&
+    value.findings.every(validReportFinding) &&
+    Array.isArray(value.evidence) &&
+    value.evidence.every(validReportEvidence)
+  );
+}
+
+function validScenarioReport(value: unknown): boolean {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "scenario_job_id",
+      "scenario_type",
+      "result_state",
+      "device_group_id",
+      "device_group_reason",
+      "bundle",
+      "failure",
+    ]) &&
+    typeof value.scenario_job_id === "string" &&
+    ["startup", "scroll", "memory_cycle"].includes(String(value.scenario_type)) &&
+    ["completed", "failed", "canceled"].includes(String(value.result_state)) &&
+    (value.bundle === null || validReportBundle(value.bundle)) &&
+    (value.failure === null || validFailure(value.failure))
+  );
+}
+
+function validSynthesisOutput(value: unknown): value is SynthesisOutput {
+  if (
+    !object(value) ||
+    !exactKeys(value, [
+      "schema_version",
+      "executive_summary",
+      "top_findings",
+      "recommendations",
+      "retest_plan",
+      "limitations",
+    ]) ||
+    value.schema_version !== "1.0" ||
+    typeof value.executive_summary !== "string" ||
+    !Array.isArray(value.top_findings) ||
+    value.top_findings.length > 5 ||
+    !Array.isArray(value.recommendations) ||
+    value.recommendations.length > 10 ||
+    !Array.isArray(value.retest_plan) ||
+    value.retest_plan.length > 5 ||
+    !Array.isArray(value.limitations) ||
+    value.limitations.length > 20
+  ) {
+    return false;
+  }
+  const findingsValid = value.top_findings.every(
+    (item) =>
+      object(item) &&
+      exactKeys(item, ["finding_id", "evidence_ids", "user_impact"]) &&
+      typeof item.finding_id === "string" &&
+      stringArray(item.evidence_ids, 20, 1) &&
+      typeof item.user_impact === "string",
+  );
+  const recommendationsValid = value.recommendations.every(
+    (item) =>
+      object(item) &&
+      exactKeys(item, [
+        "priority",
+        "title",
+        "action",
+        "expected_effect",
+        "finding_ids",
+        "evidence_ids",
+      ]) &&
+      ["p0", "p1", "p2", "p3"].includes(String(item.priority)) &&
+      typeof item.title === "string" &&
+      typeof item.action === "string" &&
+      typeof item.expected_effect === "string" &&
+      stringArray(item.finding_ids, 20, 1) &&
+      stringArray(item.evidence_ids, 20, 1),
+  );
+  const retestsValid = value.retest_plan.every(
+    (item) =>
+      object(item) &&
+      exactKeys(item, [
+        "mode",
+        "scenario_type",
+        "metric_ids",
+        "limitation_ids",
+        "steps",
+        "success_condition",
+        "failure_condition",
+      ]) &&
+      ["verify_metric", "collect_evidence"].includes(String(item.mode)) &&
+      ["startup", "scroll", "memory_cycle"].includes(String(item.scenario_type)) &&
+      stringArray(item.metric_ids, 20) &&
+      stringArray(item.limitation_ids, 20) &&
+      typeof item.steps === "string",
+  );
+  const limitationsValid = value.limitations.every(
+    (item) =>
+      object(item) &&
+      exactKeys(item, ["limitation_id", "summary"]) &&
+      typeof item.limitation_id === "string" &&
+      typeof item.summary === "string",
+  );
+  return findingsValid && recommendationsValid && retestsValid && limitationsValid;
+}
+
+function validSynthesisProvenance(value: unknown): value is SynthesisProvenance {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "provider_protocol",
+      "provider_name",
+      "model",
+      "prompt_template_version",
+      "prompt_template_sha256_b64",
+      "normalizer_version",
+      "report_worker_image_digest",
+      "projection_artifact_id",
+      "projection_sha256_b64",
+      "generated_at",
+      "prompt_tokens",
+      "completion_tokens",
+      "total_tokens",
+      "generation",
+    ]) &&
+    typeof value.provider_protocol === "string" &&
+    typeof value.provider_name === "string" &&
+    typeof value.model === "string" &&
+    typeof value.prompt_template_version === "string" &&
+    typeof value.normalizer_version === "string" &&
+    typeof value.generated_at === "string" &&
+    Number.isInteger(value.prompt_tokens) &&
+    Number.isInteger(value.completion_tokens) &&
+    Number.isInteger(value.total_tokens) &&
+    Number.isInteger(value.generation)
+  );
+}
+
+function analysisReportResponse(value: unknown): AnalysisReport {
+  if (
+    !object(value) ||
+    containsPrivateTransportData(value) ||
+    !exactKeys(value, [
+      "schema_version",
+      "analysis_id",
+      "analysis_mode",
+      "state",
+      "report_version",
+      "generated_at",
+      "scenario_reports",
+      "synthesis",
+    ]) ||
+    value.schema_version !== "1.1" ||
+    value.analysis_mode !== "trace_upload" ||
+    typeof value.analysis_id !== "string" ||
+    !["completed", "partially_completed", "failed", "canceled"].includes(
+      String(value.state),
+    ) ||
+    !Number.isSafeInteger(value.report_version) ||
+    Number(value.report_version) < 1 ||
+    typeof value.generated_at !== "string" ||
+    !Array.isArray(value.scenario_reports) ||
+    value.scenario_reports.length < 1 ||
+    value.scenario_reports.length > 3 ||
+    !value.scenario_reports.every(validScenarioReport) ||
+    !object(value.synthesis) ||
+    !exactKeys(value.synthesis, [
+      "state",
+      "output",
+      "synthesis_artifact_id",
+      "failure_code",
+      "provenance",
+    ])
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  const synthesis = value.synthesis;
+  const completed =
+    synthesis.state === "completed" &&
+    validSynthesisOutput(synthesis.output) &&
+    typeof synthesis.synthesis_artifact_id === "string" &&
+    synthesis.failure_code === null &&
+    validSynthesisProvenance(synthesis.provenance);
+  const failed =
+    synthesis.state === "failed" &&
+    synthesis.output === null &&
+    synthesis.synthesis_artifact_id === null &&
+    typeof synthesis.failure_code === "string" &&
+    synthesis.provenance === null;
+  if (!completed && !failed) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as AnalysisReport;
+}
+
+function synthesisRunResponse(value: unknown): SynthesisRunResponse {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "analysis_id", "generation", "state"]) ||
+    value.schema_version !== "1.0" ||
+    typeof value.analysis_id !== "string" ||
+    !Number.isSafeInteger(value.generation) ||
+    Number(value.generation) < 1 ||
+    value.state !== "queued"
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as SynthesisRunResponse;
+}
+
 function analysisResponse(value: unknown): AnalysisResponse {
   if (
     !object(value) ||
@@ -280,7 +819,8 @@ function analysisResponse(value: unknown): AnalysisResponse {
     !Array.isArray(value.input_uploads) ||
     typeof value.state !== "string" ||
     typeof value.version !== "number" ||
-    typeof value.report_available !== "boolean"
+    typeof value.report_available !== "boolean" ||
+    !validStages(value.stages)
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
@@ -488,6 +1028,33 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
           signal,
         ),
       );
+    },
+    async report(teamId, analysisId, signal) {
+      const report = analysisReportResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/report`,
+          {},
+          signal,
+        ),
+      );
+      if (report.analysis_id !== analysisId) {
+        throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+      }
+      return report;
+    },
+    async createSynthesisRun(teamId, analysisId, idempotencyKey, signal) {
+      const run = synthesisRunResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/synthesis-runs`,
+          { method: "POST" },
+          signal,
+          idempotencyKey,
+        ),
+      );
+      if (run.analysis_id !== analysisId) {
+        throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+      }
+      return run;
     },
   };
 }

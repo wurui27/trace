@@ -33,8 +33,10 @@ from perfpilot_api.db.control.models import (
     IdempotencyKey,
     OutboxEvent,
     ScenarioJob,
+    SynthesisExecution,
     Team,
     TeamEngineWorkspace,
+    TenantResource,
     TenantQuota,
     WorkerClaim,
 )
@@ -59,11 +61,21 @@ from perfpilot_api.services.analyses import (
     SQLAlchemyAnalysisRepository,
     SchedulingRequirements,
     StaleTaskVersionError,
+    SynthesisRunConfiguration,
+    SynthesisRunService,
     canonical_analysis_request_hash,
     canonical_memory_analysis_request_hash,
     canonical_trace_analysis_request_hash,
     scenario_job_id,
     trace_analysis_ready_event_id,
+)
+from perfpilot_api.reports.writer import (
+    AnalysisReportWriteRequest,
+    compose_analysis_report,
+    report_version_id,
+)
+from perfpilot_api.services.synthesis_executions import (
+    SQLAlchemySynthesisExecutionRepository,
 )
 from perfpilot_api.services.trace_executions import SQLAlchemyTraceExecutionRepository
 from perfpilot_api.services.uploads import (
@@ -1017,6 +1029,236 @@ async def test_trace_creation_persists_tenant_manifest_without_device_side_effec
     ]
     assert analysis.question == "为什么滑动卡顿？"
     assert (artifact_count, scenario_count) == (0, 0)
+
+
+@pytest.mark.asyncio
+async def test_ai_only_rerun_reserves_next_generation_and_replays_same_key(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    await _create_trace_analysis(analysis_databases)
+    source_id = uuid4()
+    synthesis_id = uuid4()
+    canonical_id = uuid4()
+    report_id = report_version_id(synthesis_id)
+    examples = Path(__file__).resolve().parents[4] / "contracts" / "v1" / "examples"
+    core = json.loads(
+        (examples / "normalized-trace-report.valid.json").read_text(encoding="utf-8")
+    )
+    core["analysis_id"] = str(ANALYSIS_ID)
+    core["provenance"]["canonical_artifact_id"] = str(canonical_id)
+    core["provenance"]["canonical_sha256_b64"] = CHECKSUM
+    synthesis = json.loads(
+        (examples / "synthesis-output.valid.json").read_text(encoding="utf-8")
+    )
+    composed = compose_analysis_report(
+        AnalysisReportWriteRequest(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            synthesis_execution_id=synthesis_id,
+            tenant_resource_version=1,
+            generation=1,
+            generated_at=NOW,
+            core_document=core,
+            synthesis_document=synthesis,
+            synthesis_failure_code=None,
+            canonical_artifact_id=canonical_id,
+            canonical_sha256_b64=CHECKSUM,
+            projection_artifact_id=uuid4(),
+            projection_sha256_b64=CHECKSUM,
+            synthesis_artifact_id=uuid4(),
+            synthesis_sha256_b64=CHECKSUM,
+            normalizer_version="smartperfetto-normalizer-1",
+            prompt_template_version="perfpilot-synthesis-v1",
+            prompt_template_sha256_b64=CHECKSUM,
+            report_worker_image_digest="sha256:" + "1" * 64,
+            provider_protocol="chat-completions-json-schema-v1",
+            provider_name="test-provider",
+            model="test-model",
+            prompt_tokens=10,
+            completion_tokens=20,
+            total_tokens=30,
+            latency_ms=50,
+        ),
+        report_version=1,
+    )
+    async with analysis_databases.control_sessions.begin() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        assert job is not None
+        job.state = "completed"
+        job.started_at = NOW
+        job.completed_at = NOW
+        job.version += 1
+        session.add(
+            TenantResource(
+                team_id=TEAM_ID,
+                resource_version=1,
+                state="active",
+                provisioning_step="active",
+                credential_version=1,
+                retry_count=0,
+                fencing_token=0,
+                write_paused=False,
+            )
+        )
+        session.add(
+            EngineExecution(
+                id=source_id,
+                team_id=TEAM_ID,
+                analysis_id=ANALYSIS_ID,
+                engine_id="smartperfetto",
+                attempt_number=1,
+                tenant_resource_version=1,
+                adapter_version="1.0.0",
+                engine_commit_sha="a" * 40,
+                engine_image_digest="sha256:" + "b" * 64,
+                input_manifest_hash="c" * 64,
+                config_hash="d" * 64,
+                state="completed",
+                raw_result_artifact_id=canonical_id,
+                normalized_report_version_id=report_id,
+                started_at=NOW,
+                completed_at=NOW,
+                version=3,
+            )
+        )
+        session.add(
+            SynthesisExecution(
+                id=synthesis_id,
+                team_id=TEAM_ID,
+                analysis_id=ANALYSIS_ID,
+                source_execution_id=source_id,
+                tenant_resource_version=1,
+                generation=1,
+                state="succeeded",
+                request_fingerprint="e" * 64,
+                normalizer_version="smartperfetto-normalizer-1",
+                report_worker_image_digest="sha256:" + "1" * 64,
+                projection_sha256_b64=CHECKSUM,
+                provider_protocol="chat-completions-json-schema-v1",
+                provider_name="test-provider",
+                provider_model="test-model",
+                prompt_template_version="perfpilot-synthesis-v1",
+                prompt_template_sha256_b64=CHECKSUM,
+                attempt_count=1,
+                report_generated_at=NOW,
+                report_version_id=report_id,
+                started_at=NOW,
+                completed_at=NOW,
+                version=2,
+            )
+        )
+    async with analysis_databases.tenant_sessions.begin() as session:
+        analysis = await session.get(Analysis, ANALYSIS_ID)
+        assert analysis is not None
+        analysis.state = "completed"
+        analysis.started_at = NOW
+        analysis.completed_at = NOW
+        analysis.version += 1
+        session.add(
+            Artifact(
+                id=canonical_id,
+                analysis_id=ANALYSIS_ID,
+                upload_id=canonical_id,
+                idempotency_key=f"internal:engine_result:{source_id}",
+                request_hash="f" * 64,
+                artifact_kind="engine_result",
+                mime_type="application/json",
+                size_bytes=4,
+                sha256_b64=CHECKSUM,
+                object_key=f"raw/analyses/{ANALYSIS_ID}/engine-result/{canonical_id}.json",
+                version_id="canonical-version-1",
+                state="finalized",
+                finalized_at=NOW,
+                expires_at=NOW + timedelta(days=30),
+                version=2,
+            )
+        )
+        session.add(
+            ReportVersion(
+                id=report_id,
+                analysis_id=ANALYSIS_ID,
+                scenario_result_id=None,
+                report_version=1,
+                state="complete",
+                generated_at=NOW,
+                tool_version="perfpilot-report-writer-1",
+                rule_version="smartperfetto-normalizer-1",
+                source_artifact_id=canonical_id,
+                provenance={},
+                report=composed.document,
+                report_sha256_b64=composed.sha256_b64,
+            )
+        )
+
+    service = SynthesisRunService(
+        control_session_factory=analysis_databases.control_sessions,
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+        execution_repository=SQLAlchemySynthesisExecutionRepository(
+            analysis_databases.control_sessions,
+            clock=lambda: NOW,
+        ),
+        configuration=SynthesisRunConfiguration(
+            normalizer_version="smartperfetto-normalizer-1",
+            prompt_template_version="perfpilot-synthesis-v1",
+            prompt_template_sha256_b64=CHECKSUM,
+            report_worker_image_digest="sha256:" + "1" * 64,
+            provider_name="test-provider",
+            model="test-model",
+            inference_config_hash="a" * 64,
+        ),
+        clock=lambda: NOW,
+    )
+    first = await service.create(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        idempotency_key="rerun-generation-two",
+    )
+    replay = await service.create(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        idempotency_key="rerun-generation-two",
+    )
+
+    assert first == replay
+    assert (first.generation, first.state) == (2, "queued")
+    view = await analysis_databases.repository.load_view(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=NOW,
+    )
+    assert view.report_available is True
+    assert [(stage.stage, stage.state) for stage in view.stages] == [
+        ("input_validation", "completed"),
+        ("smartperfetto", "completed"),
+        ("perfpilot_ai", "pending"),
+        ("report", "completed"),
+    ]
+    assert await analysis_databases.repository.load_report(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+    ) == composed.document
+    async with analysis_databases.control_sessions() as session:
+        runs = list(
+            (
+                await session.scalars(
+                    select(SynthesisExecution).where(
+                        SynthesisExecution.analysis_id == ANALYSIS_ID
+                    )
+                )
+            ).all()
+        )
+        events = list(
+            (
+                await session.scalars(
+                    select(OutboxEvent).where(
+                        OutboxEvent.global_job_id == ANALYSIS_ID,
+                        OutboxEvent.event_type == "analysis_synthesis_requested",
+                    )
+                )
+            ).all()
+        )
+    assert sorted(run.generation for run in runs) == [1, 2]
+    assert len(events) == 1
 
 
 @pytest.mark.asyncio

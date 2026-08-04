@@ -145,3 +145,61 @@ def test_transition_fails_closed_for_unknown_states(current: str, target: str) -
 
     with pytest.raises(InvalidTransition):
         transition(current, target)
+
+
+def test_synthesis_projection_reduces_core_and_ai_outcomes() -> None:
+    from perfpilot_api.domain.states import AnalysisState
+    from perfpilot_api.domain.transitions import synthesis_parent_state
+
+    assert (
+        synthesis_parent_state(core_state="complete", synthesis_state="completed")
+        is AnalysisState.COMPLETED
+    )
+    assert (
+        synthesis_parent_state(core_state="complete", synthesis_state="failed")
+        is AnalysisState.PARTIALLY_COMPLETED
+    )
+    assert (
+        synthesis_parent_state(
+            core_state="complete",
+            synthesis_state="completed",
+            credible_core=False,
+        )
+        is AnalysisState.FAILED
+    )
+
+
+def test_failed_synthesis_report_can_be_remediated_only_by_complete_replacement() -> None:
+    from perfpilot_api.domain.states import AnalysisState
+    from perfpilot_api.domain.transitions import (
+        InvalidSynthesisProjection,
+        remediate_failed_synthesis,
+    )
+
+    previous = {
+        "schema_version": "1.1",
+        "state": "partially_completed",
+        "synthesis": {"state": "failed"},
+        "scenario_reports": [{"result_state": "completed"}],
+    }
+    replacement = {
+        "schema_version": "1.1",
+        "state": "completed",
+        "synthesis": {"state": "completed"},
+        "scenario_reports": [{"result_state": "completed"}],
+    }
+
+    assert (
+        remediate_failed_synthesis(
+            AnalysisState.PARTIALLY_COMPLETED,
+            previous_report=previous,
+            replacement_report=replacement,
+        )
+        is AnalysisState.COMPLETED
+    )
+    with pytest.raises(InvalidSynthesisProjection):
+        remediate_failed_synthesis(
+            AnalysisState.COMPLETED,
+            previous_report=previous,
+            replacement_report=replacement,
+        )

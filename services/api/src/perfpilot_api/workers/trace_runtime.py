@@ -250,6 +250,7 @@ async def build_production_trace_worker() -> TraceWorkerRuntime:
             ),
             upload_service=artifact_runtime.upload_service,
             engine_service=engine_service,
+            schedule_synthesis=settings.ai_enabled,
         )
         queue = SQLAlchemyTraceWorkQueueRepository(
             session_factory=control_sessions,
