@@ -13,6 +13,7 @@ _MAX_DEPTH = 64
 _MAX_NODES = 200_000
 _MAX_STRING_CHARS = 2_000
 _PRIVATE_PATTERNS = (
+    re.compile(r"https?://", re.IGNORECASE),
     re.compile(r"https?://[^/\s]+@", re.IGNORECASE),
     re.compile(r"https?://[^\s?#]+[^\s]*[?&](?:x-(?:amz|goog)-(?:signature|credential)|signature|token)=[^\s&]+", re.IGNORECASE),
     re.compile(r"(?:postgres(?:ql)?|mysql|mongodb(?:\+[^:]+)?|redis)://", re.IGNORECASE),

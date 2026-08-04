@@ -51,6 +51,8 @@ def test_projection_is_allowlisted_and_uses_only_authoritative_question() -> Non
     "private_value",
     [
         "https://objects.invalid/a?X-Amz-Signature=secret",
+        "https://objects.invalid/private/customer.trace",
+        "https://storage.invalid/blob?sig=secret",
         "https://storage.googleapis.com/a?X-Goog-Signature=secret",
         "https://user:secret@objects.invalid/a",
         "postgresql://user:secret@db.invalid/app",
