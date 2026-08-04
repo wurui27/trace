@@ -176,21 +176,37 @@ class OpenAICompatibleSynthesisProvider:
             latency_ms=latency_ms,
         )
 
-    async def synthesize(self, projection: AIProjection) -> SynthesisCandidate:
+    async def synthesize(
+        self,
+        projection: AIProjection,
+        *,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
         if not isinstance(projection, AIProjection):
             raise TypeError("projection must be an AIProjection")
+        if retry_code not in {None, "ai_output_invalid"}:
+            raise ValueError("AI retry context is invalid")
         try:
             projection_text = projection.canonical_bytes.decode("utf-8")
         except UnicodeError:
             raise _error("ai_protocol_invalid", retryable=False) from None
+        messages = [
+            {"role": "system", "content": self._prompt.system_instruction},
+            {"role": "user", "content": projection_text},
+        ]
+        if retry_code is not None:
+            # The rejected candidate is deliberately not retained or reflected.
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "Previous output was rejected: ai_output_invalid.",
+                }
+            )
         request_json = {
             "model": self._model,
             "stream": False,
             "temperature": 0,
-            "messages": [
-                {"role": "system", "content": self._prompt.system_instruction},
-                {"role": "user", "content": projection_text},
-            ],
+            "messages": messages,
             "response_format": {
                 "type": "json_schema",
                 "json_schema": {

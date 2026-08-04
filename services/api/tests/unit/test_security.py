@@ -88,6 +88,9 @@ def test_production_accepts_explicit_https_smartperfetto_service() -> None:
         smartperfetto_enabled=True,
         smartperfetto_base_url="https://smartperfetto.example.com",
         smartperfetto_credential_reference="vault://services/smartperfetto",
+        ai_enabled=True,
+        ai_base_url="https://provider.example.com/openai/v1/",
+        ai_credential_reference="vault://services/ai-provider",
     )
 
     assert settings.smartperfetto_enabled is True

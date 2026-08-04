@@ -6,6 +6,7 @@ import base64
 import hashlib
 import hmac
 import json
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Callable, Literal
@@ -31,6 +32,7 @@ _NORMALIZER_VERSION = "smartperfetto-normalizer-1"
 _PROJECTION_CONTRACT_VERSION = "1.0"
 _REPORT_CONTRACT_VERSION = "1.1"
 _PROVIDER_PROTOCOL = "chat-completions-json-schema-v1"
+_STABLE_CODE = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 
 
 class SynthesisExecutionError(RuntimeError):
@@ -85,13 +87,42 @@ class SynthesisExecutionRecord:
     state: str
     request_fingerprint: str
     normalizer_version: str
+    report_worker_image_digest: str
     projection_sha256_b64: str
     projection_artifact_id: UUID | None
+    provider_protocol: str
+    provider_name: str
+    provider_model: str
+    prompt_template_version: str
+    prompt_template_sha256_b64: str
     attempt_count: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    total_tokens: int | None
+    latency_ms: int | None
+    stable_error_code: str | None
+    last_invocation_error_code: str | None
     candidate_artifact_id: UUID | None
     candidate_sha256_b64: str | None
     report_generated_at: datetime | None
     report_version_id: UUID | None
+    version: int
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisSourceRecord:
+    id: UUID
+    team_id: UUID
+    analysis_id: UUID
+    engine_id: str
+    attempt_number: int
+    tenant_resource_version: int
+    adapter_version: str
+    engine_commit_sha: str
+    engine_image_digest: str
+    state: str
+    raw_result_artifact_id: UUID | None
+    normalized_report_version_id: UUID | None
     version: int
 
 
@@ -154,16 +185,98 @@ class SQLAlchemySynthesisExecutionRepository:
         self._clock = clock
 
     @staticmethod
-    def _record(row: SynthesisExecution) -> SynthesisExecutionRecord:
+    def _record(
+        row: SynthesisExecution,
+        *,
+        last_invocation_error_code: str | None = None,
+    ) -> SynthesisExecutionRecord:
         return SynthesisExecutionRecord(
             id=row.id, team_id=row.team_id, analysis_id=row.analysis_id,
             source_execution_id=row.source_execution_id, tenant_resource_version=row.tenant_resource_version,
             generation=row.generation, state=row.state, request_fingerprint=row.request_fingerprint,
-            normalizer_version=row.normalizer_version, projection_sha256_b64=row.projection_sha256_b64,
+            normalizer_version=row.normalizer_version,
+            report_worker_image_digest=row.report_worker_image_digest,
+            projection_sha256_b64=row.projection_sha256_b64,
             projection_artifact_id=row.projection_artifact_id, attempt_count=row.attempt_count,
+            provider_protocol=row.provider_protocol, provider_name=row.provider_name,
+            provider_model=row.provider_model, prompt_template_version=row.prompt_template_version,
+            prompt_template_sha256_b64=row.prompt_template_sha256_b64,
+            prompt_tokens=row.prompt_tokens, completion_tokens=row.completion_tokens,
+            total_tokens=row.total_tokens, latency_ms=row.latency_ms,
+            stable_error_code=row.stable_error_code,
+            last_invocation_error_code=last_invocation_error_code,
             candidate_artifact_id=row.candidate_artifact_id, candidate_sha256_b64=row.candidate_sha256_b64,
             report_generated_at=row.report_generated_at, report_version_id=row.report_version_id, version=row.version,
         )
+
+    @staticmethod
+    def _source(row: EngineExecution) -> SynthesisSourceRecord:
+        return SynthesisSourceRecord(
+            id=row.id,
+            team_id=row.team_id,
+            analysis_id=row.analysis_id,
+            engine_id=row.engine_id,
+            attempt_number=row.attempt_number,
+            tenant_resource_version=row.tenant_resource_version,
+            adapter_version=row.adapter_version,
+            engine_commit_sha=row.engine_commit_sha,
+            engine_image_digest=row.engine_image_digest,
+            state=row.state,
+            raw_result_artifact_id=row.raw_result_artifact_id,
+            normalized_report_version_id=row.normalized_report_version_id,
+            version=row.version,
+        )
+
+    async def load(
+        self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID
+    ) -> SynthesisExecutionRecord:
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(SynthesisExecution).where(
+                    SynthesisExecution.id == execution_id,
+                    SynthesisExecution.team_id == team_id,
+                    SynthesisExecution.analysis_id == analysis_id,
+                )
+            )
+            if row is None:
+                raise SynthesisExecutionNotFoundError("synthesis execution was not found")
+            invocation = await session.scalar(
+                select(AIInvocation)
+                .where(AIInvocation.synthesis_execution_id == execution_id)
+                .order_by(AIInvocation.attempt_number.desc())
+                .limit(1)
+            )
+            return self._record(
+                row,
+                last_invocation_error_code=(
+                    invocation.stable_error_code if invocation is not None else None
+                ),
+            )
+
+    async def load_source(
+        self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID
+    ) -> SynthesisSourceRecord:
+        async with self._session_factory() as session:
+            synthesis = await session.scalar(
+                select(SynthesisExecution).where(
+                    SynthesisExecution.id == execution_id,
+                    SynthesisExecution.team_id == team_id,
+                    SynthesisExecution.analysis_id == analysis_id,
+                )
+            )
+            if synthesis is None:
+                raise SynthesisExecutionNotFoundError("synthesis execution was not found")
+            row = await session.scalar(
+                select(EngineExecution).where(
+                    EngineExecution.id == synthesis.source_execution_id,
+                    EngineExecution.team_id == team_id,
+                    EngineExecution.analysis_id == analysis_id,
+                    EngineExecution.engine_id == "smartperfetto",
+                )
+            )
+            if row is None or row.state not in {"completed", "insufficient_data"}:
+                raise SynthesisExecutionNotFoundError("source execution is not authoritative")
+            return self._source(row)
 
     async def allocate(
         self, *, team_id: UUID, analysis_id: UUID, source_execution_id: UUID,
@@ -252,8 +365,29 @@ class SQLAlchemySynthesisExecutionRepository:
             await session.flush()
             return self._record(row)
 
-    async def bind_projection(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, artifact_id: UUID, now: datetime, fence: SynthesisMutationFence) -> SynthesisExecutionRecord:
-        return await self._bind_uuid("projection_artifact_id", team_id, analysis_id, execution_id, artifact_id, now, fence)
+    async def bind_projection(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        execution_id: UUID,
+        artifact_id: UUID,
+        now: datetime,
+        fence: SynthesisMutationFence,
+        sha256_b64: str | None = None,
+    ) -> SynthesisExecutionRecord:
+        if sha256_b64 is not None:
+            _checksum(sha256_b64)
+        return await self._bind_uuid(
+            "projection_artifact_id",
+            team_id,
+            analysis_id,
+            execution_id,
+            artifact_id,
+            now,
+            fence,
+            sha256_b64=sha256_b64,
+        )
 
     async def bind_candidate(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, artifact_id: UUID, sha256_b64: str, now: datetime, fence: SynthesisMutationFence) -> SynthesisExecutionRecord:
         _checksum(sha256_b64)
@@ -265,13 +399,17 @@ class SQLAlchemySynthesisExecutionRepository:
             row.candidate_artifact_id, row.candidate_sha256_b64, row.version, row.updated_at = artifact_id, sha256_b64, row.version + 1, now
             return self._record(row)
 
-    async def _bind_uuid(self, field: Literal["projection_artifact_id"], team_id: UUID, analysis_id: UUID, execution_id: UUID, value: UUID, now: datetime, fence: SynthesisMutationFence) -> SynthesisExecutionRecord:
+    async def _bind_uuid(self, field: Literal["projection_artifact_id"], team_id: UUID, analysis_id: UUID, execution_id: UUID, value: UUID, now: datetime, fence: SynthesisMutationFence, *, sha256_b64: str | None = None) -> SynthesisExecutionRecord:
         async with self._session_factory.begin() as session:
             row = await self._row(session, team_id, analysis_id, execution_id)
             await self._require_fence(session, row, fence, self._clock())
             if getattr(row, field) not in (None, value):
                 raise SynthesisIdempotencyConflictError("artifact authority changed")
+            if row.projection_artifact_id is not None and sha256_b64 is not None and row.projection_sha256_b64 != sha256_b64:
+                raise SynthesisIdempotencyConflictError("projection checksum changed")
             setattr(row, field, value)
+            if sha256_b64 is not None:
+                row.projection_sha256_b64 = sha256_b64
             row.version += 1
             row.updated_at = now
             return self._record(row)
@@ -372,6 +510,149 @@ class SQLAlchemySynthesisExecutionRepository:
             row.updated_at = now
             return self._record(row)
 
+    async def bind_candidate_result(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        execution_id: UUID,
+        attempt_number: int,
+        artifact_id: UUID,
+        sha256_b64: str,
+        prompt_tokens: int,
+        completion_tokens: int,
+        total_tokens: int,
+        latency_ms: int,
+        generated_at: datetime,
+        now: datetime,
+        fence: SynthesisMutationFence,
+    ) -> SynthesisExecutionRecord:
+        _checksum(sha256_b64)
+        if (
+            attempt_number not in {1, 2}
+            or any(
+                type(value) is not int or value < 0
+                for value in (prompt_tokens, completion_tokens, total_tokens, latency_ms)
+            )
+            or total_tokens != prompt_tokens + completion_tokens
+            or generated_at.tzinfo is None
+            or generated_at.utcoffset() is None
+        ):
+            raise ValueError("AI invocation completion is invalid")
+        async with self._session_factory.begin() as session:
+            row = await self._row(session, team_id, analysis_id, execution_id)
+            await self._require_fence(session, row, fence, self._clock())
+            invocation = await session.scalar(
+                select(AIInvocation)
+                .where(
+                    AIInvocation.synthesis_execution_id == execution_id,
+                    AIInvocation.attempt_number == attempt_number,
+                    AIInvocation.team_id == team_id,
+                    AIInvocation.analysis_id == analysis_id,
+                )
+                .with_for_update()
+            )
+            if invocation is None or row.state not in {"pending", "running"}:
+                raise SynthesisLeaseLostError("AI invocation authority was lost")
+            if invocation.state == "succeeded":
+                if (
+                    row.candidate_artifact_id == artifact_id
+                    and row.candidate_sha256_b64 == sha256_b64
+                    and row.report_generated_at == generated_at
+                ):
+                    return self._record(row)
+                raise SynthesisIdempotencyConflictError("candidate authority changed")
+            if invocation.state != "running":
+                raise SynthesisLeaseLostError("AI invocation authority was lost")
+            if row.candidate_artifact_id not in (None, artifact_id) or row.candidate_sha256_b64 not in (None, sha256_b64):
+                raise SynthesisIdempotencyConflictError("candidate authority changed")
+            if row.report_generated_at not in (None, generated_at):
+                raise SynthesisIdempotencyConflictError("report timestamp changed")
+            invocation.state = "succeeded"
+            invocation.prompt_tokens = prompt_tokens
+            invocation.completion_tokens = completion_tokens
+            invocation.total_tokens = total_tokens
+            invocation.latency_ms = latency_ms
+            invocation.stable_error_code = None
+            invocation.completed_at = now
+            row.candidate_artifact_id = artifact_id
+            row.candidate_sha256_b64 = sha256_b64
+            row.prompt_tokens = prompt_tokens
+            row.completion_tokens = completion_tokens
+            row.total_tokens = total_tokens
+            row.latency_ms = latency_ms
+            row.stable_error_code = None
+            row.report_generated_at = generated_at
+            row.version += 1
+            row.updated_at = now
+            return self._record(row)
+
+    async def finish_invocation_failure(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        execution_id: UUID,
+        attempt_number: int,
+        stable_error_code: str,
+        latency_ms: int | None,
+        exhausted: bool,
+        generated_at: datetime | None,
+        now: datetime,
+        fence: SynthesisMutationFence,
+    ) -> SynthesisExecutionRecord:
+        if (
+            attempt_number not in {1, 2}
+            or _STABLE_CODE.fullmatch(stable_error_code) is None
+            or latency_ms is not None
+            and (type(latency_ms) is not int or latency_ms < 0)
+            or exhausted != (generated_at is not None)
+            or generated_at is not None
+            and (generated_at.tzinfo is None or generated_at.utcoffset() is None)
+        ):
+            raise ValueError("AI invocation completion is invalid")
+        async with self._session_factory.begin() as session:
+            row = await self._row(session, team_id, analysis_id, execution_id)
+            await self._require_fence(session, row, fence, self._clock())
+            invocation = await session.scalar(
+                select(AIInvocation)
+                .where(
+                    AIInvocation.synthesis_execution_id == execution_id,
+                    AIInvocation.attempt_number == attempt_number,
+                    AIInvocation.team_id == team_id,
+                    AIInvocation.analysis_id == analysis_id,
+                )
+                .with_for_update()
+            )
+            if invocation is None or row.state not in {"pending", "running"}:
+                raise SynthesisLeaseLostError("AI invocation authority was lost")
+            if invocation.state == "failed":
+                if invocation.stable_error_code == stable_error_code:
+                    return self._record(
+                        row, last_invocation_error_code=stable_error_code
+                    )
+                raise SynthesisIdempotencyConflictError("AI invocation result changed")
+            if invocation.state != "running":
+                raise SynthesisLeaseLostError("AI invocation authority was lost")
+            invocation.state = "failed"
+            invocation.prompt_tokens = None
+            invocation.completion_tokens = None
+            invocation.total_tokens = None
+            invocation.latency_ms = latency_ms
+            invocation.stable_error_code = stable_error_code
+            invocation.completed_at = now
+            row.latency_ms = latency_ms
+            if exhausted:
+                if row.report_generated_at not in (None, generated_at):
+                    raise SynthesisIdempotencyConflictError("report timestamp changed")
+                row.stable_error_code = stable_error_code
+                row.report_generated_at = generated_at
+            else:
+                row.stable_error_code = None
+            row.version += 1
+            row.updated_at = now
+            return self._record(row, last_invocation_error_code=stable_error_code)
+
     async def cancel(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, now: datetime) -> SynthesisExecutionRecord:
         async with self._session_factory.begin() as session:
             row = await self._row(session, team_id, analysis_id, execution_id)
@@ -399,7 +680,7 @@ class SQLAlchemySynthesisExecutionRepository:
 
     async def bind_report(
         self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, report_version_id: UUID,
-        now: datetime, fence: SynthesisMutationFence,
+        now: datetime, fence: SynthesisMutationFence, synthesis_succeeded: bool | None = None,
     ) -> SynthesisExecutionRecord:
         """Record an immutable report version; report bytes remain tenant-owned."""
         async with self._session_factory.begin() as session:
@@ -409,12 +690,92 @@ class SQLAlchemySynthesisExecutionRepository:
                 raise SynthesisIdempotencyConflictError("report timestamp is required")
             if row.report_version_id not in (None, report_version_id):
                 raise SynthesisIdempotencyConflictError("report authority changed")
-            if row.state == "succeeded" and row.report_version_id == report_version_id:
+            target_state = "failed" if synthesis_succeeded is False else "succeeded"
+            if row.state == target_state and row.report_version_id == report_version_id:
                 return self._record(row)
             if row.state not in {"pending", "running"}:
                 raise SynthesisLeaseLostError("synthesis is terminal")
+            if synthesis_succeeded is not None and synthesis_succeeded != (row.candidate_artifact_id is not None):
+                raise SynthesisIdempotencyConflictError("synthesis result is inconsistent")
+            if synthesis_succeeded is False and row.stable_error_code is None:
+                raise SynthesisIdempotencyConflictError("synthesis failure is missing")
             row.report_version_id = report_version_id
-            row.state = "succeeded"
+            row.state = target_state
+            row.started_at = row.started_at or now
+            row.completed_at = now
+            row.version += 1
+            row.updated_at = now
+            return self._record(row)
+
+    async def bind_source_report(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        execution_id: UUID,
+        report_version_id: UUID,
+        now: datetime,
+        fence: SynthesisMutationFence,
+    ) -> SynthesisSourceRecord:
+        async with self._session_factory.begin() as session:
+            row = await self._row(session, team_id, analysis_id, execution_id)
+            await self._require_fence(session, row, fence, self._clock())
+            source = await session.scalar(
+                select(EngineExecution)
+                .where(
+                    EngineExecution.id == row.source_execution_id,
+                    EngineExecution.team_id == team_id,
+                    EngineExecution.analysis_id == analysis_id,
+                    EngineExecution.engine_id == "smartperfetto",
+                )
+                .with_for_update()
+            )
+            if source is None:
+                raise SynthesisExecutionNotFoundError("source execution is not authoritative")
+            if source.normalized_report_version_id == report_version_id:
+                return self._source(source)
+            expected: UUID | None = None
+            if row.generation > 1:
+                previous = await session.scalar(
+                    select(SynthesisExecution).where(
+                        SynthesisExecution.analysis_id == analysis_id,
+                        SynthesisExecution.source_execution_id == row.source_execution_id,
+                        SynthesisExecution.generation == row.generation - 1,
+                    )
+                )
+                if previous is None or previous.report_version_id is None:
+                    raise SynthesisIdempotencyConflictError("previous report is unavailable")
+                expected = previous.report_version_id
+            if source.normalized_report_version_id != expected:
+                raise SynthesisIdempotencyConflictError("source report authority changed")
+            source.normalized_report_version_id = report_version_id
+            source.version += 1
+            source.updated_at = now
+            return self._source(source)
+
+    async def fail_without_report(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        execution_id: UUID,
+        stable_error_code: str,
+        now: datetime,
+        fence: SynthesisMutationFence,
+    ) -> SynthesisExecutionRecord:
+        if _STABLE_CODE.fullmatch(stable_error_code) is None:
+            raise ValueError("synthesis failure code is invalid")
+        async with self._session_factory.begin() as session:
+            row = await self._row(session, team_id, analysis_id, execution_id)
+            await self._require_fence(session, row, fence, self._clock())
+            if row.state == "failed" and row.report_version_id is None:
+                if row.stable_error_code != stable_error_code:
+                    raise SynthesisIdempotencyConflictError("synthesis failure changed")
+                return self._record(row)
+            if row.state not in {"pending", "running"} or row.report_version_id is not None:
+                raise SynthesisLeaseLostError("synthesis is terminal")
+            row.state = "failed"
+            row.stable_error_code = stable_error_code
             row.started_at = row.started_at or now
             row.completed_at = now
             row.version += 1
@@ -422,4 +783,4 @@ class SQLAlchemySynthesisExecutionRepository:
             return self._record(row)
 
 
-__all__ = ["SQLAlchemySynthesisExecutionRepository", "SynthesisExecutionError", "SynthesisExecutionNotFoundError", "SynthesisExecutionRecord", "SynthesisIdempotencyConflictError", "SynthesisLeaseLostError", "SynthesisMutationFence", "SynthesisRequest", "synthesis_request_fingerprint"]
+__all__ = ["SQLAlchemySynthesisExecutionRepository", "SynthesisExecutionError", "SynthesisExecutionNotFoundError", "SynthesisExecutionRecord", "SynthesisIdempotencyConflictError", "SynthesisLeaseLostError", "SynthesisMutationFence", "SynthesisRequest", "SynthesisSourceRecord", "synthesis_request_fingerprint"]

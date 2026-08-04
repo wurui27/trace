@@ -87,6 +87,15 @@ class StoredSynthesisArtifact:
     sha256_b64: str = field(repr=False)
 
 
+@dataclass(frozen=True, slots=True)
+class LoadedSynthesisArtifact:
+    artifact_id: UUID
+    analysis_id: UUID
+    kind: ArtifactKind
+    canonical_bytes: bytes = field(repr=False)
+    sha256_b64: str = field(repr=False)
+
+
 class SynthesisArtifactRepository(Protocol):
     async def reserve(
         self,
@@ -813,6 +822,105 @@ class S3SynthesisArtifactStore:
         await self._fence(tenant)
         return self._public(finalized, request)
 
+    async def read(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        tenant_resource_version: int,
+        artifact_id: UUID,
+        kind: ArtifactKind,
+        sha256_b64: str,
+    ) -> LoadedSynthesisArtifact:
+        if (
+            not all(isinstance(value, UUID) for value in (team_id, analysis_id, artifact_id))
+            or type(tenant_resource_version) is not int
+            or tenant_resource_version < 1
+            or kind not in {"ai_projection", "ai_synthesis_result"}
+            or not _is_checksum(sha256_b64)
+        ):
+            raise SynthesisArtifactConflictError
+        tenant = await self._dependency(self._bucket_resolver.active_for_team(team_id))
+        if (
+            not isinstance(tenant, TenantBucket)
+            or tenant.team_id != team_id
+            or tenant.resource_version != tenant_resource_version
+            or not _valid_bucket(tenant.bucket)
+        ):
+            raise SynthesisArtifactUnavailableError
+        await self._fence(tenant)
+        record = await self._dependency(
+            self._repository.reload(
+                tenant=tenant,
+                analysis_id=analysis_id,
+                artifact_id=artifact_id,
+            )
+        )
+        version_id = _safe_version_id(record.version_id)
+        if (
+            record.analysis_id != analysis_id
+            or record.artifact_kind != kind
+            or record.state != "finalized"
+            or record.version != 2
+            or version_id is None
+            or not hmac.compare_digest(record.sha256_b64, sha256_b64)
+            or record.object_key != artifact_key(analysis_id, artifact_id, kind)
+        ):
+            raise SynthesisArtifactConflictError
+
+        def read_sync() -> bytes:
+            try:
+                response = self._client.get_object(
+                    Bucket=tenant.bucket,
+                    Key=record.object_key,
+                    VersionId=version_id,
+                    ChecksumMode="ENABLED",
+                )
+            except Exception:
+                raise SynthesisArtifactUnavailableError from None
+            if not isinstance(response, Mapping):
+                raise SynthesisArtifactUnavailableError
+            body = response.get("Body")
+            read = getattr(body, "read", None)
+            close = getattr(body, "close", None)
+            try:
+                if (
+                    response.get("VersionId") != version_id
+                    or response.get("ContentType") != _JSON_MIME
+                    or response.get("ContentLength") != record.size_bytes
+                    or response.get("DeleteMarker", False) is not False
+                    or not isinstance(response.get("ChecksumSHA256"), str)
+                    or not hmac.compare_digest(response["ChecksumSHA256"], sha256_b64)
+                    or not callable(read)
+                    or not callable(close)
+                ):
+                    raise SynthesisArtifactConflictError
+                payload = read(record.size_bytes + 1)
+            finally:
+                if callable(close):
+                    close()
+            if not isinstance(payload, bytes) or len(payload) != record.size_bytes:
+                raise SynthesisArtifactConflictError
+            try:
+                parsed = json.loads(payload)
+                canonical = canonical_json_bytes(parsed)
+            except Exception:
+                raise SynthesisArtifactConflictError from None
+            checksum = base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
+            if canonical != payload or not hmac.compare_digest(checksum, sha256_b64):
+                raise SynthesisArtifactConflictError
+            return payload
+
+        payload = await self._dependency(asyncio.to_thread(read_sync))
+        await self._fence(tenant)
+        return LoadedSynthesisArtifact(
+            artifact_id=artifact_id,
+            analysis_id=analysis_id,
+            kind=kind,
+            canonical_bytes=payload,
+            sha256_b64=sha256_b64,
+        )
+
     @staticmethod
     def _public(
         record: SynthesisArtifactRecord,
@@ -831,6 +939,7 @@ __all__ = [
     "ArtifactKind",
     "S3SynthesisArtifactStore",
     "SQLAlchemySynthesisArtifactRepository",
+    "LoadedSynthesisArtifact",
     "StoredSynthesisArtifact",
     "SynthesisArtifactConflictError",
     "SynthesisArtifactError",

@@ -89,6 +89,37 @@ async def test_provider_posts_exact_bounded_chat_completion_request() -> None:
 
 
 @pytest.mark.asyncio
+async def test_invalid_output_retry_sends_only_the_stable_code_not_prior_candidate() -> None:
+    from perfpilot_api.ai.openai_compatible import OpenAICompatibleSynthesisProvider
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _response()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=False
+    ) as client:
+        provider = OpenAICompatibleSynthesisProvider(
+            base_url=SecretStr("https://provider.example.com/openai/v1/"),
+            model="provider-model-1",
+            token=SecretStr("private-provider-token"),
+            prompt=load_synthesis_prompt(),
+            max_response_bytes=128 * 1024,
+            client=client,
+        )
+        await provider.synthesize(_projection(), retry_code="ai_output_invalid")
+
+    body = json.loads(requests[0].content)
+    assert body["messages"][-1] == {
+        "role": "user",
+        "content": "Previous output was rejected: ai_output_invalid.",
+    }
+    assert "candidate" not in json.dumps(body).casefold()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "code", "retryable"),
     [

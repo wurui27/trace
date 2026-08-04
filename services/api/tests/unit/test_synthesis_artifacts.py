@@ -126,3 +126,30 @@ async def test_store_fails_closed_when_reserved_content_differs() -> None:
     repository = Repository(replace(record, sha256_b64=base64.b64encode(b"d" * 32).decode("ascii")))
     with pytest.raises(SynthesisArtifactConflictError):
         await S3SynthesisArtifactStore(repository=repository, bucket_resolver=Resolver(), client=Client(request), clock=lambda: NOW).write(request)
+
+
+@pytest.mark.asyncio
+async def test_store_reads_the_exact_finalized_version_and_verifies_content() -> None:
+    request = _write()
+    record = replace(_record(request), state="finalized", version=2, version_id="v1")
+    repository = Repository(record)
+    client = Client(request)
+
+    result = await S3SynthesisArtifactStore(
+        repository=repository,
+        bucket_resolver=Resolver(),
+        client=client,
+        clock=lambda: NOW,
+    ).read(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        tenant_resource_version=7,
+        artifact_id=request.artifact_id,
+        kind=request.kind,
+        sha256_b64=request.sha256_b64,
+    )
+
+    assert result.canonical_bytes == request.canonical_bytes
+    assert result.sha256_b64 == request.sha256_b64
+    assert repository.events == ["fence", "reload", "fence"]
+    assert client.events == ["get"]

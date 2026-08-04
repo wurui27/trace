@@ -27,6 +27,7 @@ perfpilot-dispatcher = "perfpilot_api.workers.dispatcher:main"
 perfpilot-scheduler = "perfpilot_api.workers.scheduler:main"
 perfpilot-reconciler = "perfpilot_api.workers.reconciler:main"
 perfpilot-trace-worker = "perfpilot_api.workers.trace_runtime:main"
+perfpilot-synthesis-worker = "perfpilot_api.workers.synthesis_runtime:main"
 
 [build-system]
 requires = ["uv_build>=0.11.25,<0.12"]

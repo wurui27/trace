@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
+from typing import Mapping
 
 from perfpilot_api.domain.states import (
     SCENARIO_TERMINAL_STATES,
@@ -15,6 +16,10 @@ class InvalidTransition(ValueError):
 
 class InvalidAggregateState(ValueError):
     """Child states cannot be safely reduced to an analysis state."""
+
+
+class InvalidSynthesisProjection(ValueError):
+    """A report cannot authorize the requested synthesis parent projection."""
 
 
 _ALLOWED_ANALYSIS_TRANSITIONS: dict[AnalysisState, frozenset[AnalysisState]] = {
@@ -118,3 +123,66 @@ def derive_parent_state(
     if ScenarioState.SCHEDULED in child_set:
         return AnalysisState.SCHEDULED
     return AnalysisState.QUEUED
+
+
+def synthesis_parent_state(
+    *,
+    core_state: str,
+    synthesis_state: str,
+    credible_core: bool = True,
+    canceled: bool = False,
+) -> AnalysisState:
+    if canceled:
+        return AnalysisState.CANCELED
+    if not credible_core:
+        return AnalysisState.FAILED
+    if core_state not in {"complete", "partial"} or synthesis_state not in {
+        "completed",
+        "failed",
+    }:
+        raise InvalidSynthesisProjection("unknown synthesis report state")
+    if core_state == "complete" and synthesis_state == "completed":
+        return AnalysisState.COMPLETED
+    return AnalysisState.PARTIALLY_COMPLETED
+
+
+def remediate_failed_synthesis(
+    current: AnalysisState | str,
+    *,
+    previous_report: Mapping[str, object],
+    replacement_report: Mapping[str, object],
+) -> AnalysisState:
+    try:
+        current_state = AnalysisState(current)
+    except (TypeError, ValueError):
+        raise InvalidSynthesisProjection("unknown analysis state") from None
+    if current_state != AnalysisState.PARTIALLY_COMPLETED:
+        raise InvalidSynthesisProjection("synthesis remediation is not allowed")
+    previous_synthesis = previous_report.get("synthesis")
+    replacement_synthesis = replacement_report.get("synthesis")
+    previous_scenarios = previous_report.get("scenario_reports")
+    replacement_scenarios = replacement_report.get("scenario_reports")
+    if (
+        previous_report.get("schema_version") != "1.1"
+        or previous_report.get("state") != "partially_completed"
+        or not isinstance(previous_synthesis, Mapping)
+        or previous_synthesis.get("state") != "failed"
+        or not isinstance(previous_scenarios, list)
+        or not previous_scenarios
+        or any(
+            not isinstance(item, Mapping) or item.get("result_state") != "completed"
+            for item in previous_scenarios
+        )
+        or replacement_report.get("schema_version") != "1.1"
+        or replacement_report.get("state") != "completed"
+        or not isinstance(replacement_synthesis, Mapping)
+        or replacement_synthesis.get("state") != "completed"
+        or not isinstance(replacement_scenarios, list)
+        or not replacement_scenarios
+        or any(
+            not isinstance(item, Mapping) or item.get("result_state") != "completed"
+            for item in replacement_scenarios
+        )
+    ):
+        raise InvalidSynthesisProjection("synthesis remediation is not allowed")
+    return AnalysisState.COMPLETED
