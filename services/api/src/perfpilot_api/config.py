@@ -35,11 +35,14 @@ _DEVELOPMENT_SMARTPERFETTO_BASE_URL = "http://127.0.0.1:3001"
 _DEVELOPMENT_SMARTPERFETTO_CREDENTIAL_REFERENCE = (
     "development-only-smartperfetto-credential-reference"
 )
+_DEVELOPMENT_AI_BASE_URL = "http://127.0.0.1:4010/v1/"
+_DEVELOPMENT_AI_CREDENTIAL_REFERENCE = "development-only-ai-credential-reference"
 _DEVELOPMENT_ALLOWED_ORIGIN = "http://127.0.0.1:3000"
 _REDACTED_VALIDATION_INPUT = "[redacted]"
 _INVALID_PRODUCTION_SERVICE_URL = "production service URL configuration is invalid"
 _INVALID_PRODUCTION_ARTIFACT_RUNTIME = "production artifact runtime configuration is invalid"
 _INVALID_PRODUCTION_ANDROID_MEMORY = "production Android memory configuration is invalid"
+_INVALID_PRODUCTION_AI = "production AI configuration is invalid"
 _DEVELOPMENT_TENANT_CLUSTER_HOST = "127.0.0.1"
 _DEVELOPMENT_SECRET_KEYRING_CONFIG = Path(".perfpilot/keyring.json")
 _DEVELOPMENT_SECRET_STORE_ROOT = Path(".perfpilot/secrets")
@@ -82,6 +85,46 @@ def _is_loopback_host(host: str | None) -> bool:
         except OSError:
             return False
     return address.is_loopback
+
+
+def _is_unsafe_ai_host(host: str | None) -> bool:
+    if host is None:
+        return True
+    normalized_host = host.strip("[]").rstrip(".").casefold()
+    if normalized_host == "localhost":
+        return True
+    try:
+        address = ip_address(normalized_host)
+    except ValueError:
+        return False
+    return (
+        address.is_loopback
+        or address.is_unspecified
+        or address.is_link_local
+        or address.is_multicast
+    )
+
+
+def _is_valid_ai_base_url(value: SecretStr, *, production: bool) -> bool:
+    try:
+        parsed_url = urlsplit(value.get_secret_value())
+    except ValueError:
+        return False
+    if (
+        parsed_url.scheme.casefold() not in {"http", "https"}
+        or parsed_url.hostname is None
+        or parsed_url.username is not None
+        or parsed_url.password is not None
+        or parsed_url.query
+        or parsed_url.fragment
+        or not parsed_url.path.endswith("/v1/")
+        or "\\" in parsed_url.path
+    ):
+        return False
+    return not production or (
+        parsed_url.scheme.casefold() == "https"
+        and not _is_unsafe_ai_host(parsed_url.hostname)
+    )
 
 
 def _production_validation_error(message: str) -> ValidationError:
@@ -239,6 +282,32 @@ class Settings(BaseSettings):
         le=60,
         allow_inf_nan=False,
     )
+    ai_enabled: bool = False
+    ai_base_url: SecretStr = SecretStr(_DEVELOPMENT_AI_BASE_URL)
+    ai_provider_name: str = Field(
+        default="development-fake",
+        pattern=r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$",
+    )
+    ai_model: str = Field(default="fake-json-model", min_length=1, max_length=128)
+    ai_credential_reference: SecretStr = SecretStr(_DEVELOPMENT_AI_CREDENTIAL_REFERENCE)
+    ai_connect_timeout_seconds: float = Field(
+        default=5.0, gt=0, le=120, allow_inf_nan=False
+    )
+    ai_read_timeout_seconds: float = Field(
+        default=60.0, gt=0, le=120, allow_inf_nan=False
+    )
+    ai_write_timeout_seconds: float = Field(
+        default=30.0, gt=0, le=120, allow_inf_nan=False
+    )
+    ai_pool_timeout_seconds: float = Field(
+        default=5.0, gt=0, le=120, allow_inf_nan=False
+    )
+    ai_max_projection_bytes: int = Field(
+        default=256 * 1024, ge=1024, le=256 * 1024, strict=True
+    )
+    ai_max_response_bytes: int = Field(
+        default=128 * 1024, ge=1024, le=128 * 1024, strict=True
+    )
     android_memory_enabled: bool = False
     android_memory_backend: Literal["local", "oci"] = "local"
     android_memory_image_reference: str | None = None
@@ -335,6 +404,14 @@ class Settings(BaseSettings):
 
         if self.app_env != "production":
             return self
+
+        if self.ai_enabled and (
+            not _is_valid_ai_base_url(self.ai_base_url, production=True)
+            or not self.ai_credential_reference.get_secret_value().strip()
+            or self.ai_credential_reference.get_secret_value()
+            == _DEVELOPMENT_AI_CREDENTIAL_REFERENCE
+        ):
+            raise _production_validation_error(_INVALID_PRODUCTION_AI)
 
         if self.android_memory_enabled and self.android_memory_backend != "oci":
             raise _production_validation_error(_INVALID_PRODUCTION_ANDROID_MEMORY)
