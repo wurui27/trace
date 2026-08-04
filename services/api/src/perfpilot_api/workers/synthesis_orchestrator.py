@@ -156,7 +156,6 @@ class SQLAlchemySynthesisWorkQueue:
         if (
             synthesis is None
             or synthesis.state not in {"pending", "running"}
-            or event.subject_version != synthesis.version
         ):
             raise SynthesisClaimLostError("synthesis work authority was lost")
         return row, event

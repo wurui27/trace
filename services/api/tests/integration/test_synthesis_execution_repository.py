@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+from dataclasses import replace
 from uuid import uuid4
 
 import pytest
@@ -10,6 +11,7 @@ from sqlalchemy import select
 from perfpilot_api.db.control.models import EngineExecution, SynthesisExecution, TenantResource
 from perfpilot_api.services.synthesis_executions import (
     SQLAlchemySynthesisExecutionRepository,
+    SynthesisIdempotencyConflictError,
     SynthesisRequest,
 )
 
@@ -66,5 +68,34 @@ async def test_automatic_generation_replays_authoritative_source(
     replay = await repository.allocate(team_id=TEAM_ID, analysis_id=ANALYSIS_ID, source_execution_id=source_id, request=request, now=NOW)
 
     assert replay == first
+    manual = replace(request, generation=2)
+    second = await repository.allocate(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        source_execution_id=source_id,
+        request=manual,
+        now=NOW,
+        mode="manual",
+        idempotency_key="manual-generation-two",
+    )
+    assert await repository.allocate(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        source_execution_id=source_id,
+        request=manual,
+        now=NOW,
+        mode="manual",
+        idempotency_key="manual-generation-two",
+    ) == second
+    with pytest.raises(SynthesisIdempotencyConflictError):
+        await repository.allocate(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            source_execution_id=source_id,
+            request=manual,
+            now=NOW,
+            mode="manual",
+            idempotency_key="another-key",
+        )
     async with execution_database.sessions() as session:
-        assert len((await session.scalars(select(SynthesisExecution))).all()) == 1
+        assert len((await session.scalars(select(SynthesisExecution))).all()) == 2
