@@ -2,6 +2,37 @@
 
 PerfPilot analyzes Android performance evidence and publishes versioned reports.
 
+## Local report workspace
+
+The local runtime keeps SmartPerfetto and PerfPilot decoupled. Start the
+SmartPerfetto backend on `127.0.0.1:3001`, then configure an OpenAI-compatible
+model for PerfPilot's three report passes:
+
+```bash
+export PERFPILOT_LOCAL_AI_BASE_URL="https://your-provider.example/v1/"
+export PERFPILOT_LOCAL_AI_MODEL="your-model"
+export PERFPILOT_LOCAL_AI_TOKEN="your-token"
+export PERFPILOT_LOCAL_AI_PROVIDER_NAME="local-provider"
+npm run dev:api
+```
+
+In a second terminal, start the web workspace:
+
+```bash
+cp .dev.vars.example .dev.vars
+npm run dev
+```
+
+Open `http://localhost:3000`. Completed analyses expose an **打开完整报告**
+link. The report page shows SmartPerfetto provenance, the three PerfPilot AI
+rounds, evidence-backed findings, recommendations, retest steps, and known
+limitations. Runtime state and every AI round are stored below
+`.perfpilot/local-runtime`; provider tokens are never persisted there.
+
+The optional runtime overrides are `PERFPILOT_LOCAL_SMARTPERFETTO_URL`,
+`PERFPILOT_LOCAL_DATA_DIR`, `PERFPILOT_LOCAL_API_ORIGIN`, and
+`PERFPILOT_LOCAL_ADB`.
+
 ## Local checks
 
 Start PostgreSQL and Redis, then copy the safe, AI-disabled defaults:
