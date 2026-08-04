@@ -52,7 +52,7 @@ from perfpilot_api.engines.smartperfetto_contracts import (
 from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
 from perfpilot_api.local_device import AdbDeviceProbe, LocalDeviceProbe
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
-from perfpilot_api.reports.contracts import validate_contract
+from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import (
     SmartPerfettoNormalizationError,
     normalize_smartperfetto_result,
@@ -60,7 +60,13 @@ from perfpilot_api.reports.normalizer import (
 from perfpilot_api.reports.smartperfetto_live_normalizer import (
     normalize_live_smartperfetto_result,
 )
-from perfpilot_api.reports.projection import AIProjection, build_ai_projection
+from perfpilot_api.reports.projection import (
+    AIProjection,
+    ProjectionPrivacyError,
+    ProjectionQuestionError,
+    ProjectionSizeError,
+    build_ai_projection,
+)
 from perfpilot_api.reports.writer import AnalysisReportWriteRequest, compose_analysis_report
 from perfpilot_api.services.canonical_result_reader import LoadedCanonicalResult
 
@@ -421,6 +427,7 @@ class _LocalAnalysis:
 class _PreparedLocalReport:
     core_document: dict[str, object]
     projection: AIProjection
+    projection_failure_code: str | None
     canonical_artifact_id: UUID
     canonical_sha256_b64: str
     normalizer_version: str
@@ -441,6 +448,36 @@ def _parse_utc_datetime(value: object) -> datetime | None:
 
 def _sha256_b64(value: bytes) -> str:
     return base64.b64encode(hashlib.sha256(value).digest()).decode("ascii")
+
+
+def _blocked_ai_projection(
+    *,
+    analysis_id: UUID,
+    analysis_profile: str,
+    canonical_artifact_id: UUID,
+) -> AIProjection:
+    document = validate_contract(
+        "analysis-projection",
+        {
+            "schema_version": "1.0",
+            "analysis_id": str(analysis_id),
+            "analysis_profile": analysis_profile,
+            "question": None,
+            "source": {
+                "engine_id": "smartperfetto",
+                "adapter_version": "privacy-blocked",
+                "source_contract": "workspace-agent-v1",
+                "canonical_artifact_id": str(canonical_artifact_id),
+            },
+            "scenarios": [],
+            "limitations": [],
+        },
+    )
+    payload = canonical_json_bytes(document)
+    return AIProjection(
+        canonical_bytes=payload,
+        sha256_b64=_sha256_b64(payload),
+    )
 
 
 def _public_origin(value: str) -> str:
@@ -629,14 +666,38 @@ def _prepare_local_report(
     report_payload = result.payload.get("report")
     if not isinstance(report_payload, Mapping):
         raise ValueError("SmartPerfetto report is invalid")
-    projection = build_ai_projection(
-        normalized,
-        analysis_profile=analysis.profile,  # type: ignore[arg-type]
-        question=analysis.question,
-    )
+    projection_failure_code: str | None = None
+    try:
+        projection = build_ai_projection(
+            normalized,
+            analysis_profile=analysis.profile,  # type: ignore[arg-type]
+            question=analysis.question,
+        )
+    except ProjectionPrivacyError:
+        projection_failure_code = "ai_projection_private_data"
+        projection = _blocked_ai_projection(
+            analysis_id=analysis.analysis_id,
+            analysis_profile=analysis.profile,
+            canonical_artifact_id=artifact_id,
+        )
+    except ProjectionQuestionError:
+        projection_failure_code = "ai_projection_invalid_question"
+        projection = _blocked_ai_projection(
+            analysis_id=analysis.analysis_id,
+            analysis_profile=analysis.profile,
+            canonical_artifact_id=artifact_id,
+        )
+    except ProjectionSizeError:
+        projection_failure_code = "ai_projection_too_large"
+        projection = _blocked_ai_projection(
+            analysis_id=analysis.analysis_id,
+            analysis_profile=analysis.profile,
+            canonical_artifact_id=artifact_id,
+        )
     return _PreparedLocalReport(
         core_document=normalized.document,
         projection=projection,
+        projection_failure_code=projection_failure_code,
         canonical_artifact_id=artifact_id,
         canonical_sha256_b64=canonical.checksum_sha256_b64,
         normalizer_version=normalizer_version,
@@ -1341,6 +1402,11 @@ class _LocalRuntime:
             rounds: tuple[LocalRoundUsage, ...] = ()
             synthesis_failure_code: str | None = None
             try:
+                if prepared.projection_failure_code is not None:
+                    raise LocalSynthesisError(
+                        prepared.projection_failure_code,
+                        retryable=False,
+                    )
                 if self.synthesizer is None:
                     raise LocalSynthesisError("ai_not_configured", retryable=False)
 

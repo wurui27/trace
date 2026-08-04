@@ -631,6 +631,81 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
             }
 
 
+def test_local_app_publishes_core_report_when_ai_projection_is_privacy_blocked(
+    tmp_path: Path,
+) -> None:
+    result = _live_smartperfetto_result()
+    report = result.payload["report"]
+    assert isinstance(report, dict)
+    contract = report["resultContract"]
+    assert isinstance(contract, dict)
+    diagnostics = contract["diagnostics"]
+    assert isinstance(diagnostics, list)
+    diagnostic = diagnostics[0]
+    assert isinstance(diagnostic, dict)
+    evidence = diagnostic["evidence"]
+    assert isinstance(evidence, list)
+    evidence[0] = {
+        "text": "Trace evidence is stored at /Users/example/private/trace.pb"
+    }
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(result),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+        )
+
+        terminal = None
+        for _ in range(200):
+            terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if terminal["state"] in {"completed", "partially_completed", "failed"}:
+                break
+            time.sleep(0.01)
+
+        assert terminal is not None
+        assert terminal["state"] == "partially_completed"
+        assert terminal["report_available"] is True
+        assert terminal["stages"][-2]["state"] == "failed"
+        assert terminal["stages"][-1]["state"] == "completed"
+        published = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert published.status_code == 200
+    validated = validate_contract("analysis-report", published.json())
+    assert validated["synthesis"]["state"] == "failed"
+    assert validated["synthesis"]["failure_code"] == "ai_projection_private_data"
+    bundle = validated["scenario_reports"][0]["bundle"]
+    assert bundle is not None
+    assert bundle["findings"][0]["title"] == "JIT 编译活跃"
+    projection = LocalAnalysisStore(tmp_path).load_document(
+        UUID(analysis_id),
+        "projection.json",
+    )
+    assert projection["question"] is None
+    assert projection["scenarios"] == []
+    assert "/Users/example/private/trace.pb" not in json.dumps(projection)
+
+
 def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> None:
     trace = b"persistent-local-trace"
     checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
