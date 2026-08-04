@@ -400,6 +400,13 @@ class AnalysisRepository(Protocol):
         now: datetime,
     ) -> AnalysisView: ...
 
+    async def list_report_analysis_ids(
+        self,
+        *,
+        team_id: UUID,
+        limit: int,
+    ) -> tuple[UUID, ...]: ...
+
     async def mark_trace_uploading(
         self,
         *,
@@ -1251,6 +1258,37 @@ class AnalysisService:
             )
         )
 
+    async def list_report_analyses(
+        self,
+        *,
+        team_id: UUID,
+        limit: int,
+    ) -> tuple[AnalysisView, ...]:
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise AnalysisInvalidRequestError("analysis list limit is invalid")
+        analysis_ids = await _repository_call(
+            lambda: self._repository.list_report_analysis_ids(
+                team_id=team_id,
+                limit=limit,
+            )
+        )
+        now = self._clock()
+        views = tuple(
+            [
+                await _repository_call(
+                    lambda analysis_id=analysis_id: self._repository.load_view(
+                        team_id=team_id,
+                        analysis_id=analysis_id,
+                        now=now,
+                    )
+                )
+                for analysis_id in analysis_ids
+            ]
+        )
+        if any(view.team_id != team_id or not view.report_available for view in views):
+            raise AnalysisUnavailableError("analysis report list is unavailable")
+        return views
+
     async def finalize_device_upload(
         self,
         *,
@@ -1766,6 +1804,29 @@ class SQLAlchemyAnalysisRepository:
     ) -> None:
         self._control_session_factory = control_session_factory
         self._tenant_router = tenant_router
+
+    async def list_report_analysis_ids(
+        self,
+        *,
+        team_id: UUID,
+        limit: int,
+    ) -> tuple[UUID, ...]:
+        async with self._tenant_router.session(team_id) as session:
+            analysis_ids = await session.scalars(
+                select(Analysis.id)
+                .join(ReportVersion, ReportVersion.analysis_id == Analysis.id)
+                .where(
+                    Analysis.tombstoned_at.is_(None),
+                    Analysis.state != "deleted",
+                    Analysis.analysis_mode == "trace_upload",
+                    ReportVersion.scenario_result_id.is_(None),
+                    ReportVersion.report.is_not(None),
+                )
+                .group_by(Analysis.id, Analysis.created_at)
+                .order_by(Analysis.created_at.desc(), Analysis.id.desc())
+                .limit(limit)
+            )
+            return tuple(analysis_ids.all())
 
     @staticmethod
     def _reservation(

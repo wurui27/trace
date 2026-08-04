@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -66,6 +67,7 @@ class FakeAnalysisService:
             "generated_at": NOW.isoformat(),
             "scenario_reports": [],
         }
+        self.list_results: tuple[AnalysisView, ...] = ()
 
     async def create_device_analysis(self, **kwargs: object) -> AnalysisView:
         self.calls.append(("create", kwargs))
@@ -120,6 +122,12 @@ class FakeAnalysisService:
         if self.error is not None:
             raise self.error
         return _created_view(include_upload_authorization=False)
+
+    async def list_report_analyses(self, **kwargs: object) -> tuple[AnalysisView, ...]:
+        self.calls.append(("list", kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.list_results
 
     async def get_report(self, **kwargs: object) -> dict[str, object]:
         self.calls.append(("report", kwargs))
@@ -323,14 +331,21 @@ def _settings() -> Settings:
     )
 
 
-def _headers(*, method: str, target: str, body: bytes, request_id: str) -> dict[str, str]:
+def _headers(
+    *,
+    method: str,
+    target: str,
+    body: bytes,
+    request_id: str,
+    raw_query: bytes = b"",
+) -> dict[str, str]:
     signature = sign_proxy_request(
         PROXY_SECRET.encode(),
         timestamp=1_700_000_000,
         request_id=request_id,
         method=method,
         raw_path=target.encode("ascii"),
-        raw_query=b"",
+        raw_query=raw_query,
         body=body,
     )
     return {
@@ -838,6 +853,116 @@ def test_get_analysis_does_not_reissue_the_pending_upload_authorization() -> Non
     assert "put_url" not in response.json()["apk_upload"]
     assert "required_headers" not in response.json()["apk_upload"]
     assert analysis_service.calls == [("get", {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID})]
+
+
+def test_list_report_analyses_returns_latest_team_report_without_cache() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    report_view = replace(
+        _trace_created_view(profile="auto", question=None),
+        state="completed",
+        report_available=True,
+        created_at=NOW + timedelta(minutes=2),
+        completed_at=NOW + timedelta(minutes=3),
+        stages=(
+            AnalysisStageView("input_validation", "completed"),
+            AnalysisStageView("smartperfetto", "completed"),
+            AnalysisStageView("perfpilot_ai", "completed"),
+            AnalysisStageView("report", "completed"),
+        ),
+    )
+    analysis_service.list_results = (report_view,)
+    target = f"/v1/teams/{TEAM_ID}/analyses"
+    query = b"report_available=true&limit=1"
+    headers = _headers(
+        method="GET",
+        target=target,
+        raw_query=query,
+        body=b"",
+        request_id="req-analysis-list",
+    )
+    headers.pop("content-type")
+
+    with _client(auth_service, analysis_service) as client:
+        response = client.get(f"{target}?{query.decode()}", headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json() == {
+        "schema_version": "1.0",
+        "analyses": [
+            {
+                "schema_version": "1.0",
+                "analysis_id": str(ANALYSIS_ID),
+                "team_id": str(TEAM_ID),
+                "analysis_mode": "trace_upload",
+                "state": "completed",
+                "version": 2,
+                "application_version_id": None,
+                "application_metadata": None,
+                "apk_upload": None,
+                "scenarios": [],
+                "sample_verdict_counts": {
+                    "valid": 0,
+                    "invalid": 0,
+                    "pending": 0,
+                    "validation_error": 0,
+                    "total": 0,
+                },
+                "active_lease": None,
+                "report_available": True,
+                "created_at": "2026-07-28T08:02:00+00:00",
+                "started_at": None,
+                "completed_at": "2026-07-28T08:03:00+00:00",
+                "failure": None,
+                "analysis_profile": "auto",
+                "question": None,
+                "input_uploads": [
+                    {
+                        "state": "awaiting_upload",
+                        "artifact_kind": "trace",
+                        "mime": "application/octet-stream",
+                        "size": 4,
+                        "sha256_b64": CHECKSUM,
+                    }
+                ],
+                "stages": [
+                    {"stage": "input_validation", "state": "completed", "failure": None},
+                    {"stage": "smartperfetto", "state": "completed", "failure": None},
+                    {"stage": "perfpilot_ai", "state": "completed", "failure": None},
+                    {"stage": "report", "state": "completed", "failure": None},
+                ],
+            }
+        ],
+    }
+    assert analysis_service.calls == [
+        ("list", {"team_id": TEAM_ID, "limit": 1})
+    ]
+    assert auth_service.calls[0]["team_id"] == TEAM_ID
+
+
+def test_list_report_analyses_rejects_false_filter_and_out_of_range_limit() -> None:
+    for index, query in enumerate(
+        (b"report_available=false&limit=1", b"report_available=true&limit=21")
+    ):
+        auth_service = FakeAuthService()
+        analysis_service = FakeAnalysisService()
+        target = f"/v1/teams/{TEAM_ID}/analyses"
+        headers = _headers(
+            method="GET",
+            target=target,
+            raw_query=query,
+            body=b"",
+            request_id=f"req-analysis-list-invalid-{index}",
+        )
+        headers.pop("content-type")
+
+        with _client(auth_service, analysis_service) as client:
+            response = client.get(f"{target}?{query.decode()}", headers=headers)
+
+        assert response.status_code == 422
+        assert response.json()["error"]["code"] == "request_validation_failed"
+        assert analysis_service.calls == []
 
 
 def test_finalize_route_uses_authoritative_analysis_upload_classification() -> None:

@@ -2,7 +2,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Header, Request, Response
+from fastapi import APIRouter, Depends, Header, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from perfpilot_api.api.auth import get_auth_service, proxy_router_dependencies
@@ -504,6 +504,38 @@ async def create_analysis(
         raise analysis_error(error) from None
     response.headers["cache-control"] = "no-store"
     return analysis_response(view)
+
+
+@router.get("")
+async def list_report_analyses(
+    team_id: UUID,
+    request: Request,
+    response: Response,
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    analysis_service: Annotated[AnalysisService, Depends(get_analysis_service)],
+    report_available: Annotated[bool, Query()] = True,
+    limit: Annotated[int, Query(ge=1, le=20)] = 1,
+) -> dict[str, object]:
+    if not report_available:
+        raise ApiError("request_validation_failed", "请求参数校验失败", 422, False)
+    await _authorize_team(
+        request=request,
+        auth_service=auth_service,
+        team_id=team_id,
+        access="read",
+    )
+    try:
+        views = await analysis_service.list_report_analyses(
+            team_id=team_id,
+            limit=limit,
+        )
+    except (AnalysisInvalidRequestError, AnalysisUnavailableError) as error:
+        raise analysis_error(error) from None
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "analyses": [analysis_response(view) for view in views],
+    }
 
 
 @router.get("/{analysis_id}")
