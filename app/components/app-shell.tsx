@@ -1,17 +1,16 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import {
-  CheckCircle2,
   CircleAlert,
   FlaskConical,
   GitCompare,
   Layers3,
   LayoutDashboard,
-  Smartphone,
+  PackageOpen,
   UserRound,
 } from "lucide-react";
 
-import type { DashboardData } from "../lib/performance-data";
+import { ConnectedDevice } from "./connected-device";
 
 type ActiveItem =
   | "overview"
@@ -22,8 +21,10 @@ type ActiveItem =
 
 interface AppShellProps {
   readonly activeItem: ActiveItem;
-  readonly app: DashboardData["app"];
-  readonly device: DashboardData["device"];
+  readonly app?: {
+    readonly name: string;
+    readonly packageName: string;
+  };
   readonly children: ReactNode;
 }
 
@@ -63,11 +64,8 @@ const navigationItems = [
 export function AppShell({
   activeItem,
   app,
-  device,
   children,
 }: AppShellProps) {
-  const verificationLabel = device.verified ? "已验证" : "未验证";
-
   return (
     <div className="app-shell">
       <a className="skip-link" href="#main-content">
@@ -106,47 +104,36 @@ export function AppShell({
         </nav>
 
         <div className="sidebar-footer">
-          <div
-            className="connected-device"
-            aria-label={`${device.name}，${verificationLabel}，已连接，${device.os}`}
-          >
-            <span className="device-icon">
-              <Smartphone aria-hidden="true" />
-            </span>
-            <span className="device-details">
-              <strong>{device.name}</strong>
-              <span className="device-connection">
-                <CheckCircle2 aria-hidden="true" />
-                {verificationLabel} · 已连接
-              </span>
-              <span className="device-os">{device.os}</span>
-            </span>
-          </div>
+          <ConnectedDevice />
         </div>
       </aside>
 
       <div className="app-workspace">
         <header className="top-bar">
           <div className="current-app">
-            <span className="app-icon" aria-hidden="true">
-              <span className="app-icon-frame">
-                <span className="app-icon-sun" />
-                <span className="app-icon-landscape" />
-              </span>
+            <span className={`app-icon${app ? "" : " is-empty"}`} aria-hidden="true">
+              {app ? (
+                <span className="app-icon-frame">
+                  <span className="app-icon-sun" />
+                  <span className="app-icon-landscape" />
+                </span>
+              ) : (
+                <PackageOpen />
+              )}
             </span>
             <span className="current-app-details">
-              <strong>{app.name}</strong>
-              <code>{app.packageName}</code>
+              <strong>{app?.name ?? "尚未选择应用"}</strong>
+              <code>{app?.packageName ?? "新建分析后自动识别"}</code>
             </span>
           </div>
 
-          <div className="current-user" aria-label="当前用户：林墨，Android 团队">
+          <div className="current-user" aria-label="当前用户：ray_wu，本地管理员">
             <span className="user-avatar" aria-hidden="true">
               <UserRound />
             </span>
             <span className="user-details">
-              <strong>林墨</strong>
-              <span>Android 团队</span>
+              <strong>ray_wu</strong>
+              <span>本地管理员</span>
             </span>
           </div>
         </header>
