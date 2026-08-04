@@ -17,12 +17,14 @@ from perfpilot_api.services.analyses import (
     AnalysisNotFoundError,
     AnalysisQueueLimitError,
     AnalysisUnavailableError,
+    AnalysisStageView,
     AnalysisView,
     ApplicationMetadataView,
     InputUploadView,
     ReportNotAvailableError,
     SampleVerdictCounts,
     ScenarioView,
+    SynthesisRunView,
 )
 from perfpilot_api.services.uploads import UploadSlot
 
@@ -144,6 +146,18 @@ class FakeAnalysisService:
             object_key="must-never-leave-the-service",
             version_id="must-never-leave-the-service",
         )
+
+
+class FakeSynthesisRunService:
+    def __init__(self) -> None:
+        self.calls: list[dict[str, object]] = []
+        self.error: Exception | None = None
+
+    async def create(self, **kwargs: object) -> SynthesisRunView:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return SynthesisRunView(analysis_id=ANALYSIS_ID, generation=2)
 
 
 def _created_view(*, include_upload_authorization: bool = True) -> AnalysisView:
@@ -290,6 +304,12 @@ def _trace_created_view(*, profile: str, question: str | None) -> AnalysisView:
                 finalized_at=None,
             ),
         ),
+        stages=(
+            AnalysisStageView("input_validation", "pending"),
+            AnalysisStageView("smartperfetto", "pending"),
+            AnalysisStageView("perfpilot_ai", "pending"),
+            AnalysisStageView("report", "pending"),
+        ),
     )
 
 
@@ -327,6 +347,7 @@ def _headers(*, method: str, target: str, body: bytes, request_id: str) -> dict[
 def _client(
     auth_service: FakeAuthService,
     analysis_service: FakeAnalysisService,
+    synthesis_run_service: FakeSynthesisRunService | None = None,
 ) -> TestClient:
     return TestClient(
         create_app(
@@ -334,6 +355,7 @@ def _client(
             settings_override=_settings(),
             auth_service=auth_service,  # type: ignore[arg-type]
             analysis_service=analysis_service,  # type: ignore[arg-type]
+            synthesis_run_service=synthesis_run_service,  # type: ignore[arg-type]
             proxy_clock=lambda: 1_700_000_000,
         )
     )
@@ -879,6 +901,39 @@ def test_analysis_and_report_not_found_errors_do_not_leak_cross_team_existence()
         assert response.json()["error"]["code"] == code
         assert "database" not in response.text.lower()
         assert "bucket" not in response.text.lower()
+
+
+def test_create_synthesis_run_requires_write_access_and_is_idempotent_shape() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    synthesis_service = FakeSynthesisRunService()
+    target = f"/v1/teams/{TEAM_ID}/analyses/{ANALYSIS_ID}/synthesis-runs"
+    headers = _headers(
+        method="POST",
+        target=target,
+        body=b"",
+        request_id="req-analysis-synthesis-rerun",
+    )
+    headers["Idempotency-Key"] = "rerun-ai-2"
+
+    with _client(auth_service, analysis_service, synthesis_service) as client:
+        response = client.post(target, content=b"", headers=headers)
+
+    assert response.status_code == 201
+    assert response.json() == {
+        "schema_version": "1.0",
+        "analysis_id": str(ANALYSIS_ID),
+        "generation": 2,
+        "state": "queued",
+    }
+    assert synthesis_service.calls == [
+        {
+            "team_id": TEAM_ID,
+            "analysis_id": ANALYSIS_ID,
+            "idempotency_key": "rerun-ai-2",
+        }
+    ]
+    assert auth_service.calls[-1]["access"] == "write"
 
 
 def test_unavailable_analysis_error_does_not_leak_private_question() -> None:

@@ -22,10 +22,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfpilot_api.db.control.models import (
     AgentLease,
+    EngineExecution,
     GlobalJob,
     IdempotencyKey,
     OutboxEvent,
     ScenarioJob,
+    SynthesisExecution,
     Team,
     TenantQuota,
 )
@@ -46,6 +48,12 @@ from perfpilot_api.domain.transitions import (
     InvalidTransition,
     derive_parent_state,
     transition,
+)
+from perfpilot_api.services.synthesis_executions import (
+    SQLAlchemySynthesisExecutionRepository,
+    SynthesisExecutionNotFoundError,
+    SynthesisIdempotencyConflictError,
+    SynthesisRequest,
 )
 from perfpilot_api.services.uploads import (
     UploadError,
@@ -241,6 +249,21 @@ class InputUploadView:
     finalized_at: datetime | None
 
 
+AnalysisStageName = Literal[
+    "input_validation", "smartperfetto", "perfpilot_ai", "report"
+]
+AnalysisStageState = Literal[
+    "pending", "running", "completed", "failed", "canceled", "not_requested"
+]
+
+
+@dataclass(frozen=True, slots=True)
+class AnalysisStageView:
+    stage: AnalysisStageName
+    state: AnalysisStageState
+    failure_code: str | None = None
+
+
 @dataclass(frozen=True, slots=True)
 class AnalysisView:
     analysis_id: UUID
@@ -262,9 +285,28 @@ class AnalysisView:
     question: str | None = None
     analysis_profile: Literal["auto", "startup", "scroll"] | None = None
     input_uploads: tuple[InputUploadView, ...] = ()
+    stages: tuple[AnalysisStageView, ...] = ()
 
 
 MemoryAnalysisView = AnalysisView
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisRunConfiguration:
+    normalizer_version: str
+    prompt_template_version: str
+    prompt_template_sha256_b64: str
+    report_worker_image_digest: str
+    provider_name: str
+    model: str
+    inference_config_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class SynthesisRunView:
+    analysis_id: UUID
+    generation: int
+    state: Literal["queued"] = "queued"
 
 
 @dataclass(frozen=True, slots=True)
@@ -751,6 +793,159 @@ def _validate_report_contract(schema_name: str, value: object) -> None:
         _report_contract_validator(schema_name).validate(value)
     except ValidationError:
         raise AnalysisUnavailableError("analysis report contract is invalid") from None
+
+
+def _load_trace_report_from_versions(
+    *,
+    analysis_id: UUID,
+    versions: list[ReportVersion],
+) -> dict[str, object] | None:
+    for version in sorted(
+        versions,
+        key=lambda item: item.report_version,
+        reverse=True,
+    ):
+        if version.analysis_id != analysis_id or version.scenario_result_id is not None:
+            raise AnalysisUnavailableError("analysis report identity is invalid")
+        if version.report is None:
+            if (
+                version.report_sha256_b64 is not None
+                or version.bundle is not None
+                or version.bundle_sha256_b64 is not None
+            ):
+                raise AnalysisUnavailableError("analysis report metadata is invalid")
+            continue
+        if (
+            version.report_sha256_b64 is None
+            or version.bundle is not None
+            or version.bundle_sha256_b64 is not None
+            or not hmac.compare_digest(
+                _bundle_sha256_b64(version.report),
+                version.report_sha256_b64,
+            )
+        ):
+            raise AnalysisUnavailableError("analysis report checksum is invalid")
+        candidate = _copy_public_json(version.report)
+        if not isinstance(candidate, dict):
+            raise AnalysisUnavailableError("analysis report is invalid")
+        _validate_report_contract("analysis-report.schema.json", candidate)
+        expected_row_state = {
+            "completed": "complete",
+            "partially_completed": "partial",
+            "failed": "failed",
+        }.get(candidate.get("state"))
+        if (
+            candidate.get("schema_version") != "1.1"
+            or candidate.get("analysis_id") != str(analysis_id)
+            or candidate.get("analysis_mode") != "trace_upload"
+            or candidate.get("report_version") != version.report_version
+            or expected_row_state is None
+            or version.state != expected_row_state
+        ):
+            raise AnalysisUnavailableError("analysis report identity is invalid")
+        return candidate
+    return None
+
+
+def _stage(
+    name: AnalysisStageName,
+    state: AnalysisStageState,
+    failure_code: str | None = None,
+) -> AnalysisStageView:
+    if state == "failed":
+        code = failure_code or f"{name}_failed"
+        if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", code) is None:
+            code = f"{name}_failed"
+        return AnalysisStageView(name, state, code)
+    return AnalysisStageView(name, state, None)
+
+
+def _trace_stages(
+    *,
+    job: GlobalJob,
+    engine: EngineExecution | None,
+    synthesis: SynthesisExecution | None,
+    report_available: bool,
+) -> tuple[AnalysisStageView, ...]:
+    if engine is not None or job.state in {
+        "queued",
+        "scheduled",
+        "running",
+        "analyzing",
+        "completed",
+        "partially_completed",
+    }:
+        input_stage = _stage("input_validation", "completed")
+    elif job.state == "uploading":
+        input_stage = _stage("input_validation", "running")
+    elif job.state == "failed":
+        input_stage = _stage("input_validation", "failed", job.failure_code)
+    elif job.state == "canceled":
+        input_stage = _stage("input_validation", "canceled")
+    else:
+        input_stage = _stage("input_validation", "pending")
+
+    if engine is None:
+        if job.state == "failed" and input_stage.state == "completed":
+            engine_stage = _stage("smartperfetto", "failed", job.failure_code)
+        elif job.state == "canceled" and input_stage.state == "completed":
+            engine_stage = _stage("smartperfetto", "canceled")
+        else:
+            engine_stage = _stage("smartperfetto", "pending")
+    elif engine.state in {"completed", "insufficient_data"}:
+        engine_stage = _stage("smartperfetto", "completed")
+    elif engine.state in {"running", "awaiting_user"}:
+        engine_stage = _stage("smartperfetto", "running")
+    elif engine.state == "failed":
+        engine_stage = _stage(
+            "smartperfetto", "failed", engine.stable_error_code
+        )
+    elif engine.state == "canceled":
+        engine_stage = _stage("smartperfetto", "canceled")
+    else:
+        engine_stage = _stage("smartperfetto", "pending")
+
+    if synthesis is None:
+        if engine is not None and engine.state in {"completed", "insufficient_data"}:
+            ai_state: AnalysisStageState = (
+                "pending" if job.state == "analyzing" else "not_requested"
+            )
+        elif engine_stage.state in {"failed", "canceled"} or job.state in {
+            "completed",
+            "partially_completed",
+            "failed",
+            "canceled",
+        }:
+            ai_state = "not_requested"
+        else:
+            ai_state = "pending"
+        ai_stage = _stage("perfpilot_ai", ai_state)
+    elif synthesis.state == "succeeded":
+        ai_stage = _stage("perfpilot_ai", "completed")
+    elif synthesis.state == "failed":
+        ai_stage = _stage(
+            "perfpilot_ai", "failed", synthesis.stable_error_code
+        )
+    elif synthesis.state == "canceled":
+        ai_stage = _stage("perfpilot_ai", "canceled")
+    elif synthesis.state == "running":
+        ai_stage = _stage("perfpilot_ai", "running")
+    else:
+        ai_stage = _stage("perfpilot_ai", "pending")
+
+    if report_available:
+        report_stage = _stage("report", "completed")
+    elif synthesis is None and ai_stage.state == "not_requested":
+        report_stage = _stage("report", "not_requested")
+    elif synthesis is not None and synthesis.state == "failed":
+        report_stage = _stage("report", "failed", synthesis.stable_error_code)
+    elif job.state == "failed":
+        report_stage = _stage("report", "failed", job.failure_code)
+    elif job.state == "canceled":
+        report_stage = _stage("report", "canceled")
+    else:
+        report_stage = _stage("report", "pending")
+    return input_stage, engine_stage, ai_stage, report_stage
 
 
 def _validate_idempotency_key(idempotency_key: str) -> None:
@@ -1323,6 +1518,242 @@ class AnalysisService:
                 team_id=team_id,
                 analysis_id=analysis_id,
             )
+        )
+
+
+class SynthesisRunService:
+    """Reserve an AI-only generation without changing the current public report."""
+
+    def __init__(
+        self,
+        *,
+        control_session_factory: Callable[[], AsyncSession],
+        tenant_router: TenantRouter,
+        execution_repository: SQLAlchemySynthesisExecutionRepository,
+        configuration: SynthesisRunConfiguration,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        self._control_sessions = control_session_factory
+        self._tenant_router = tenant_router
+        self._executions = execution_repository
+        self._configuration = configuration
+        self._clock = clock
+
+    async def create(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        idempotency_key: str,
+    ) -> SynthesisRunView:
+        _validate_idempotency_key(idempotency_key)
+        now = self._clock()
+        async with self._control_sessions() as session:
+            job = await session.scalar(
+                select(GlobalJob).where(
+                    GlobalJob.id == analysis_id,
+                    GlobalJob.team_id == team_id,
+                )
+            )
+            if job is None:
+                raise AnalysisNotFoundError("analysis was not found")
+            if job.analysis_mode != "trace_upload":
+                raise AnalysisInvalidRequestError("analysis does not support AI reruns")
+            if AnalysisState(job.state) not in ANALYSIS_TERMINAL_STATES:
+                raise AnalysisIdempotencyConflictError("analysis is not terminal")
+            source = await session.scalar(
+                select(EngineExecution)
+                .where(
+                    EngineExecution.team_id == team_id,
+                    EngineExecution.analysis_id == analysis_id,
+                    EngineExecution.engine_id == "smartperfetto",
+                )
+                .order_by(EngineExecution.attempt_number.desc())
+                .limit(1)
+            )
+            if (
+                source is None
+                or source.state not in {"completed", "insufficient_data"}
+                or source.raw_result_artifact_id is None
+                or source.normalized_report_version_id is None
+            ):
+                raise AnalysisIdempotencyConflictError(
+                    "authoritative core report is unavailable"
+                )
+            existing_key = await session.scalar(
+                select(IdempotencyKey).where(
+                    IdempotencyKey.operation == "create_synthesis_run",
+                    IdempotencyKey.scope_type == "team",
+                    IdempotencyKey.scope_id == team_id,
+                    IdempotencyKey.key == idempotency_key,
+                )
+            )
+            replay: SynthesisExecution | None = None
+            if existing_key is not None:
+                replay = (
+                    await session.get(
+                        SynthesisExecution,
+                        existing_key.response_resource_id,
+                    )
+                    if existing_key.response_resource_id is not None
+                    else None
+                )
+                if (
+                    existing_key.team_id != team_id
+                    or existing_key.state != "completed"
+                    or replay is None
+                    or replay.team_id != team_id
+                    or replay.analysis_id != analysis_id
+                    or replay.source_execution_id != source.id
+                ):
+                    raise AnalysisIdempotencyConflictError(
+                        "synthesis idempotency key changed"
+                    )
+                generation = replay.generation
+            else:
+                latest = await session.scalar(
+                    select(SynthesisExecution)
+                    .where(
+                        SynthesisExecution.team_id == team_id,
+                        SynthesisExecution.analysis_id == analysis_id,
+                        SynthesisExecution.source_execution_id == source.id,
+                    )
+                    .order_by(SynthesisExecution.generation.desc())
+                    .limit(1)
+                )
+                if latest is None or latest.report_version_id is None:
+                    raise AnalysisIdempotencyConflictError(
+                        "authoritative AI report is unavailable"
+                    )
+                generation = latest.generation + 1
+
+        async with self._tenant_router.session(team_id) as session:
+            if session.info.get("tenant_resource_version") != source.tenant_resource_version:
+                raise AnalysisUnavailableError("tenant resource changed")
+            analysis = await session.get(Analysis, analysis_id)
+            artifact = await session.get(Artifact, source.raw_result_artifact_id)
+            report_rows = list(
+                (
+                    await session.scalars(
+                        select(ReportVersion)
+                        .where(
+                            ReportVersion.analysis_id == analysis_id,
+                            ReportVersion.scenario_result_id.is_(None),
+                        )
+                        .order_by(ReportVersion.report_version.desc())
+                    )
+                ).all()
+            )
+            if (
+                analysis is None
+                or analysis.analysis_mode != "trace_upload"
+                or analysis.tombstoned_at is not None
+                or artifact is None
+                or artifact.analysis_id != analysis_id
+                or artifact.artifact_kind != "engine_result"
+                or artifact.state != "finalized"
+                or artifact.version_id is None
+                or artifact.deleted_at is not None
+                or not isinstance(artifact.sha256_b64, str)
+            ):
+                raise AnalysisIdempotencyConflictError(
+                    "authoritative core report is unavailable"
+                )
+            report = _load_trace_report_from_versions(
+                analysis_id=analysis_id,
+                versions=report_rows,
+            )
+            latest_content = next(
+                (row for row in report_rows if row.report is not None),
+                None,
+            )
+            if (
+                report is None
+                or latest_content is None
+                or latest_content.id != source.normalized_report_version_id
+            ):
+                raise AnalysisIdempotencyConflictError(
+                    "authoritative core report is unavailable"
+                )
+            question = analysis.question
+            canonical_checksum = artifact.sha256_b64
+
+        config = self._configuration
+        request = SynthesisRequest(
+            canonical_sha256_b64=canonical_checksum,
+            tenant_resource_version=source.tenant_resource_version,
+            question=question,
+            normalizer_version=config.normalizer_version,
+            prompt_template_version=config.prompt_template_version,
+            prompt_template_sha256_b64=config.prompt_template_sha256_b64,
+            report_worker_image_digest=config.report_worker_image_digest,
+            provider_name=config.provider_name,
+            model=config.model,
+            inference_config_hash=config.inference_config_hash,
+            # The worker binds the content-derived projection checksum before invocation.
+            projection_sha256_b64=canonical_checksum,
+            generation=generation,
+        )
+        try:
+            record = await self._executions.allocate(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                source_execution_id=source.id,
+                request=request,
+                now=now,
+                mode="manual",
+                idempotency_key=idempotency_key,
+            )
+        except SynthesisIdempotencyConflictError:
+            raise AnalysisIdempotencyConflictError(
+                "synthesis idempotency key changed"
+            ) from None
+        except SynthesisExecutionNotFoundError:
+            raise AnalysisIdempotencyConflictError(
+                "authoritative core report is unavailable"
+            ) from None
+
+        from perfpilot_api.workers.synthesis_orchestrator import (
+            analysis_synthesis_requested_event_id,
+        )
+
+        event_id = analysis_synthesis_requested_event_id(record.id)
+        async with self._control_sessions() as session:
+            async with session.begin():
+                event = await session.get(OutboxEvent, event_id)
+                if event is None:
+                    session.add(
+                        OutboxEvent(
+                            id=event_id,
+                            team_id=team_id,
+                            global_job_id=analysis_id,
+                            scenario_job_id=None,
+                            event_type="analysis_synthesis_requested",
+                            subject_type="synthesis_execution",
+                            subject_id=record.id,
+                            subject_version=record.version,
+                            ready_at=now,
+                            published_at=None,
+                            dead_lettered_at=None,
+                            retry_count=0,
+                            version=1,
+                        )
+                    )
+                elif (
+                    event.team_id != team_id
+                    or event.global_job_id != analysis_id
+                    or event.scenario_job_id is not None
+                    or event.event_type != "analysis_synthesis_requested"
+                    or event.subject_type != "synthesis_execution"
+                    or event.subject_id != record.id
+                    or event.subject_version is None
+                    or event.subject_version > record.version
+                    or event.dead_lettered_at is not None
+                ):
+                    raise AnalysisUnavailableError("synthesis event is unavailable")
+        return SynthesisRunView(
+            analysis_id=analysis_id,
+            generation=record.generation,
         )
 
 
@@ -2013,6 +2444,31 @@ class SQLAlchemyAnalysisRepository:
             )
             if job is None:
                 raise AnalysisNotFoundError("analysis was not found")
+            latest_smartperfetto = await session.scalar(
+                select(EngineExecution)
+                .where(
+                    EngineExecution.analysis_id == analysis_id,
+                    EngineExecution.team_id == team_id,
+                    EngineExecution.engine_id == "smartperfetto",
+                )
+                .order_by(EngineExecution.attempt_number.desc())
+                .limit(1)
+            )
+            latest_synthesis = (
+                await session.scalar(
+                    select(SynthesisExecution)
+                    .where(
+                        SynthesisExecution.analysis_id == analysis_id,
+                        SynthesisExecution.team_id == team_id,
+                        SynthesisExecution.source_execution_id
+                        == latest_smartperfetto.id,
+                    )
+                    .order_by(SynthesisExecution.generation.desc())
+                    .limit(1)
+                )
+                if latest_smartperfetto is not None
+                else None
+            )
             children = list(
                 (
                     await session.scalars(
@@ -2101,6 +2557,18 @@ class SQLAlchemyAnalysisRepository:
                     )
                 ).all()
             )
+            trace_report_versions = list(
+                (
+                    await session.scalars(
+                        select(ReportVersion)
+                        .where(
+                            ReportVersion.analysis_id == analysis_id,
+                            ReportVersion.scenario_result_id.is_(None),
+                        )
+                        .order_by(ReportVersion.report_version.desc())
+                    )
+                ).all()
+            )
 
         if job.analysis_mode != tenant_analysis.analysis_mode:
             raise AnalysisUnavailableError("tenant analysis state is unavailable")
@@ -2129,6 +2597,27 @@ class SQLAlchemyAnalysisRepository:
                 raise AnalysisUnavailableError("trace analysis state is unavailable") from None
             if list(canonical_manifest) != stored_manifest:
                 raise AnalysisUnavailableError("trace analysis state is unavailable")
+            trace_report = _load_trace_report_from_versions(
+                analysis_id=analysis_id,
+                versions=trace_report_versions,
+            )
+            latest_trace_content = next(
+                (row for row in trace_report_versions if row.report is not None),
+                None,
+            )
+            report_available = (
+                trace_report is not None
+                and latest_trace_content is not None
+                and latest_smartperfetto is not None
+                and latest_smartperfetto.normalized_report_version_id
+                == latest_trace_content.id
+            )
+            if (
+                latest_synthesis is not None
+                and latest_synthesis.report_version_id is not None
+                and not report_available
+            ):
+                raise AnalysisUnavailableError("trace analysis report is unavailable")
             manifest_by_kind = {
                 str(item["kind"]): item for item in canonical_manifest
             }
@@ -2223,7 +2712,7 @@ class SQLAlchemyAnalysisRepository:
                     total=0,
                 ),
                 active_lease=None,
-                report_available=False,
+                report_available=report_available,
                 created_at=job.created_at,
                 started_at=job.started_at,
                 completed_at=job.completed_at,
@@ -2231,6 +2720,12 @@ class SQLAlchemyAnalysisRepository:
                 question=question,
                 analysis_profile=tenant_analysis.analysis_profile,  # type: ignore[arg-type]
                 input_uploads=tuple(input_uploads),
+                stages=_trace_stages(
+                    job=job,
+                    engine=latest_smartperfetto,
+                    synthesis=latest_synthesis,
+                    report_available=report_available,
+                ),
             )
 
         children_by_type = {child.scenario_type: child for child in children}
@@ -3361,20 +3856,51 @@ class SQLAlchemyAnalysisRepository:
             )
             if job is None:
                 raise AnalysisNotFoundError("analysis was not found")
-            if AnalysisState(job.state) not in ANALYSIS_TERMINAL_STATES:
+            if (
+                job.analysis_mode != "trace_upload"
+                and AnalysisState(job.state) not in ANALYSIS_TERMINAL_STATES
+            ):
                 raise ReportNotAvailableError("analysis report is not available")
-            children = list(
-                (
-                    await session.scalars(
-                        select(ScenarioJob).where(ScenarioJob.analysis_id == analysis_id)
-                    )
-                ).all()
+            children = (
+                []
+                if job.analysis_mode == "trace_upload"
+                else list(
+                    (
+                        await session.scalars(
+                            select(ScenarioJob).where(
+                                ScenarioJob.analysis_id == analysis_id
+                            )
+                        )
+                    ).all()
+                )
             )
 
         async with self._tenant_router.session(team_id) as session:
             analysis = await session.get(Analysis, analysis_id)
             if analysis is None or analysis.tombstoned_at is not None:
                 raise AnalysisNotFoundError("analysis was not found")
+            if analysis.analysis_mode != job.analysis_mode:
+                raise AnalysisUnavailableError("analysis report identity is invalid")
+            if job.analysis_mode == "trace_upload":
+                trace_versions = list(
+                    (
+                        await session.scalars(
+                            select(ReportVersion)
+                            .where(
+                                ReportVersion.analysis_id == analysis_id,
+                                ReportVersion.scenario_result_id.is_(None),
+                            )
+                            .order_by(ReportVersion.report_version.desc())
+                        )
+                    ).all()
+                )
+                report = _load_trace_report_from_versions(
+                    analysis_id=analysis_id,
+                    versions=trace_versions,
+                )
+                if report is None:
+                    raise ReportNotAvailableError("analysis report is not available")
+                return report
             scenarios = list(
                 (
                     await session.scalars(

@@ -77,6 +77,7 @@
       ]
     },
     "report_available": {"type": "boolean"},
+    "stages": {"$ref": "#/$defs/traceStages"},
     "created_at": {"type": "string", "format": "date-time"},
     "started_at": {"$ref": "#/$defs/nullableDateTime"},
     "completed_at": {"$ref": "#/$defs/nullableDateTime"},
@@ -149,7 +150,8 @@
             "anyOf": [
               {"required": ["question"]},
               {"required": ["analysis_profile"]},
-              {"required": ["input_uploads"]}
+              {"required": ["input_uploads"]},
+              {"required": ["stages"]}
             ]
           }
         },
@@ -174,7 +176,8 @@
           "not": {
             "anyOf": [
               {"required": ["analysis_profile"]},
-              {"required": ["input_uploads"]}
+              {"required": ["input_uploads"]},
+              {"required": ["stages"]}
             ]
           }
         },
@@ -210,13 +213,65 @@
             "analysis_mode",
             "analysis_profile",
             "question",
-            "input_uploads"
+            "input_uploads",
+            "stages"
           ]
         }
       ]
     }
   ],
   "$defs": {
+    "analysisStage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["stage", "state", "failure"],
+      "properties": {
+        "stage": {
+          "enum": ["input_validation", "smartperfetto", "perfpilot_ai", "report"]
+        },
+        "state": {
+          "enum": ["pending", "running", "completed", "failed", "canceled", "not_requested"]
+        },
+        "failure": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/failure"}
+          ]
+        }
+      }
+    },
+    "traceStages": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/analysisStage"},
+            {"properties": {"stage": {"const": "input_validation"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/analysisStage"},
+            {"properties": {"stage": {"const": "smartperfetto"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/analysisStage"},
+            {"properties": {"stage": {"const": "perfpilot_ai"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/analysisStage"},
+            {"properties": {"stage": {"const": "report"}}}
+          ]
+        }
+      ],
+      "items": false
+    },
     "sha256": {
       "type": "string",
       "minLength": 44,
