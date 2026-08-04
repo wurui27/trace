@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import hashlib
 from dataclasses import dataclass, field
 from importlib.resources import files
@@ -20,7 +21,7 @@ class PromptLoadError(ValueError):
 @dataclass(frozen=True, slots=True)
 class SynthesisPrompt:
     version: str
-    sha256: str
+    sha256_b64: str
     system_instruction: str
     raw_bytes: bytes = field(repr=False)
 
@@ -35,7 +36,7 @@ def load_synthesis_prompt() -> SynthesisPrompt:
         raise PromptLoadError
     return SynthesisPrompt(
         version=_PROMPT_VERSION,
-        sha256=hashlib.sha256(raw_bytes).hexdigest(),
+        sha256_b64=base64.b64encode(hashlib.sha256(raw_bytes).digest()).decode("ascii"),
         system_instruction=system_instruction,
         raw_bytes=raw_bytes,
     )

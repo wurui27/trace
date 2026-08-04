@@ -100,12 +100,7 @@ def _is_unsafe_ai_host(host: str | None) -> bool:
             address = ip_address(inet_aton(normalized_host))
         except OSError:
             return False
-    return (
-        address.is_loopback
-        or address.is_unspecified
-        or address.is_link_local
-        or address.is_multicast
-    )
+    return not address.is_global or address.is_multicast
 
 
 def _is_valid_ai_base_url(value: SecretStr, *, production: bool) -> bool:

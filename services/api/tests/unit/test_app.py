@@ -134,6 +134,11 @@ def test_ai_settings_have_bounded_development_defaults() -> None:
         "https://0.0.0.0/v1/",
         "https://169.254.1.2/v1/",
         "https://224.0.0.1/v1/",
+        "https://10.0.0.1/v1/",
+        "https://172.16.0.1/v1/",
+        "https://192.168.0.1/v1/",
+        "https://100.64.0.1/v1/",
+        "https://[fc00::1]/v1/",
         "https://[::ffff:127.0.0.1]/v1/",
     ],
 )
