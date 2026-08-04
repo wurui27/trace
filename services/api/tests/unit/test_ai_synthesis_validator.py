@@ -183,6 +183,14 @@ def test_rejects_new_numeric_literals_in_narrative_fields(field_path: tuple[str 
         _validate(candidate)
 
 
+def test_rejects_invented_numeric_target_attached_to_unit() -> None:
+    candidate = _candidate()
+    candidate["retest_plan"][0]["steps"] = "Reduce the target to 16ms."
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate)
+
+
 @pytest.mark.parametrize(
     ("section", "identifier"),
     [("recommendations", "recommendation_id"), ("retest_plan", "retest_id")],

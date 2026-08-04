@@ -16,7 +16,7 @@ from perfpilot_api.reports.projection import AIProjection
 
 
 DEFAULT_MAX_CANDIDATE_BYTES = 128 * 1024
-_NUMERIC_TOKEN = re.compile(r"(?<![A-Za-z0-9_])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?(?![A-Za-z0-9_])")
+_NUMERIC_TOKEN = re.compile(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
 
 
 class SynthesisValidationError(ValueError):
