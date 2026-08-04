@@ -6,7 +6,7 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import urlsplit
 
 import httpx
@@ -31,9 +31,16 @@ SYNTHESIS_SCHEMA = _load_synthesis_schema()
 
 
 class AIProviderError(RuntimeError):
-    def __init__(self, stable_code: str, *, retryable: bool) -> None:
+    def __init__(
+        self,
+        stable_code: str,
+        *,
+        retryable: bool,
+        detail_code: str = "unspecified",
+    ) -> None:
         self.stable_code = stable_code
         self.retryable = retryable
+        self.detail_code = detail_code
         super().__init__(stable_code)
 
 
@@ -45,8 +52,17 @@ class SynthesisCandidate:
     latency_ms: int
 
 
-def _error(stable_code: str, *, retryable: bool) -> AIProviderError:
-    return AIProviderError(stable_code, retryable=retryable)
+def _error(
+    stable_code: str,
+    *,
+    retryable: bool,
+    detail_code: str = "unspecified",
+) -> AIProviderError:
+    return AIProviderError(
+        stable_code,
+        retryable=retryable,
+        detail_code=detail_code,
+    )
 
 
 def _validated_base_url(value: SecretStr) -> str:
@@ -84,6 +100,8 @@ class OpenAICompatibleSynthesisProvider:
         token: SecretStr,
         prompt: SynthesisPrompt,
         max_response_bytes: int,
+        response_format: Literal["json_schema", "json_object"] = "json_schema",
+        max_completion_tokens: int | None = None,
         client: httpx.AsyncClient | None = None,
         timeout: httpx.Timeout | None = None,
     ) -> None:
@@ -93,6 +111,13 @@ class OpenAICompatibleSynthesisProvider:
             raise TypeError("prompt must be a SynthesisPrompt")
         if type(max_response_bytes) is not int or max_response_bytes <= 0:
             raise ValueError("max_response_bytes must be positive")
+        if response_format not in {"json_schema", "json_object"}:
+            raise ValueError("AI provider response format is invalid")
+        if max_completion_tokens is not None and (
+            type(max_completion_tokens) is not int
+            or not 1 <= max_completion_tokens <= 65_536
+        ):
+            raise ValueError("AI provider token limit is invalid")
         if not token.get_secret_value().strip():
             raise ValueError("AI provider token is invalid")
         if client is not None and client.follow_redirects:
@@ -102,6 +127,8 @@ class OpenAICompatibleSynthesisProvider:
         self._token = token
         self._prompt = prompt
         self._max_response_bytes = max_response_bytes
+        self._response_format = response_format
+        self._max_completion_tokens = max_completion_tokens
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             follow_redirects=False,
@@ -123,36 +150,82 @@ class OpenAICompatibleSynthesisProvider:
             remaining = self._max_response_bytes + 1 - len(body)
             body.extend(chunk[:remaining])
             if len(chunk) > remaining or len(body) > self._max_response_bytes:
-                raise _error("ai_protocol_invalid", retryable=False)
+                raise _error(
+                    "ai_protocol_invalid",
+                    retryable=False,
+                    detail_code="response_too_large",
+                )
         return bytes(body)
 
     @staticmethod
     def _check_status(response: httpx.Response) -> None:
         if 300 <= response.status_code <= 399:
-            raise _error("ai_protocol_invalid", retryable=False)
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="http_redirect",
+            )
         if response.status_code == 429:
-            raise _error("ai_rate_limited", retryable=True)
+            raise _error(
+                "ai_rate_limited", retryable=True, detail_code="http_rate_limited"
+            )
         if 500 <= response.status_code <= 599:
-            raise _error("ai_provider_unavailable", retryable=True)
+            raise _error(
+                "ai_provider_unavailable",
+                retryable=True,
+                detail_code="http_server_error",
+            )
         if response.status_code in {401, 403}:
-            raise _error("ai_authentication_failed", retryable=False)
+            raise _error(
+                "ai_authentication_failed",
+                retryable=False,
+                detail_code="http_authentication",
+            )
         if response.status_code != 200:
-            raise _error("ai_protocol_invalid", retryable=False)
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="http_unexpected_status",
+            )
 
     @staticmethod
     def _candidate_from_response(payload: object, *, latency_ms: int) -> SynthesisCandidate:
         if not isinstance(payload, dict):
-            raise _error("ai_protocol_invalid", retryable=False)
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="response_not_object",
+            )
         choices = payload.get("choices")
         usage = payload.get("usage")
         if not isinstance(choices, list) or len(choices) != 1 or not isinstance(usage, dict):
-            raise _error("ai_protocol_invalid", retryable=False)
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="choices_or_usage_invalid",
+            )
         choice = choices[0]
-        if not isinstance(choice, dict) or choice.get("finish_reason") != "stop":
-            raise _error("ai_protocol_invalid", retryable=False)
+        if not isinstance(choice, dict):
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="choice_invalid",
+            )
+        if choice.get("finish_reason") != "stop":
+            reason = choice.get("finish_reason")
+            safe_reason = reason if isinstance(reason, str) and reason.isidentifier() else "invalid"
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code=f"finish_reason_{safe_reason}",
+            )
         message = choice.get("message")
         if not isinstance(message, dict):
-            raise _error("ai_protocol_invalid", retryable=False)
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="message_invalid",
+            )
         content = message.get("content")
         if (
             not isinstance(content, str)
@@ -160,15 +233,27 @@ class OpenAICompatibleSynthesisProvider:
             or message.get("tool_calls") is not None
             or message.get("function_call") is not None
         ):
-            raise _error("ai_protocol_invalid", retryable=False)
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="message_content_invalid",
+            )
         prompt_tokens = _nonnegative_int(usage.get("prompt_tokens"))
         completion_tokens = _nonnegative_int(usage.get("completion_tokens"))
         if prompt_tokens is None or completion_tokens is None or latency_ms < 0:
-            raise _error("ai_protocol_invalid", retryable=False)
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="usage_invalid",
+            )
         try:
             candidate_json = content.encode("utf-8")
         except UnicodeError:
-            raise _error("ai_protocol_invalid", retryable=False) from None
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="content_encoding_invalid",
+            ) from None
         return SynthesisCandidate(
             candidate_json=candidate_json,
             prompt_tokens=prompt_tokens,
@@ -189,7 +274,11 @@ class OpenAICompatibleSynthesisProvider:
         try:
             projection_text = projection.canonical_bytes.decode("utf-8")
         except UnicodeError:
-            raise _error("ai_protocol_invalid", retryable=False) from None
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="projection_encoding_invalid",
+            ) from None
         messages = [
             {"role": "system", "content": self._prompt.system_instruction},
             {"role": "user", "content": projection_text},
@@ -202,20 +291,27 @@ class OpenAICompatibleSynthesisProvider:
                     "content": "Previous output was rejected: ai_output_invalid.",
                 }
             )
-        request_json = {
-            "model": self._model,
-            "stream": False,
-            "temperature": 0,
-            "messages": messages,
-            "response_format": {
+        response_format: dict[str, object]
+        if self._response_format == "json_schema":
+            response_format = {
                 "type": "json_schema",
                 "json_schema": {
                     "name": "perfpilot_synthesis_1_0",
                     "strict": True,
                     "schema": SYNTHESIS_SCHEMA,
                 },
-            },
+            }
+        else:
+            response_format = {"type": "json_object"}
+        request_json = {
+            "model": self._model,
+            "stream": False,
+            "temperature": 0,
+            "messages": messages,
+            "response_format": response_format,
         }
+        if self._max_completion_tokens is not None:
+            request_json["max_tokens"] = self._max_completion_tokens
         started = time.monotonic_ns()
         try:
             async with self._client.stream(
@@ -233,15 +329,29 @@ class OpenAICompatibleSynthesisProvider:
         except AIProviderError:
             raise
         except httpx.TimeoutException:
-            raise _error("ai_timeout", retryable=True) from None
+            raise _error(
+                "ai_timeout", retryable=True, detail_code="transport_timeout"
+            ) from None
         except httpx.ProtocolError:
-            raise _error("ai_protocol_invalid", retryable=False) from None
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="transport_protocol_error",
+            ) from None
         except httpx.RequestError:
-            raise _error("ai_provider_unavailable", retryable=True) from None
+            raise _error(
+                "ai_provider_unavailable",
+                retryable=True,
+                detail_code="transport_request_error",
+            ) from None
         try:
             payload: Any = json.loads(raw_body.decode("utf-8"))
         except (UnicodeError, ValueError, json.JSONDecodeError):
-            raise _error("ai_protocol_invalid", retryable=False) from None
+            raise _error(
+                "ai_protocol_invalid",
+                retryable=False,
+                detail_code="response_json_invalid",
+            ) from None
         latency_ms = max(0, (time.monotonic_ns() - started) // 1_000_000)
         return self._candidate_from_response(payload, latency_ms=latency_ms)
 

@@ -120,6 +120,36 @@ async def test_invalid_output_retry_sends_only_the_stable_code_not_prior_candida
 
 
 @pytest.mark.asyncio
+async def test_provider_supports_json_object_mode_for_compatible_endpoints() -> None:
+    from perfpilot_api.ai.openai_compatible import OpenAICompatibleSynthesisProvider
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _response()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=False
+    ) as client:
+        provider = OpenAICompatibleSynthesisProvider(
+            base_url=SecretStr("https://provider.example.com/v1/"),
+            model="provider-model-1",
+            token=SecretStr("private-provider-token"),
+            prompt=load_synthesis_prompt(),
+            max_response_bytes=128 * 1024,
+            response_format="json_object",
+            max_completion_tokens=8192,
+            client=client,
+        )
+        await provider.synthesize(_projection())
+
+    body = json.loads(requests[0].content)
+    assert body["response_format"] == {"type": "json_object"}
+    assert body["max_tokens"] == 8192
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("response", "code", "retryable"),
     [
@@ -207,3 +237,37 @@ async def test_provider_maps_timeouts_and_oversized_responses_without_disclosure
                 await provider.synthesize(_projection())
             assert (exc_info.value.stable_code, exc_info.value.retryable) == (code, retryable)
             assert "private-provider" not in str(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_provider_retains_a_safe_internal_protocol_reason() -> None:
+    from perfpilot_api.ai.openai_compatible import (
+        AIProviderError,
+        OpenAICompatibleSynthesisProvider,
+    )
+
+    response = httpx.Response(
+        200,
+        json={
+            "choices": [
+                {"finish_reason": "length", "message": {"content": "{}"}}
+            ],
+            "usage": {"prompt_tokens": 1, "completion_tokens": 8192},
+        },
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: response), follow_redirects=False
+    ) as client:
+        provider = OpenAICompatibleSynthesisProvider(
+            base_url=SecretStr("https://provider.example.com/v1/"),
+            model="provider-model-1",
+            token=SecretStr("private-provider-token"),
+            prompt=load_synthesis_prompt(),
+            max_response_bytes=128 * 1024,
+            client=client,
+        )
+        with pytest.raises(AIProviderError) as exc_info:
+            await provider.synthesize(_projection())
+
+    assert exc_info.value.detail_code == "finish_reason_length"
+    assert "private-provider-token" not in repr(exc_info.value)
