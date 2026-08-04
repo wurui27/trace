@@ -80,7 +80,14 @@ class SynthesisCoordinator:
             # Close the control transaction before repository allocation to retain one
             # lock authority; retries reload by unique source/generation.
             team_id, analysis_id, source_id = source.team_id, source.analysis_id, source.id
-        record = await self._repository.allocate(team_id=team_id, analysis_id=analysis_id, source_execution_id=source_id, request=self._request_factory(source, 1), now=now)
+        record = await self._repository.allocate(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            source_execution_id=source_id,
+            request=self._request_factory(source, 1),
+            now=now,
+            mode="auto",
+        )
         async with self._sessions.begin() as session:
             event = await session.get(OutboxEvent, event.id)
             if event is None:
@@ -138,9 +145,20 @@ class SQLAlchemySynthesisWorkQueue:
         now = self._clock()
         row = await session.scalar(select(WorkerClaim).where(WorkerClaim.id == claim.claim_id, WorkerClaim.event_id == claim.event_id, WorkerClaim.global_job_id == claim.analysis_id, WorkerClaim.consumer_id == claim.consumer_id).with_for_update())
         event = await session.scalar(select(OutboxEvent).where(OutboxEvent.id == claim.event_id, OutboxEvent.team_id == claim.team_id, OutboxEvent.global_job_id == claim.analysis_id).with_for_update())
+        synthesis = await session.scalar(select(SynthesisExecution).where(
+            SynthesisExecution.id == claim.synthesis_execution_id,
+            SynthesisExecution.team_id == claim.team_id,
+            SynthesisExecution.analysis_id == claim.analysis_id,
+        ).with_for_update())
         if (row is None or event is None or row.state != "active" or row.expires_at <= now or not hmac.compare_digest(row.token_digest, self._digest(claim.token))
                 or event.event_type != "analysis_synthesis_requested" or event.subject_type != "synthesis_execution" or event.subject_id != claim.synthesis_execution_id):
             raise SynthesisClaimLostError("synthesis claim was lost")
+        if (
+            synthesis is None
+            or synthesis.state not in {"pending", "running"}
+            or event.subject_version != synthesis.version
+        ):
+            raise SynthesisClaimLostError("synthesis work authority was lost")
         return row, event
 
     async def renew(self, claim: SynthesisWorkClaim) -> None:

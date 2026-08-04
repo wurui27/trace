@@ -524,6 +524,13 @@ class SQLAlchemyEngineExecutionRepository:
                 if job.analysis_mode != "trace_upload":
                     raise ValueError("only SmartPerfetto trace executions can schedule synthesis")
             if row.state in _TERMINAL_STATES:
+                if (
+                    row.raw_result_artifact_id != artifact_id
+                    or row.state != terminal_state
+                    or row.version != expected_version + 1
+                    or row.stable_error_code is not None
+                ):
+                    raise EngineExecutionOwnershipError("engine finalization authority changed")
                 if schedule_synthesis:
                     await self._ensure_result_ready_event(session, row=row, now=now)
                 return self._record(row)

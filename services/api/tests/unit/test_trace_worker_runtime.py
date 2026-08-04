@@ -153,6 +153,7 @@ async def test_builder_composes_pinned_runtime_and_closes_separate_clients(
     settings = SimpleNamespace(
         app_env="production",
         smartperfetto_enabled=True,
+        ai_enabled=True,
         control_database_url=SecretStr(
             "postgresql+psycopg://control.example/db?sslmode=verify-full"
         ),
@@ -249,6 +250,7 @@ async def test_builder_composes_pinned_runtime_and_closes_separate_clients(
     assert engine_calls[0]["engine_lock"] is fake_lock
     assert engine_calls[0]["result_sink"] is fake_artifacts.engine_result_sink
     assert engine_calls[0]["engine_client"] is not engine_calls[0]["artifact_client"]
+    assert runtime.worker._service._schedule_synthesis is True  # type: ignore[attr-defined]
     credential_resolver = engine_calls[0]["credential_resolver"]
     resolved = await credential_resolver(settings.smartperfetto_credential_reference)
     assert resolved.get_secret_value() == marker

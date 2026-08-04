@@ -11,7 +11,7 @@ from datetime import datetime, timedelta
 from typing import Literal
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from perfpilot_api.db.control.models import (
@@ -150,7 +150,9 @@ class SQLAlchemySynthesisExecutionRepository:
 
     async def allocate(
         self, *, team_id: UUID, analysis_id: UUID, source_execution_id: UUID,
-        request: SynthesisRequest, now: datetime, idempotency_key: str | None = None,
+        request: SynthesisRequest, now: datetime,
+        mode: Literal["auto", "manual"] = "auto",
+        idempotency_key: str | None = None,
     ) -> SynthesisExecutionRecord:
         fingerprint = synthesis_request_fingerprint(
             canonical_sha256_b64=request.canonical_sha256_b64, tenant_resource_version=request.tenant_resource_version,
@@ -160,6 +162,12 @@ class SQLAlchemySynthesisExecutionRepository:
             provider_name=request.provider_name, model=request.model, inference_config_hash=request.inference_config_hash,
             generation=request.generation,
         )
+        if mode not in {"auto", "manual"}:
+            raise ValueError("synthesis allocation mode is invalid")
+        if mode == "auto" and (request.generation != 1 or idempotency_key is not None):
+            raise SynthesisIdempotencyConflictError("automatic synthesis must be generation one")
+        if mode == "manual" and not idempotency_key:
+            raise ValueError("manual synthesis idempotency key is required")
         async with self._session_factory.begin() as session:
             source = await session.scalar(select(EngineExecution).where(
                 EngineExecution.id == source_execution_id, EngineExecution.team_id == team_id,
@@ -181,7 +189,15 @@ class SQLAlchemySynthesisExecutionRepository:
                 if not hmac.compare_digest(existing.request_fingerprint, fingerprint):
                     raise SynthesisIdempotencyConflictError("synthesis request changed")
                 return self._record(existing)
-            if idempotency_key is not None:
+            if mode == "manual":
+                maximum = await session.scalar(
+                    select(func.max(SynthesisExecution.generation)).where(
+                        SynthesisExecution.analysis_id == analysis_id,
+                        SynthesisExecution.source_execution_id == source_execution_id,
+                    )
+                )
+                if request.generation != (maximum or 0) + 1:
+                    raise SynthesisIdempotencyConflictError("manual synthesis generation is not next")
                 key = await session.scalar(select(IdempotencyKey).where(
                     IdempotencyKey.operation == "create_synthesis_run", IdempotencyKey.scope_type == "team",
                     IdempotencyKey.scope_id == team_id, IdempotencyKey.key == idempotency_key).with_for_update())
@@ -205,7 +221,7 @@ class SQLAlchemySynthesisExecutionRepository:
                 started_at=None, completed_at=None, version=1,
             )
             session.add(row)
-            if idempotency_key is not None:
+            if mode == "manual":
                 session.add(IdempotencyKey(id=uuid4(), team_id=team_id, key=idempotency_key,
                     operation="create_synthesis_run", scope_type="team", scope_id=team_id,
                     request_hash=fingerprint, state="completed", response_resource_id=row.id,
@@ -213,21 +229,23 @@ class SQLAlchemySynthesisExecutionRepository:
             await session.flush()
             return self._record(row)
 
-    async def bind_projection(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, artifact_id: UUID, now: datetime) -> SynthesisExecutionRecord:
-        return await self._bind_uuid("projection_artifact_id", team_id, analysis_id, execution_id, artifact_id, now)
+    async def bind_projection(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, artifact_id: UUID, now: datetime, expected_version: int | None = None) -> SynthesisExecutionRecord:
+        return await self._bind_uuid("projection_artifact_id", team_id, analysis_id, execution_id, artifact_id, now, expected_version)
 
-    async def bind_candidate(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, artifact_id: UUID, sha256_b64: str, now: datetime) -> SynthesisExecutionRecord:
+    async def bind_candidate(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, artifact_id: UUID, sha256_b64: str, now: datetime, expected_version: int | None = None) -> SynthesisExecutionRecord:
         _checksum(sha256_b64)
         async with self._session_factory.begin() as session:
             row = await self._row(session, team_id, analysis_id, execution_id)
+            self._require_fence(row, expected_version)
             if row.candidate_artifact_id not in (None, artifact_id) or row.candidate_sha256_b64 not in (None, sha256_b64):
                 raise SynthesisIdempotencyConflictError("candidate authority changed")
             row.candidate_artifact_id, row.candidate_sha256_b64, row.version, row.updated_at = artifact_id, sha256_b64, row.version + 1, now
             return self._record(row)
 
-    async def _bind_uuid(self, field: Literal["projection_artifact_id"], team_id: UUID, analysis_id: UUID, execution_id: UUID, value: UUID, now: datetime) -> SynthesisExecutionRecord:
+    async def _bind_uuid(self, field: Literal["projection_artifact_id"], team_id: UUID, analysis_id: UUID, execution_id: UUID, value: UUID, now: datetime, expected_version: int | None) -> SynthesisExecutionRecord:
         async with self._session_factory.begin() as session:
             row = await self._row(session, team_id, analysis_id, execution_id)
+            self._require_fence(row, expected_version)
             if getattr(row, field) not in (None, value):
                 raise SynthesisIdempotencyConflictError("artifact authority changed")
             setattr(row, field, value)
@@ -241,11 +259,16 @@ class SQLAlchemySynthesisExecutionRepository:
             raise SynthesisExecutionNotFoundError("synthesis execution was not found")
         return row
 
+    @staticmethod
+    def _require_fence(row: SynthesisExecution, expected_version: int | None) -> None:
+        if expected_version is not None and row.version != expected_version:
+            raise SynthesisLeaseLostError("synthesis execution fence was lost")
+
     async def begin_invocation(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, now: datetime) -> int:
         async with self._session_factory.begin() as session:
             row = await self._row(session, team_id, analysis_id, execution_id)
-            if row.state == "canceled":
-                raise SynthesisLeaseLostError("synthesis is canceled")
+            if row.state not in {"pending", "running"}:
+                raise SynthesisLeaseLostError("synthesis is terminal")
             attempt = row.attempt_count + 1
             if attempt > 2:
                 raise SynthesisIdempotencyConflictError("invocation retry limit reached")
@@ -257,6 +280,47 @@ class SQLAlchemySynthesisExecutionRepository:
                 stable_error_code=None, started_at=now, completed_at=None))
             return attempt
 
+    async def finish_invocation(
+        self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, attempt_number: int,
+        succeeded: bool, prompt_tokens: int | None, completion_tokens: int | None,
+        total_tokens: int | None, latency_ms: int | None, stable_error_code: str | None,
+        now: datetime, expected_version: int | None = None,
+    ) -> SynthesisExecutionRecord:
+        if attempt_number not in {1, 2} or (succeeded and stable_error_code is not None):
+            raise ValueError("AI invocation completion is invalid")
+        if any(value is not None and (type(value) is not int or value < 0) for value in (prompt_tokens, completion_tokens, total_tokens, latency_ms)):
+            raise ValueError("AI invocation completion is invalid")
+        if None not in (prompt_tokens, completion_tokens, total_tokens) and total_tokens != prompt_tokens + completion_tokens:
+            raise ValueError("AI invocation completion is invalid")
+        async with self._session_factory.begin() as session:
+            row = await self._row(session, team_id, analysis_id, execution_id)
+            self._require_fence(row, expected_version)
+            invocation = await session.scalar(select(AIInvocation).where(
+                AIInvocation.synthesis_execution_id == execution_id,
+                AIInvocation.attempt_number == attempt_number,
+                AIInvocation.team_id == team_id, AIInvocation.analysis_id == analysis_id,
+            ).with_for_update())
+            if invocation is None or invocation.state != "running" or row.state not in {"pending", "running"}:
+                raise SynthesisLeaseLostError("AI invocation authority was lost")
+            invocation.state = "succeeded" if succeeded else "failed"
+            invocation.prompt_tokens = prompt_tokens
+            invocation.completion_tokens = completion_tokens
+            invocation.total_tokens = total_tokens
+            invocation.latency_ms = latency_ms
+            invocation.stable_error_code = stable_error_code
+            invocation.completed_at = now
+            row.prompt_tokens = prompt_tokens
+            row.completion_tokens = completion_tokens
+            row.total_tokens = total_tokens
+            row.latency_ms = latency_ms
+            row.stable_error_code = stable_error_code
+            if not succeeded and attempt_number == 2:
+                row.state = "failed"
+                row.completed_at = now
+            row.version += 1
+            row.updated_at = now
+            return self._record(row)
+
     async def cancel(self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, now: datetime) -> SynthesisExecutionRecord:
         async with self._session_factory.begin() as session:
             row = await self._row(session, team_id, analysis_id, execution_id)
@@ -265,13 +329,15 @@ class SQLAlchemySynthesisExecutionRepository:
             return self._record(row)
 
     async def bind_report_timestamp(
-        self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, generated_at: datetime
+        self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, generated_at: datetime,
+        expected_version: int | None = None,
     ) -> SynthesisExecutionRecord:
         """Persist the one report timestamp before any report writer is invoked."""
         if generated_at.tzinfo is None or generated_at.utcoffset() is None:
             raise ValueError("report timestamp is invalid")
         async with self._session_factory.begin() as session:
             row = await self._row(session, team_id, analysis_id, execution_id)
+            self._require_fence(row, expected_version)
             if row.report_generated_at not in (None, generated_at):
                 raise SynthesisIdempotencyConflictError("report timestamp changed")
             if row.report_generated_at is None:
@@ -282,11 +348,12 @@ class SQLAlchemySynthesisExecutionRepository:
 
     async def bind_report(
         self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID, report_version_id: UUID,
-        now: datetime,
+        now: datetime, expected_version: int | None = None,
     ) -> SynthesisExecutionRecord:
         """Record an immutable report version; report bytes remain tenant-owned."""
         async with self._session_factory.begin() as session:
             row = await self._row(session, team_id, analysis_id, execution_id)
+            self._require_fence(row, expected_version)
             if row.report_generated_at is None:
                 raise SynthesisIdempotencyConflictError("report timestamp is required")
             if row.report_version_id not in (None, report_version_id):
