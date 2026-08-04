@@ -169,7 +169,7 @@
       },
       "then": {
         "properties": {
-          "synthesis": {"type": "object", "properties": {"state": {"const": "completed"}}},
+          "synthesis": {"properties": {"state": {"const": "completed"}}},
           "scenario_reports": {"items": {"properties": {"result_state": {"const": "completed"}}}}
         }
       }
@@ -181,7 +181,7 @@
       },
       "then": {
         "anyOf": [
-          {"properties": {"synthesis": {"type": "object", "properties": {"state": {"const": "failed"}}}}},
+          {"properties": {"synthesis": {"properties": {"state": {"const": "failed"}}}}},
           {"properties": {"scenario_reports": {"contains": {"properties": {"result_state": {"enum": ["failed", "canceled"]}}, "required": ["result_state"]}, "minContains": 1}}}
         ]
       }
