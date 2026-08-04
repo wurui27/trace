@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import inspect
+import json
 import os
 import re
 from collections.abc import Callable
@@ -38,9 +40,11 @@ from perfpilot_api.services.synthesis_executions import (
 from perfpilot_api.services.uploads import SQLAlchemyTenantBucketResolver
 from perfpilot_api.reports.writer import AnalysisReportWriter
 from perfpilot_api.workers.synthesis_orchestrator import (
+    SQLAlchemyAutomaticSynthesisRequestFactory,
     SQLAlchemySynthesisAnalysisContextRepository,
     SQLAlchemySynthesisParentProjector,
     SQLAlchemySynthesisWorkQueue,
+    SynthesisCoordinator,
     SynthesisOrchestrationWorker,
     SynthesisPipeline,
 )
@@ -242,15 +246,46 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
             timeout=timeout,
         )
         callbacks.append(provider_client.aclose)
+        prompt = load_synthesis_prompt()
         provider = OpenAICompatibleSynthesisProvider(
             base_url=settings.ai_base_url,
             model=settings.ai_model,
             token=token,
-            prompt=load_synthesis_prompt(),
+            prompt=prompt,
             max_response_bytes=settings.ai_max_response_bytes,
             client=provider_client,
         )
         repository = SQLAlchemySynthesisExecutionRepository(control_sessions)
+        inference_payload = json.dumps(
+            {
+                "connect_timeout": settings.ai_connect_timeout_seconds,
+                "max_projection_bytes": settings.ai_max_projection_bytes,
+                "max_response_bytes": settings.ai_max_response_bytes,
+                "model": settings.ai_model,
+                "pool_timeout": settings.ai_pool_timeout_seconds,
+                "provider": settings.ai_provider_name,
+                "read_timeout": settings.ai_read_timeout_seconds,
+                "write_timeout": settings.ai_write_timeout_seconds,
+            },
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        coordinator = SynthesisCoordinator(
+            session_factory=control_sessions,
+            repository=repository,
+            request_factory=SQLAlchemyAutomaticSynthesisRequestFactory(
+                tenant_router=artifacts.tenant_router,
+                normalizer_version="smartperfetto-normalizer-1",
+                prompt_template_version=prompt.version,
+                prompt_template_sha256_b64=prompt.sha256_b64,
+                report_worker_image_digest=inputs.report_worker_image_digest,
+                provider_name=settings.ai_provider_name,
+                model=settings.ai_model,
+                inference_config_hash=hashlib.sha256(inference_payload).hexdigest(),
+            ),
+        )
         pipeline = SynthesisPipeline(
             repository=repository,
             canonical_reader=canonical_reader,
@@ -266,8 +301,10 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
                 control_session_factory=control_sessions,
                 tenant_router=artifacts.tenant_router,
             ),
+            max_projection_bytes=settings.ai_max_projection_bytes,
         )
         worker = SynthesisOrchestrationWorker(
+            coordinator=coordinator,
             queue=SQLAlchemySynthesisWorkQueue(
                 control_sessions, lease_seconds=30
             ),

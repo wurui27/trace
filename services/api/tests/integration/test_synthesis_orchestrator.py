@@ -11,15 +11,19 @@ from uuid import UUID, uuid4
 import pytest
 from sqlalchemy import select
 
+from perfpilot_api.workers import synthesis_orchestrator
+
 from perfpilot_api.db.control.models import (
     AIInvocation,
     EngineExecution,
     OutboxEvent,
     SynthesisExecution,
+    TenantResource,
     WorkerClaim,
 )
 from perfpilot_api.db.control.models import GlobalJob
-from perfpilot_api.db.tenant.models import Analysis, ReportVersion
+from perfpilot_api.db.tenant.models import Analysis, Artifact, ReportVersion
+from perfpilot_api.db.tenant.router import TenantRouteError
 from perfpilot_api.reports.writer import (
     AnalysisReportWriteRequest,
     compose_analysis_report,
@@ -27,10 +31,12 @@ from perfpilot_api.reports.writer import (
 from perfpilot_api.services.synthesis_executions import (
     SQLAlchemySynthesisExecutionRepository,
     SynthesisMutationFence,
+    SynthesisRequest,
 )
 from perfpilot_api.workers.synthesis_orchestrator import (
     SQLAlchemySynthesisParentProjector,
     SQLAlchemySynthesisWorkQueue,
+    SynthesisCoordinator,
 )
 
 from test_engine_execution_repository import (  # type: ignore[import-not-found]
@@ -140,6 +146,382 @@ async def _seed(database: ExecutionDatabase) -> tuple[UUID, UUID, UUID]:
             )
         )
     return source_id, synthesis_id, event_id
+
+
+async def _seed_source_event(
+    database: ExecutionDatabase,
+) -> tuple[UUID, UUID]:
+    source_id = uuid4()
+    event_id = uuid4()
+    async with database.sessions.begin() as session:
+        session.add(
+            TenantResource(
+                team_id=TEAM_ID,
+                resource_version=7,
+                state="active",
+                provisioning_step="active",
+                credential_version=1,
+                retry_count=0,
+                fencing_token=0,
+                write_paused=False,
+            )
+        )
+        session.add(
+            EngineExecution(
+                id=source_id,
+                team_id=TEAM_ID,
+                analysis_id=ANALYSIS_ID,
+                engine_id="smartperfetto",
+                attempt_number=1,
+                tenant_resource_version=7,
+                adapter_version="1.0.0",
+                engine_commit_sha="a" * 40,
+                engine_image_digest="sha256:" + "b" * 64,
+                input_manifest_hash="c" * 64,
+                config_hash="d" * 64,
+                state="completed",
+                raw_result_artifact_id=uuid4(),
+                completed_at=NOW,
+                version=3,
+            )
+        )
+        session.add(
+            OutboxEvent(
+                id=event_id,
+                team_id=TEAM_ID,
+                global_job_id=ANALYSIS_ID,
+                scenario_job_id=None,
+                event_type="engine_result_ready",
+                subject_type="engine_execution",
+                subject_id=source_id,
+                subject_version=3,
+                ready_at=NOW,
+                retry_count=0,
+                version=1,
+            )
+        )
+    return source_id, event_id
+
+
+def _automatic_request(
+    *,
+    checksum: str,
+    inference_config_hash: str = "f" * 64,
+) -> SynthesisRequest:
+    return SynthesisRequest(
+        canonical_sha256_b64=checksum,
+        tenant_resource_version=7,
+        question=None,
+        normalizer_version="smartperfetto-normalizer-1",
+        prompt_template_version="perfpilot-synthesis-v1",
+        prompt_template_sha256_b64=checksum,
+        report_worker_image_digest="sha256:" + "e" * 64,
+        provider_name="fake",
+        model="fake-model",
+        inference_config_hash=inference_config_hash,
+        projection_sha256_b64=checksum,
+        generation=1,
+    )
+
+
+@pytest.mark.asyncio
+async def test_coordinator_awaits_private_tenant_request_factory(
+    database: ExecutionDatabase,
+) -> None:
+    source_id = uuid4()
+    source_artifact_id = uuid4()
+    event_id = uuid4()
+    async with database.sessions.begin() as session:
+        session.add(
+            TenantResource(
+                team_id=TEAM_ID,
+                resource_version=7,
+                state="active",
+                provisioning_step="active",
+                credential_version=1,
+                retry_count=0,
+                fencing_token=0,
+                write_paused=False,
+            )
+        )
+        session.add(
+            EngineExecution(
+                id=source_id,
+                team_id=TEAM_ID,
+                analysis_id=ANALYSIS_ID,
+                engine_id="smartperfetto",
+                attempt_number=1,
+                tenant_resource_version=7,
+                adapter_version="1.0.0",
+                engine_commit_sha="a" * 40,
+                engine_image_digest="sha256:" + "b" * 64,
+                input_manifest_hash="c" * 64,
+                config_hash="d" * 64,
+                state="completed",
+                raw_result_artifact_id=source_artifact_id,
+                completed_at=NOW,
+                version=3,
+            )
+        )
+        session.add(
+            OutboxEvent(
+                id=event_id,
+                team_id=TEAM_ID,
+                global_job_id=ANALYSIS_ID,
+                scenario_job_id=None,
+                event_type="engine_result_ready",
+                subject_type="engine_execution",
+                subject_id=source_id,
+                subject_version=3,
+                ready_at=NOW,
+                retry_count=0,
+                version=1,
+            )
+        )
+    checksum = _checksum(b"canonical")
+    calls: list[tuple[UUID, int]] = []
+
+    async def request_factory(source: EngineExecution, generation: int) -> SynthesisRequest:
+        calls.append((source.id, generation))
+        return SynthesisRequest(
+            canonical_sha256_b64=checksum,
+            tenant_resource_version=source.tenant_resource_version,
+            question="Why is startup slow?",
+            normalizer_version="smartperfetto-normalizer-1",
+            prompt_template_version="perfpilot-synthesis-v1",
+            prompt_template_sha256_b64=checksum,
+            report_worker_image_digest="sha256:" + "e" * 64,
+            provider_name="fake",
+            model="fake-model",
+            inference_config_hash="f" * 64,
+            projection_sha256_b64=checksum,
+            generation=generation,
+        )
+
+    coordinator = SynthesisCoordinator(
+        session_factory=database.sessions,
+        repository=SQLAlchemySynthesisExecutionRepository(
+            database.sessions, clock=lambda: NOW
+        ),
+        request_factory=request_factory,
+        clock=lambda: NOW,
+    )
+
+    record = await coordinator.coordinate_next()
+
+    assert record is not None and record.generation == 1
+    assert calls == [(source_id, 1)]
+    async with database.sessions() as session:
+        source_event = await session.get(OutboxEvent, event_id)
+        requested_event = await session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.event_type == "analysis_synthesis_requested"
+            )
+        )
+        assert source_event is not None and source_event.published_at == NOW
+        assert requested_event is not None
+        assert requested_event.subject_id == record.id
+
+
+@pytest.mark.asyncio
+async def test_coordinator_consumes_stale_attempt_before_current_source_event(
+    database: ExecutionDatabase,
+) -> None:
+    stale_source_id = uuid4()
+    current_source_id = uuid4()
+    stale_event_id = uuid4()
+    current_event_id = uuid4()
+    async with database.sessions.begin() as session:
+        session.add(
+            TenantResource(
+                team_id=TEAM_ID,
+                resource_version=7,
+                state="active",
+                provisioning_step="active",
+                credential_version=1,
+                retry_count=0,
+                fencing_token=0,
+                write_paused=False,
+            )
+        )
+        for source_id, attempt_number in (
+            (stale_source_id, 1),
+            (current_source_id, 2),
+        ):
+            session.add(
+                EngineExecution(
+                    id=source_id,
+                    team_id=TEAM_ID,
+                    analysis_id=ANALYSIS_ID,
+                    engine_id="smartperfetto",
+                    attempt_number=attempt_number,
+                    tenant_resource_version=7,
+                    adapter_version="1.0.0",
+                    engine_commit_sha="a" * 40,
+                    engine_image_digest="sha256:" + "b" * 64,
+                    input_manifest_hash="c" * 64,
+                    config_hash="d" * 64,
+                    state="completed",
+                    raw_result_artifact_id=uuid4(),
+                    completed_at=NOW,
+                    version=3,
+                )
+            )
+        for event_id, source_id, ready_at in (
+            (stale_event_id, stale_source_id, NOW - timedelta(seconds=1)),
+            (current_event_id, current_source_id, NOW),
+        ):
+            session.add(
+                OutboxEvent(
+                    id=event_id,
+                    team_id=TEAM_ID,
+                    global_job_id=ANALYSIS_ID,
+                    scenario_job_id=None,
+                    event_type="engine_result_ready",
+                    subject_type="engine_execution",
+                    subject_id=source_id,
+                    subject_version=3,
+                    ready_at=ready_at,
+                    retry_count=0,
+                    version=1,
+                )
+            )
+    checksum = _checksum(b"canonical")
+
+    def request_factory(source: EngineExecution, generation: int) -> SynthesisRequest:
+        return SynthesisRequest(
+            canonical_sha256_b64=checksum,
+            tenant_resource_version=source.tenant_resource_version,
+            question=None,
+            normalizer_version="smartperfetto-normalizer-1",
+            prompt_template_version="perfpilot-synthesis-v1",
+            prompt_template_sha256_b64=checksum,
+            report_worker_image_digest="sha256:" + "e" * 64,
+            provider_name="fake",
+            model="fake-model",
+            inference_config_hash="f" * 64,
+            projection_sha256_b64=checksum,
+            generation=generation,
+        )
+
+    coordinator = SynthesisCoordinator(
+        session_factory=database.sessions,
+        repository=SQLAlchemySynthesisExecutionRepository(
+            database.sessions, clock=lambda: NOW
+        ),
+        request_factory=request_factory,
+        clock=lambda: NOW,
+    )
+
+    assert await coordinator.coordinate_next() is None
+    current = await coordinator.coordinate_next()
+
+    assert current is not None
+    assert current.source_execution_id == current_source_id
+    async with database.sessions() as session:
+        stale_event = await session.get(OutboxEvent, stale_event_id)
+        current_event = await session.get(OutboxEvent, current_event_id)
+        assert stale_event is not None and stale_event.published_at == NOW
+        assert current_event is not None and current_event.published_at == NOW
+
+
+@pytest.mark.asyncio
+async def test_coordinator_reschedules_tenant_route_failure(
+    database: ExecutionDatabase,
+) -> None:
+    _source_id, event_id = await _seed_source_event(database)
+    checksum = _checksum(b"canonical")
+    clock = Clock()
+    attempts = 0
+
+    async def request_factory(
+        _source: EngineExecution,
+        _generation: int,
+    ) -> SynthesisRequest:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TenantRouteError()
+        return _automatic_request(checksum=checksum)
+
+    coordinator = SynthesisCoordinator(
+        session_factory=database.sessions,
+        repository=SQLAlchemySynthesisExecutionRepository(
+            database.sessions, clock=clock
+        ),
+        request_factory=request_factory,
+        clock=clock,
+        retry_backoff_seconds=5,
+    )
+
+    assert await coordinator.coordinate_next() is None
+    async with database.sessions() as session:
+        event = await session.get(OutboxEvent, event_id)
+        assert event is not None
+        assert event.retry_count == 1
+        assert event.ready_at == NOW + timedelta(seconds=5)
+        assert event.published_at is None and event.dead_lettered_at is None
+
+    clock.now = NOW + timedelta(seconds=5)
+    record = await coordinator.coordinate_next()
+
+    assert record is not None and record.generation == 1
+    assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_coordinator_recovers_allocated_generation_across_config_change(
+    database: ExecutionDatabase,
+) -> None:
+    source_id, source_event_id = await _seed_source_event(database)
+    checksum = _checksum(b"canonical")
+    repository = SQLAlchemySynthesisExecutionRepository(
+        database.sessions, clock=lambda: NOW
+    )
+    allocated = await repository.allocate(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        source_execution_id=source_id,
+        request=_automatic_request(
+            checksum=checksum,
+            inference_config_hash="1" * 64,
+        ),
+        now=NOW,
+        mode="auto",
+    )
+    factory_calls = 0
+
+    def changed_request_factory(
+        _source: EngineExecution,
+        _generation: int,
+    ) -> SynthesisRequest:
+        nonlocal factory_calls
+        factory_calls += 1
+        return _automatic_request(
+            checksum=checksum,
+            inference_config_hash="2" * 64,
+        )
+
+    coordinator = SynthesisCoordinator(
+        session_factory=database.sessions,
+        repository=repository,
+        request_factory=changed_request_factory,
+        clock=lambda: NOW,
+    )
+
+    recovered = await coordinator.coordinate_next()
+
+    assert recovered is not None and recovered.id == allocated.id
+    assert factory_calls == 0
+    async with database.sessions() as session:
+        source_event = await session.get(OutboxEvent, source_event_id)
+        work_event = await session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.event_type == "analysis_synthesis_requested"
+            )
+        )
+        assert source_event is not None and source_event.published_at == NOW
+        assert work_event is not None and work_event.subject_id == allocated.id
 
 
 def _fence(claim) -> SynthesisMutationFence:
@@ -471,3 +853,83 @@ async def test_parent_remediation_promotes_only_failed_synthesis_partial_report(
     async with parent_databases.tenant_sessions() as session:
         analysis = await session.get(Analysis, PARENT_ANALYSIS_ID)
         assert analysis is not None and analysis.state == "completed"
+
+
+@pytest.mark.asyncio
+async def test_automatic_request_factory_reads_only_authoritative_tenant_metadata(
+    parent_databases: AnalysisDatabases,
+) -> None:
+    artifact_id = uuid4()
+    checksum = _checksum(b"canonical-result")
+    async with parent_databases.tenant_sessions.begin() as session:
+        session.add(
+            Analysis(
+                id=PARENT_ANALYSIS_ID,
+                application_version_id=None,
+                analysis_mode="trace_upload",
+                analysis_profile="auto",
+                input_manifest=[],
+                question="Why is startup slow?",
+                state="analyzing",
+                started_at=PARENT_NOW,
+                version=1,
+            )
+        )
+        session.add(
+            Artifact(
+                id=artifact_id,
+                analysis_id=PARENT_ANALYSIS_ID,
+                upload_id=uuid4(),
+                idempotency_key="internal:canonical-result",
+                request_hash="a" * 64,
+                artifact_kind="engine_result",
+                mime_type="application/json",
+                size_bytes=16,
+                sha256_b64=checksum,
+                object_key="raw/analyses/test/canonical.json",
+                version_id="canonical-version-1",
+                state="finalized",
+                finalized_at=PARENT_NOW,
+                expires_at=PARENT_NOW + timedelta(days=30),
+                version=2,
+            )
+        )
+    source = EngineExecution(
+        id=uuid4(),
+        team_id=PARENT_TEAM_ID,
+        analysis_id=PARENT_ANALYSIS_ID,
+        engine_id="smartperfetto",
+        attempt_number=1,
+        tenant_resource_version=1,
+        adapter_version="1.0.0",
+        engine_commit_sha="b" * 40,
+        engine_image_digest="sha256:" + "c" * 64,
+        input_manifest_hash="d" * 64,
+        config_hash="e" * 64,
+        state="completed",
+        raw_result_artifact_id=artifact_id,
+        completed_at=PARENT_NOW,
+        version=3,
+    )
+    factory_type = getattr(
+        synthesis_orchestrator, "SQLAlchemyAutomaticSynthesisRequestFactory", None
+    )
+    assert factory_type is not None
+    factory = factory_type(
+        tenant_router=parent_databases.tenant_router,  # type: ignore[arg-type]
+        normalizer_version="smartperfetto-normalizer-1",
+        prompt_template_version="perfpilot-synthesis-v1",
+        prompt_template_sha256_b64=_checksum(b"prompt"),
+        report_worker_image_digest="sha256:" + "f" * 64,
+        provider_name="fake",
+        model="fake-model",
+        inference_config_hash="1" * 64,
+    )
+
+    request = await factory(source, 1)
+
+    assert request.canonical_sha256_b64 == checksum
+    assert request.projection_sha256_b64 == checksum
+    assert request.question == "Why is startup slow?"
+    assert request.tenant_resource_version == 1
+    assert request.generation == 1

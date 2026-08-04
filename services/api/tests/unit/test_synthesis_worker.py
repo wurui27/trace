@@ -9,12 +9,23 @@ from pathlib import Path
 from types import SimpleNamespace
 from uuid import UUID
 
+import httpx
 import pytest
 from pydantic import SecretStr
 
-from perfpilot_api.ai.openai_compatible import AIProviderError, SynthesisCandidate
+from perfpilot_api.ai.openai_compatible import (
+    AIProviderError,
+    OpenAICompatibleSynthesisProvider,
+    SynthesisCandidate,
+)
+from perfpilot_api.ai.prompt import load_synthesis_prompt
 from perfpilot_api.reports.contracts import canonical_json_bytes
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
+from perfpilot_api.reports.privacy import ProjectionPrivacyError
+from perfpilot_api.reports.projection import (
+    ProjectionQuestionError,
+    ProjectionSizeError,
+)
 from perfpilot_api.services.synthesis_executions import (
     SynthesisExecutionRecord,
     SynthesisSourceRecord,
@@ -40,6 +51,16 @@ PROMPT_CHECKSUM = base64.b64encode(b"p" * 32).decode("ascii")
 def _load(name: str) -> dict[str, object]:
     return json.loads(
         (ROOT / "contracts" / "v1" / "examples" / name).read_text(encoding="utf-8")
+    )
+
+
+def _provider_fixture(name: str) -> dict[str, object]:
+    return json.loads(
+        (
+            ROOT
+            / "services/api/tests/fixtures/openai_compatible"
+            / name
+        ).read_text(encoding="utf-8")
     )
 
 
@@ -178,6 +199,22 @@ class FakeRepository:
         self.record = replace(self.record, report_generated_at=generated_at)
         return self.record
 
+    async def bind_preflight_failure(
+        self,
+        *,
+        stable_error_code: str,
+        generated_at: datetime,
+        **_: object,
+    ):
+        self.record = replace(
+            self.record,
+            state="running",
+            stable_error_code=stable_error_code,
+            report_generated_at=generated_at,
+            version=self.record.version + 1,
+        )
+        return self.record
+
     async def bind_source_report(self, *, report_version_id: UUID, **_: object):
         self.source = replace(
             self.source,
@@ -291,7 +328,12 @@ def _pipeline(
     writer: FakeWriter,
     projector: FakeProjector,
     checkpoint=None,
+    projection_builder=None,
+    max_projection_bytes: int = 256 * 1024,
 ) -> SynthesisPipeline:
+    kwargs = {}
+    if projection_builder is not None:
+        kwargs["projection_builder"] = projection_builder
     return SynthesisPipeline(
         repository=repository,  # type: ignore[arg-type]
         canonical_reader=FakeCanonicalReader(),
@@ -303,6 +345,8 @@ def _pipeline(
         clock=lambda: NOW,
         checkpoint=checkpoint,
         normalizer=lambda _loaded: _core(),
+        max_projection_bytes=max_projection_bytes,
+        **kwargs,
     )
 
 
@@ -344,6 +388,67 @@ async def test_pipeline_converges_on_one_report_and_does_not_repeat_provider_aft
 
 
 @pytest.mark.asyncio
+async def test_pipeline_enforces_the_configured_projection_limit() -> None:
+    received: dict[str, object] = {}
+
+    def projection_builder(*args: object, **kwargs: object):
+        received.update(kwargs)
+        from perfpilot_api.reports.projection import build_ai_projection
+
+        return build_ai_projection(*args, **kwargs)
+
+    pipeline = _pipeline(
+        FakeRepository(),
+        FakeProvider(),
+        FakeArtifactStore(),
+        FakeWriter(),
+        FakeProjector(),
+        projection_builder=projection_builder,
+        max_projection_bytes=65536,
+    )
+
+    assert (await pipeline.advance(_claim())).state == "running"
+    assert received["max_bytes"] == 65536
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "projection_error",
+    [
+        ProjectionSizeError(),
+        ProjectionPrivacyError(),
+        ProjectionQuestionError(),
+    ],
+)
+async def test_projection_preflight_failure_publishes_core_without_calling_provider(
+    projection_error: Exception,
+) -> None:
+    def projection_builder(*_args: object, **_kwargs: object):
+        raise projection_error
+
+    repository = FakeRepository()
+    provider = FakeProvider()
+    writer = FakeWriter()
+    projector = FakeProjector()
+    pipeline = _pipeline(
+        repository,
+        provider,
+        FakeArtifactStore(),
+        writer,
+        projector,
+        projection_builder=projection_builder,
+    )
+
+    result = await _finish(pipeline)
+
+    assert result.state == "failed"
+    assert provider.retry_codes == []
+    assert writer.requests[-1].synthesis_failure_code == "ai_projection_invalid"
+    assert repository.record.report_version_id is not None
+    assert projector.calls[-1]["terminal"] == "report"
+
+
+@pytest.mark.asyncio
 async def test_invalid_candidate_retries_once_with_only_stable_retry_code() -> None:
     repository = FakeRepository()
     provider = FakeProvider([b"{}", _load("synthesis-output.valid.json")])
@@ -360,6 +465,76 @@ async def test_invalid_candidate_retries_once_with_only_stable_retry_code() -> N
     assert result.state == "succeeded"
     assert provider.retry_codes == [None, "ai_output_invalid"]
     assert repository.record.attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_rate_limit_then_success_uses_two_fake_provider_calls() -> None:
+    calls = 0
+    success = _provider_fixture("synthesis-success.json")
+    success["choices"][0]["message"]["content"] = json.dumps(  # type: ignore[index]
+        _load("synthesis-output.valid.json"),
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return httpx.Response(429)
+        return httpx.Response(200, json=success)
+
+    repository = FakeRepository()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=False
+    ) as client:
+        provider = OpenAICompatibleSynthesisProvider(
+            base_url=SecretStr("https://provider.example.com/openai/v1/"),
+            model="fake-model",
+            token=SecretStr("local-test-provider-token"),
+            prompt=load_synthesis_prompt(),
+            max_response_bytes=128 * 1024,
+            client=client,
+        )
+        result = await _finish(
+            _pipeline(
+                repository,
+                provider,  # type: ignore[arg-type]
+                FakeArtifactStore(),
+                FakeWriter(),
+                FakeProjector(),
+            )
+        )
+
+    assert result.state == "succeeded"
+    assert calls == 2
+    assert repository.record.attempt_count == 2
+
+
+@pytest.mark.asyncio
+async def test_two_invalid_reference_fixtures_publish_partial_core_report() -> None:
+    envelope = _provider_fixture("synthesis-invalid-reference.json")
+    content = envelope["choices"][0]["message"]["content"]  # type: ignore[index]
+    assert isinstance(content, str)
+    repository = FakeRepository()
+    provider = FakeProvider([content.encode(), content.encode()])
+    writer = FakeWriter()
+
+    result = await _finish(
+        _pipeline(
+            repository,
+            provider,
+            FakeArtifactStore(),
+            writer,
+            FakeProjector(),
+        )
+    )
+
+    assert result.state == "failed"
+    assert provider.retry_codes == [None, "ai_output_invalid"]
+    assert writer.requests[-1].synthesis_failure_code == "ai_output_invalid"
 
 
 @pytest.mark.asyncio

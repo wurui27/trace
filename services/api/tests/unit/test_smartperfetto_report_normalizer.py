@@ -117,6 +117,7 @@ def test_normalizer_only_uses_verified_or_explicitly_partial_evidence_and_exclud
     for marker in ("conversation-secret", "query-secret", "notes-secret", "echoed-query-secret", "session-secret", "workspace-secret", "run-secret", "tool-secret", "external-report-id"):
         assert marker not in encoded
     assert core["limitations"]
+    assert core["core_state"] == "complete"
 
 
 def test_missing_measurement_value_is_insufficient_data_never_zero() -> None:

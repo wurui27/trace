@@ -1,0 +1,19 @@
+{
+  "id": "chatcmpl-local-success",
+  "object": "chat.completion",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "__DYNAMIC_SYNTHESIS_JSON__"
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 120,
+    "completion_tokens": 80,
+    "total_tokens": 200
+  }
+}

@@ -274,7 +274,7 @@ def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
         "schema_version": "1.0",
         "analysis_id": str(source.analysis_id),
         "analysis_mode": "trace_upload",
-        "core_state": "partial" if result["state"] == "insufficient_data" or limitations or any(item["core_state"] == "partial" for item in scenario_reports) else "complete",
+        "core_state": "partial" if result["state"] == "insufficient_data" or any(item["core_state"] == "partial" for item in scenario_reports) else "complete",
         "scenario_reports": scenario_reports,
         "limitations": _sort(limitations, "limitation_id"),
         "provenance": {

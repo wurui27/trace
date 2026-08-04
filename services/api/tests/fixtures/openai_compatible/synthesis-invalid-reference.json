@@ -1,0 +1,19 @@
+{
+  "id": "chatcmpl-local-invalid-reference",
+  "object": "chat.completion",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "stop",
+      "message": {
+        "role": "assistant",
+        "content": "{\"schema_version\":\"1.0\",\"executive_summary\":\"The measured issue affects launch.\",\"top_findings\":[{\"finding_id\":\"ffffffff-ffff-4fff-8fff-ffffffffffff\",\"evidence_ids\":[],\"user_impact\":\"Launch feels delayed.\"}],\"recommendations\":[],\"retest_plan\":[],\"limitations\":[]}"
+      }
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 120,
+    "completion_tokens": 40,
+    "total_tokens": 160
+  }
+}

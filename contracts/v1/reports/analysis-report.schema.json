@@ -1611,7 +1611,6 @@
         },
         "trace_capabilities": {
           "type": "array",
-          "minItems": 1,
           "items": {
             "$ref": "#/$defs/traceCapability"
           }

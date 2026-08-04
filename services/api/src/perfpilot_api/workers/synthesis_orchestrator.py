@@ -29,8 +29,8 @@ from perfpilot_api.db.control.models import (
     SynthesisExecution,
     WorkerClaim,
 )
-from perfpilot_api.db.tenant.models import Analysis, ReportVersion
-from perfpilot_api.db.tenant.router import TenantRouter
+from perfpilot_api.db.tenant.models import Analysis, Artifact, ReportVersion
+from perfpilot_api.db.tenant.router import TenantRouteError, TenantRouter
 from perfpilot_api.domain.states import AnalysisState
 from perfpilot_api.domain.transitions import (
     InvalidSynthesisProjection,
@@ -43,7 +43,13 @@ from perfpilot_api.reports.normalizer import (
     SmartPerfettoNormalizationError,
     normalize_smartperfetto_result,
 )
-from perfpilot_api.reports.projection import AIProjection, build_ai_projection
+from perfpilot_api.reports.privacy import ProjectionPrivacyError
+from perfpilot_api.reports.projection import (
+    AIProjection,
+    ProjectionQuestionError,
+    ProjectionSizeError,
+    build_ai_projection,
+)
 from perfpilot_api.reports.writer import (
     AnalysisReportWriteRequest,
     AnalysisReportWriter,
@@ -64,7 +70,9 @@ from perfpilot_api.services.synthesis_artifacts import (
 )
 from perfpilot_api.services.synthesis_executions import (
     SQLAlchemySynthesisExecutionRepository,
+    SynthesisExecutionNotFoundError,
     SynthesisExecutionRecord,
+    SynthesisIdempotencyConflictError,
     SynthesisLeaseLostError,
     SynthesisMutationFence,
     SynthesisRequest,
@@ -96,6 +104,72 @@ class SynthesisWorkClaim:
     expires_at: datetime
 
 
+class SQLAlchemyAutomaticSynthesisRequestFactory:
+    """Builds generation-one metadata from the authoritative tenant database."""
+
+    def __init__(
+        self,
+        *,
+        tenant_router: TenantRouter,
+        normalizer_version: str,
+        prompt_template_version: str,
+        prompt_template_sha256_b64: str,
+        report_worker_image_digest: str,
+        provider_name: str,
+        model: str,
+        inference_config_hash: str,
+    ) -> None:
+        self._tenant_router = tenant_router
+        self._normalizer_version = normalizer_version
+        self._prompt_template_version = prompt_template_version
+        self._prompt_template_sha256_b64 = prompt_template_sha256_b64
+        self._report_worker_image_digest = report_worker_image_digest
+        self._provider_name = provider_name
+        self._model = model
+        self._inference_config_hash = inference_config_hash
+
+    async def __call__(
+        self, source: EngineExecution, generation: int
+    ) -> SynthesisRequest:
+        if source.raw_result_artifact_id is None:
+            raise SynthesisClaimLostError("source artifact authority changed")
+        async with self._tenant_router.session(source.team_id) as session:
+            analysis = await session.get(Analysis, source.analysis_id)
+            artifact = await session.get(Artifact, source.raw_result_artifact_id)
+            if (
+                session.info.get("tenant_resource_version")
+                != source.tenant_resource_version
+                or analysis is None
+                or analysis.analysis_mode != "trace_upload"
+                or analysis.tombstoned_at is not None
+                or artifact is None
+                or artifact.analysis_id != source.analysis_id
+                or artifact.artifact_kind != "engine_result"
+                or artifact.state != "finalized"
+                or artifact.version_id is None
+                or artifact.deleted_at is not None
+                or not isinstance(artifact.sha256_b64, str)
+            ):
+                raise SynthesisClaimLostError("source artifact authority changed")
+            question = analysis.question
+            checksum = artifact.sha256_b64
+        return SynthesisRequest(
+            canonical_sha256_b64=checksum,
+            tenant_resource_version=source.tenant_resource_version,
+            question=question,
+            normalizer_version=self._normalizer_version,
+            prompt_template_version=self._prompt_template_version,
+            prompt_template_sha256_b64=self._prompt_template_sha256_b64,
+            report_worker_image_digest=self._report_worker_image_digest,
+            provider_name=self._provider_name,
+            model=self._model,
+            inference_config_hash=self._inference_config_hash,
+            # The worker replaces this placeholder with the content-derived value.
+            projection_sha256_b64=checksum,
+            generation=generation,
+        )
+
+
 class SynthesisCoordinator:
     """Turns verified source-result events into automatic generation one.
 
@@ -103,8 +177,62 @@ class SynthesisCoordinator:
     unavailable to this component.
     """
 
-    def __init__(self, *, session_factory: async_sessionmaker[AsyncSession], repository: SQLAlchemySynthesisExecutionRepository, request_factory: Callable[[EngineExecution, int], SynthesisRequest], clock: Callable[[], datetime] = lambda: datetime.now(UTC)) -> None:
+    def __init__(self, *, session_factory: async_sessionmaker[AsyncSession], repository: SQLAlchemySynthesisExecutionRepository, request_factory: Callable[[EngineExecution, int], SynthesisRequest | Awaitable[SynthesisRequest]], clock: Callable[[], datetime] = lambda: datetime.now(UTC), retry_backoff_seconds: float = 5) -> None:
+        if (
+            isinstance(retry_backoff_seconds, bool)
+            or not isinstance(retry_backoff_seconds, (int, float))
+            or not 0 < retry_backoff_seconds <= 3600
+        ):
+            raise ValueError("synthesis coordinator backoff is invalid")
         self._sessions, self._repository, self._request_factory, self._clock = session_factory, repository, request_factory, clock
+        self._retry_backoff = timedelta(seconds=retry_backoff_seconds)
+
+    @staticmethod
+    def _settle_source_event(
+        event: OutboxEvent,
+        *,
+        now: datetime,
+        dead_letter: bool,
+    ) -> None:
+        if dead_letter:
+            event.dead_lettered_at = now
+        else:
+            event.published_at = now
+        event.version += 1
+        event.updated_at = now
+
+    async def _dead_letter_source_event(self, event_id: UUID, now: datetime) -> None:
+        async with self._sessions.begin() as session:
+            event = await session.scalar(
+                select(OutboxEvent)
+                .where(
+                    OutboxEvent.id == event_id,
+                    OutboxEvent.event_type == "engine_result_ready",
+                    OutboxEvent.published_at.is_(None),
+                    OutboxEvent.dead_lettered_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if event is not None:
+                self._settle_source_event(event, now=now, dead_letter=True)
+
+    async def _reschedule_source_event(self, event_id: UUID, now: datetime) -> None:
+        async with self._sessions.begin() as session:
+            event = await session.scalar(
+                select(OutboxEvent)
+                .where(
+                    OutboxEvent.id == event_id,
+                    OutboxEvent.event_type == "engine_result_ready",
+                    OutboxEvent.published_at.is_(None),
+                    OutboxEvent.dead_lettered_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if event is not None:
+                event.ready_at = now + self._retry_backoff
+                event.retry_count += 1
+                event.version += 1
+                event.updated_at = now
 
     async def coordinate_next(self) -> SynthesisExecutionRecord | None:
         now = self._clock()
@@ -120,27 +248,70 @@ class SynthesisCoordinator:
                 EngineExecution.analysis_id == event.global_job_id).with_for_update())
             if (source is None or source.engine_id != "smartperfetto" or source.state not in {"completed", "insufficient_data"}
                     or source.raw_result_artifact_id is None or event.subject_version != source.version):
-                raise SynthesisClaimLostError("source event authority changed")
+                self._settle_source_event(event, now=now, dead_letter=True)
+                return None
             latest = await session.scalar(select(EngineExecution.id).where(
                 EngineExecution.team_id == source.team_id, EngineExecution.analysis_id == source.analysis_id,
                 EngineExecution.engine_id == "smartperfetto").order_by(EngineExecution.attempt_number.desc()).limit(1))
             if latest != source.id:
-                raise SynthesisClaimLostError("source attempt is stale")
+                self._settle_source_event(event, now=now, dead_letter=False)
+                return None
+            existing_execution_id = await session.scalar(
+                select(SynthesisExecution.id).where(
+                    SynthesisExecution.team_id == source.team_id,
+                    SynthesisExecution.analysis_id == source.analysis_id,
+                    SynthesisExecution.source_execution_id == source.id,
+                    SynthesisExecution.generation == 1,
+                )
+            )
             # Close the control transaction before repository allocation to retain one
             # lock authority; retries reload by unique source/generation.
-            team_id, analysis_id, source_id = source.team_id, source.analysis_id, source.id
-        record = await self._repository.allocate(
-            team_id=team_id,
-            analysis_id=analysis_id,
-            source_execution_id=source_id,
-            request=self._request_factory(source, 1),
-            now=now,
-            mode="auto",
-        )
+            team_id, analysis_id, source_id, source_event_id = source.team_id, source.analysis_id, source.id, event.id
+        if existing_execution_id is not None:
+            try:
+                record = await self._repository.load(
+                    team_id=team_id,
+                    analysis_id=analysis_id,
+                    execution_id=existing_execution_id,
+                )
+            except SynthesisExecutionNotFoundError:
+                await self._dead_letter_source_event(source_event_id, now)
+                return None
+        else:
+            try:
+                request = self._request_factory(source, 1)
+                if inspect.isawaitable(request):
+                    request = await request
+                record = await self._repository.allocate(
+                    team_id=team_id,
+                    analysis_id=analysis_id,
+                    source_execution_id=source_id,
+                    request=request,
+                    now=now,
+                    mode="auto",
+                )
+            except TenantRouteError:
+                await self._reschedule_source_event(source_event_id, now)
+                return None
+            except SynthesisIdempotencyConflictError:
+                record = await self._repository.load_generation(
+                    team_id=team_id,
+                    analysis_id=analysis_id,
+                    source_execution_id=source_id,
+                    generation=1,
+                )
+                if record is None:
+                    await self._dead_letter_source_event(source_event_id, now)
+                    return None
+            except (SynthesisClaimLostError, SynthesisExecutionNotFoundError):
+                await self._dead_letter_source_event(source_event_id, now)
+                return None
         async with self._sessions.begin() as session:
-            event = await session.get(OutboxEvent, event.id)
+            event = await session.get(OutboxEvent, source_event_id)
             if event is None:
                 raise SynthesisClaimLostError("source event disappeared")
+            if event.dead_lettered_at is not None:
+                event.dead_lettered_at = None
             requested_id = analysis_synthesis_requested_event_id(record.id)
             requested = await session.get(OutboxEvent, requested_id)
             if requested is None:
@@ -149,9 +320,9 @@ class SynthesisCoordinator:
                     subject_id=record.id, subject_version=record.version, ready_at=now, published_at=None,
                     dead_lettered_at=None, retry_count=0, version=1))
             elif (requested.team_id != record.team_id or requested.global_job_id != record.analysis_id
-                  or requested.subject_id != record.id or requested.subject_version != record.version):
+                  or requested.subject_id != record.id or requested.subject_version > record.version):
                 raise SynthesisClaimLostError("synthesis event authority changed")
-            event.published_at, event.version, event.updated_at = now, event.version + 1, now
+            event.published_at, event.version, event.updated_at = event.published_at or now, event.version + 1, now
         return record
 
 
@@ -245,7 +416,10 @@ class SQLAlchemySynthesisWorkQueue:
     ) -> None:
         now = self._clock()
         async with self._sessions.begin() as session:
-            row, event = await self._owned(session, claim)
+            # A pipeline boundary may make the synthesis execution terminal before
+            # the following pass projects that terminal state to the parent job.
+            # Keep the durable event runnable across that reconciliation boundary.
+            row, event = await self._owned(session, claim, allow_terminal=True)
             row.state = "expired" if retry else "completed"
             row.completed_at = None if retry else now
             row.version += 1
@@ -533,7 +707,13 @@ class SynthesisPipeline:
         checkpoint: Checkpoint | None = None,
         normalizer: Callable[[Any], NormalizedTraceReport] = normalize_smartperfetto_result,
         projection_builder: Callable[..., AIProjection] = build_ai_projection,
+        max_projection_bytes: int = 256 * 1024,
     ) -> None:
+        if (
+            type(max_projection_bytes) is not int
+            or not 1024 <= max_projection_bytes <= 256 * 1024
+        ):
+            raise ValueError("projection byte limit is invalid")
         self._repository = repository
         self._canonical_reader = canonical_reader
         self._artifact_store = artifact_store
@@ -545,6 +725,7 @@ class SynthesisPipeline:
         self._checkpoint_callback = checkpoint
         self._normalizer = normalizer
         self._projection_builder = projection_builder
+        self._max_projection_bytes = max_projection_bytes
 
     async def _checkpoint(self, name: str) -> None:
         if self._checkpoint_callback is None:
@@ -583,8 +764,27 @@ class SynthesisPipeline:
             core,
             analysis_profile=context.analysis_profile,
             question=context.question,
+            max_bytes=self._max_projection_bytes,
         )
         return loaded, core, projection
+
+    async def _record_projection_failure(
+        self,
+        *,
+        record: SynthesisExecutionRecord,
+        now: datetime,
+        fence: SynthesisMutationFence,
+    ) -> SynthesisStepResult:
+        await self._repository.bind_preflight_failure(
+            team_id=record.team_id,
+            analysis_id=record.analysis_id,
+            execution_id=record.id,
+            stable_error_code="ai_projection_invalid",
+            generated_at=now,
+            fence=fence,
+        )
+        await self._checkpoint("projection_preflight_failure")
+        return SynthesisStepResult("running")
 
     async def advance(self, claim: SynthesisWorkClaim) -> SynthesisStepResult:
         try:
@@ -673,11 +873,18 @@ class SynthesisPipeline:
             return SynthesisStepResult(record.state)
 
         fence = self._fence(claim)
-        if record.projection_artifact_id is None:
-            loaded, _core, projection = await self._projection(
-                execution=record,
-                source=source,
-            )
+        if record.projection_artifact_id is None and record.stable_error_code is None:
+            try:
+                loaded, _core, projection = await self._projection(
+                    execution=record,
+                    source=source,
+                )
+            except (ProjectionSizeError, ProjectionPrivacyError, ProjectionQuestionError):
+                return await self._record_projection_failure(
+                    record=record,
+                    now=now,
+                    fence=fence,
+                )
             artifact_id = projection_artifact_id(
                 loaded.artifact_id, record.normalizer_version
             )
@@ -706,10 +913,17 @@ class SynthesisPipeline:
             return SynthesisStepResult("running")
 
         if record.candidate_artifact_id is None and record.stable_error_code is None:
-            _loaded, _core, projection = await self._projection(
-                execution=record,
-                source=source,
-            )
+            try:
+                _loaded, _core, projection = await self._projection(
+                    execution=record,
+                    source=source,
+                )
+            except (ProjectionSizeError, ProjectionPrivacyError, ProjectionQuestionError):
+                return await self._record_projection_failure(
+                    record=record,
+                    now=now,
+                    fence=fence,
+                )
             attempt = await self._repository.begin_invocation(
                 team_id=record.team_id,
                 analysis_id=record.analysis_id,
@@ -879,6 +1093,7 @@ class SynthesisOrchestrationWorker:
     def __init__(
         self,
         *,
+        coordinator: SynthesisCoordinator | None = None,
         queue: SQLAlchemySynthesisWorkQueue,
         pipeline: SynthesisPipeline,
         worker_id: str,
@@ -894,6 +1109,7 @@ class SynthesisOrchestrationWorker:
             heartbeat_seconds,
         ) <= 0:
             raise ValueError("synthesis worker configuration is invalid")
+        self._coordinator = coordinator
         self._queue = queue
         self._pipeline = pipeline
         self._worker_id = worker_id
@@ -927,9 +1143,17 @@ class SynthesisOrchestrationWorker:
                 await heartbeat
 
     async def run_once(self) -> bool:
+        try:
+            coordinated = (
+                await self._coordinator.coordinate_next()
+                if self._coordinator is not None
+                else None
+            )
+        except (SynthesisClaimLostError, TenantRouteError):
+            coordinated = None
         claim = await self._queue.claim_next(consumer_id=self._worker_id)
         if claim is None:
-            return False
+            return coordinated is not None
         try:
             outcome = await self._advance(claim)
             if outcome.state in {"succeeded", "failed", "canceled"}:
@@ -974,4 +1198,17 @@ class SynthesisOrchestrationWorker:
                 pass
 
 
-__all__ = ["SQLAlchemySynthesisAnalysisContextRepository", "SQLAlchemySynthesisParentProjector", "SQLAlchemySynthesisWorkQueue", "SynthesisAnalysisContext", "SynthesisClaimLostError", "SynthesisCoordinator", "SynthesisOrchestrationWorker", "SynthesisPipeline", "SynthesisStepResult", "SynthesisWorkClaim", "analysis_synthesis_requested_event_id"]
+__all__ = [
+    "SQLAlchemyAutomaticSynthesisRequestFactory",
+    "SQLAlchemySynthesisAnalysisContextRepository",
+    "SQLAlchemySynthesisParentProjector",
+    "SQLAlchemySynthesisWorkQueue",
+    "SynthesisAnalysisContext",
+    "SynthesisClaimLostError",
+    "SynthesisCoordinator",
+    "SynthesisOrchestrationWorker",
+    "SynthesisPipeline",
+    "SynthesisStepResult",
+    "SynthesisWorkClaim",
+    "analysis_synthesis_requested_event_id",
+]

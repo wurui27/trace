@@ -10,6 +10,23 @@ on:
 permissions:
   contents: read
 
+env:
+  # CI never receives a provider token and never calls a public AI provider.
+  # Tests that exercise synthesis inject an in-process or loopback fake.
+  PERFPILOT_APP_ENV: test
+  PERFPILOT_AI_ENABLED: "false"
+  PERFPILOT_AI_BASE_URL: http://127.0.0.1:4010/v1/
+  PERFPILOT_AI_PROVIDER_NAME: development-fake
+  PERFPILOT_AI_MODEL: fake-json-model
+  PERFPILOT_AI_CREDENTIAL_REFERENCE: development-only-ai-credential-reference
+  PERFPILOT_AI_CREDENTIAL_FILE: ""
+  PERFPILOT_AI_EGRESS_ALLOWLIST: ""
+  PERFPILOT_SYNTHESIS_WORKER_ID: ""
+  PERFPILOT_REPORT_WORKER_IMAGE_DIGEST: ""
+  PERFPILOT_ENGINE_LOCK_FILE: ""
+  PERFPILOT_ENGINE_LOCK_SCHEMA_FILE: ""
+  OPENAI_API_KEY: ""
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true

@@ -117,6 +117,35 @@ def test_ai_settings_have_bounded_development_defaults() -> None:
     assert settings.ai_max_response_bytes == 128 * 1024
 
 
+def test_ai_size_limits_parse_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PERFPILOT_AI_MAX_PROJECTION_BYTES", "65536")
+    monkeypatch.setenv("PERFPILOT_AI_MAX_RESPONSE_BYTES", "32768")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_max_projection_bytes == 65536
+    assert settings.ai_max_response_bytes == 32768
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("ai_max_projection_bytes", True),
+        ("ai_max_projection_bytes", 65536.0),
+        ("ai_max_response_bytes", False),
+        ("ai_max_response_bytes", 32768.0),
+    ],
+)
+def test_ai_size_limits_reject_non_integer_python_values(
+    field: str,
+    value: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        Settings(_env_file=None, **{field: value})
+
+
 @pytest.mark.parametrize(
     "base_url",
     [

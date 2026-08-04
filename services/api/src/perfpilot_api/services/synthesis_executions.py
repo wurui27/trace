@@ -253,6 +253,40 @@ class SQLAlchemySynthesisExecutionRepository:
                 ),
             )
 
+    async def load_generation(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        source_execution_id: UUID,
+        generation: int,
+    ) -> SynthesisExecutionRecord | None:
+        if type(generation) is not int or generation < 1:
+            raise ValueError("synthesis generation is invalid")
+        async with self._session_factory() as session:
+            row = await session.scalar(
+                select(SynthesisExecution).where(
+                    SynthesisExecution.team_id == team_id,
+                    SynthesisExecution.analysis_id == analysis_id,
+                    SynthesisExecution.source_execution_id == source_execution_id,
+                    SynthesisExecution.generation == generation,
+                )
+            )
+            if row is None:
+                return None
+            invocation = await session.scalar(
+                select(AIInvocation)
+                .where(AIInvocation.synthesis_execution_id == row.id)
+                .order_by(AIInvocation.attempt_number.desc())
+                .limit(1)
+            )
+            return self._record(
+                row,
+                last_invocation_error_code=(
+                    invocation.stable_error_code if invocation is not None else None
+                ),
+            )
+
     async def load_source(
         self, *, team_id: UUID, analysis_id: UUID, execution_id: UUID
     ) -> SynthesisSourceRecord:
@@ -676,6 +710,47 @@ class SQLAlchemySynthesisExecutionRepository:
                 row.report_generated_at = generated_at
                 row.version += 1
                 row.updated_at = generated_at
+            return self._record(row)
+
+    async def bind_preflight_failure(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        execution_id: UUID,
+        stable_error_code: str,
+        generated_at: datetime,
+        fence: SynthesisMutationFence,
+    ) -> SynthesisExecutionRecord:
+        """Persist a deterministic pre-provider failure so core reporting can resume."""
+        if (
+            _STABLE_CODE.fullmatch(stable_error_code) is None
+            or generated_at.tzinfo is None
+            or generated_at.utcoffset() is None
+        ):
+            raise ValueError("synthesis preflight failure is invalid")
+        async with self._session_factory.begin() as session:
+            row = await self._row(session, team_id, analysis_id, execution_id)
+            await self._require_fence(session, row, fence, self._clock())
+            if (
+                row.stable_error_code == stable_error_code
+                and row.report_generated_at == generated_at
+            ):
+                return self._record(row)
+            if (
+                row.state not in {"pending", "running"}
+                or row.report_version_id is not None
+                or row.candidate_artifact_id is not None
+                or row.stable_error_code is not None
+                or row.report_generated_at is not None
+            ):
+                raise SynthesisLeaseLostError("synthesis preflight authority was lost")
+            row.state = "running"
+            row.started_at = row.started_at or generated_at
+            row.stable_error_code = stable_error_code
+            row.report_generated_at = generated_at
+            row.version += 1
+            row.updated_at = generated_at
             return self._record(row)
 
     async def bind_report(

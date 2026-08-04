@@ -8,12 +8,17 @@ from uuid import UUID
 import pytest
 from pydantic import SecretStr
 
+from perfpilot_api.workers import synthesis_runtime
+from perfpilot_api.db.tenant.router import TenantRouteError
+
 from perfpilot_api.workers.synthesis_orchestrator import (
+    SynthesisClaimLostError,
     SynthesisOrchestrationWorker,
     SynthesisStepResult,
     SynthesisWorkClaim,
 )
 from perfpilot_api.workers.synthesis_runtime import (
+    SynthesisRuntimeInputs,
     SynthesisWorkerRuntime,
     SynthesisWorkerRuntimeError,
     validate_synthesis_runtime_environment,
@@ -121,6 +126,85 @@ class FakePipeline:
         return self.outcome
 
 
+class FakeCoordinator:
+    def __init__(self, actions: list[str]) -> None:
+        self.actions = actions
+
+    async def coordinate_next(self) -> object:
+        self.actions.append("coordinate")
+        return object()
+
+
+class EmptyQueue:
+    def __init__(self, actions: list[str]) -> None:
+        self.actions = actions
+
+    async def claim_next(self, *, consumer_id: str):
+        assert consumer_id == "synthesis-1"
+        self.actions.append("claim")
+        return None
+
+
+class LostCoordinator:
+    def __init__(self, actions: list[str]) -> None:
+        self.actions = actions
+
+    async def coordinate_next(self) -> object:
+        self.actions.append("coordinate")
+        raise SynthesisClaimLostError("stale source event")
+
+
+class TenantUnavailableCoordinator:
+    def __init__(self, actions: list[str]) -> None:
+        self.actions = actions
+
+    async def coordinate_next(self) -> object:
+        self.actions.append("coordinate")
+        raise TenantRouteError()
+
+
+@pytest.mark.asyncio
+async def test_worker_coordinates_engine_results_before_claiming_synthesis_work() -> None:
+    actions: list[str] = []
+    worker = SynthesisOrchestrationWorker(
+        coordinator=FakeCoordinator(actions),  # type: ignore[arg-type]
+        queue=EmptyQueue(actions),  # type: ignore[arg-type]
+        pipeline=FakePipeline(SynthesisStepResult("succeeded")),  # type: ignore[arg-type]
+        worker_id="synthesis-1",
+    )
+
+    assert await worker.run_once() is True
+    assert actions == ["coordinate", "claim"]
+
+
+@pytest.mark.asyncio
+async def test_stale_source_event_does_not_block_synthesis_queue_claims() -> None:
+    actions: list[str] = []
+    worker = SynthesisOrchestrationWorker(
+        coordinator=LostCoordinator(actions),  # type: ignore[arg-type]
+        queue=EmptyQueue(actions),  # type: ignore[arg-type]
+        pipeline=FakePipeline(SynthesisStepResult("succeeded")),  # type: ignore[arg-type]
+        worker_id="synthesis-1",
+    )
+
+    assert await worker.run_once() is False
+    assert actions == ["coordinate", "claim"]
+
+
+@pytest.mark.asyncio
+async def test_tenant_route_failure_does_not_block_synthesis_queue_claims() -> None:
+    actions: list[str] = []
+    worker = SynthesisOrchestrationWorker(
+        coordinator=TenantUnavailableCoordinator(actions),  # type: ignore[arg-type]
+        queue=EmptyQueue(actions),  # type: ignore[arg-type]
+        pipeline=FakePipeline(SynthesisStepResult("succeeded")),  # type: ignore[arg-type]
+        worker_id="synthesis-1",
+    )
+
+    assert await worker.run_once() is False
+    assert actions == ["coordinate", "claim"]
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("outcome", "action"),
@@ -169,3 +253,121 @@ async def test_runtime_closes_owned_components_in_reverse_order() -> None:
     await runtime.close()
 
     assert order == ["second", "first"]
+
+
+@pytest.mark.asyncio
+async def test_production_builder_wires_automatic_synthesis_coordinator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = SimpleNamespace(
+        control_database_url=SecretStr("postgresql+psycopg://control"),
+        ai_base_url=SecretStr("https://provider.example.com/openai/v1/"),
+        ai_provider_name="provider",
+        ai_model="model",
+        ai_connect_timeout_seconds=1.0,
+        ai_read_timeout_seconds=2.0,
+        ai_write_timeout_seconds=3.0,
+        ai_pool_timeout_seconds=4.0,
+        ai_max_projection_bytes=2048,
+        ai_max_response_bytes=4096,
+    )
+    inputs = SynthesisRuntimeInputs(
+        worker_id="synthesis-1",
+        report_worker_image_digest="sha256:" + "1" * 64,
+        credential_path=Path("/run/secrets/ai"),
+        engine_lock_path=Path("/app/engines.lock.json"),
+        engine_lock_schema_path=Path("/app/engines.lock.schema.json"),
+        provider_host="provider.example.com",
+    )
+    sessions = object()
+    tenant_router = object()
+    captured: dict[str, object] = {}
+
+    class FakeEngine:
+        async def dispose(self) -> None:
+            return None
+
+    class FakeArtifacts:
+        s3_client = object()
+
+        def __init__(self) -> None:
+            self.tenant_router = tenant_router
+
+        async def close(self) -> None:
+            return None
+
+    class FakeClient:
+        async def aclose(self) -> None:
+            return None
+
+    async def build_artifacts(**_kwargs):
+        return FakeArtifacts()
+
+    def fake_component(*_args, **kwargs):
+        return SimpleNamespace(**kwargs)
+
+    def fake_coordinator(*_args, **kwargs):
+        captured["coordinator"] = kwargs
+        return "automatic-coordinator"
+
+    def fake_pipeline(*_args, **kwargs):
+        captured["pipeline"] = kwargs
+        return SimpleNamespace()
+
+    def fake_worker(*_args, **kwargs):
+        captured["worker"] = kwargs
+        return SimpleNamespace()
+
+    monkeypatch.setattr(synthesis_runtime, "get_settings", lambda: settings)
+    monkeypatch.setattr(
+        synthesis_runtime,
+        "validate_synthesis_runtime_environment",
+        lambda _settings: inputs,
+    )
+    monkeypatch.setattr(synthesis_runtime, "load_engine_lock", lambda *_a, **_k: None)
+    monkeypatch.setattr(synthesis_runtime, "_load_token", lambda _path: SecretStr("x" * 32))
+    monkeypatch.setattr(synthesis_runtime, "create_control_engine", lambda _url: FakeEngine())
+    monkeypatch.setattr(
+        synthesis_runtime, "create_control_session_factory", lambda _engine: sessions
+    )
+    monkeypatch.setattr(synthesis_runtime, "build_artifact_runtime", build_artifacts)
+    monkeypatch.setattr(synthesis_runtime.httpx, "AsyncClient", lambda **_kwargs: FakeClient())
+    for name in (
+        "SQLAlchemyTenantBucketResolver",
+        "CanonicalResultReader",
+        "SQLAlchemyEngineResultArtifactRepository",
+        "S3SynthesisArtifactStore",
+        "SQLAlchemySynthesisArtifactRepository",
+        "OpenAICompatibleSynthesisProvider",
+        "SQLAlchemySynthesisExecutionRepository",
+        "AnalysisReportWriter",
+        "SQLAlchemySynthesisAnalysisContextRepository",
+        "SQLAlchemySynthesisParentProjector",
+        "SQLAlchemySynthesisWorkQueue",
+    ):
+        monkeypatch.setattr(synthesis_runtime, name, fake_component)
+    monkeypatch.setattr(synthesis_runtime, "SynthesisPipeline", fake_pipeline)
+    monkeypatch.setattr(
+        synthesis_runtime,
+        "load_synthesis_prompt",
+        lambda: SimpleNamespace(version="prompt-v1", sha256_b64="p" * 44),
+    )
+    monkeypatch.setattr(
+        synthesis_runtime,
+        "SQLAlchemyAutomaticSynthesisRequestFactory",
+        fake_component,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        synthesis_runtime, "SynthesisCoordinator", fake_coordinator, raising=False
+    )
+    monkeypatch.setattr(
+        synthesis_runtime, "SynthesisOrchestrationWorker", fake_worker
+    )
+
+    runtime = await synthesis_runtime.build_production_synthesis_worker()
+
+    assert runtime.worker is not None
+    assert captured["worker"]["coordinator"] == "automatic-coordinator"  # type: ignore[index]
+    assert captured["coordinator"]["session_factory"] is sessions  # type: ignore[index]
+    assert captured["pipeline"]["max_projection_bytes"] == 2048  # type: ignore[index]

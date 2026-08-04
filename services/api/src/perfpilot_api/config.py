@@ -9,6 +9,7 @@ from urllib.parse import parse_qsl, urlsplit
 from pydantic import (
     AnyHttpUrl,
     Field,
+    field_validator,
     PostgresDsn,
     RedisDsn,
     SecretStr,
@@ -331,6 +332,13 @@ class Settings(BaseSettings):
     allowed_origins: tuple[AnyHttpUrl, ...] = Field(
         default_factory=lambda: (AnyHttpUrl(_DEVELOPMENT_ALLOWED_ORIGIN),)
     )
+
+    @field_validator("ai_max_projection_bytes", "ai_max_response_bytes", mode="before")
+    @classmethod
+    def parse_ai_byte_limits(cls, value: object) -> object:
+        if isinstance(value, str) and value.isascii() and value.isdecimal():
+            return int(value)
+        return value
 
     @model_validator(mode="wrap")
     @classmethod
