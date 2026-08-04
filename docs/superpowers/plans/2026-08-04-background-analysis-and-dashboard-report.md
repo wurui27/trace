@@ -41,7 +41,7 @@ class _FakeSmartPerfettoGateway:
 Run:
 
 ```bash
-uv run --locked --package perfpilot-api pytest -p no:cacheprovider services/api/tests/integration/test_local_app.py -q
+PYTHONPATH=services/api/src .venv/bin/python -m pytest -p no:cacheprovider services/api/tests/integration/test_local_app.py -q
 ```
 
 Expected failure: the protocol has no `cancel`, `status=active` is rejected or returns report history, and the cancel route is 404.
@@ -91,7 +91,7 @@ Return 202 for a newly accepted cancel and 200 for an already terminal analysis.
 Run the command from Step 2, then:
 
 ```bash
-uv run --locked --package perfpilot-api ruff check services/api/src/perfpilot_api/local_app.py services/api/tests/integration/test_local_app.py
+.venv/bin/ruff check services/api/src/perfpilot_api/local_app.py services/api/tests/integration/test_local_app.py
 ```
 
 - [ ] **Step 7: Commit only the local backend boundary**
@@ -286,9 +286,9 @@ git commit -m "fix: populate dashboard from the latest trace report"
 - [ ] **Step 1: Run backend verification**
 
 ```bash
-uv run --locked --package perfpilot-api pytest -p no:cacheprovider services/api/tests/integration/test_local_app.py -q
-uv run --locked --package perfpilot-api pytest -p no:cacheprovider services/api/tests -q
-uv run --locked --package perfpilot-api ruff check services/api/src services/api/tests
+PYTHONPATH=services/api/src .venv/bin/python -m pytest -p no:cacheprovider services/api/tests/integration/test_local_app.py -q
+PYTHONPATH=services/api/src .venv/bin/python -m pytest -p no:cacheprovider services/api/tests -q
+.venv/bin/ruff check services/api/src services/api/tests
 ```
 
 - [ ] **Step 2: Run frontend verification**
