@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -10,6 +11,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from perfpilot_api.workers import synthesis_orchestrator
 
@@ -82,6 +84,37 @@ class Clock:
 
     def __call__(self):
         return self.now
+
+
+class OutboxInsertRace:
+    def __init__(self, source_event_id: UUID) -> None:
+        self.source_event_id = source_event_id
+        self.request_factory_barrier = asyncio.Barrier(2)
+        self.requested_event_lookup_barrier = asyncio.Barrier(2)
+
+
+class CoordinatedOutboxSession(AsyncSession):
+    def __init__(
+        self,
+        *args: object,
+        outbox_insert_race: OutboxInsertRace,
+        **kwargs: object,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        self._outbox_insert_race = outbox_insert_race
+
+    async def get(self, entity: object, ident: object, **kwargs: object):
+        row = await super().get(entity, ident, **kwargs)
+        if (
+            entity is OutboxEvent
+            and ident != self._outbox_insert_race.source_event_id
+            and row is None
+        ):
+            await asyncio.wait_for(
+                self._outbox_insert_race.requested_event_lookup_barrier.wait(),
+                timeout=2,
+            )
+        return row
 
 
 async def _seed(database: ExecutionDatabase) -> tuple[UUID, UUID, UUID]:
@@ -321,6 +354,57 @@ async def test_coordinator_awaits_private_tenant_request_factory(
         assert source_event is not None and source_event.published_at == NOW
         assert requested_event is not None
         assert requested_event.subject_id == record.id
+
+
+@pytest.mark.asyncio
+async def test_coordinator_deduplicates_concurrent_work_event_insert(
+    database: ExecutionDatabase,
+) -> None:
+    _source_id, source_event_id = await _seed_source_event(database)
+    checksum = _checksum(b"canonical")
+    race = OutboxInsertRace(source_event_id)
+    coordinated_sessions = async_sessionmaker(
+        database.engine,
+        class_=CoordinatedOutboxSession,
+        expire_on_commit=False,
+        outbox_insert_race=race,
+    )
+
+    async def request_factory(
+        _source: EngineExecution,
+        _generation: int,
+    ) -> SynthesisRequest:
+        await asyncio.wait_for(race.request_factory_barrier.wait(), timeout=2)
+        return _automatic_request(checksum=checksum)
+
+    coordinator = SynthesisCoordinator(
+        session_factory=coordinated_sessions,
+        repository=SQLAlchemySynthesisExecutionRepository(
+            database.sessions, clock=lambda: NOW
+        ),
+        request_factory=request_factory,
+        clock=lambda: NOW,
+    )
+
+    records = await asyncio.gather(
+        coordinator.coordinate_next(),
+        coordinator.coordinate_next(),
+    )
+
+    assert records[0] is not None and records[1] is not None
+    assert records[0].id == records[1].id
+    async with database.sessions() as session:
+        events = list(
+            (
+                await session.scalars(
+                    select(OutboxEvent).where(
+                        OutboxEvent.event_type == "analysis_synthesis_requested"
+                    )
+                )
+            ).all()
+        )
+    assert len(events) == 1
+    assert events[0].subject_id == records[0].id
 
 
 @pytest.mark.asyncio

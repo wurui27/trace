@@ -18,6 +18,7 @@ from uuid import UUID, uuid4, uuid5
 
 from pydantic import SecretStr
 from sqlalchemy import select, update
+from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from perfpilot_api.ai.openai_compatible import AIProviderError, SynthesisCandidate
@@ -313,13 +314,27 @@ class SynthesisCoordinator:
             if event.dead_lettered_at is not None:
                 event.dead_lettered_at = None
             requested_id = analysis_synthesis_requested_event_id(record.id)
+            await session.execute(
+                postgresql_insert(OutboxEvent)
+                .values(
+                    id=requested_id,
+                    team_id=record.team_id,
+                    global_job_id=record.analysis_id,
+                    scenario_job_id=None,
+                    event_type="analysis_synthesis_requested",
+                    subject_type="synthesis_execution",
+                    subject_id=record.id,
+                    subject_version=record.version,
+                    ready_at=now,
+                    published_at=None,
+                    dead_lettered_at=None,
+                    retry_count=0,
+                    version=1,
+                )
+                .on_conflict_do_nothing()
+            )
             requested = await session.get(OutboxEvent, requested_id)
-            if requested is None:
-                session.add(OutboxEvent(id=requested_id, team_id=record.team_id, global_job_id=record.analysis_id,
-                    scenario_job_id=None, event_type="analysis_synthesis_requested", subject_type="synthesis_execution",
-                    subject_id=record.id, subject_version=record.version, ready_at=now, published_at=None,
-                    dead_lettered_at=None, retry_count=0, version=1))
-            elif (requested.team_id != record.team_id or requested.global_job_id != record.analysis_id
+            if (requested is None or requested.team_id != record.team_id or requested.global_job_id != record.analysis_id
                   or requested.subject_id != record.id or requested.subject_version > record.version):
                 raise SynthesisClaimLostError("synthesis event authority changed")
             event.published_at, event.version, event.updated_at = event.published_at or now, event.version + 1, now
