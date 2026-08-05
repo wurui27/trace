@@ -1,7 +1,7 @@
 import asyncio
 import base64
 import binascii
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from types import MappingProxyType
 from typing import Any
 
@@ -11,6 +11,10 @@ from perfpilot_api.storage.base import (
     ArtifactNotFoundError,
     ArtifactStorageError,
     GetAuthorization,
+    CompletedMultipart,
+    MultipartCreation,
+    MultipartPart,
+    MultipartPartAuthorization,
     ObjectLocation,
     PutAuthorization,
     StoredObjectMetadata,
@@ -115,6 +119,152 @@ class S3ArtifactStore:
             ),
             expires_in_seconds=expires_in_seconds,
         )
+
+    async def create_multipart(
+        self,
+        *,
+        location: ObjectLocation,
+        content_type: str,
+    ) -> MultipartCreation:
+        if (
+            not self._valid_location(location)
+            or location.version_id is not None
+            or not _is_nonempty_text(content_type)
+        ):
+            raise ArtifactAuthorizationError
+        failed = False
+        response: object = None
+        try:
+            response = await asyncio.to_thread(
+                self._client.create_multipart_upload,
+                Bucket=location.bucket,
+                Key=location.key,
+                ContentType=content_type,
+                ChecksumAlgorithm="SHA256",
+            )
+        except Exception:
+            failed = True
+        upload_id = response.get("UploadId") if isinstance(response, Mapping) else None
+        if failed or not _is_nonempty_text(upload_id):
+            raise ArtifactAuthorizationError
+        return MultipartCreation(location=location, storage_upload_id=upload_id)
+
+    async def authorize_part(
+        self,
+        *,
+        location: ObjectLocation,
+        storage_upload_id: str,
+        part_number: int,
+        expires_in_seconds: int = 900,
+    ) -> MultipartPartAuthorization:
+        if (
+            not self._valid_location(location)
+            or location.version_id is not None
+            or not _is_nonempty_text(storage_upload_id)
+            or not isinstance(part_number, int)
+            or isinstance(part_number, bool)
+            or not 1 <= part_number <= 10_000
+            or not _valid_ttl(expires_in_seconds, maximum=900)
+        ):
+            raise ArtifactAuthorizationError
+        failed = False
+        url: object = None
+        try:
+            url = await asyncio.to_thread(
+                self._client.generate_presigned_url,
+                ClientMethod="upload_part",
+                Params={
+                    "Bucket": location.bucket,
+                    "Key": location.key,
+                    "UploadId": storage_upload_id,
+                    "PartNumber": part_number,
+                },
+                ExpiresIn=expires_in_seconds,
+                HttpMethod="PUT",
+            )
+        except Exception:
+            failed = True
+        if failed or not _is_nonempty_text(url):
+            raise ArtifactAuthorizationError
+        return MultipartPartAuthorization(
+            part_number=part_number,
+            url=url,
+            required_headers=MappingProxyType({}),
+            expires_in_seconds=expires_in_seconds,
+        )
+
+    async def complete_multipart(
+        self,
+        *,
+        location: ObjectLocation,
+        storage_upload_id: str,
+        parts: Sequence[MultipartPart],
+    ) -> CompletedMultipart:
+        if (
+            not self._valid_location(location)
+            or location.version_id is not None
+            or not _is_nonempty_text(storage_upload_id)
+            or not parts
+            or len(parts) > 10_000
+            or any(
+                item.part_number != index
+                or not _is_nonempty_text(item.etag)
+                or len(item.etag) > 1024
+                for index, item in enumerate(parts, start=1)
+            )
+        ):
+            raise ArtifactAuthorizationError
+        failed = False
+        response: object = None
+        try:
+            response = await asyncio.to_thread(
+                self._client.complete_multipart_upload,
+                Bucket=location.bucket,
+                Key=location.key,
+                UploadId=storage_upload_id,
+                MultipartUpload={
+                    "Parts": [{"PartNumber": item.part_number, "ETag": item.etag} for item in parts]
+                },
+            )
+        except Exception:
+            failed = True
+        if failed or not isinstance(response, Mapping):
+            raise ArtifactStorageError
+        version_id = response.get("VersionId")
+        if version_id is not None and not _is_immutable_version_id(version_id):
+            raise ArtifactMetadataError
+        return CompletedMultipart(
+            location=ObjectLocation(
+                bucket=location.bucket,
+                key=location.key,
+                version_id=version_id,
+            )
+        )
+
+    async def abort_multipart(
+        self,
+        *,
+        location: ObjectLocation,
+        storage_upload_id: str,
+    ) -> None:
+        if (
+            not self._valid_location(location)
+            or location.version_id is not None
+            or not _is_nonempty_text(storage_upload_id)
+        ):
+            raise ArtifactAuthorizationError
+        failed = False
+        try:
+            await asyncio.to_thread(
+                self._client.abort_multipart_upload,
+                Bucket=location.bucket,
+                Key=location.key,
+                UploadId=storage_upload_id,
+            )
+        except Exception:
+            failed = True
+        if failed:
+            raise ArtifactStorageError
 
     async def head(self, *, location: ObjectLocation) -> StoredObjectMetadata:
         if not self._valid_location(location) or (

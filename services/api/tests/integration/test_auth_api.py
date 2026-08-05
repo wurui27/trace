@@ -1017,6 +1017,8 @@ def test_production_app_wires_and_closes_database_and_redis_adapters(
             self.apk_inspector = object()
             self.tenant_router = object()
             self.s3_client = object()
+            self.artifact_store = object()
+            self.bucket_resolver = object()
 
         async def close(self) -> None:
             closed.append("artifacts")
@@ -3613,7 +3615,6 @@ def test_non_testing_app_requires_verified_client_identity_by_default() -> None:
     assert app.state.proxy_client_identity_required is True
     assert response.status_code == 401
     assert response.json()["error"]["code"] == "proxy_authentication_failed"
-
 
 @pytest.mark.asyncio
 async def test_login_runs_argon2_off_loop_after_releasing_pre_auth_row_lock(

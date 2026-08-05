@@ -84,6 +84,10 @@ from perfpilot_api.services.agent_tasks import (
     RedisAgentTaskWakeup,
     SQLAlchemyAgentTaskRepository,
 )
+from perfpilot_api.services.agent_uploads import (
+    AgentUploadService,
+    SQLAlchemyAgentUploadRepository,
+)
 from perfpilot_api.services.analyses import (
     AnalysisService,
     ApkInspector,
@@ -213,6 +217,7 @@ def create_app(
     agent_service: AgentService | None = None,
     device_directory: DeviceDirectory | None = None,
     agent_task_service: AgentTaskService | None = None,
+    agent_upload_service: AgentUploadService | None = None,
     android_memory_worker: AndroidMemoryWorker | None = None,
     apk_inspector: ApkInspector | None = None,
     replay_store: ReplayStore | None = None,
@@ -244,6 +249,7 @@ def create_app(
     resolved_agent_service = agent_service
     resolved_device_directory = device_directory
     resolved_agent_task_service = agent_task_service
+    resolved_agent_upload_service = agent_upload_service
     resolved_task_snapshot_signer: TaskSnapshotSigner | None = None
     resolved_android_memory_worker = android_memory_worker
     active_android_memory_worker: AndroidMemoryWorker | None = None
@@ -357,6 +363,7 @@ def create_app(
         nonlocal resolved_memory_capture_service
         nonlocal resolved_upload_service
         nonlocal resolved_agent_task_service
+        nonlocal resolved_agent_upload_service
         nonlocal active_android_memory_worker
         nonlocal engine_adapter_registry
         nonlocal owned_android_memory_artifact_client
@@ -465,6 +472,24 @@ def create_app(
                         wakeup=RedisAgentTaskWakeup(owned_redis),
                     )
                     lifespan_app.state.agent_task_service = resolved_agent_task_service
+                if (
+                    resolved_agent_upload_service is None
+                    and resolved_agent_task_service is not None
+                ):
+                    if (
+                        owned_artifact_runtime.artifact_store is None
+                        or owned_artifact_runtime.bucket_resolver is None
+                    ):
+                        raise RuntimeError("Agent upload dependencies are unavailable")
+                    resolved_agent_upload_service = AgentUploadService(
+                        repository=SQLAlchemyAgentUploadRepository(
+                            tenant_router=owned_artifact_runtime.tenant_router,
+                        ),
+                        artifact_store=owned_artifact_runtime.artifact_store,
+                        bucket_resolver=owned_artifact_runtime.bucket_resolver,
+                        execution_authorizer=resolved_agent_task_service,
+                    )
+                    lifespan_app.state.agent_upload_service = resolved_agent_upload_service
                 if resolved_synthesis_run_service is None and settings.ai_enabled:
                     raw_digest = os.getenv("PERFPILOT_REPORT_WORKER_IMAGE_DIGEST", "")
                     if re.fullmatch(r"sha256:[a-f0-9]{64}", raw_digest) is None:
@@ -561,6 +586,7 @@ def create_app(
     app.state.agent_service = resolved_agent_service
     app.state.device_directory = resolved_device_directory
     app.state.agent_task_service = resolved_agent_task_service
+    app.state.agent_upload_service = resolved_agent_upload_service
     app.state.engine_adapter_registry = engine_adapter_registry
     app.state.android_memory_worker = None
     app.state.android_memory_artifact_client = None

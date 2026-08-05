@@ -28,6 +28,17 @@ from perfpilot_api.services.agent_tasks import (
     AgentTaskUnavailable,
     StaleLeaseVersion,
 )
+from perfpilot_api.services.agent_uploads import (
+    AgentUploadError,
+    AgentUploadExpired,
+    AgentUploadInvalidRequest,
+    AgentUploadMismatch,
+    AgentUploadNotFound,
+    AgentUploadService,
+    AgentUploadStaleLease,
+    AgentUploadUnavailable,
+)
+from perfpilot_api.storage.base import MultipartPart
 
 _PUBLIC_KEY_PATTERN = r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
 _REGISTRATION_CODE_PATTERN = r"^ppreg_[A-Za-z0-9_-]{43}$"
@@ -148,6 +159,49 @@ class RenewAgentTaskRequest(BaseModel):
     lease_version: int = Field(strict=True, ge=1)
 
 
+class CreateAgentUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    lease_version: int = Field(strict=True, ge=1)
+    artifact_kind: Literal[
+        "startup_trace",
+        "scroll_trace",
+        "memory_evidence",
+        "agent_log",
+    ]
+    mime: str = Field(
+        min_length=3,
+        max_length=255,
+        pattern=r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$",
+    )
+    size: int = Field(strict=True, ge=1, le=512 * 1024 * 1024)
+    sha256_b64: str = Field(min_length=44, max_length=44, pattern=r"^[A-Za-z0-9+/]{43}=$")
+
+
+class AuthorizeAgentUploadPartRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    lease_version: int = Field(strict=True, ge=1)
+    part_number: int = Field(strict=True, ge=1, le=10_000)
+
+
+class AgentUploadCompletedPart(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    part_number: int = Field(strict=True, ge=1, le=10_000)
+    etag: str = Field(min_length=1, max_length=1024, pattern=r"^[^\x00-\x1f\x7f]+$")
+
+
+class CompleteAgentUploadRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    lease_version: int = Field(strict=True, ge=1)
+    parts: tuple[AgentUploadCompletedPart, ...] = Field(min_length=1, max_length=10_000)
+
+
 def _reject_browser_credentials(request: Request) -> None:
     forbidden = (
         "cookie",
@@ -201,6 +255,46 @@ def get_agent_task_service(request: Request) -> AgentTaskService:
     if service is None:
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
     return service
+
+
+def get_agent_upload_service(request: Request) -> AgentUploadService:
+    service: AgentUploadService | None = request.app.state.agent_upload_service
+    if service is None:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    return service
+
+
+def _raise_agent_upload_error(error: AgentUploadError) -> None:
+    if isinstance(error, AgentUploadInvalidRequest):
+        raise ApiError("invalid_request", "上传请求无效", 400, False) from None
+    if isinstance(error, AgentUploadStaleLease):
+        raise ApiError("stale_lease_version", "租约版本已经变化", 409, True) from None
+    if isinstance(error, AgentUploadNotFound):
+        raise ApiError("resource_not_found", "资源不存在", 404, False) from None
+    if isinstance(error, AgentUploadExpired):
+        raise ApiError("upload_expired", "上传任务已经过期", 410, False) from None
+    if isinstance(error, AgentUploadMismatch):
+        raise ApiError("upload_mismatch", "上传内容校验失败", 409, False) from None
+    if isinstance(error, AgentUploadUnavailable):
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
+    raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
+
+
+def _agent_upload_payload(upload) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "artifact_id": str(upload.artifact_id),
+        "upload_id": str(upload.upload_id),
+        "artifact_kind": upload.artifact_kind,
+        "mime": upload.mime,
+        "size": upload.size,
+        "sha256_b64": upload.sha256_b64,
+        "part_size_bytes": upload.part_size_bytes,
+        "part_count": upload.part_count,
+        "state": upload.state,
+        "expires_at": _utc(upload.expires_at),
+        "finalized_at": None if upload.finalized_at is None else _utc(upload.finalized_at),
+    }
 
 
 router = APIRouter(
@@ -373,6 +467,92 @@ async def renew_task(
         "lease_expires_at": _utc(renewal.lease_expires_at),
         "renew_after_seconds": renewal.renew_after_seconds,
     }
+
+
+@router.post("/tasks/{execution_id}/uploads", status_code=201)
+async def create_agent_upload(
+    execution_id: UUID,
+    payload: CreateAgentUploadRequest,
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        upload = await upload_service.create_upload(
+            agent_id=principal.agent_id,
+            execution_id=execution_id,
+            lease_version=payload.lease_version,
+            artifact_kind=payload.artifact_kind,
+            mime=payload.mime,
+            size=payload.size,
+            sha256_b64=payload.sha256_b64,
+        )
+    except AgentUploadError as error:
+        _raise_agent_upload_error(error)
+    response.headers["cache-control"] = "no-store"
+    return _agent_upload_payload(upload)
+
+
+@router.post("/tasks/{execution_id}/uploads/{upload_id}/parts")
+async def authorize_agent_upload_part(
+    execution_id: UUID,
+    upload_id: UUID,
+    payload: AuthorizeAgentUploadPartRequest,
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        part = await upload_service.authorize_part(
+            agent_id=principal.agent_id,
+            execution_id=execution_id,
+            lease_version=payload.lease_version,
+            upload_id=upload_id,
+            part_number=payload.part_number,
+        )
+    except AgentUploadError as error:
+        _raise_agent_upload_error(error)
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "upload_id": str(part.upload_id),
+        "part_number": part.part_number,
+        "put_url": part.url,
+        "required_headers": part.required_headers,
+        "expires_at": _utc(part.expires_at),
+    }
+
+
+@router.post("/tasks/{execution_id}/uploads/{upload_id}/complete")
+async def complete_agent_upload(
+    execution_id: UUID,
+    upload_id: UUID,
+    payload: CompleteAgentUploadRequest,
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        upload = await upload_service.complete_upload(
+            agent_id=principal.agent_id,
+            execution_id=execution_id,
+            lease_version=payload.lease_version,
+            upload_id=upload_id,
+            parts=tuple(
+                MultipartPart(part_number=part.part_number, etag=part.etag)
+                for part in payload.parts
+            ),
+        )
+    except AgentUploadError as error:
+        _raise_agent_upload_error(error)
+    response.headers["cache-control"] = "no-store"
+    return _agent_upload_payload(upload)
 
 
 __all__ = ["router"]

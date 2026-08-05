@@ -13,6 +13,7 @@ from perfpilot_api.storage.base import (
     ArtifactNotFoundError,
     ArtifactStorageError,
     GetAuthorization,
+    MultipartPart,
     ObjectLocation,
     PutAuthorization,
     StoredObjectMetadata,
@@ -55,6 +56,27 @@ class RecordingS3Client:
         if self.failure is not None:
             raise self.failure
         return self.head_response
+
+    def create_multipart_upload(self, **kwargs: Any) -> object:
+        self.worker_thread_ids.append(threading.get_ident())
+        self.calls.append(("create_multipart_upload", kwargs))
+        if self.failure is not None:
+            raise self.failure
+        return {"UploadId": "private-storage-upload-id"}
+
+    def complete_multipart_upload(self, **kwargs: Any) -> object:
+        self.worker_thread_ids.append(threading.get_ident())
+        self.calls.append(("complete_multipart_upload", kwargs))
+        if self.failure is not None:
+            raise self.failure
+        return {"VersionId": VERSION_ID}
+
+    def abort_multipart_upload(self, **kwargs: Any) -> object:
+        self.worker_thread_ids.append(threading.get_ident())
+        self.calls.append(("abort_multipart_upload", kwargs))
+        if self.failure is not None:
+            raise self.failure
+        return {}
 
 
 def _valid_head_response(*, version_id: str = VERSION_ID) -> dict[str, object]:
@@ -139,6 +161,84 @@ def test_authorize_put_signs_only_required_headers_and_runs_off_event_loop() -> 
         "Content-Type": CONTENT_TYPE,
         "x-amz-checksum-sha256": CHECKSUM_SHA256_B64,
     }
+
+
+def test_multipart_lifecycle_is_strictly_scoped_and_runs_off_event_loop() -> None:
+    client = RecordingS3Client()
+    store = S3ArtifactStore(client=client)
+    location = ObjectLocation(bucket=BUCKET, key=OBJECT_KEY)
+    caller_thread_id = threading.get_ident()
+
+    created = asyncio.run(store.create_multipart(location=location, content_type=CONTENT_TYPE))
+    authorized = asyncio.run(
+        store.authorize_part(
+            location=location,
+            storage_upload_id=created.storage_upload_id,
+            part_number=2,
+            expires_in_seconds=900,
+        )
+    )
+    completed = asyncio.run(
+        store.complete_multipart(
+            location=location,
+            storage_upload_id=created.storage_upload_id,
+            parts=(MultipartPart(part_number=1, etag='"etag-1"'),),
+        )
+    )
+    asyncio.run(
+        store.abort_multipart(
+            location=location,
+            storage_upload_id=created.storage_upload_id,
+        )
+    )
+
+    assert created.location == location
+    assert authorized.part_number == 2
+    assert authorized.expires_in_seconds == 900
+    assert completed.location.version_id == VERSION_ID
+    assert all(thread_id != caller_thread_id for thread_id in client.worker_thread_ids)
+    assert client.calls == [
+        (
+            "create_multipart_upload",
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "ContentType": CONTENT_TYPE,
+                "ChecksumAlgorithm": "SHA256",
+            },
+        ),
+        (
+            "generate_presigned_url",
+            {
+                "ClientMethod": "upload_part",
+                "Params": {
+                    "Bucket": BUCKET,
+                    "Key": OBJECT_KEY,
+                    "UploadId": "private-storage-upload-id",
+                    "PartNumber": 2,
+                },
+                "ExpiresIn": 900,
+                "HttpMethod": "PUT",
+            },
+        ),
+        (
+            "complete_multipart_upload",
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "private-storage-upload-id",
+                "MultipartUpload": {"Parts": [{"PartNumber": 1, "ETag": '"etag-1"'}]},
+            },
+        ),
+        (
+            "abort_multipart_upload",
+            {
+                "Bucket": BUCKET,
+                "Key": OBJECT_KEY,
+                "UploadId": "private-storage-upload-id",
+            },
+        ),
+    ]
 
 
 @pytest.mark.parametrize("expires_in_seconds", [0, -1, 901, True])

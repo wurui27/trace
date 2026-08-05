@@ -28,6 +28,12 @@ from perfpilot_api.db.tenant.models import (
     Application,
     ApplicationVersion,
     Artifact,
+    ArtifactMultipartUpload,
+)
+from perfpilot_api.services.agent_tasks import AgentExecutionAccess
+from perfpilot_api.services.agent_uploads import (
+    AgentUploadDescriptor,
+    SQLAlchemyAgentUploadRepository,
 )
 from perfpilot_api.services.uploads import (
     SQLAlchemyUploadRepository,
@@ -38,6 +44,7 @@ from perfpilot_api.services.uploads import (
     UploadNotFoundError,
     UploadUnavailableError,
 )
+from perfpilot_api.storage.base import MultipartPart
 
 TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 APPLICATION_ID = UUID("20000000-0000-4000-8000-000000000001")
@@ -50,6 +57,7 @@ ARTIFACT_ID_2 = UUID("50000000-0000-4000-8000-000000000002")
 UPLOAD_ID_1 = UUID("60000000-0000-4000-8000-000000000001")
 UPLOAD_ID_2 = UUID("60000000-0000-4000-8000-000000000002")
 NOW = datetime(2026, 7, 28, 1, 2, 3, tzinfo=UTC)
+AGENT_EXECUTION_ID = UUID("70000000-0000-4000-8000-000000000001")
 CHECKSUM = "iNQmb9TmM40TuEX88olXnVf6kQbc4EZhDbs8WjoWj4E="
 DESCRIPTOR = UploadDescriptor(
     artifact_kind="apk",
@@ -179,6 +187,78 @@ def _repository(
     )
 
 
+@pytest.mark.asyncio
+async def test_agent_multipart_repository_finalizes_once_with_execution_ownership(
+    upload_database: UploadDatabase,
+) -> None:
+    repository = SQLAlchemyAgentUploadRepository(
+        tenant_router=DirectTenantRouter(upload_database.session_factory)  # type: ignore[arg-type]
+    )
+    access = AgentExecutionAccess(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        agent_id=UUID("71000000-0000-4000-8000-000000000001"),
+        execution_id=AGENT_EXECUTION_ID,
+        lease_version=1,
+        lease_expires_at=NOW + timedelta(minutes=1),
+    )
+    descriptor = AgentUploadDescriptor(
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=4,
+        sha256_b64=CHECKSUM,
+    )
+
+    reservation = await repository.reserve_upload(
+        tenant=TENANT,
+        access=access,
+        descriptor=descriptor,
+        artifact_id=ARTIFACT_ID_1,
+        upload_id=UPLOAD_ID_1,
+        object_key=f"raw/analyses/{ANALYSIS_ID}/agent/{AGENT_EXECUTION_ID}/startup_trace/1",
+        storage_upload_id="opaque-storage-upload",
+        part_size_bytes=64 * 1024 * 1024,
+        part_count=1,
+        now=NOW,
+        expires_at=NOW + timedelta(minutes=15),
+    )
+    claim = await repository.prepare_completion(
+        tenant=TENANT,
+        access=access,
+        upload_id=UPLOAD_ID_1,
+        parts=(MultipartPart(part_number=1, etag='"etag-1"'),),
+        now=NOW,
+    )
+    completed = await repository.finalize_upload(
+        tenant=TENANT,
+        access=access,
+        upload_id=UPLOAD_ID_1,
+        storage_version_id="immutable-version",
+        now=NOW,
+        expires_at=NOW + timedelta(days=30),
+    )
+    replayed = await repository.finalize_upload(
+        tenant=TENANT,
+        access=access,
+        upload_id=UPLOAD_ID_1,
+        storage_version_id="immutable-version",
+        now=NOW,
+        expires_at=NOW + timedelta(days=30),
+    )
+
+    assert reservation.created is True
+    assert claim.call_storage_complete is True
+    assert completed == replayed
+    assert completed.state == "finalized"
+    async with upload_database.session_factory() as session:
+        artifact = await session.get(Artifact, ARTIFACT_ID_1)
+        multipart = await session.get(ArtifactMultipartUpload, UPLOAD_ID_1)
+    assert artifact is not None and artifact.state == "finalized"
+    assert artifact.version_id == "immutable-version"
+    assert multipart is not None and multipart.state == "completed"
+    assert multipart.completed_parts == [{"part_number": 1, "etag": '"etag-1"'}]
+
+
 async def _reserve(
     repository: SQLAlchemyUploadRepository,
     *,
@@ -270,9 +350,9 @@ async def test_trace_reservation_requires_the_declared_slot_and_moves_tenant_to_
     async with upload_database.session_factory() as session:
         analysis = await session.get(Analysis, TRACE_ANALYSIS_ID)
         artifact_count = await session.scalar(
-            select(func.count()).select_from(Artifact).where(
-                Artifact.analysis_id == TRACE_ANALYSIS_ID
-            )
+            select(func.count())
+            .select_from(Artifact)
+            .where(Artifact.analysis_id == TRACE_ANALYSIS_ID)
         )
     assert analysis is not None
     assert (analysis.state, analysis.version) == ("uploading", 2)
@@ -319,9 +399,9 @@ async def test_trace_reservation_rejects_undeclared_or_cross_tenant_inputs_witho
 
     async with upload_database.session_factory() as session:
         artifact_count = await session.scalar(
-            select(func.count()).select_from(Artifact).where(
-                Artifact.analysis_id == TRACE_ANALYSIS_ID
-            )
+            select(func.count())
+            .select_from(Artifact)
+            .where(Artifact.analysis_id == TRACE_ANALYSIS_ID)
         )
         analysis = await session.get(Analysis, TRACE_ANALYSIS_ID)
     assert artifact_count == 0

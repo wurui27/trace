@@ -120,6 +120,17 @@ class LeaseRenewal:
     renew_after_seconds: int = _RENEW_AFTER_SECONDS
 
 
+@dataclass(frozen=True, slots=True)
+class AgentExecutionAccess:
+    team_id: UUID
+    analysis_id: UUID
+    agent_id: UUID
+    execution_id: UUID
+    lease_version: int
+    lease_expires_at: datetime
+    allowed_uploads: tuple[str, ...] = _ALLOWED_UPLOADS
+
+
 class AgentTaskRepository(Protocol):
     async def schedule(
         self,
@@ -153,6 +164,15 @@ class AgentTaskRepository(Protocol):
         lease_version: int,
         now: datetime,
     ) -> LeaseRenewal: ...
+
+    async def authorize_execution(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        now: datetime,
+    ) -> AgentExecutionAccess: ...
 
 
 class AgentTaskWakeup(Protocol):
@@ -301,6 +321,29 @@ class InMemoryAgentTaskRepository:
             lease_expires_at=expires_at,
         )
 
+    async def authorize_execution(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        now: datetime,
+    ) -> AgentExecutionAccess:
+        _require_aware(now)
+        lease = self._leases.get(execution_id)
+        if lease is None or lease.definition.agent_id != agent_id or lease.expires_at <= now:
+            raise AgentTaskNotFound
+        if lease.lease_version != lease_version:
+            raise StaleLeaseVersion
+        return AgentExecutionAccess(
+            team_id=lease.definition.team_id,
+            analysis_id=lease.definition.analysis_id,
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            lease_expires_at=lease.expires_at,
+        )
+
     def snapshot_digest(self, execution_id: UUID) -> str | None:
         lease = self._leases.get(execution_id)
         return None if lease is None else lease.task_snapshot_digest
@@ -419,6 +462,27 @@ class AgentTaskService:
             execution_id=execution_id,
             lease_version=lease_version,
             now=_aware_now(self._clock()),
+        )
+
+    async def authorize_execution(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        now: datetime,
+    ) -> AgentExecutionAccess:
+        if (
+            isinstance(lease_version, bool)
+            or not isinstance(lease_version, int)
+            or lease_version < 1
+        ):
+            raise StaleLeaseVersion
+        return await self._repository.authorize_execution(
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            now=_aware_now(now),
         )
 
 
@@ -707,6 +771,44 @@ class SQLAlchemyAgentTaskRepository:
                     lease_expires_at=lease.expires_at,
                 )
 
+    async def authorize_execution(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        now: datetime,
+    ) -> AgentExecutionAccess:
+        _require_aware(now)
+        async with self._control_sessions() as session:
+            row = (
+                await session.execute(
+                    select(AgentLease, GlobalJob)
+                    .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
+                    .where(AgentLease.execution_id == execution_id)
+                )
+            ).one_or_none()
+        if row is None:
+            raise AgentTaskNotFound
+        lease, job = row
+        if (
+            lease.agent_id != agent_id
+            or lease.state != "active"
+            or lease.expires_at <= now
+            or job.state not in ("scheduled", "running")
+        ):
+            raise AgentTaskNotFound
+        if lease.version != lease_version:
+            raise StaleLeaseVersion
+        return AgentExecutionAccess(
+            team_id=job.team_id,
+            analysis_id=job.id,
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            lease_expires_at=lease.expires_at,
+        )
+
 
 def _task_claims(task: ActiveAgentTask, *, issued_at: datetime) -> dict[str, object]:
     definition = task.definition
@@ -829,6 +931,7 @@ __all__ = [
     "ActiveAgentTask",
     "AgentTaskDefinition",
     "AgentTaskDelivery",
+    "AgentExecutionAccess",
     "AgentTaskError",
     "AgentTaskNotFound",
     "AgentTaskService",

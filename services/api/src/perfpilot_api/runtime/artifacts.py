@@ -112,6 +112,8 @@ class ArtifactRuntime:
     tenant_router: Any = field(repr=False)
     s3_client: Any = field(repr=False)
     secret_store: Any = field(repr=False)
+    artifact_store: S3ArtifactStore | None = field(default=None, repr=False)
+    bucket_resolver: Any = field(default=None, repr=False)
     _closed: bool = field(default=False, init=False, repr=False)
 
     async def close(self) -> None:
@@ -194,6 +196,8 @@ async def build_artifact_runtime(
             )
         runtime = ArtifactRuntime(
             upload_service=upload_service,
+            artifact_store=artifact_store,
+            bucket_resolver=bucket_resolver,
             engine_result_sink=engine_result_sink,
             apk_inspector=apk_inspector,
             tenant_router=tenant_router,
