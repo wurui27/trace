@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -11,6 +12,7 @@ from uuid import uuid4
 
 import httpx
 import uvicorn
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from starlette.datastructures import Headers, MutableHeaders
@@ -21,6 +23,8 @@ from redis import asyncio as redis
 from perfpilot_api.api.auth import PROXY_CLIENT_IDENTITY_STATE_KEY
 from perfpilot_api.api.auth import ProxyAuthenticationMiddleware
 from perfpilot_api.api.auth import router as auth_router
+from perfpilot_api.api.agent_control import router as agent_control_router
+from perfpilot_api.api.agents import router as agents_router
 from perfpilot_api.api.admin_teams import router as admin_teams_router
 from perfpilot_api.api.analyses import router as analyses_router
 from perfpilot_api.api.health import router as health_router
@@ -54,11 +58,21 @@ from perfpilot_api.security.proxy_signature import (
     RedisReplayStore,
     ReplayStore,
 )
+from perfpilot_api.security.agent_credentials import AgentCredentialCodec
+from perfpilot_api.security.agent_signatures import (
+    RedisAgentNonceStore,
+    encode_ed25519_public_key,
+)
 from perfpilot_api.runtime.artifacts import ArtifactRuntime, build_artifact_runtime
 from perfpilot_api.services.auth import (
     AuthService,
     RedisLoginRateLimiter,
     RedisPreAuthSessionLimiter,
+)
+from perfpilot_api.services.agents import (
+    AgentService,
+    SQLAlchemyAgentRepository,
+    TaskSigningKey,
 )
 from perfpilot_api.services.analyses import (
     AnalysisService,
@@ -110,6 +124,19 @@ def _verified_client_identity(request: Request) -> str:
     return identity
 
 
+def _derive_agent_runtime_key(
+    root_secret: bytes,
+    *,
+    purpose: bytes,
+    key_reference: str,
+) -> bytes:
+    return hmac.new(
+        root_secret,
+        purpose + b"\x00" + key_reference.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+
+
 class RequestIdMiddleware:
     def __init__(self, app: ASGIApp) -> None:
         self.app = app
@@ -149,6 +176,8 @@ class AuthNoStoreMiddleware:
             or path.startswith("/v1/admin/")
             or path == "/v1/teams"
             or path.startswith("/v1/teams/")
+            or path == "/v1/agent"
+            or path.startswith("/v1/agent/")
         ):
             await self.app(scope, receive, send)
             return
@@ -171,6 +200,7 @@ def create_app(
     analysis_service: AnalysisService | None = None,
     synthesis_run_service: SynthesisRunService | None = None,
     memory_capture_service: MemoryCaptureService | None = None,
+    agent_service: AgentService | None = None,
     android_memory_worker: AndroidMemoryWorker | None = None,
     apk_inspector: ApkInspector | None = None,
     replay_store: ReplayStore | None = None,
@@ -199,6 +229,7 @@ def create_app(
     resolved_analysis_service = analysis_service
     resolved_synthesis_run_service = synthesis_run_service
     resolved_memory_capture_service = memory_capture_service
+    resolved_agent_service = agent_service
     resolved_android_memory_worker = android_memory_worker
     active_android_memory_worker: AndroidMemoryWorker | None = None
     owned_android_memory_artifact_client: httpx.AsyncClient | None = None
@@ -244,6 +275,45 @@ def create_app(
             resolved_admin_team_service = AdminTeamService(
                 session_factory=control_session_factory,
             )
+    if (
+        not testing
+        and resolved_agent_service is None
+        and control_session_factory is not None
+        and owned_redis is not None
+    ):
+        root_secret = settings.session_secret.get_secret_value().encode("utf-8")
+        credential_reference = settings.agent_registration_secret_reference.get_secret_value()
+        signing_reference = settings.jws_signing_key_reference.get_secret_value()
+        credential_secret = _derive_agent_runtime_key(
+            root_secret,
+            purpose=b"perfpilot-agent-credentials-v1",
+            key_reference=credential_reference,
+        )
+        nonce_secret = _derive_agent_runtime_key(
+            root_secret,
+            purpose=b"perfpilot-agent-refresh-nonce-v1",
+            key_reference=credential_reference,
+        )
+        task_private_key = Ed25519PrivateKey.from_private_bytes(
+            _derive_agent_runtime_key(
+                root_secret,
+                purpose=b"perfpilot-agent-task-signing-v1",
+                key_reference=signing_reference,
+            )
+        )
+        task_public_key_b64 = encode_ed25519_public_key(task_private_key.public_key())
+        resolved_agent_service = AgentService(
+            repository=SQLAlchemyAgentRepository(control_session_factory),
+            credentials=AgentCredentialCodec(credential_secret),
+            nonce_store=RedisAgentNonceStore(
+                owned_redis,
+                key_secret=nonce_secret,
+            ),
+            task_signing_key=TaskSigningKey(
+                kid=f"lan-{hashlib.sha256(task_public_key_b64.encode('ascii')).hexdigest()[:16]}",
+                public_key_b64=task_public_key_b64,
+            ),
+        )
 
     @asynccontextmanager
     async def lifespan(lifespan_app: FastAPI) -> AsyncIterator[None]:
@@ -380,14 +450,10 @@ def create_app(
                             report_worker_image_digest=raw_digest,
                             provider_name=settings.ai_provider_name,
                             model=settings.ai_model,
-                            inference_config_hash=hashlib.sha256(
-                                inference_payload
-                            ).hexdigest(),
+                            inference_config_hash=hashlib.sha256(inference_payload).hexdigest(),
                         ),
                     )
-                    lifespan_app.state.synthesis_run_service = (
-                        resolved_synthesis_run_service
-                    )
+                    lifespan_app.state.synthesis_run_service = resolved_synthesis_run_service
                 if resolved_memory_capture_service is None:
                     resolved_memory_capture_service = MemoryCaptureService(
                         repository=SQLAlchemyMemoryCaptureRepository(
@@ -444,6 +510,7 @@ def create_app(
     app.state.analysis_service = resolved_analysis_service
     app.state.synthesis_run_service = resolved_synthesis_run_service
     app.state.memory_capture_service = resolved_memory_capture_service
+    app.state.agent_service = resolved_agent_service
     app.state.engine_adapter_registry = engine_adapter_registry
     app.state.android_memory_worker = None
     app.state.android_memory_artifact_client = None
@@ -469,6 +536,8 @@ def create_app(
     app.add_exception_handler(Exception, internal_server_error_handler)
     app.include_router(health_router)
     app.include_router(auth_router)
+    app.include_router(agent_control_router)
+    app.include_router(agents_router)
     app.include_router(admin_teams_router)
     app.include_router(me_router)
     app.include_router(members_router)
