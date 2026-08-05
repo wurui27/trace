@@ -28,6 +28,7 @@
     "analysis_id": {"type": "string", "format": "uuid"},
     "team_id": {"type": "string", "format": "uuid"},
     "analysis_mode": {"enum": ["device", "trace_upload", "memory_upload"]},
+    "device_id": {"type": "string", "format": "uuid"},
     "state": {
       "enum": [
         "creating",
@@ -145,7 +146,7 @@
             },
             "scenarios": {"$ref": "#/$defs/deviceScenarios"}
           },
-          "required": ["analysis_mode"],
+          "required": ["analysis_mode", "device_id"],
           "not": {
             "anyOf": [
               {"required": ["question"]},
@@ -175,6 +176,7 @@
           "required": ["analysis_mode", "question"],
           "not": {
             "anyOf": [
+              {"required": ["device_id"]},
               {"required": ["analysis_profile"]},
               {"required": ["input_uploads"]},
               {"required": ["stages"]}
@@ -215,7 +217,8 @@
             "question",
             "input_uploads",
             "stages"
-          ]
+          ],
+          "not": {"required": ["device_id"]}
         }
       ]
     }

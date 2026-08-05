@@ -13,6 +13,7 @@ from perfpilot_api.main import create_app
 from perfpilot_api.security.proxy_signature import sign_proxy_request
 from perfpilot_api.security.sessions import COOKIE_NAME
 from perfpilot_api.services.analyses import (
+    AnalysisDeviceUnavailableError,
     AnalysisIdempotencyConflictError,
     AnalysisInvalidRequestError,
     AnalysisNotFoundError,
@@ -35,6 +36,7 @@ ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000001")
 UPLOAD_ID = UUID("40000000-0000-4000-8000-000000000001")
 ARTIFACT_ID = UUID("50000000-0000-4000-8000-000000000001")
 APPLICATION_VERSION_ID = UUID("60000000-0000-4000-8000-000000000001")
+DEVICE_ID = UUID("72000000-0000-4000-8000-000000000001")
 NOW = datetime(2026, 7, 28, 8, 0, tzinfo=UTC)
 CHECKSUM = "iNQmb9TmM40TuEX88olXnVf6kQbc4EZhDbs8WjoWj4E="
 PROXY_SECRET = "task7-analysis-proxy-secret"
@@ -218,6 +220,7 @@ def _created_view(*, include_upload_authorization: bool = True) -> AnalysisView:
         analysis_id=ANALYSIS_ID,
         team_id=TEAM_ID,
         analysis_mode="device",
+        device_id=DEVICE_ID,
         state="created",
         version=2,
         application_version_id=None,
@@ -381,6 +384,7 @@ def _create_body() -> bytes:
         {
             "schema_version": "1.0",
             "analysis_mode": "device",
+            "device_id": str(DEVICE_ID),
             "scenarios": ["cold_start", "scroll", "memory_cycle"],
             "apk": {
                 "artifact_kind": "apk",
@@ -715,6 +719,7 @@ def test_create_device_analysis_returns_pending_apk_slot_without_internal_locati
         "analysis_id": str(ANALYSIS_ID),
         "team_id": str(TEAM_ID),
         "analysis_mode": "device",
+        "device_id": str(DEVICE_ID),
         "state": "created",
         "version": 2,
         "application_version_id": None,
@@ -775,6 +780,7 @@ def test_create_device_analysis_returns_pending_apk_slot_without_internal_locati
                 "team_id": TEAM_ID,
                 "requested_by_user_id": USER_ID,
                 "idempotency_key": "device-analysis-1",
+                "device_id": DEVICE_ID,
                 "scenarios": ("cold_start", "scroll", "memory_cycle"),
                 "apk_mime": "application/vnd.android.package-archive",
                 "apk_size": 4,
@@ -811,6 +817,7 @@ def test_idempotency_conflict_and_queue_limit_have_stable_errors() -> None:
     cases = (
         (AnalysisIdempotencyConflictError(), 409, "idempotency_conflict"),
         (AnalysisQueueLimitError(), 429, "team_queue_limit"),
+        (AnalysisDeviceUnavailableError(), 409, "device_unavailable"),
     )
     for index, (error, status, code) in enumerate(cases):
         auth_service = FakeAuthService()
@@ -935,9 +942,7 @@ def test_list_report_analyses_returns_latest_team_report_without_cache() -> None
             }
         ],
     }
-    assert analysis_service.calls == [
-        ("list", {"team_id": TEAM_ID, "limit": 1})
-    ]
+    assert analysis_service.calls == [("list", {"team_id": TEAM_ID, "limit": 1})]
     assert auth_service.calls[0]["team_id"] == TEAM_ID
 
 

@@ -543,12 +543,8 @@ def test_remote_agent_schema_enforces_identity_states_and_ownership(
     _upgrade("control", migration_databases.control_url)
     control_inspector = inspect(migration_databases.control_engine)
 
-    agent_columns = {
-        column["name"]: column for column in control_inspector.get_columns("agents")
-    }
-    device_columns = {
-        column["name"]: column for column in control_inspector.get_columns("devices")
-    }
+    agent_columns = {column["name"]: column for column in control_inspector.get_columns("agents")}
+    device_columns = {column["name"]: column for column in control_inspector.get_columns("devices")}
     lease_columns = {
         column["name"]: column for column in control_inspector.get_columns("agent_leases")
     }
@@ -607,9 +603,11 @@ def test_remote_agent_schema_enforces_identity_states_and_ownership(
         "expired",
         "revoked",
     }
-    assert checks["global_jobs"]["ck_global_jobs_device_selection"] == (
-        "selected_device_idisnulloranalysis_mode='device'"
-    )
+    device_selection = checks["global_jobs"]["ck_global_jobs_device_selection"]
+    assert "analysis_mode<>'device'andselected_device_idisnull" in device_selection
+    assert "analysis_mode='device'" in device_selection
+    assert "selected_device_idisnotnull" in device_selection
+    assert {"device", "scheduled", "running"} <= (_check_string_literals(device_selection))
 
     device_owner_fk = next(
         foreign_key
@@ -640,24 +638,21 @@ def test_agent_multipart_schema_keeps_transport_state_in_tenant_database(
     assert columns["state"]["nullable"] is False
     assert columns["expires_at"]["nullable"] is False
     assert columns["completed_at"]["nullable"] is True
-    assert ("artifact_id",) in _unique_column_sets(
-        tenant_inspector, "artifact_multipart_uploads"
-    )
+    assert ("artifact_id",) in _unique_column_sets(tenant_inspector, "artifact_multipart_uploads")
     assert ("storage_upload_id",) in _unique_column_sets(
         tenant_inspector, "artifact_multipart_uploads"
     )
     checks = {
         constraint["name"]: _normalize_postgresql_predicate(constraint["sqltext"])
-        for constraint in tenant_inspector.get_check_constraints(
-            "artifact_multipart_uploads"
-        )
+        for constraint in tenant_inspector.get_check_constraints("artifact_multipart_uploads")
     }
-    assert _check_string_literals(
-        checks["ck_artifact_multipart_uploads_state"]
-    ) == {"pending", "completed", "aborted", "expired"}
-    assert checks["ck_artifact_multipart_uploads_part_size_positive"] == (
-        "part_size_bytes>0"
-    )
+    assert _check_string_literals(checks["ck_artifact_multipart_uploads_state"]) == {
+        "pending",
+        "completed",
+        "aborted",
+        "expired",
+    }
+    assert checks["ck_artifact_multipart_uploads_part_size_positive"] == ("part_size_bytes>0")
     assert checks["ck_artifact_multipart_uploads_part_count_range"] == (
         "part_count>=1andpart_count<=10000"
     )
@@ -669,9 +664,7 @@ def test_remote_agent_upgrade_refuses_legacy_identity_rows(
     config = _alembic_config("control", migration_databases.control_url)
     command.upgrade(config, "0008_ai_synthesis")
     with migration_databases.control_engine.begin() as connection:
-        connection.execute(
-            text("INSERT INTO agents (name) VALUES ('legacy-agent')")
-        )
+        connection.execute(text("INSERT INTO agents (name) VALUES ('legacy-agent')"))
 
     with pytest.raises(
         RuntimeError,
@@ -892,7 +885,7 @@ def test_control_execution_tenant_version_migration_round_trips_empty_table(
     assert tenant_version["default"] is None
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0009_remote_device_agents"
+            "0010_device_task_leases"
         )
 
     command.downgrade(config, "0005_memory_upload_mode")
@@ -995,7 +988,7 @@ def test_control_execution_tenant_version_downgrade_refuses_rows(
 
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0009_remote_device_agents"
+            "0010_device_task_leases"
         )
     assert "tenant_resource_version" in {
         column["name"]
@@ -1011,9 +1004,7 @@ def test_control_execution_tenant_version_migration_requests_exclusive_lock(
     config = _alembic_config("control", migration_databases.control_url)
     command.upgrade(
         config,
-        "0005_memory_upload_mode"
-        if direction == "upgrade"
-        else "0006_engine_tenant_version",
+        "0005_memory_upload_mode" if direction == "upgrade" else "0006_engine_tenant_version",
     )
     blocker = migration_databases.control_engine.connect()
     blocker_transaction = blocker.begin()
@@ -1023,9 +1014,7 @@ def test_control_execution_tenant_version_migration_requests_exclusive_lock(
         migration_future = executor.submit(
             command.upgrade if direction == "upgrade" else command.downgrade,
             config,
-            "0006_engine_tenant_version"
-            if direction == "upgrade"
-            else "0005_memory_upload_mode",
+            "0006_engine_tenant_version" if direction == "upgrade" else "0005_memory_upload_mode",
         )
         lock_wait_query = text(
             "SELECT EXISTS ("
@@ -1091,9 +1080,7 @@ def test_control_external_engine_downgrade_refuses_nonempty_metadata(
             _alembic_config("control", migration_databases.control_url),
             "0003_analysis_orchestration",
         )
-    assert "team_engine_workspaces" in inspect(
-        migration_databases.control_engine
-    ).get_table_names()
+    assert "team_engine_workspaces" in inspect(migration_databases.control_engine).get_table_names()
 
     with migration_databases.control_engine.begin() as connection:
         connection.execute(text("DELETE FROM team_engine_workspaces"))
@@ -1353,21 +1340,45 @@ def test_tenant_report_versions_enforce_exclusive_scenario_and_analysis_content(
 
         invalid_contents = (
             {"scenario_result_id": scenario_id, "bundle": '{"scenario":true}', "report": None},
-            {"scenario_result_id": scenario_id, "bundle": None, "bundle_sha256_b64": "A" * 44, "report": None},
+            {
+                "scenario_result_id": scenario_id,
+                "bundle": None,
+                "bundle_sha256_b64": "A" * 44,
+                "report": None,
+            },
             {"scenario_result_id": None, "bundle": None, "report": '{"analysis":true}'},
-            {"scenario_result_id": None, "bundle": None, "report": None, "report_sha256_b64": "B" * 44},
-            {"scenario_result_id": scenario_id, "bundle": '{"scenario":true}', "bundle_sha256_b64": "A" * 44, "report": '{"analysis":true}', "report_sha256_b64": "B" * 44},
-            {"scenario_result_id": None, "bundle": '{"scenario":true}', "bundle_sha256_b64": "A" * 44, "report": None},
-            {"scenario_result_id": scenario_id, "bundle": None, "report": '{"analysis":true}', "report_sha256_b64": "B" * 44},
+            {
+                "scenario_result_id": None,
+                "bundle": None,
+                "report": None,
+                "report_sha256_b64": "B" * 44,
+            },
+            {
+                "scenario_result_id": scenario_id,
+                "bundle": '{"scenario":true}',
+                "bundle_sha256_b64": "A" * 44,
+                "report": '{"analysis":true}',
+                "report_sha256_b64": "B" * 44,
+            },
+            {
+                "scenario_result_id": None,
+                "bundle": '{"scenario":true}',
+                "bundle_sha256_b64": "A" * 44,
+                "report": None,
+            },
+            {
+                "scenario_result_id": scenario_id,
+                "bundle": None,
+                "report": '{"analysis":true}',
+                "report_sha256_b64": "B" * 44,
+            },
         )
         for content in invalid_contents:
             with pytest.raises(IntegrityError):
                 with connection.begin_nested():
                     connection.execute(
                         insert,
-                        common
-                        | content
-                        | {"id": uuid4(), "report_version": 10 + len(content)},
+                        common | content | {"id": uuid4(), "report_version": 10 + len(content)},
                     )
 
 
@@ -1508,9 +1519,10 @@ def test_partial_indexes_enforce_active_leases_and_ready_outbox_dispatch(
     )
     assert engine_result_index["unique"] is True
     assert engine_result_index["column_names"] == ["subject_id"]
-    assert _normalize_postgresql_predicate(
-        engine_result_index["dialect_options"]["postgresql_where"]
-    ) == "event_type='engine_result_ready'andsubject_type='engine_execution'"
+    assert (
+        _normalize_postgresql_predicate(engine_result_index["dialect_options"]["postgresql_where"])
+        == "event_type='engine_result_ready'andsubject_type='engine_execution'"
+    )
     synthesis_index = next(
         index
         for index in control_inspector.get_indexes("outbox_events")
@@ -1518,9 +1530,10 @@ def test_partial_indexes_enforce_active_leases_and_ready_outbox_dispatch(
     )
     assert synthesis_index["unique"] is True
     assert synthesis_index["column_names"] == ["subject_id"]
-    assert _normalize_postgresql_predicate(
-        synthesis_index["dialect_options"]["postgresql_where"]
-    ) == "event_type='analysis_synthesis_requested'andsubject_type='synthesis_execution'"
+    assert (
+        _normalize_postgresql_predicate(synthesis_index["dialect_options"]["postgresql_where"])
+        == "event_type='analysis_synthesis_requested'andsubject_type='synthesis_execution'"
+    )
     outbox_checks = {
         constraint["name"]: _normalize_postgresql_predicate(constraint["sqltext"])
         for constraint in control_inspector.get_check_constraints("outbox_events")
@@ -1549,8 +1562,7 @@ def test_control_schema_persists_only_nonsecret_ai_synthesis_audit_metadata(
     control_inspector = inspect(migration_databases.control_engine)
 
     synthesis_columns = {
-        column["name"]: column
-        for column in control_inspector.get_columns("synthesis_executions")
+        column["name"]: column for column in control_inspector.get_columns("synthesis_executions")
     }
     invocation_columns = {
         column["name"]: column for column in control_inspector.get_columns("ai_invocations")
@@ -2042,14 +2054,12 @@ def test_control_ai_synthesis_downgrade_refuses_audit_records(
         )
 
     control_inspector = inspect(migration_databases.control_engine)
-    assert {"synthesis_executions", "ai_invocations"} <= set(
-        control_inspector.get_table_names()
-    )
+    assert {"synthesis_executions", "ai_invocations"} <= set(control_inspector.get_table_names())
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM synthesis_executions")) == 1
         assert connection.scalar(text("SELECT count(*) FROM ai_invocations")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0009_remote_device_agents"
+            "0010_device_task_leases"
         )
 
 
@@ -2102,7 +2112,7 @@ def test_control_ai_synthesis_downgrade_refuses_retained_outbox_authority(
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM outbox_events")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0009_remote_device_agents"
+            "0010_device_task_leases"
         )
 
 
@@ -2205,15 +2215,11 @@ def test_memory_upload_mode_is_present_in_both_databases(
 
     control_checks = {
         item["name"]: item["sqltext"]
-        for item in inspect(migration_databases.control_engine).get_check_constraints(
-            "global_jobs"
-        )
+        for item in inspect(migration_databases.control_engine).get_check_constraints("global_jobs")
     }
     tenant_checks = {
         item["name"]: item["sqltext"]
-        for item in inspect(migration_databases.tenant_engine).get_check_constraints(
-            "analyses"
-        )
+        for item in inspect(migration_databases.tenant_engine).get_check_constraints("analyses")
     }
 
     expected_modes = {"device", "trace_upload", "memory_upload"}
@@ -2230,7 +2236,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
 @pytest.mark.parametrize(
     ("tree", "downgrade_revision", "head_revision"),
     [
-        ("control", "0004_external_engine_foundation", "0009_remote_device_agents"),
+        ("control", "0004_external_engine_foundation", "0010_device_task_leases"),
         ("tenant", "0003_analysis_orchestration", "0008_agent_multipart_uploads"),
     ],
 )
@@ -2277,9 +2283,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == head_revision
     if tree == "tenant":
-        assert "question" in {
-            column["name"] for column in inspect(engine).get_columns("analyses")
-        }
+        assert "question" in {column["name"] for column in inspect(engine).get_columns("analyses")}
 
 
 @pytest.mark.parametrize(
@@ -2288,7 +2292,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "control",
             "0004_external_engine_foundation",
-            "0009_remote_device_agents",
+            "0010_device_task_leases",
             "global_jobs",
             "ck_global_jobs_analysis_mode",
         ),
@@ -2379,8 +2383,7 @@ def test_memory_upload_downgrade_serializes_with_concurrent_writers(
         executor.shutdown(wait=True, cancel_futures=True)
 
     checks = {
-        item["name"]: item["sqltext"]
-        for item in inspect(engine).get_check_constraints(table_name)
+        item["name"]: item["sqltext"] for item in inspect(engine).get_check_constraints(table_name)
     }
     assert _check_string_literals(checks[constraint_name]) == {
         "device",
@@ -2390,9 +2393,7 @@ def test_memory_upload_downgrade_serializes_with_concurrent_writers(
     with engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == head_revision
     if tree == "tenant":
-        assert "question" in {
-            column["name"] for column in inspect(engine).get_columns("analyses")
-        }
+        assert "question" in {column["name"] for column in inspect(engine).get_columns("analyses")}
 
 
 @pytest.mark.parametrize("tree", ["control", "tenant"])

@@ -44,7 +44,10 @@ class GlobalJob(
             name="ck_global_jobs_state",
         ),
         CheckConstraint(
-            "selected_device_id IS NULL OR analysis_mode = 'device'",
+            "(analysis_mode <> 'device' AND selected_device_id IS NULL) OR "
+            "(analysis_mode = 'device' AND "
+            "(state NOT IN ('scheduled', 'running') OR "
+            "selected_device_id IS NOT NULL))",
             name="ck_global_jobs_device_selection",
         ),
         CheckConstraint(
@@ -76,9 +79,7 @@ class GlobalJob(
     analysis_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     input_artifact_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
-    selected_device_id: Mapped[UUID | None] = mapped_column(
-        PostgreSQLUUID(as_uuid=True)
-    )
+    selected_device_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     required_abi: Mapped[str | None] = mapped_column(String(64))
     supported_abis: Mapped[list[str]] = mapped_column(
         ARRAY(String(64)), nullable=False, default=list, server_default=text("'{}'::varchar[]")

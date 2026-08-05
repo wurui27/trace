@@ -100,6 +100,7 @@ def _pending_analysis_response(*, include_authorization: bool) -> dict[str, obje
         "analysis_id": "31000000-0000-4000-8000-000000000001",
         "team_id": "21000000-0000-4000-8000-000000000001",
         "analysis_mode": "device",
+        "device_id": "72000000-0000-4000-8000-000000000001",
         "state": "created",
         "version": 1,
         "application_version_id": None,
@@ -250,6 +251,7 @@ def test_device_create_request_has_one_server_parsed_apk_and_fixed_scenario_orde
     payload = {
         "schema_version": "1.0",
         "analysis_mode": "device",
+        "device_id": "72000000-0000-4000-8000-000000000001",
         "scenarios": ["cold_start", "scroll", "memory_cycle"],
         "apk": {
             "artifact_kind": "apk",

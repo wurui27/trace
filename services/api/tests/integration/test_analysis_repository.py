@@ -16,6 +16,7 @@ import psycopg
 import pytest
 from alembic import command
 from alembic.config import Config
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from psycopg import sql
 from sqlalchemy import func, select
 from sqlalchemy.engine import URL, make_url
@@ -28,6 +29,9 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from perfpilot_api.db.control.models import (
+    Agent,
+    AgentLease,
+    Device,
     EngineExecution,
     GlobalJob,
     IdempotencyKey,
@@ -38,6 +42,7 @@ from perfpilot_api.db.control.models import (
     TeamEngineWorkspace,
     TenantResource,
     TenantQuota,
+    User,
     WorkerClaim,
 )
 from perfpilot_api.db.tenant.models import (
@@ -50,6 +55,7 @@ from perfpilot_api.db.tenant.models import (
     ScenarioResult,
 )
 from perfpilot_api.services.analyses import (
+    AnalysisDeviceUnavailableError,
     AnalysisIdempotencyConflictError,
     AnalysisNotFoundError,
     AnalysisQueueLimitError,
@@ -68,6 +74,17 @@ from perfpilot_api.services.analyses import (
     canonical_trace_analysis_request_hash,
     scenario_job_id,
     trace_analysis_ready_event_id,
+)
+from perfpilot_api.security.agent_signatures import encode_ed25519_public_key
+from perfpilot_api.security.task_snapshots import (
+    TaskSnapshotSigner,
+    snapshot_digest,
+    verify_task_jws,
+)
+from perfpilot_api.services.agent_tasks import (
+    AgentTaskService,
+    InMemoryAgentTaskWakeup,
+    SQLAlchemyAgentTaskRepository,
 )
 from perfpilot_api.reports.writer import (
     AnalysisReportWriteRequest,
@@ -90,6 +107,8 @@ from perfpilot_api.workers.trace_orchestrator import (
 TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 OTHER_TEAM_ID = UUID("10000000-0000-4000-8000-000000000002")
 USER_ID = UUID("20000000-0000-4000-8000-000000000001")
+AGENT_ID = UUID("71000000-0000-4000-8000-000000000010")
+DEVICE_ID = UUID("72000000-0000-4000-8000-000000000010")
 ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000001")
 OTHER_ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000002")
 ARTIFACT_ID = UUID("40000000-0000-4000-8000-000000000001")
@@ -275,6 +294,43 @@ async def analysis_databases() -> AsyncIterator[AnalysisDatabases]:
                 (
                     Team(id=TEAM_ID, name="Repository Team", state="active"),
                     Team(id=OTHER_TEAM_ID, name="Other Team", state="active"),
+                    User(
+                        id=USER_ID,
+                        username="analysis-repository-user",
+                        password_hash="test-only",
+                        state="active",
+                    ),
+                )
+            )
+            await session.flush()
+            session.add(
+                Agent(
+                    id=AGENT_ID,
+                    team_id=TEAM_ID,
+                    owner_user_id=USER_ID,
+                    name="Repository Agent",
+                    token_version=1,
+                    state="online",
+                    last_heartbeat_at=NOW,
+                    capabilities={"execution_slot": {"state": "idle", "execution_id": None}},
+                    version=1,
+                )
+            )
+            await session.flush()
+            session.add_all(
+                (
+                    Device(
+                        id=DEVICE_ID,
+                        team_id=TEAM_ID,
+                        agent_id=AGENT_ID,
+                        serial_digest="a" * 64,
+                        serial_suffix="0010",
+                        connection_type="usb",
+                        adb_state="device",
+                        state="ready",
+                        last_seen_at=NOW,
+                        version=1,
+                    ),
                     TenantQuota(
                         id=UUID("60000000-0000-4000-8000-000000000001"),
                         team_id=TEAM_ID,
@@ -365,9 +421,7 @@ async def two_tenant_analysis_databases(
         if database_created:
             with psycopg.connect(_conninfo(admin_url), autocommit=True) as connection:
                 connection.execute(
-                    sql.SQL("DROP DATABASE {} WITH (FORCE)").format(
-                        sql.Identifier(database_name)
-                    )
+                    sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(database_name))
                 )
 
 
@@ -383,6 +437,7 @@ async def _reserve_creation(
         idempotency_key=idempotency_key,
         request_hash=request_hash,
         candidate_analysis_id=analysis_id,
+        selected_device_id=DEVICE_ID,
         now=NOW,
     )
 
@@ -581,6 +636,7 @@ async def _create_device_analysis_graph(
     idempotency_key: str,
 ) -> tuple[str, UUID, str]:
     request_hash = canonical_analysis_request_hash(
+        device_id=DEVICE_ID,
         scenarios=("cold_start", "scroll", "memory_cycle"),
         apk_mime=APK_MIME,
         apk_size=4,
@@ -591,6 +647,7 @@ async def _create_device_analysis_graph(
         idempotency_key=idempotency_key,
         request_hash=request_hash,
         candidate_analysis_id=ANALYSIS_ID,
+        selected_device_id=DEVICE_ID,
         now=NOW,
     )
     await repository.ensure_tenant_parent(
@@ -851,9 +908,7 @@ async def test_engine_metadata_cascades_with_its_control_plane_owner(
         await session.delete(team)
 
     async with analysis_databases.control_sessions() as session:
-        execution_count = await session.scalar(
-            select(func.count()).select_from(EngineExecution)
-        )
+        execution_count = await session.scalar(select(func.count()).select_from(EngineExecution))
         workspace_count = await session.scalar(
             select(func.count()).select_from(TeamEngineWorkspace)
         )
@@ -888,6 +943,45 @@ async def test_quota_serializes_same_hash_replay_and_rejects_conflicts(
         key_count = await session.scalar(select(func.count()).select_from(IdempotencyKey))
     assert job_count == 1
     assert key_count == 1
+
+
+@pytest.mark.asyncio
+async def test_device_creation_rejects_missing_cross_team_and_unready_devices(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    repository = analysis_databases.repository
+
+    with pytest.raises(AnalysisNotFoundError):
+        await repository.reserve_creation(
+            team_id=TEAM_ID,
+            idempotency_key="missing-device",
+            request_hash="e" * 64,
+            candidate_analysis_id=uuid4(),
+            selected_device_id=uuid4(),
+            now=NOW,
+        )
+    with pytest.raises(AnalysisNotFoundError):
+        await repository.reserve_creation(
+            team_id=OTHER_TEAM_ID,
+            idempotency_key="cross-team-device",
+            request_hash="f" * 64,
+            candidate_analysis_id=uuid4(),
+            selected_device_id=DEVICE_ID,
+            now=NOW,
+        )
+    async with analysis_databases.control_sessions.begin() as session:
+        device = await session.get(Device, DEVICE_ID)
+        assert device is not None
+        device.state = "busy"
+    with pytest.raises(AnalysisDeviceUnavailableError):
+        await repository.reserve_creation(
+            team_id=TEAM_ID,
+            idempotency_key="busy-device",
+            request_hash="1" * 64,
+            candidate_analysis_id=uuid4(),
+            selected_device_id=DEVICE_ID,
+            now=NOW,
+        )
 
 
 @pytest.mark.asyncio
@@ -1041,15 +1135,11 @@ async def test_ai_only_rerun_reserves_next_generation_and_replays_same_key(
     canonical_id = uuid4()
     report_id = report_version_id(synthesis_id)
     examples = Path(__file__).resolve().parents[4] / "contracts" / "v1" / "examples"
-    core = json.loads(
-        (examples / "normalized-trace-report.valid.json").read_text(encoding="utf-8")
-    )
+    core = json.loads((examples / "normalized-trace-report.valid.json").read_text(encoding="utf-8"))
     core["analysis_id"] = str(ANALYSIS_ID)
     core["provenance"]["canonical_artifact_id"] = str(canonical_id)
     core["provenance"]["canonical_sha256_b64"] = CHECKSUM
-    synthesis = json.loads(
-        (examples / "synthesis-output.valid.json").read_text(encoding="utf-8")
-    )
+    synthesis = json.loads((examples / "synthesis-output.valid.json").read_text(encoding="utf-8"))
     composed = compose_analysis_report(
         AnalysisReportWriteRequest(
             team_id=TEAM_ID,
@@ -1233,17 +1323,18 @@ async def test_ai_only_rerun_reserves_next_generation_and_replays_same_key(
         ("perfpilot_ai", "pending"),
         ("report", "completed"),
     ]
-    assert await analysis_databases.repository.load_report(
-        team_id=TEAM_ID,
-        analysis_id=ANALYSIS_ID,
-    ) == composed.document
+    assert (
+        await analysis_databases.repository.load_report(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+        )
+        == composed.document
+    )
     async with analysis_databases.control_sessions() as session:
         runs = list(
             (
                 await session.scalars(
-                    select(SynthesisExecution).where(
-                        SynthesisExecution.analysis_id == ANALYSIS_ID
-                    )
+                    select(SynthesisExecution).where(SynthesisExecution.analysis_id == ANALYSIS_ID)
                 )
             ).all()
         )
@@ -1872,9 +1963,7 @@ async def test_memory_version_lookup_routes_by_authoritative_team_id(
     async with databases.base.control_sessions() as session:
         job = await session.get(GlobalJob, OTHER_ANALYSIS_ID)
         key = await session.scalar(
-            select(IdempotencyKey).where(
-                IdempotencyKey.response_resource_id == OTHER_ANALYSIS_ID
-            )
+            select(IdempotencyKey).where(IdempotencyKey.response_resource_id == OTHER_ANALYSIS_ID)
         )
     async with databases.other_tenant_sessions() as session:
         analysis = await session.get(Analysis, OTHER_ANALYSIS_ID)
@@ -2366,6 +2455,81 @@ async def test_control_queue_is_exactly_once_with_three_children_and_requirement
     assert events[0].subject_type == "analysis"
     assert events[0].subject_id == ANALYSIS_ID
     assert events[0].scenario_job_id is None
+
+
+@pytest.mark.asyncio
+async def test_scheduler_leases_selected_device_and_persists_only_snapshot_digest(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    prepared = await _persist_metadata_and_stage(analysis_databases)
+    scheduled_at = NOW + timedelta(minutes=3)
+    await analysis_databases.repository.queue_control_scenarios(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=ARTIFACT_ID,
+        scenarios=prepared,
+        requirements=SchedulingRequirements(
+            min_api_level=28,
+            supported_abis=("arm64-v8a", "x86_64"),
+        ),
+        now=scheduled_at,
+    )
+    async with analysis_databases.control_sessions.begin() as session:
+        agent = await session.get(Agent, AGENT_ID)
+        device = await session.get(Device, DEVICE_ID)
+        assert agent is not None and device is not None
+        agent.last_heartbeat_at = scheduled_at
+        agent.state = "online"
+        device.last_seen_at = scheduled_at
+        device.state = "ready"
+        device.adb_state = "device"
+
+    private_key = Ed25519PrivateKey.generate()
+    service = AgentTaskService(
+        repository=SQLAlchemyAgentTaskRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+            lease_id_source=lambda: UUID("75000000-0000-4000-8000-000000000001"),
+            execution_id_source=lambda: UUID("73000000-0000-4000-8000-000000000001"),
+            lease_token_source=lambda: b"lease-token" * 4,
+        ),
+        signer=TaskSnapshotSigner(
+            private_key=private_key,
+            kid="lan-integration",
+            clock=lambda: scheduled_at,
+        ),
+        wakeup=InMemoryAgentTaskWakeup(),
+        clock=lambda: scheduled_at,
+    )
+
+    scheduled = await service.schedule(analysis_id=ANALYSIS_ID)
+    assert scheduled is not None and scheduled.agent_id == AGENT_ID
+    task = await service.poll(agent_id=AGENT_ID, wait_seconds=0)
+    assert task is not None
+    claims = verify_task_jws(
+        task.snapshot_jws,
+        encode_ed25519_public_key(private_key.public_key()),
+        now=scheduled_at,
+    )
+
+    assert claims["analysis_id"] == str(ANALYSIS_ID)
+    assert claims["device_digest"] == "a" * 64
+    assert [item["scenario_type"] for item in claims["scenarios"]] == [
+        "startup",
+        "scroll",
+        "memory_cycle",
+    ]
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        device = await session.get(Device, DEVICE_ID)
+        lease = await session.scalar(
+            select(AgentLease).where(AgentLease.execution_id == scheduled.execution_id)
+        )
+    assert job is not None and job.state == "scheduled"
+    assert device is not None and device.state == "busy"
+    assert lease is not None
+    assert lease.task_snapshot_digest == snapshot_digest(task.snapshot_jws)
+    assert task.snapshot_jws not in repr(lease)
 
 
 @pytest.mark.asyncio

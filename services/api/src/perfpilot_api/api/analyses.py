@@ -10,6 +10,7 @@ from perfpilot_api.errors import ApiError
 from perfpilot_api.security.csrf import OriginNotAllowedError, require_allowed_origin
 from perfpilot_api.security.sessions import COOKIE_NAME
 from perfpilot_api.services.analyses import (
+    AnalysisDeviceUnavailableError,
     AnalysisIdempotencyConflictError,
     AnalysisInvalidRequestError,
     AnalysisNotFoundError,
@@ -56,6 +57,7 @@ class CreateDeviceAnalysisRequest(BaseModel):
 
     schema_version: Literal["1.0"]
     analysis_mode: Literal["device"]
+    device_id: UUID
     scenarios: tuple[
         Literal["cold_start"],
         Literal["scroll"],
@@ -190,6 +192,8 @@ def analysis_error(error: Exception) -> ApiError:
         return ApiError("stale_task_version", "任务版本已经变化", 409, True)
     if isinstance(error, AnalysisQueueLimitError):
         return ApiError("team_queue_limit", "团队排队任务已达上限", 429, True)
+    if isinstance(error, AnalysisDeviceUnavailableError):
+        return ApiError("device_unavailable", "设备当前不可用", 409, True)
     if isinstance(error, (ApkInspectionUnavailableError, AnalysisUnavailableError)):
         return ApiError("service_unavailable", "服务暂时不可用", 503, True)
     return ApiError("service_unavailable", "服务暂时不可用", 503, True)
@@ -414,6 +418,10 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
         "completed_at": (_utc(view.completed_at) if view.completed_at is not None else None),
         "failure": _failure(view.failure_code),
     }
+    if view.analysis_mode == "device":
+        if view.device_id is None:
+            raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+        result["device_id"] = str(view.device_id)
     if view.analysis_mode == "memory_upload":
         result["question"] = view.question
     elif view.analysis_mode == "trace_upload":
@@ -483,6 +491,7 @@ async def create_analysis(
                 team_id=team_id,
                 requested_by_user_id=principal.user_id,
                 idempotency_key=idempotency_key,
+                device_id=payload.device_id,
                 scenarios=payload.scenarios,
                 apk_mime=payload.apk.mime,
                 apk_size=payload.apk.size,
@@ -496,6 +505,7 @@ async def create_analysis(
                 AnalysisNotFoundError,
                 AnalysisIdempotencyConflictError,
                 AnalysisQueueLimitError,
+                AnalysisDeviceUnavailableError,
                 StaleTaskVersionError,
                 AnalysisUnavailableError,
             ),

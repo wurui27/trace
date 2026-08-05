@@ -5,7 +5,7 @@ from decimal import Decimal
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from perfpilot_api.api.agents import get_agent_service, get_device_directory
@@ -21,6 +21,12 @@ from perfpilot_api.services.device_directory import (
     AgentHeartbeat,
     DeviceDirectory,
     DeviceHeartbeatRejected,
+)
+from perfpilot_api.services.agent_tasks import (
+    AgentTaskNotFound,
+    AgentTaskService,
+    AgentTaskUnavailable,
+    StaleLeaseVersion,
 )
 
 _PUBLIC_KEY_PATTERN = r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
@@ -135,6 +141,13 @@ class AgentHeartbeatRequest(BaseModel):
         return value
 
 
+class RenewAgentTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    lease_version: int = Field(strict=True, ge=1)
+
+
 def _reject_browser_credentials(request: Request) -> None:
     forbidden = (
         "cookie",
@@ -181,6 +194,13 @@ async def _authenticate_access(
         return await agent_service.authenticate_access(token)
     except AgentAuthenticationRejected:
         raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
+
+
+def get_agent_task_service(request: Request) -> AgentTaskService:
+    service: AgentTaskService | None = request.app.state.agent_task_service
+    if service is None:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    return service
 
 
 router = APIRouter(
@@ -288,6 +308,70 @@ async def heartbeat(
             }
             for device in receipt.devices
         ],
+    }
+
+
+@router.get("/tasks/next")
+async def poll_next_task(
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    task_service: Annotated[AgentTaskService, Depends(get_agent_task_service)],
+    wait_seconds: Annotated[int, Query(ge=0, le=20)] = 20,
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        task = await task_service.poll(
+            agent_id=principal.agent_id,
+            wait_seconds=wait_seconds,
+        )
+    except AgentTaskUnavailable:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
+    response.headers["cache-control"] = "no-store"
+    if task is None:
+        return {
+            "schema_version": "1.0",
+            "action": "wait",
+            "retry_after_seconds": max(1, min(20, wait_seconds or 1)),
+        }
+    return {
+        "schema_version": "1.0",
+        "action": "execute",
+        "snapshot_jws": task.snapshot_jws,
+        "lease_expires_at": _utc(task.lease_expires_at),
+        "renew_after_seconds": task.renew_after_seconds,
+    }
+
+
+@router.post("/tasks/{execution_id}/renew")
+async def renew_task(
+    execution_id: UUID,
+    payload: RenewAgentTaskRequest,
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    task_service: Annotated[AgentTaskService, Depends(get_agent_task_service)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        renewal = await task_service.renew(
+            agent_id=principal.agent_id,
+            execution_id=execution_id,
+            lease_version=payload.lease_version,
+        )
+    except StaleLeaseVersion:
+        raise ApiError("stale_lease_version", "租约版本已经变化", 409, True) from None
+    except AgentTaskNotFound:
+        raise ApiError("resource_not_found", "资源不存在", 404, False) from None
+    except AgentTaskUnavailable:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "execution_id": str(renewal.execution_id),
+        "lease_version": renewal.lease_version,
+        "lease_expires_at": _utc(renewal.lease_expires_at),
+        "renew_after_seconds": renewal.renew_after_seconds,
     }
 
 

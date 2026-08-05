@@ -6,10 +6,11 @@
     {
       "type": "object",
       "additionalProperties": false,
-      "required": ["schema_version", "analysis_mode", "scenarios", "apk"],
+      "required": ["schema_version", "analysis_mode", "device_id", "scenarios", "apk"],
       "properties": {
         "schema_version": {"const": "1.0"},
         "analysis_mode": {"const": "device"},
+        "device_id": {"type": "string", "format": "uuid"},
         "scenarios": {
           "type": "array",
           "minItems": 3,

@@ -63,6 +63,7 @@ from perfpilot_api.security.agent_signatures import (
     RedisAgentNonceStore,
     encode_ed25519_public_key,
 )
+from perfpilot_api.security.task_snapshots import TaskSnapshotSigner
 from perfpilot_api.runtime.artifacts import ArtifactRuntime, build_artifact_runtime
 from perfpilot_api.services.auth import (
     AuthService,
@@ -77,6 +78,11 @@ from perfpilot_api.services.agents import (
 from perfpilot_api.services.device_directory import (
     DeviceDirectory,
     SQLAlchemyDeviceDirectoryRepository,
+)
+from perfpilot_api.services.agent_tasks import (
+    AgentTaskService,
+    RedisAgentTaskWakeup,
+    SQLAlchemyAgentTaskRepository,
 )
 from perfpilot_api.services.analyses import (
     AnalysisService,
@@ -206,6 +212,7 @@ def create_app(
     memory_capture_service: MemoryCaptureService | None = None,
     agent_service: AgentService | None = None,
     device_directory: DeviceDirectory | None = None,
+    agent_task_service: AgentTaskService | None = None,
     android_memory_worker: AndroidMemoryWorker | None = None,
     apk_inspector: ApkInspector | None = None,
     replay_store: ReplayStore | None = None,
@@ -236,6 +243,8 @@ def create_app(
     resolved_memory_capture_service = memory_capture_service
     resolved_agent_service = agent_service
     resolved_device_directory = device_directory
+    resolved_agent_task_service = agent_task_service
+    resolved_task_snapshot_signer: TaskSnapshotSigner | None = None
     resolved_android_memory_worker = android_memory_worker
     active_android_memory_worker: AndroidMemoryWorker | None = None
     owned_android_memory_artifact_client: httpx.AsyncClient | None = None
@@ -308,6 +317,13 @@ def create_app(
             )
         )
         task_public_key_b64 = encode_ed25519_public_key(task_private_key.public_key())
+        task_signing_kid = (
+            f"lan-{hashlib.sha256(task_public_key_b64.encode('ascii')).hexdigest()[:16]}"
+        )
+        resolved_task_snapshot_signer = TaskSnapshotSigner(
+            private_key=task_private_key,
+            kid=task_signing_kid,
+        )
         resolved_agent_service = AgentService(
             repository=SQLAlchemyAgentRepository(control_session_factory),
             credentials=AgentCredentialCodec(credential_secret),
@@ -316,7 +332,7 @@ def create_app(
                 key_secret=nonce_secret,
             ),
             task_signing_key=TaskSigningKey(
-                kid=f"lan-{hashlib.sha256(task_public_key_b64.encode('ascii')).hexdigest()[:16]}",
+                kid=task_signing_kid,
                 public_key_b64=task_public_key_b64,
             ),
         )
@@ -340,6 +356,7 @@ def create_app(
         nonlocal resolved_android_memory_worker
         nonlocal resolved_memory_capture_service
         nonlocal resolved_upload_service
+        nonlocal resolved_agent_task_service
         nonlocal active_android_memory_worker
         nonlocal engine_adapter_registry
         nonlocal owned_android_memory_artifact_client
@@ -434,6 +451,20 @@ def create_app(
                         apk_inspector=resolved_inspector,
                     )
                     lifespan_app.state.analysis_service = resolved_analysis_service
+                if (
+                    resolved_agent_task_service is None
+                    and resolved_task_snapshot_signer is not None
+                    and owned_redis is not None
+                ):
+                    resolved_agent_task_service = AgentTaskService(
+                        repository=SQLAlchemyAgentTaskRepository(
+                            control_session_factory=control_session_factory,
+                            tenant_router=owned_artifact_runtime.tenant_router,
+                        ),
+                        signer=resolved_task_snapshot_signer,
+                        wakeup=RedisAgentTaskWakeup(owned_redis),
+                    )
+                    lifespan_app.state.agent_task_service = resolved_agent_task_service
                 if resolved_synthesis_run_service is None and settings.ai_enabled:
                     raw_digest = os.getenv("PERFPILOT_REPORT_WORKER_IMAGE_DIGEST", "")
                     if re.fullmatch(r"sha256:[a-f0-9]{64}", raw_digest) is None:
@@ -529,6 +560,7 @@ def create_app(
     app.state.memory_capture_service = resolved_memory_capture_service
     app.state.agent_service = resolved_agent_service
     app.state.device_directory = resolved_device_directory
+    app.state.agent_task_service = resolved_agent_task_service
     app.state.engine_adapter_registry = engine_adapter_registry
     app.state.android_memory_worker = None
     app.state.android_memory_artifact_client = None

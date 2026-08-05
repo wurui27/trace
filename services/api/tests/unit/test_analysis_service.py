@@ -16,6 +16,7 @@ ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000001")
 ARTIFACT_ID = UUID("40000000-0000-4000-8000-000000000001")
 UPLOAD_ID = UUID("50000000-0000-4000-8000-000000000001")
 APPLICATION_VERSION_ID = UUID("60000000-0000-4000-8000-000000000001")
+DEVICE_ID = UUID("72000000-0000-4000-8000-000000000001")
 INSPECTION_TOKEN = UUID("60000000-0000-4000-8000-000000000002")
 CANDIDATE_ONE = UUID("70000000-0000-4000-8000-000000000001")
 CANDIDATE_TWO = UUID("70000000-0000-4000-8000-000000000002")
@@ -438,6 +439,7 @@ async def _create(service: Any, *, checksum: str = CHECKSUM) -> Any:
         team_id=TEAM_ID,
         requested_by_user_id=USER_ID,
         idempotency_key="analysis-device-1",
+        device_id=DEVICE_ID,
         scenarios=SCENARIOS,
         apk_mime=APK_MIME,
         apk_size=4,
@@ -552,16 +554,16 @@ async def test_finalize_trace_input_recomputes_required_readiness_after_storage_
         "trace_required_input_ready",
         "queue_trace_execution",
     ]
-    assert repository.trace_readiness_calls == [
-        {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID}
-    ]
+    assert repository.trace_readiness_calls == [{"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID}]
     assert repository.trace_queue_calls == [
         {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID, "now": NOW}
     ]
 
 
 @pytest.mark.asyncio
-async def test_finalize_optional_trace_input_does_not_queue_before_required_trace_is_ready() -> None:
+async def test_finalize_optional_trace_input_does_not_queue_before_required_trace_is_ready() -> (
+    None
+):
     events: list[str] = []
     repository = FakeAnalysisRepository(events)
     repository.upload_class = "trace_input"
@@ -906,6 +908,7 @@ async def test_changed_request_hash_preserves_the_repository_conflict() -> None:
     events: list[str] = []
     repository = FakeAnalysisRepository(events)
     repository.saved_request_hash = canonical_analysis_request_hash(
+        device_id=DEVICE_ID,
         scenarios=SCENARIOS,
         apk_mime=APK_MIME,
         apk_size=4,

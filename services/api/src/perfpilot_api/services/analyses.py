@@ -21,6 +21,7 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from perfpilot_api.db.control.models import (
+    Device,
     AgentLease,
     EngineExecution,
     GlobalJob,
@@ -77,9 +78,7 @@ _APPLICATION_NAMESPACE = UUID("115a38fd-705d-4aa8-9674-d6af5b19aa0d")
 _APPLICATION_VERSION_NAMESPACE = UUID("d057f159-35a6-42fb-b319-b3415bfb1b63")
 _RECIPE_NAMESPACE = UUID("6af10575-b7ae-443e-a485-4477573236a3")
 _PACKAGE_NAME = re.compile(r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+\Z")
-_COMPONENT_NAME = re.compile(
-    r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\Z"
-)
+_COMPONENT_NAME = re.compile(r"[A-Za-z_$][A-Za-z0-9_$]*(?:\.[A-Za-z_$][A-Za-z0-9_$]*)*\Z")
 _MANIFEST_SHA256 = re.compile(r"[a-f0-9]{64}\Z")
 _SUPPORTED_ABIS = frozenset(("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
 _TRACE_INPUT_ORDER = (
@@ -129,6 +128,10 @@ class AnalysisIdempotencyConflictError(AnalysisError):
 
 
 class AnalysisQueueLimitError(AnalysisError):
+    pass
+
+
+class AnalysisDeviceUnavailableError(AnalysisError):
     pass
 
 
@@ -249,9 +252,7 @@ class InputUploadView:
     finalized_at: datetime | None
 
 
-AnalysisStageName = Literal[
-    "input_validation", "smartperfetto", "perfpilot_ai", "report"
-]
+AnalysisStageName = Literal["input_validation", "smartperfetto", "perfpilot_ai", "report"]
 AnalysisStageState = Literal[
     "pending", "running", "completed", "failed", "canceled", "not_requested"
 ]
@@ -282,6 +283,7 @@ class AnalysisView:
     started_at: datetime | None
     completed_at: datetime | None
     failure_code: str | None
+    device_id: UUID | None = None
     question: str | None = None
     analysis_profile: Literal["auto", "startup", "scroll"] | None = None
     input_uploads: tuple[InputUploadView, ...] = ()
@@ -362,6 +364,7 @@ class AnalysisRepository(Protocol):
         idempotency_key: str,
         request_hash: str,
         candidate_analysis_id: UUID,
+        selected_device_id: UUID,
         now: datetime,
     ) -> CreationReservation: ...
 
@@ -570,6 +573,7 @@ def _prepared_scenarios_from_results(
 
 def canonical_analysis_request_hash(
     *,
+    device_id: UUID,
     scenarios: tuple[str, ...],
     apk_mime: str,
     apk_size: int,
@@ -578,6 +582,7 @@ def canonical_analysis_request_hash(
     payload = json.dumps(
         {
             "analysis_mode": "device",
+            "device_id": str(device_id),
             "apk": {
                 "artifact_kind": "apk",
                 "mime": apk_mime,
@@ -631,8 +636,7 @@ def _canonical_trace_inputs(
             try:
                 decoded = base64.b64decode(checksum, validate=True)
                 checksum_valid = (
-                    len(decoded) == 32
-                    and base64.b64encode(decoded).decode("ascii") == checksum
+                    len(decoded) == 32 and base64.b64encode(decoded).decode("ascii") == checksum
                 )
             except (binascii.Error, ValueError):
                 pass
@@ -904,9 +908,7 @@ def _trace_stages(
     elif engine.state in {"running", "awaiting_user"}:
         engine_stage = _stage("smartperfetto", "running")
     elif engine.state == "failed":
-        engine_stage = _stage(
-            "smartperfetto", "failed", engine.stable_error_code
-        )
+        engine_stage = _stage("smartperfetto", "failed", engine.stable_error_code)
     elif engine.state == "canceled":
         engine_stage = _stage("smartperfetto", "canceled")
     else:
@@ -930,9 +932,7 @@ def _trace_stages(
     elif synthesis.state == "succeeded":
         ai_stage = _stage("perfpilot_ai", "completed")
     elif synthesis.state == "failed":
-        ai_stage = _stage(
-            "perfpilot_ai", "failed", synthesis.stable_error_code
-        )
+        ai_stage = _stage("perfpilot_ai", "failed", synthesis.stable_error_code)
     elif synthesis.state == "canceled":
         ai_stage = _stage("perfpilot_ai", "canceled")
     elif synthesis.state == "running":
@@ -1151,6 +1151,7 @@ class AnalysisService:
         team_id: UUID,
         requested_by_user_id: UUID,
         idempotency_key: str,
+        device_id: UUID,
         scenarios: tuple[str, ...],
         apk_mime: str,
         apk_size: int,
@@ -1164,6 +1165,7 @@ class AnalysisService:
             apk_sha256_b64=apk_sha256_b64,
         )
         request_hash = canonical_analysis_request_hash(
+            device_id=device_id,
             scenarios=scenarios,
             apk_mime=apk_mime,
             apk_size=apk_size,
@@ -1176,6 +1178,7 @@ class AnalysisService:
                 idempotency_key=idempotency_key,
                 request_hash=request_hash,
                 candidate_analysis_id=self._uuid_source(),
+                selected_device_id=device_id,
                 now=now,
             )
         )
@@ -1615,9 +1618,7 @@ class SynthesisRunService:
                 or source.raw_result_artifact_id is None
                 or source.normalized_report_version_id is None
             ):
-                raise AnalysisIdempotencyConflictError(
-                    "authoritative core report is unavailable"
-                )
+                raise AnalysisIdempotencyConflictError("authoritative core report is unavailable")
             existing_key = await session.scalar(
                 select(IdempotencyKey).where(
                     IdempotencyKey.operation == "create_synthesis_run",
@@ -1644,9 +1645,7 @@ class SynthesisRunService:
                     or replay.analysis_id != analysis_id
                     or replay.source_execution_id != source.id
                 ):
-                    raise AnalysisIdempotencyConflictError(
-                        "synthesis idempotency key changed"
-                    )
+                    raise AnalysisIdempotencyConflictError("synthesis idempotency key changed")
                 generation = replay.generation
             else:
                 latest = await session.scalar(
@@ -1660,9 +1659,7 @@ class SynthesisRunService:
                     .limit(1)
                 )
                 if latest is None or latest.report_version_id is None:
-                    raise AnalysisIdempotencyConflictError(
-                        "authoritative AI report is unavailable"
-                    )
+                    raise AnalysisIdempotencyConflictError("authoritative AI report is unavailable")
                 generation = latest.generation + 1
 
         async with self._tenant_router.session(team_id) as session:
@@ -1694,9 +1691,7 @@ class SynthesisRunService:
                 or artifact.deleted_at is not None
                 or not isinstance(artifact.sha256_b64, str)
             ):
-                raise AnalysisIdempotencyConflictError(
-                    "authoritative core report is unavailable"
-                )
+                raise AnalysisIdempotencyConflictError("authoritative core report is unavailable")
             report = _load_trace_report_from_versions(
                 analysis_id=analysis_id,
                 versions=report_rows,
@@ -1710,9 +1705,7 @@ class SynthesisRunService:
                 or latest_content is None
                 or latest_content.id != source.normalized_report_version_id
             ):
-                raise AnalysisIdempotencyConflictError(
-                    "authoritative core report is unavailable"
-                )
+                raise AnalysisIdempotencyConflictError("authoritative core report is unavailable")
             question = analysis.question
             canonical_checksum = artifact.sha256_b64
 
@@ -1743,9 +1736,7 @@ class SynthesisRunService:
                 idempotency_key=idempotency_key,
             )
         except SynthesisIdempotencyConflictError:
-            raise AnalysisIdempotencyConflictError(
-                "synthesis idempotency key changed"
-            ) from None
+            raise AnalysisIdempotencyConflictError("synthesis idempotency key changed") from None
         except SynthesisExecutionNotFoundError:
             raise AnalysisIdempotencyConflictError(
                 "authoritative core report is unavailable"
@@ -2261,6 +2252,7 @@ class SQLAlchemyAnalysisRepository:
         idempotency_key: str,
         request_hash: str,
         candidate_analysis_id: UUID,
+        selected_device_id: UUID,
         now: datetime,
     ) -> CreationReservation:
         async with self._control_session_factory() as session:
@@ -2274,6 +2266,14 @@ class SQLAlchemyAnalysisRepository:
                 )
                 if existing is not None:
                     return existing
+
+                device = await session.scalar(
+                    select(Device).where(Device.id == selected_device_id).with_for_update()
+                )
+                if device is None or device.team_id != team_id:
+                    raise AnalysisNotFoundError("device was not found")
+                if device.state != "ready":
+                    raise AnalysisDeviceUnavailableError("device is unavailable")
 
                 existing, quota = await self._lock_creation_scope_and_recheck(
                     session,
@@ -2303,6 +2303,7 @@ class SQLAlchemyAnalysisRepository:
                     idempotency_key=idempotency_key,
                     analysis_mode="device",
                     state="creating",
+                    selected_device_id=selected_device_id,
                     input_artifact_id=None,
                     required_abi=None,
                     min_api_level=None,
@@ -2521,8 +2522,7 @@ class SQLAlchemyAnalysisRepository:
                     .where(
                         SynthesisExecution.analysis_id == analysis_id,
                         SynthesisExecution.team_id == team_id,
-                        SynthesisExecution.source_execution_id
-                        == latest_smartperfetto.id,
+                        SynthesisExecution.source_execution_id == latest_smartperfetto.id,
                     )
                     .order_by(SynthesisExecution.generation.desc())
                     .limit(1)
@@ -2670,8 +2670,7 @@ class SQLAlchemyAnalysisRepository:
                 trace_report is not None
                 and latest_trace_content is not None
                 and latest_smartperfetto is not None
-                and latest_smartperfetto.normalized_report_version_id
-                == latest_trace_content.id
+                and latest_smartperfetto.normalized_report_version_id == latest_trace_content.id
             )
             if (
                 latest_synthesis is not None
@@ -2679,9 +2678,7 @@ class SQLAlchemyAnalysisRepository:
                 and not report_available
             ):
                 raise AnalysisUnavailableError("trace analysis report is unavailable")
-            manifest_by_kind = {
-                str(item["kind"]): item for item in canonical_manifest
-            }
+            manifest_by_kind = {str(item["kind"]): item for item in canonical_manifest}
             artifacts_by_kind: dict[str, Artifact] = {}
             for input_artifact in input_artifacts:
                 kind = input_artifact.artifact_kind
@@ -2701,10 +2698,7 @@ class SQLAlchemyAnalysisRepository:
                         or input_artifact.finalized_at is not None
                     )
                     or input_artifact.state == "finalized"
-                    and (
-                        input_artifact.version_id is None
-                        or input_artifact.finalized_at is None
-                    )
+                    and (input_artifact.version_id is None or input_artifact.finalized_at is None)
                 ):
                     raise AnalysisUnavailableError("trace analysis input state is unavailable")
                 artifacts_by_kind[kind] = input_artifact
@@ -2900,6 +2894,7 @@ class SQLAlchemyAnalysisRepository:
             analysis_id=job.id,
             team_id=job.team_id,
             analysis_mode=job.analysis_mode,  # type: ignore[arg-type]
+            device_id=job.selected_device_id,
             state=job.state,
             version=job.version,
             application_version_id=tenant_analysis.application_version_id,
@@ -3262,9 +3257,7 @@ class SQLAlchemyAnalysisRepository:
                         team_id=team_id,
                         analysis_id=analysis_id,
                     ):
-                        raise AnalysisUnavailableError(
-                            "trace analysis queue state is unavailable"
-                        )
+                        raise AnalysisUnavailableError("trace analysis queue state is unavailable")
                 else:
                     raise AnalysisUnavailableError("trace analysis queue state is unavailable")
 
@@ -3928,9 +3921,7 @@ class SQLAlchemyAnalysisRepository:
                 else list(
                     (
                         await session.scalars(
-                            select(ScenarioJob).where(
-                                ScenarioJob.analysis_id == analysis_id
-                            )
+                            select(ScenarioJob).where(ScenarioJob.analysis_id == analysis_id)
                         )
                     ).all()
                 )
@@ -4276,6 +4267,7 @@ def _copy_public_json(value: object) -> object:
 __all__ = [
     "ActiveLeaseView",
     "AnalysisError",
+    "AnalysisDeviceUnavailableError",
     "AnalysisIdempotencyConflictError",
     "AnalysisInvalidRequestError",
     "AnalysisNotFoundError",
