@@ -72,6 +72,8 @@ class FakeAnalysisRepository:
         self.trace_ready = True
         self.report_analysis_ids: tuple[UUID, ...] = ()
         self.report_list_calls: list[dict[str, object]] = []
+        self.active_analysis_ids: tuple[UUID, ...] = ()
+        self.active_list_calls: list[dict[str, object]] = []
         self.views: dict[UUID, Any] = {}
         self.upload_class = "generic"
         self.created_modes: list[str] = []
@@ -131,6 +133,11 @@ class FakeAnalysisRepository:
         self.events.append("list_report_analysis_ids")
         self.report_list_calls.append(kwargs)
         return self.report_analysis_ids
+
+    async def list_active_analysis_ids(self, **kwargs: object) -> tuple[UUID, ...]:
+        self.events.append("list_active_analysis_ids")
+        self.active_list_calls.append(kwargs)
+        return self.active_analysis_ids
 
     async def require_finalizable(self, **_: object) -> Any:
         self.events.append("require_finalizable")
@@ -450,6 +457,46 @@ async def test_list_report_analyses_preserves_repository_newest_first_order() ->
     ]
 
 
+@pytest.mark.asyncio
+async def test_list_active_analyses_preserves_repository_newest_first_order() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    newer_id = UUID("30000000-0000-4000-8000-000000000010")
+    older_id = UUID("30000000-0000-4000-8000-000000000009")
+    repository.active_analysis_ids = (newer_id, older_id)
+    repository.views = {
+        newer_id: replace(
+            _analysis_view(),
+            analysis_id=newer_id,
+            state="running",
+            report_available=False,
+            created_at=NOW,
+        ),
+        older_id: replace(
+            _analysis_view(),
+            analysis_id=older_id,
+            state="queued",
+            report_available=False,
+            created_at=NOW - timedelta(minutes=1),
+        ),
+    }
+    service = _service(
+        repository,
+        FakeUploadService(events),
+        FakeApkInspector(events),
+    )
+
+    views = await service.list_active_analyses(team_id=TEAM_ID, limit=2)
+
+    assert [view.analysis_id for view in views] == [newer_id, older_id]
+    assert repository.active_list_calls == [{"team_id": TEAM_ID, "limit": 2}]
+    assert events == [
+        "list_active_analysis_ids",
+        "load_view",
+        "load_view",
+    ]
+
+
 @pytest.mark.parametrize("limit", (0, 21))
 @pytest.mark.asyncio
 async def test_list_report_analyses_rejects_out_of_range_limit(limit: int) -> None:
@@ -465,6 +512,25 @@ async def test_list_report_analyses_rejects_out_of_range_limit(limit: int) -> No
 
     with pytest.raises(AnalysisInvalidRequestError):
         await service.list_report_analyses(team_id=TEAM_ID, limit=limit)
+
+    assert events == []
+
+
+@pytest.mark.parametrize("limit", (0, 21))
+@pytest.mark.asyncio
+async def test_list_active_analyses_rejects_out_of_range_limit(limit: int) -> None:
+    from perfpilot_api.services.analyses import AnalysisInvalidRequestError
+
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    service = _service(
+        repository,
+        FakeUploadService(events),
+        FakeApkInspector(events),
+    )
+
+    with pytest.raises(AnalysisInvalidRequestError):
+        await service.list_active_analyses(team_id=TEAM_ID, limit=limit)
 
     assert events == []
 

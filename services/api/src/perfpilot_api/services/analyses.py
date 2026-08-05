@@ -69,6 +69,15 @@ _IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
 _APK_MIME = "application/vnd.android.package-archive"
 _SCENARIOS = ("cold_start", "scroll", "memory_cycle")
 _QUEUE_RESERVATION_STATES = ("creating", "created", "uploading", "queued")
+_ACTIVE_ANALYSIS_STATES = (
+    "creating",
+    "created",
+    "uploading",
+    "queued",
+    "scheduled",
+    "running",
+    "analyzing",
+)
 _CREATE_OPERATION = "create_analysis"
 _CREATE_IDEMPOTENCY_TTL = timedelta(days=30)
 _APK_INSPECTION_CLAIM_TTL = timedelta(minutes=5)
@@ -414,6 +423,13 @@ class AnalysisRepository(Protocol):
     ) -> AnalysisView: ...
 
     async def list_report_analysis_ids(
+        self,
+        *,
+        team_id: UUID,
+        limit: int,
+    ) -> tuple[UUID, ...]: ...
+
+    async def list_active_analysis_ids(
         self,
         *,
         team_id: UUID,
@@ -1335,6 +1351,40 @@ class AnalysisService:
             raise AnalysisUnavailableError("analysis report list is unavailable")
         return views
 
+    async def list_active_analyses(
+        self,
+        *,
+        team_id: UUID,
+        limit: int,
+    ) -> tuple[AnalysisView, ...]:
+        if type(limit) is not int or not 1 <= limit <= 20:
+            raise AnalysisInvalidRequestError("active analysis list limit is invalid")
+        analysis_ids = await _repository_call(
+            lambda: self._repository.list_active_analysis_ids(
+                team_id=team_id,
+                limit=limit,
+            )
+        )
+        now = self._clock()
+        views = tuple(
+            [
+                await _repository_call(
+                    lambda analysis_id=analysis_id: self._repository.load_view(
+                        team_id=team_id,
+                        analysis_id=analysis_id,
+                        now=now,
+                    )
+                )
+                for analysis_id in analysis_ids
+            ]
+        )
+        if any(
+            view.team_id != team_id or view.state not in _ACTIVE_ANALYSIS_STATES
+            for view in views
+        ):
+            raise AnalysisUnavailableError("active analysis list is unavailable")
+        return views
+
     async def finalize_device_upload(
         self,
         *,
@@ -1858,6 +1908,24 @@ class SQLAlchemyAnalysisRepository:
                 )
                 .group_by(Analysis.id, Analysis.created_at)
                 .order_by(Analysis.created_at.desc(), Analysis.id.desc())
+                .limit(limit)
+            )
+            return tuple(analysis_ids.all())
+
+    async def list_active_analysis_ids(
+        self,
+        *,
+        team_id: UUID,
+        limit: int,
+    ) -> tuple[UUID, ...]:
+        async with self._control_session_factory() as session:
+            analysis_ids = await session.scalars(
+                select(GlobalJob.id)
+                .where(
+                    GlobalJob.team_id == team_id,
+                    GlobalJob.state.in_(_ACTIVE_ANALYSIS_STATES),
+                )
+                .order_by(GlobalJob.created_at.desc(), GlobalJob.id.desc())
                 .limit(limit)
             )
             return tuple(analysis_ids.all())

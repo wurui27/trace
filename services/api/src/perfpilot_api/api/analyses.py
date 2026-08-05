@@ -525,10 +525,13 @@ async def list_report_analyses(
     response: Response,
     auth_service: Annotated[AuthService, Depends(get_auth_service)],
     analysis_service: Annotated[AnalysisService, Depends(get_analysis_service)],
-    report_available: Annotated[bool, Query()] = True,
+    report_available: Annotated[bool | None, Query()] = None,
+    status_filter: Annotated[Literal["active"] | None, Query(alias="status")] = None,
     limit: Annotated[int, Query(ge=1, le=20)] = 1,
 ) -> dict[str, object]:
-    if not report_available:
+    if report_available is False or (
+        status_filter == "active" and report_available is not None
+    ):
         raise ApiError("request_validation_failed", "请求参数校验失败", 422, False)
     await _authorize_team(
         request=request,
@@ -537,10 +540,16 @@ async def list_report_analyses(
         access="read",
     )
     try:
-        views = await analysis_service.list_report_analyses(
-            team_id=team_id,
-            limit=limit,
-        )
+        if status_filter == "active":
+            views = await analysis_service.list_active_analyses(
+                team_id=team_id,
+                limit=limit,
+            )
+        else:
+            views = await analysis_service.list_report_analyses(
+                team_id=team_id,
+                limit=limit,
+            )
     except (AnalysisInvalidRequestError, AnalysisUnavailableError) as error:
         raise analysis_error(error) from None
     response.headers["cache-control"] = "no-store"

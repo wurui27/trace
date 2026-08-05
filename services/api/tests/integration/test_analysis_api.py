@@ -141,6 +141,12 @@ class FakeAnalysisService:
             raise self.error
         return self.list_results
 
+    async def list_active_analyses(self, **kwargs: object) -> tuple[AnalysisView, ...]:
+        self.calls.append(("list_active", kwargs))
+        if self.error is not None:
+            raise self.error
+        return self.list_results
+
     async def get_report(self, **kwargs: object) -> dict[str, object]:
         self.calls.append(("report", kwargs))
         if self.error is not None:
@@ -985,6 +991,44 @@ def test_list_report_analyses_returns_latest_team_report_without_cache() -> None
     }
     assert analysis_service.calls == [("list", {"team_id": TEAM_ID, "limit": 1})]
     assert auth_service.calls[0]["team_id"] == TEAM_ID
+
+
+def test_list_active_analyses_returns_latest_non_terminal_task_without_cache() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    active_view = replace(
+        _trace_created_view(profile="auto", question=None),
+        state="analyzing",
+        created_at=NOW + timedelta(minutes=2),
+        stages=(
+            AnalysisStageView("input_validation", "completed"),
+            AnalysisStageView("smartperfetto", "running"),
+            AnalysisStageView("perfpilot_ai", "pending"),
+            AnalysisStageView("report", "pending"),
+        ),
+    )
+    analysis_service.list_results = (active_view,)
+    target = f"/v1/teams/{TEAM_ID}/analyses"
+    query = b"status=active&limit=1"
+    headers = _headers(
+        method="GET",
+        target=target,
+        raw_query=query,
+        body=b"",
+        request_id="req-analysis-active-list",
+    )
+    headers.pop("content-type")
+
+    with _client(auth_service, analysis_service) as client:
+        response = client.get(f"{target}?{query.decode()}", headers=headers)
+
+    assert response.status_code == 200
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["analyses"][0]["analysis_id"] == str(ANALYSIS_ID)
+    assert response.json()["analyses"][0]["state"] == "analyzing"
+    assert analysis_service.calls == [
+        ("list_active", {"team_id": TEAM_ID, "limit": 1})
+    ]
 
 
 def test_list_report_analyses_rejects_false_filter_and_out_of_range_limit() -> None:
