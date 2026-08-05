@@ -1,5 +1,5 @@
 [tool.uv.workspace]
-members = ["services/api"]
+members = ["services/api", "agents/device-agent"]
 
 [dependency-groups]
 dev = [
@@ -13,7 +13,7 @@ dev = [
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
-testpaths = ["services/api/tests"]
+testpaths = ["services/api/tests", "agents/device-agent/tests"]
 
 [tool.ruff]
 line-length = 100
