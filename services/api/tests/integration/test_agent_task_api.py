@@ -29,6 +29,8 @@ class FakeTaskService:
     def __init__(self) -> None:
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.poll_result = None
+        self.renew_result = None
+        self.acknowledgement = None
 
     async def poll(self, **kwargs: object):
         self.calls.append(("poll", kwargs))
@@ -36,6 +38,8 @@ class FakeTaskService:
 
     async def renew(self, **kwargs: object):
         self.calls.append(("renew", kwargs))
+        if self.renew_result is not None:
+            return self.renew_result
         from perfpilot_api.services.agent_tasks import LeaseRenewal
 
         return LeaseRenewal(
@@ -43,6 +47,19 @@ class FakeTaskService:
             lease_version=1,
             lease_expires_at=NOW,
             renew_after_seconds=20,
+        )
+
+    async def acknowledge_cancellation(self, **kwargs: object):
+        self.calls.append(("cancel_ack", kwargs))
+        if self.acknowledgement is not None:
+            return self.acknowledgement
+        from perfpilot_api.services.agent_tasks import AgentCancellationAcknowledgement
+
+        return AgentCancellationAcknowledgement(
+            execution_id=EXECUTION_ID,
+            analysis_id=UUID("30000000-0000-4000-8000-000000000001"),
+            lease_version=1,
+            acknowledged_at=NOW,
         )
 
 
@@ -63,6 +80,7 @@ def _client(task_service: AgentTaskService | FakeTaskService) -> TestClient:
             settings_override=_settings(),
             agent_service=FakeAgentService(),  # type: ignore[arg-type]
             agent_task_service=task_service,  # type: ignore[arg-type]
+            agent_upload_service=SimpleNamespace(),  # type: ignore[arg-type]
         )
     )
 
@@ -126,3 +144,72 @@ def test_agent_poll_returns_only_the_signed_execution_contract() -> None:
         "lease_expires_at": NOW.isoformat(),
         "renew_after_seconds": 20,
     }
+
+
+def test_agent_poll_and_renew_return_the_closed_cancel_action() -> None:
+    from perfpilot_api.services.agent_tasks import AgentTaskCancellation
+
+    service = FakeTaskService()
+    cancellation = AgentTaskCancellation(
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        requested_at=NOW,
+    )
+    service.poll_result = cancellation
+    service.renew_result = cancellation
+    with _client(service) as client:
+        polled = client.get(
+            "/v1/agent/tasks/next?wait_seconds=0",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        renewed = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/renew",
+            json={"schema_version": "1.0", "lease_version": 1},
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    expected = {
+        "schema_version": "1.0",
+        "action": "cancel",
+        "execution_id": str(EXECUTION_ID),
+        "lease_version": 1,
+        "reason_code": "analysis_canceled",
+    }
+    assert polled.status_code == 200
+    assert renewed.status_code == 200
+    assert polled.json() == expected
+    assert renewed.json() == expected
+
+
+def test_agent_cancel_ack_accepts_only_the_stable_reason_code() -> None:
+    service = FakeTaskService()
+    with _client(service) as client:
+        response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/cancel-ack",
+            json={
+                "schema_version": "1.0",
+                "lease_version": 1,
+                "reason_code": "analysis_canceled",
+            },
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        rejected = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/cancel-ack",
+            json={
+                "schema_version": "1.0",
+                "lease_version": 1,
+                "reason_code": "raw_adb_error",
+            },
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": "1.0",
+        "execution_id": str(EXECUTION_ID),
+        "analysis_id": "30000000-0000-4000-8000-000000000001",
+        "lease_version": 1,
+        "state": "canceled",
+        "acknowledged_at": NOW.isoformat(),
+    }
+    assert rejected.status_code == 422

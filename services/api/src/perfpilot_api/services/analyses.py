@@ -283,6 +283,7 @@ class AnalysisView:
     started_at: datetime | None
     completed_at: datetime | None
     failure_code: str | None
+    cancel_requested_at: datetime | None = None
     device_id: UUID | None = None
     question: str | None = None
     analysis_profile: Literal["auto", "startup", "scroll"] | None = None
@@ -327,6 +328,15 @@ class ApkInspector(Protocol):
         artifact_id: UUID,
         apk_sha256_b64: str,
     ) -> InspectedApkMetadata: ...
+
+
+class AnalysisCancellationCoordinator(Protocol):
+    async def request_cancel(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+    ) -> object: ...
 
 
 class AnalysisRepository(Protocol):
@@ -1036,12 +1046,14 @@ class AnalysisService:
         repository: AnalysisRepository,
         upload_service: UploadService,
         apk_inspector: ApkInspector | None = None,
+        cancellation_coordinator: AnalysisCancellationCoordinator | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_source: Callable[[], UUID] = uuid4,
     ) -> None:
         self._repository = repository
         self._upload_service = upload_service
         self._apk_inspector = apk_inspector
+        self._cancellation_coordinator = cancellation_coordinator
         self._clock = clock
         self._uuid_source = uuid_source
 
@@ -1253,6 +1265,37 @@ class AnalysisService:
         return replace(view, apk_upload=slot)
 
     async def get_analysis(self, *, team_id: UUID, analysis_id: UUID) -> AnalysisView:
+        return await _repository_call(
+            lambda: self._repository.load_view(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                now=self._clock(),
+            )
+        )
+
+    async def request_cancel(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        requested_by_user_id: UUID,
+    ) -> AnalysisView:
+        del requested_by_user_id
+        if self._cancellation_coordinator is None:
+            raise AnalysisUnavailableError("analysis cancellation is unavailable")
+        try:
+            await self._cancellation_coordinator.request_cancel(
+                team_id=team_id,
+                analysis_id=analysis_id,
+            )
+        except AnalysisError:
+            raise
+        except Exception as error:
+            from perfpilot_api.services.agent_tasks import AgentTaskNotFound
+
+            if isinstance(error, AgentTaskNotFound):
+                raise AnalysisNotFoundError("analysis was not found") from None
+            raise AnalysisUnavailableError("analysis cancellation is unavailable") from None
         return await _repository_call(
             lambda: self._repository.load_view(
                 team_id=team_id,
@@ -2772,6 +2815,7 @@ class SQLAlchemyAnalysisRepository:
                 started_at=job.started_at,
                 completed_at=job.completed_at,
                 failure_code=job.failure_code,
+                cancel_requested_at=job.cancel_requested_at,
                 question=question,
                 analysis_profile=tenant_analysis.analysis_profile,  # type: ignore[arg-type]
                 input_uploads=tuple(input_uploads),
@@ -2872,6 +2916,7 @@ class SQLAlchemyAnalysisRepository:
                 started_at=job.started_at,
                 completed_at=job.completed_at,
                 failure_code=job.failure_code,
+                cancel_requested_at=job.cancel_requested_at,
                 question=tenant_analysis.question,
             )
         if job.analysis_mode == "device" and tenant_analysis.question is not None:
@@ -2914,6 +2959,7 @@ class SQLAlchemyAnalysisRepository:
             started_at=job.started_at,
             completed_at=job.completed_at,
             failure_code=job.failure_code,
+            cancel_requested_at=job.cancel_requested_at,
             question=tenant_analysis.question,
         )
 

@@ -10,6 +10,9 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from perfpilot_api.security.agent_signatures import encode_ed25519_public_key
 from perfpilot_api.security.task_snapshots import TaskSnapshotSigner, verify_task_jws
 from perfpilot_api.services.agent_tasks import (
+    AgentCancellationAcknowledgement,
+    AgentExecutionAccess,
+    AgentTaskCancellation,
     AgentTaskDefinition,
     AgentTaskService,
     InMemoryAgentTaskRepository,
@@ -133,3 +136,92 @@ async def test_poll_rejects_wait_above_twenty_seconds() -> None:
 
     with pytest.raises(ValueError):
         await service.poll(agent_id=AGENT_ID, wait_seconds=21)
+
+
+class RecordingCancellationArtifacts:
+    def __init__(self) -> None:
+        self.aborted: list[AgentExecutionAccess] = []
+        self.projected: list[tuple[AgentExecutionAccess, str]] = []
+
+    async def abort_execution(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> None:
+        assert now == NOW
+        self.aborted.append(access)
+
+    async def project_cancellation(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        assert now == NOW
+        self.projected.append((access, reason_code))
+
+
+@pytest.mark.asyncio
+async def test_cancel_is_delivered_by_poll_and_renew_then_acknowledged() -> None:
+    service, _repository, _public_key = _service()
+    await service.schedule(analysis_id=ANALYSIS_ID)
+
+    requested = await service.request_cancel(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+    polled = await service.poll(agent_id=AGENT_ID, wait_seconds=0)
+    renewed = await service.renew(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+    )
+
+    assert requested.cancel_requested_at == NOW
+    assert requested.execution_id == EXECUTION_ID
+    assert polled == AgentTaskCancellation(
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        requested_at=NOW,
+    )
+    assert renewed == polled
+
+    artifacts = RecordingCancellationArtifacts()
+    acknowledged = await service.acknowledge_cancellation(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        reason_code="analysis_canceled",
+        artifact_coordinator=artifacts,
+    )
+    repeated = await service.acknowledge_cancellation(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        reason_code="analysis_canceled",
+        artifact_coordinator=artifacts,
+    )
+
+    assert acknowledged == repeated == AgentCancellationAcknowledgement(
+        execution_id=EXECUTION_ID,
+        analysis_id=ANALYSIS_ID,
+        lease_version=1,
+        acknowledged_at=NOW,
+    )
+    assert await service.poll(agent_id=AGENT_ID, wait_seconds=0) is None
+    assert artifacts.projected[-1][1] == "analysis_canceled"
+
+
+@pytest.mark.asyncio
+async def test_cancel_rejects_caller_controlled_reason_code() -> None:
+    service, _repository, _public_key = _service()
+    await service.schedule(analysis_id=ANALYSIS_ID)
+    await service.request_cancel(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+
+    with pytest.raises(ValueError):
+        await service.acknowledge_cancellation(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=1,
+            reason_code="private_process_error_with_secrets",
+            artifact_coordinator=RecordingCancellationArtifacts(),
+        )

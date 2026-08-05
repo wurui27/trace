@@ -140,6 +140,14 @@ class AgentTaskDelivery:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentTaskCancellation:
+    execution_id: UUID
+    lease_version: int
+    requested_at: datetime
+    reason_code: Literal["analysis_canceled"] = "analysis_canceled"
+
+
+@dataclass(frozen=True, slots=True)
 class LeaseRenewal:
     execution_id: UUID
     lease_version: int
@@ -204,12 +212,55 @@ class AgentExecutionCompletion:
     accepted_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class AgentCancellationRequest:
+    analysis_id: UUID
+    analysis_state: str
+    cancel_requested_at: datetime | None
+    agent_id: UUID | None
+    execution_id: UUID | None
+    lease_version: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class AgentCancellationAcknowledgement:
+    execution_id: UUID
+    analysis_id: UUID
+    lease_version: int
+    acknowledged_at: datetime
+
+
 class AgentCompletionArtifactValidator(Protocol):
     async def validate_completion(
         self,
         *,
         access: AgentExecutionAccess,
         manifest: ValidatedAgentExecutionManifest,
+    ) -> None: ...
+
+    async def project_completion(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None: ...
+
+
+class AgentCancellationArtifactCoordinator(Protocol):
+    async def abort_execution(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> None: ...
+
+    async def project_cancellation(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        reason_code: str,
+        now: datetime,
     ) -> None: ...
 
 
@@ -375,15 +426,6 @@ def validate_agent_execution_manifest(
         document_hash=hashlib.sha256(canonical).hexdigest(),
     )
 
-    async def project_completion(
-        self,
-        *,
-        access: AgentExecutionAccess,
-        manifest: ValidatedAgentExecutionManifest,
-        now: datetime,
-    ) -> None: ...
-
-
 class AgentTaskRepository(Protocol):
     async def schedule(
         self,
@@ -398,6 +440,13 @@ class AgentTaskRepository(Protocol):
         agent_id: UUID,
         now: datetime,
     ) -> ActiveAgentTask | None: ...
+
+    async def load_cancellation(
+        self,
+        *,
+        agent_id: UUID,
+        now: datetime,
+    ) -> AgentTaskCancellation | None: ...
 
     async def record_snapshot_digest(
         self,
@@ -416,7 +465,31 @@ class AgentTaskRepository(Protocol):
         execution_id: UUID,
         lease_version: int,
         now: datetime,
-    ) -> LeaseRenewal: ...
+    ) -> LeaseRenewal | AgentTaskCancellation: ...
+
+    async def request_cancel(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        now: datetime,
+    ) -> AgentCancellationRequest: ...
+
+    async def authorize_cancellation(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        now: datetime,
+    ) -> AgentExecutionAccess: ...
+
+    async def acknowledge_cancellation(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> AgentCancellationAcknowledgement: ...
 
     async def authorize_execution(
         self,
@@ -461,7 +534,9 @@ class _MemoryLease:
     acquired_at: datetime
     expires_at: datetime
     task_snapshot_digest: str | None = None
-    state: Literal["active", "released"] = "active"
+    state: Literal["active", "cancel_requested", "released"] = "active"
+    cancel_requested_at: datetime | None = None
+    cancel_acknowledged_at: datetime | None = None
     completion_manifest_digest: str | None = None
     completion: AgentExecutionCompletion | None = None
 
@@ -509,7 +584,7 @@ class InMemoryAgentTaskRepository:
                     lease
                     for lease in self._leases.values()
                     if lease.definition.analysis_id == definition.analysis_id
-                    and lease.state == "active"
+                    and lease.state in ("active", "cancel_requested")
                     and lease.expires_at > now
                 ),
                 None,
@@ -518,7 +593,7 @@ class InMemoryAgentTaskRepository:
                 return _scheduled(existing)
             if any(
                 lease.expires_at > now
-                and lease.state == "active"
+                and lease.state in ("active", "cancel_requested")
                 and (
                     lease.definition.device_id == definition.device_id
                     or lease.definition.agent_id == definition.agent_id
@@ -536,6 +611,27 @@ class InMemoryAgentTaskRepository:
             )
             self._leases[lease.execution_id] = lease
             return _scheduled(lease)
+        return None
+
+    async def load_cancellation(
+        self,
+        *,
+        agent_id: UUID,
+        now: datetime,
+    ) -> AgentTaskCancellation | None:
+        _require_aware(now)
+        for lease in self._leases.values():
+            if (
+                lease.definition.agent_id == agent_id
+                and lease.state == "cancel_requested"
+                and lease.expires_at > now
+                and lease.cancel_requested_at is not None
+            ):
+                return AgentTaskCancellation(
+                    execution_id=lease.execution_id,
+                    lease_version=lease.lease_version,
+                    requested_at=lease.cancel_requested_at,
+                )
         return None
 
     async def load_active(
@@ -587,24 +683,137 @@ class InMemoryAgentTaskRepository:
         execution_id: UUID,
         lease_version: int,
         now: datetime,
-    ) -> LeaseRenewal:
+    ) -> LeaseRenewal | AgentTaskCancellation:
         _require_aware(now)
         lease = self._leases.get(execution_id)
         if (
             lease is None
             or lease.definition.agent_id != agent_id
-            or lease.state != "active"
             or lease.expires_at <= now
         ):
             raise AgentTaskNotFound
         if lease.lease_version != lease_version:
             raise StaleLeaseVersion
+        if lease.state == "cancel_requested" and lease.cancel_requested_at is not None:
+            return AgentTaskCancellation(
+                execution_id=execution_id,
+                lease_version=lease_version,
+                requested_at=lease.cancel_requested_at,
+            )
+        if lease.state != "active":
+            raise AgentTaskNotFound
         expires_at = max(lease.expires_at, now + _LEASE_TTL)
         self._leases[execution_id] = replace(lease, expires_at=expires_at)
         return LeaseRenewal(
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=expires_at,
+        )
+
+    async def request_cancel(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        now: datetime,
+    ) -> AgentCancellationRequest:
+        _require_aware(now)
+        definition = self._definitions.get(analysis_id)
+        if definition is None or definition.team_id != team_id:
+            raise AgentTaskNotFound
+        lease = next(
+            (
+                item
+                for item in self._leases.values()
+                if item.definition.analysis_id == analysis_id
+                and item.state in ("active", "cancel_requested")
+            ),
+            None,
+        )
+        if lease is None:
+            return AgentCancellationRequest(
+                analysis_id=analysis_id,
+                analysis_state="canceled",
+                cancel_requested_at=now,
+                agent_id=None,
+                execution_id=None,
+                lease_version=None,
+            )
+        requested_at = lease.cancel_requested_at or now
+        self._leases[lease.execution_id] = replace(
+            lease,
+            state="cancel_requested",
+            cancel_requested_at=requested_at,
+        )
+        return AgentCancellationRequest(
+            analysis_id=analysis_id,
+            analysis_state="scheduled",
+            cancel_requested_at=requested_at,
+            agent_id=definition.agent_id,
+            execution_id=lease.execution_id,
+            lease_version=lease.lease_version,
+        )
+
+    async def authorize_cancellation(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        now: datetime,
+    ) -> AgentExecutionAccess:
+        _require_aware(now)
+        lease = self._leases.get(execution_id)
+        if lease is None or lease.definition.agent_id != agent_id:
+            raise AgentTaskNotFound
+        if lease.lease_version != lease_version:
+            raise StaleLeaseVersion
+        if lease.state == "cancel_requested" and lease.cancel_requested_at is not None:
+            pass
+        elif lease.state == "released" and lease.cancel_acknowledged_at is not None:
+            pass
+        else:
+            raise AgentTaskNotFound
+        return AgentExecutionAccess(
+            team_id=lease.definition.team_id,
+            analysis_id=lease.definition.analysis_id,
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            lease_expires_at=lease.expires_at,
+            scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
+        )
+
+    async def acknowledge_cancellation(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> AgentCancellationAcknowledgement:
+        _require_aware(now)
+        lease = self._leases.get(access.execution_id)
+        if (
+            lease is None
+            or lease.definition.agent_id != access.agent_id
+            or lease.lease_version != access.lease_version
+        ):
+            raise AgentTaskNotFound
+        acknowledged_at = lease.cancel_acknowledged_at or now
+        if lease.state == "released" and lease.cancel_acknowledged_at is not None:
+            pass
+        elif lease.state == "cancel_requested":
+            self._leases[access.execution_id] = replace(
+                lease,
+                state="released",
+                cancel_acknowledged_at=acknowledged_at,
+            )
+        else:
+            raise AgentTaskNotFound
+        return AgentCancellationAcknowledgement(
+            execution_id=access.execution_id,
+            analysis_id=access.analysis_id,
+            lease_version=access.lease_version,
+            acknowledged_at=acknowledged_at,
         )
 
     async def authorize_execution(
@@ -773,7 +982,12 @@ class AgentTaskService:
             await self._wakeup.wake(scheduled.agent_id)
         return scheduled
 
-    async def poll(self, *, agent_id: UUID, wait_seconds: int) -> AgentTaskDelivery | None:
+    async def poll(
+        self,
+        *,
+        agent_id: UUID,
+        wait_seconds: int,
+    ) -> AgentTaskDelivery | AgentTaskCancellation | None:
         if (
             isinstance(wait_seconds, bool)
             or not isinstance(wait_seconds, int)
@@ -781,10 +995,16 @@ class AgentTaskService:
         ):
             raise ValueError("Agent task poll wait is invalid")
         now = _aware_now(self._clock())
+        cancellation = await self._repository.load_cancellation(agent_id=agent_id, now=now)
+        if cancellation is not None:
+            return cancellation
         task = await self._repository.load_active(agent_id=agent_id, now=now)
         if task is None and wait_seconds:
             await self._wakeup.wait(agent_id, wait_seconds)
             now = _aware_now(self._clock())
+            cancellation = await self._repository.load_cancellation(agent_id=agent_id, now=now)
+            if cancellation is not None:
+                return cancellation
             task = await self._repository.load_active(agent_id=agent_id, now=now)
         if task is None:
             return None
@@ -808,7 +1028,7 @@ class AgentTaskService:
         agent_id: UUID,
         execution_id: UUID,
         lease_version: int,
-    ) -> LeaseRenewal:
+    ) -> LeaseRenewal | AgentTaskCancellation:
         if (
             isinstance(lease_version, bool)
             or not isinstance(lease_version, int)
@@ -821,6 +1041,57 @@ class AgentTaskService:
             lease_version=lease_version,
             now=_aware_now(self._clock()),
         )
+
+    async def request_cancel(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+    ) -> AgentCancellationRequest:
+        cancellation = await self._repository.request_cancel(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            now=_aware_now(self._clock()),
+        )
+        if cancellation.agent_id is not None:
+            await self._wakeup.wake(cancellation.agent_id)
+        return cancellation
+
+    async def acknowledge_cancellation(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        reason_code: str,
+        artifact_coordinator: AgentCancellationArtifactCoordinator,
+    ) -> AgentCancellationAcknowledgement:
+        if reason_code != "analysis_canceled":
+            raise ValueError("Cancellation reason is invalid")
+        if (
+            isinstance(lease_version, bool)
+            or not isinstance(lease_version, int)
+            or lease_version < 1
+        ):
+            raise StaleLeaseVersion
+        now = _aware_now(self._clock())
+        access = await self._repository.authorize_cancellation(
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            now=now,
+        )
+        await artifact_coordinator.abort_execution(access=access, now=now)
+        acknowledgement = await self._repository.acknowledge_cancellation(
+            access=access,
+            now=now,
+        )
+        await artifact_coordinator.project_cancellation(
+            access=access,
+            reason_code=reason_code,
+            now=now,
+        )
+        return acknowledgement
 
     async def authorize_execution(
         self,
@@ -1049,6 +1320,39 @@ class SQLAlchemyAgentTaskRepository:
             lease_expires_at=lease.expires_at,
         )
 
+    async def load_cancellation(
+        self,
+        *,
+        agent_id: UUID,
+        now: datetime,
+    ) -> AgentTaskCancellation | None:
+        _require_aware(now)
+        async with self._control_sessions() as session:
+            row = (
+                await session.execute(
+                    select(AgentLease, GlobalJob)
+                    .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
+                    .where(
+                        AgentLease.agent_id == agent_id,
+                        AgentLease.state == "cancel_requested",
+                        AgentLease.expires_at > now,
+                        GlobalJob.cancel_requested_at.is_not(None),
+                    )
+                    .order_by(AgentLease.acquired_at, AgentLease.id)
+                    .limit(1)
+                )
+            ).one_or_none()
+        if row is None:
+            return None
+        lease, job = row
+        if job.cancel_requested_at is None:
+            raise AgentTaskUnavailable("Cancellation state is unavailable")
+        return AgentTaskCancellation(
+            execution_id=lease.execution_id,
+            lease_version=lease.version,
+            requested_at=job.cancel_requested_at,
+        )
+
     async def _load_definition(
         self,
         *,
@@ -1156,23 +1460,37 @@ class SQLAlchemyAgentTaskRepository:
         execution_id: UUID,
         lease_version: int,
         now: datetime,
-    ) -> LeaseRenewal:
+    ) -> LeaseRenewal | AgentTaskCancellation:
         async with self._control_sessions() as session:
             async with session.begin():
-                lease = await session.scalar(
-                    select(AgentLease)
+                row = (
+                    await session.execute(
+                    select(AgentLease, GlobalJob)
+                    .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
                     .where(AgentLease.execution_id == execution_id)
                     .with_for_update()
-                )
+                    )
+                ).one_or_none()
+                if row is None:
+                    raise AgentTaskNotFound
+                lease, job = row
                 if (
-                    lease is None
-                    or lease.agent_id != agent_id
-                    or lease.state != "active"
+                    lease.agent_id != agent_id
                     or lease.expires_at <= now
                 ):
                     raise AgentTaskNotFound
                 if lease.version != lease_version:
                     raise StaleLeaseVersion
+                if lease.state == "cancel_requested":
+                    if job.cancel_requested_at is None:
+                        raise AgentTaskUnavailable("Cancellation state is unavailable")
+                    return AgentTaskCancellation(
+                        execution_id=execution_id,
+                        lease_version=lease.version,
+                        requested_at=job.cancel_requested_at,
+                    )
+                if lease.state != "active":
+                    raise AgentTaskNotFound
                 lease.expires_at = max(lease.expires_at, now + _LEASE_TTL)
                 lease.renewed_at = now
                 lease.updated_at = now
@@ -1180,6 +1498,253 @@ class SQLAlchemyAgentTaskRepository:
                     execution_id=execution_id,
                     lease_version=lease.version,
                     lease_expires_at=lease.expires_at,
+                )
+
+    async def request_cancel(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        now: datetime,
+    ) -> AgentCancellationRequest:
+        _require_aware(now)
+        async with self._control_sessions() as session:
+            async with session.begin():
+                job = await session.scalar(
+                    select(GlobalJob)
+                    .where(GlobalJob.id == analysis_id, GlobalJob.team_id == team_id)
+                    .with_for_update()
+                )
+                if job is None:
+                    raise AgentTaskNotFound
+                if job.state in ("completed", "partially_completed", "failed", "canceled"):
+                    return AgentCancellationRequest(
+                        analysis_id=analysis_id,
+                        analysis_state=job.state,
+                        cancel_requested_at=job.cancel_requested_at,
+                        agent_id=None,
+                        execution_id=None,
+                        lease_version=None,
+                    )
+                requested_at = job.cancel_requested_at or now
+                if job.cancel_requested_at is None:
+                    job.cancel_requested_at = requested_at
+                    job.version += 1
+                    job.updated_at = now
+                lease = await session.scalar(
+                    select(AgentLease)
+                    .where(
+                        AgentLease.global_job_id == analysis_id,
+                        AgentLease.state.in_(("active", "cancel_requested")),
+                    )
+                    .order_by(AgentLease.acquired_at.desc(), AgentLease.id.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+                if lease is None:
+                    job.state = "canceled"
+                    job.completed_at = now
+                    job.failure_code = None
+                    job.version += 1
+                    job.updated_at = now
+                    await session.execute(
+                        update(ScenarioJob)
+                        .where(
+                            ScenarioJob.analysis_id == analysis_id,
+                            ScenarioJob.state.in_(
+                                ("queued", "scheduled", "running", "analyzing")
+                            ),
+                        )
+                        .values(
+                            state="canceled",
+                            completed_at=now,
+                            failure_code=None,
+                            version=ScenarioJob.version + 1,
+                            updated_at=now,
+                        )
+                    )
+                else:
+                    if lease.state == "active":
+                        lease.state = "cancel_requested"
+                        lease.updated_at = now
+                    await session.execute(
+                        update(ScenarioJob)
+                        .where(
+                            ScenarioJob.analysis_id == analysis_id,
+                            ScenarioJob.state == "queued",
+                        )
+                        .values(
+                            state="canceled",
+                            completed_at=now,
+                            failure_code=None,
+                            version=ScenarioJob.version + 1,
+                            updated_at=now,
+                        )
+                    )
+                await session.flush()
+                return AgentCancellationRequest(
+                    analysis_id=analysis_id,
+                    analysis_state=job.state,
+                    cancel_requested_at=requested_at,
+                    agent_id=None if lease is None else lease.agent_id,
+                    execution_id=None if lease is None else lease.execution_id,
+                    lease_version=None if lease is None else lease.version,
+                )
+
+    async def authorize_cancellation(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        now: datetime,
+    ) -> AgentExecutionAccess:
+        _require_aware(now)
+        async with self._control_sessions() as session:
+            row = (
+                await session.execute(
+                    select(AgentLease, GlobalJob)
+                    .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
+                    .where(AgentLease.execution_id == execution_id)
+                )
+            ).one_or_none()
+            scenario_rows = (
+                ()
+                if row is None
+                else tuple(
+                    (
+                        await session.scalars(
+                            select(ScenarioJob).where(ScenarioJob.analysis_id == row[1].id)
+                        )
+                    ).all()
+                )
+            )
+        if row is None:
+            raise AgentTaskNotFound
+        lease, job = row
+        if lease.agent_id != agent_id:
+            raise AgentTaskNotFound
+        if lease.version != lease_version:
+            raise StaleLeaseVersion
+        if lease.state == "cancel_requested":
+            if job.cancel_requested_at is None:
+                raise AgentTaskNotFound
+        elif lease.state == "released":
+            if lease.cancel_acknowledged_at is None or job.state != "canceled":
+                raise AgentTaskNotFound
+        else:
+            raise AgentTaskNotFound
+        return AgentExecutionAccess(
+            team_id=job.team_id,
+            analysis_id=job.id,
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            lease_expires_at=lease.expires_at,
+            scenario_types=_control_scenario_types(scenario_rows),
+        )
+
+    async def acknowledge_cancellation(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> AgentCancellationAcknowledgement:
+        _require_aware(now)
+        async with self._control_sessions() as session:
+            async with session.begin():
+                row = (
+                    await session.execute(
+                        select(AgentLease, GlobalJob, Device)
+                        .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
+                        .join(Device, Device.id == AgentLease.device_id)
+                        .where(AgentLease.execution_id == access.execution_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if row is None:
+                    raise AgentTaskNotFound
+                lease, job, device = row
+                if (
+                    lease.agent_id != access.agent_id
+                    or lease.version != access.lease_version
+                    or job.id != access.analysis_id
+                    or job.team_id != access.team_id
+                ):
+                    raise AgentTaskNotFound
+                if lease.state == "released" and lease.cancel_acknowledged_at is not None:
+                    if job.state != "canceled":
+                        raise AgentTaskUnavailable("Cancellation state is unavailable")
+                    return AgentCancellationAcknowledgement(
+                        execution_id=access.execution_id,
+                        analysis_id=access.analysis_id,
+                        lease_version=access.lease_version,
+                        acknowledged_at=lease.cancel_acknowledged_at,
+                    )
+                if lease.state != "cancel_requested" or job.cancel_requested_at is None:
+                    raise AgentTaskNotFound
+
+                lease.state = "released"
+                lease.released_at = now
+                lease.cancel_acknowledged_at = now
+                lease.updated_at = now
+                newer_lease = await session.scalar(
+                    select(AgentLease.id)
+                    .where(
+                        AgentLease.device_id == device.id,
+                        AgentLease.id != lease.id,
+                        AgentLease.state.in_(("active", "cancel_requested")),
+                    )
+                    .limit(1)
+                )
+                if newer_lease is None:
+                    device.state = "ready"
+                    device.version += 1
+                    device.updated_at = now
+                job.state = "canceled"
+                job.completed_at = now
+                job.failure_code = None
+                job.version += 1
+                job.updated_at = now
+                await session.execute(
+                    update(ScenarioJob)
+                    .where(
+                        ScenarioJob.analysis_id == access.analysis_id,
+                        ScenarioJob.state.in_(("queued", "scheduled", "running", "analyzing")),
+                    )
+                    .values(
+                        state="canceled",
+                        completed_at=now,
+                        failure_code=None,
+                        version=ScenarioJob.version + 1,
+                        updated_at=now,
+                    )
+                )
+                event_id = agent_execution_canceled_event_id(access.execution_id)
+                if await session.get(OutboxEvent, event_id) is None:
+                    session.add(
+                        OutboxEvent(
+                            id=event_id,
+                            team_id=access.team_id,
+                            global_job_id=access.analysis_id,
+                            scenario_job_id=None,
+                            event_type="agent_execution_canceled",
+                            subject_type="agent_execution",
+                            subject_id=access.execution_id,
+                            subject_version=access.lease_version,
+                            ready_at=now,
+                            published_at=None,
+                            dead_lettered_at=None,
+                            retry_count=0,
+                            version=1,
+                        )
+                    )
+                await session.flush()
+                return AgentCancellationAcknowledgement(
+                    execution_id=access.execution_id,
+                    analysis_id=access.analysis_id,
+                    lease_version=access.lease_version,
+                    acknowledged_at=now,
                 )
 
     async def authorize_execution(
@@ -1519,6 +2084,10 @@ def agent_execution_completed_event_id(execution_id: UUID) -> UUID:
     return uuid5(_EVENT_NAMESPACE, f"agent_execution_completed:{execution_id}")
 
 
+def agent_execution_canceled_event_id(execution_id: UUID) -> UUID:
+    return uuid5(_EVENT_NAMESPACE, f"agent_execution_canceled:{execution_id}")
+
+
 def _agent_scenario_type(value: str) -> TaskScenarioType:
     if value == "cold_start":
         return "startup"
@@ -1600,11 +2169,14 @@ def _aware_now(value: datetime) -> datetime:
 
 __all__ = [
     "ActiveAgentTask",
+    "AgentCancellationAcknowledgement",
+    "AgentCancellationRequest",
     "AgentExecutionAccess",
     "AgentExecutionArtifact",
     "AgentExecutionCompletion",
     "AgentExecutionScenario",
     "AgentTaskDefinition",
+    "AgentTaskCancellation",
     "AgentTaskDelivery",
     "AgentTaskConflict",
     "AgentTaskError",
@@ -1622,5 +2194,6 @@ __all__ = [
     "TaskScenario",
     "ValidatedAgentExecutionManifest",
     "agent_execution_completed_event_id",
+    "agent_execution_canceled_event_id",
     "validate_agent_execution_manifest",
 ]

@@ -125,6 +125,16 @@ class FakeAnalysisService:
             raise self.error
         return _created_view(include_upload_authorization=False)
 
+    async def request_cancel(self, **kwargs: object) -> AnalysisView:
+        self.calls.append(("cancel", kwargs))
+        if self.error is not None:
+            raise self.error
+        return replace(
+            _created_view(include_upload_authorization=False),
+            state="scheduled",
+            cancel_requested_at=NOW,
+        )
+
     async def list_report_analyses(self, **kwargs: object) -> tuple[AnalysisView, ...]:
         self.calls.append(("list", kwargs))
         if self.error is not None:
@@ -860,6 +870,37 @@ def test_get_analysis_does_not_reissue_the_pending_upload_authorization() -> Non
     assert "put_url" not in response.json()["apk_upload"]
     assert "required_headers" not in response.json()["apk_upload"]
     assert analysis_service.calls == [("get", {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID})]
+
+
+def test_cancel_analysis_is_csrf_protected_and_returns_pending_cancellation() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    target = f"/v1/teams/{TEAM_ID}/analyses/{ANALYSIS_ID}/cancel"
+    headers = _headers(
+        method="POST",
+        target=target,
+        body=b"",
+        request_id="req-analysis-cancel",
+    )
+    headers.pop("content-type")
+
+    with _client(auth_service, analysis_service) as client:
+        response = client.post(target, content=b"", headers=headers)
+
+    assert response.status_code == 202
+    assert response.headers["cache-control"] == "no-store"
+    assert response.json()["state"] == "scheduled"
+    assert response.json()["cancel_requested_at"] == NOW.isoformat()
+    assert analysis_service.calls == [
+        (
+            "cancel",
+            {
+                "team_id": TEAM_ID,
+                "analysis_id": ANALYSIS_ID,
+                "requested_by_user_id": USER_ID,
+            },
+        )
+    ]
 
 
 def test_list_report_analyses_returns_latest_team_report_without_cache() -> None:

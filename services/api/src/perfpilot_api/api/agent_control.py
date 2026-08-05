@@ -23,6 +23,7 @@ from perfpilot_api.services.device_directory import (
     DeviceHeartbeatRejected,
 )
 from perfpilot_api.services.agent_tasks import (
+    AgentTaskCancellation,
     AgentTaskConflict,
     AgentTaskNotFound,
     AgentTaskService,
@@ -158,6 +159,14 @@ class RenewAgentTaskRequest(BaseModel):
 
     schema_version: Literal["1.0"]
     lease_version: int = Field(strict=True, ge=1)
+
+
+class AcknowledgeAgentCancellationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    lease_version: int = Field(strict=True, ge=1)
+    reason_code: Literal["analysis_canceled"]
 
 
 class CreateAgentUploadRequest(BaseModel):
@@ -383,6 +392,16 @@ def _agent_upload_payload(upload) -> dict[str, object]:
     }
 
 
+def _cancellation_payload(cancellation: AgentTaskCancellation) -> dict[str, object]:
+    return {
+        "schema_version": "1.0",
+        "action": "cancel",
+        "execution_id": str(cancellation.execution_id),
+        "lease_version": cancellation.lease_version,
+        "reason_code": cancellation.reason_code,
+    }
+
+
 router = APIRouter(
     prefix="/v1/agent",
     dependencies=[Depends(_reject_browser_credentials)],
@@ -514,6 +533,8 @@ async def poll_next_task(
             "action": "wait",
             "retry_after_seconds": max(1, min(20, wait_seconds or 1)),
         }
+    if isinstance(task, AgentTaskCancellation):
+        return _cancellation_payload(task)
     return {
         "schema_version": "1.0",
         "action": "execute",
@@ -546,12 +567,52 @@ async def renew_task(
     except AgentTaskUnavailable:
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
     response.headers["cache-control"] = "no-store"
+    if isinstance(renewal, AgentTaskCancellation):
+        return _cancellation_payload(renewal)
     return {
         "schema_version": "1.0",
         "execution_id": str(renewal.execution_id),
         "lease_version": renewal.lease_version,
         "lease_expires_at": _utc(renewal.lease_expires_at),
         "renew_after_seconds": renewal.renew_after_seconds,
+    }
+
+
+@router.post("/tasks/{execution_id}/cancel-ack")
+async def acknowledge_agent_cancellation(
+    execution_id: UUID,
+    payload: AcknowledgeAgentCancellationRequest,
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    task_service: Annotated[AgentTaskService, Depends(get_agent_task_service)],
+    upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        acknowledgement = await task_service.acknowledge_cancellation(
+            agent_id=principal.agent_id,
+            execution_id=execution_id,
+            lease_version=payload.lease_version,
+            reason_code=payload.reason_code,
+            artifact_coordinator=upload_service,
+        )
+    except StaleLeaseVersion:
+        raise ApiError("stale_lease_version", "租约版本已经变化", 409, True) from None
+    except AgentTaskNotFound:
+        raise ApiError("resource_not_found", "资源不存在", 404, False) from None
+    except AgentUploadError as error:
+        _raise_agent_upload_error(error)
+    except AgentTaskUnavailable:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "execution_id": str(acknowledgement.execution_id),
+        "analysis_id": str(acknowledgement.analysis_id),
+        "lease_version": acknowledgement.lease_version,
+        "state": "canceled",
+        "acknowledged_at": _utc(acknowledgement.acknowledged_at),
     }
 
 

@@ -418,6 +418,8 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
         "completed_at": (_utc(view.completed_at) if view.completed_at is not None else None),
         "failure": _failure(view.failure_code),
     }
+    if view.cancel_requested_at is not None:
+        result["cancel_requested_at"] = _utc(view.cancel_requested_at)
     if view.analysis_mode == "device":
         if view.device_id is None:
             raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
@@ -570,6 +572,35 @@ async def get_analysis(
         )
     except (AnalysisNotFoundError, AnalysisUnavailableError) as error:
         raise analysis_error(error) from None
+    response.headers["cache-control"] = "no-store"
+    return analysis_response(view)
+
+
+@router.post("/{analysis_id}/cancel", status_code=202)
+async def cancel_analysis(
+    team_id: UUID,
+    analysis_id: UUID,
+    request: Request,
+    response: Response,
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    analysis_service: Annotated[AnalysisService, Depends(get_analysis_service)],
+) -> dict[str, object]:
+    principal = await _authorize_team(
+        request=request,
+        auth_service=auth_service,
+        team_id=team_id,
+        access="write",
+    )
+    try:
+        view = await analysis_service.request_cancel(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            requested_by_user_id=principal.user_id,
+        )
+    except (AnalysisNotFoundError, AnalysisUnavailableError) as error:
+        raise analysis_error(error) from None
+    if view.state in ("completed", "partially_completed", "failed", "canceled", "deleted"):
+        response.status_code = 200
     response.headers["cache-control"] = "no-store"
     return analysis_response(view)
 

@@ -441,6 +441,20 @@ def create_app(
                 if resolved_upload_service is None:
                     resolved_upload_service = owned_artifact_runtime.upload_service
                 lifespan_app.state.upload_service = resolved_upload_service
+                if (
+                    resolved_agent_task_service is None
+                    and resolved_task_snapshot_signer is not None
+                    and owned_redis is not None
+                ):
+                    resolved_agent_task_service = AgentTaskService(
+                        repository=SQLAlchemyAgentTaskRepository(
+                            control_session_factory=control_session_factory,
+                            tenant_router=owned_artifact_runtime.tenant_router,
+                        ),
+                        signer=resolved_task_snapshot_signer,
+                        wakeup=RedisAgentTaskWakeup(owned_redis),
+                    )
+                    lifespan_app.state.agent_task_service = resolved_agent_task_service
                 if resolved_analysis_service is None:
                     resolved_inspector = apk_inspector
                     if settings.app_env != "production":
@@ -456,22 +470,9 @@ def create_app(
                         ),
                         upload_service=resolved_upload_service,
                         apk_inspector=resolved_inspector,
+                        cancellation_coordinator=resolved_agent_task_service,
                     )
                     lifespan_app.state.analysis_service = resolved_analysis_service
-                if (
-                    resolved_agent_task_service is None
-                    and resolved_task_snapshot_signer is not None
-                    and owned_redis is not None
-                ):
-                    resolved_agent_task_service = AgentTaskService(
-                        repository=SQLAlchemyAgentTaskRepository(
-                            control_session_factory=control_session_factory,
-                            tenant_router=owned_artifact_runtime.tenant_router,
-                        ),
-                        signer=resolved_task_snapshot_signer,
-                        wakeup=RedisAgentTaskWakeup(owned_redis),
-                    )
-                    lifespan_app.state.agent_task_service = resolved_agent_task_service
                 if (
                     resolved_agent_upload_service is None
                     and resolved_agent_task_service is not None

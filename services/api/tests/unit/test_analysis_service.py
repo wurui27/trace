@@ -341,6 +341,7 @@ def _service(
     repository: FakeAnalysisRepository,
     upload_service: FakeUploadService,
     inspector: FakeApkInspector,
+    cancellation_coordinator: Any | None = None,
 ) -> Any:
     from perfpilot_api.services.analyses import AnalysisService
 
@@ -349,9 +350,43 @@ def _service(
         repository=repository,
         upload_service=upload_service,
         apk_inspector=inspector,
+        cancellation_coordinator=cancellation_coordinator,
         clock=lambda: NOW,
         uuid_source=candidates.__next__,
     )
+
+
+@pytest.mark.asyncio
+async def test_request_cancel_coordinates_control_state_before_loading_latest_view() -> None:
+    events: list[str] = []
+    repository = FakeAnalysisRepository(events)
+    repository.views[ANALYSIS_ID] = replace(
+        _analysis_view(),
+        state="scheduled",
+        cancel_requested_at=NOW,
+    )
+
+    class CancellationCoordinator:
+        async def request_cancel(self, **kwargs: object) -> object:
+            events.append("request_cancel")
+            assert kwargs == {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID}
+            return SimpleNamespace(cancel_requested_at=NOW)
+
+    service = _service(
+        repository,
+        FakeUploadService(events),
+        FakeApkInspector(events),
+        CancellationCoordinator(),
+    )
+
+    view = await service.request_cancel(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        requested_by_user_id=USER_ID,
+    )
+
+    assert view.cancel_requested_at == NOW
+    assert events == ["request_cancel", "load_view"]
 
 
 def test_trace_stage_projection_uses_latest_engine_synthesis_and_existing_report() -> None:

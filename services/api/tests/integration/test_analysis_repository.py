@@ -50,6 +50,7 @@ from perfpilot_api.db.tenant.models import (
     Application,
     ApplicationVersion,
     Artifact,
+    ArtifactMultipartUpload,
     ReportVersion,
     ScenarioRecipe,
     ScenarioResult,
@@ -82,9 +83,11 @@ from perfpilot_api.security.task_snapshots import (
     verify_task_jws,
 )
 from perfpilot_api.services.agent_tasks import (
+    AgentTaskCancellation,
     AgentTaskService,
     InMemoryAgentTaskWakeup,
     SQLAlchemyAgentTaskRepository,
+    agent_execution_canceled_event_id,
     agent_execution_completed_event_id,
 )
 from perfpilot_api.services.agent_uploads import (
@@ -2764,6 +2767,170 @@ async def test_agent_completion_releases_device_and_queues_trace_analysis_exactl
     claim = await queue.claim_next(consumer_id="device-trace-worker")
     assert claim is not None
     assert claim.analysis_id == ANALYSIS_ID
+
+
+@pytest.mark.asyncio
+async def test_agent_cancellation_is_fenced_cleans_uploads_and_releases_device(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    prepared = await _persist_metadata_and_stage(analysis_databases)
+    scheduled_at = NOW + timedelta(minutes=3)
+    canceled_at = scheduled_at + timedelta(seconds=10)
+    await analysis_databases.repository.queue_control_scenarios(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=ARTIFACT_ID,
+        scenarios=prepared,
+        requirements=SchedulingRequirements(
+            min_api_level=28,
+            supported_abis=("arm64-v8a", "x86_64"),
+        ),
+        now=scheduled_at,
+    )
+    async with analysis_databases.control_sessions.begin() as session:
+        agent = await session.get(Agent, AGENT_ID)
+        device = await session.get(Device, DEVICE_ID)
+        assert agent is not None and device is not None
+        agent.last_heartbeat_at = scheduled_at
+        agent.state = "online"
+        device.last_seen_at = scheduled_at
+        device.state = "ready"
+        device.adb_state = "device"
+
+    execution_id = UUID("73000000-0000-4000-8000-000000000021")
+    clock = [scheduled_at]
+    service = AgentTaskService(
+        repository=SQLAlchemyAgentTaskRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+            lease_id_source=lambda: UUID("75000000-0000-4000-8000-000000000021"),
+            execution_id_source=lambda: execution_id,
+            lease_token_source=lambda: b"cancellation-token" * 2,
+        ),
+        signer=TaskSnapshotSigner(
+            private_key=Ed25519PrivateKey.generate(),
+            kid="lan-cancellation",
+            clock=lambda: clock[0],
+        ),
+        wakeup=InMemoryAgentTaskWakeup(),
+        clock=lambda: clock[0],
+    )
+    scheduled = await service.schedule(analysis_id=ANALYSIS_ID)
+    assert scheduled is not None
+    access = await service.authorize_execution(
+        agent_id=AGENT_ID,
+        execution_id=execution_id,
+        lease_version=1,
+        now=scheduled_at,
+    )
+    tenant = TenantBucket(team_id=TEAM_ID, bucket="unused", resource_version=1)
+    uploads = SQLAlchemyAgentUploadRepository(
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    )
+    pending_upload_id = UUID("77000000-0000-4000-8000-000000000021")
+    await uploads.reserve_upload(
+        tenant=tenant,
+        access=access,
+        descriptor=AgentUploadDescriptor(
+            "startup_trace",
+            "application/x-perfetto-trace",
+            4,
+            CHECKSUM,
+        ),
+        artifact_id=UUID("76000000-0000-4000-8000-000000000021"),
+        upload_id=pending_upload_id,
+        object_key=f"raw/agent/{execution_id}/startup_trace",
+        storage_upload_id="storage-cancellation",
+        part_size_bytes=64 * 1024 * 1024,
+        part_count=1,
+        now=scheduled_at,
+        expires_at=scheduled_at + timedelta(minutes=15),
+    )
+
+    class CancellationArtifacts:
+        async def abort_execution(self, **kwargs: object) -> None:
+            current_access = kwargs["access"]
+            pending = await uploads.pending_execution_uploads(
+                tenant=tenant,
+                access=current_access,  # type: ignore[arg-type]
+            )
+            for upload in pending:
+                await uploads.mark_upload_aborted(
+                    tenant=tenant,
+                    access=current_access,  # type: ignore[arg-type]
+                    upload_id=upload.upload_id,
+                    now=kwargs["now"],  # type: ignore[arg-type]
+                )
+
+        async def project_cancellation(self, **kwargs: object) -> None:
+            await uploads.project_cancellation(tenant=tenant, **kwargs)  # type: ignore[arg-type]
+
+    clock[0] = canceled_at
+    cancellation = await service.request_cancel(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+    polled = await service.poll(agent_id=AGENT_ID, wait_seconds=0)
+    renewed = await service.renew(
+        agent_id=AGENT_ID,
+        execution_id=execution_id,
+        lease_version=1,
+    )
+    assert cancellation.cancel_requested_at == canceled_at
+    assert polled == renewed == AgentTaskCancellation(
+        execution_id=execution_id,
+        lease_version=1,
+        requested_at=canceled_at,
+    )
+
+    acknowledged = await service.acknowledge_cancellation(
+        agent_id=AGENT_ID,
+        execution_id=execution_id,
+        lease_version=1,
+        reason_code="analysis_canceled",
+        artifact_coordinator=CancellationArtifacts(),
+    )
+    replayed = await service.acknowledge_cancellation(
+        agent_id=AGENT_ID,
+        execution_id=execution_id,
+        lease_version=1,
+        reason_code="analysis_canceled",
+        artifact_coordinator=CancellationArtifacts(),
+    )
+
+    assert replayed == acknowledged
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        device = await session.get(Device, DEVICE_ID)
+        lease = await session.scalar(
+            select(AgentLease).where(AgentLease.execution_id == execution_id)
+        )
+        scenarios = tuple(
+            (
+                await session.scalars(
+                    select(ScenarioJob).where(ScenarioJob.analysis_id == ANALYSIS_ID)
+                )
+            ).all()
+        )
+        event = await session.get(OutboxEvent, agent_execution_canceled_event_id(execution_id))
+    async with analysis_databases.tenant_sessions() as session:
+        tenant_analysis = await session.get(Analysis, ANALYSIS_ID)
+        tenant_scenarios = tuple(
+            (
+                await session.scalars(
+                    select(ScenarioResult).where(ScenarioResult.analysis_id == ANALYSIS_ID)
+                )
+            ).all()
+        )
+        multipart = await session.get(ArtifactMultipartUpload, pending_upload_id)
+
+    assert job is not None and job.state == "canceled"
+    assert job.cancel_requested_at == canceled_at
+    assert device is not None and device.state == "ready"
+    assert lease is not None and lease.state == "released"
+    assert lease.cancel_acknowledged_at == canceled_at
+    assert {item.state for item in scenarios} == {"canceled"}
+    assert tenant_analysis is not None and tenant_analysis.state == "canceled"
+    assert {item.state for item in tenant_scenarios} == {"canceled"}
+    assert multipart is not None and multipart.state == "aborted"
+    assert event is not None
 
 
 @pytest.mark.asyncio

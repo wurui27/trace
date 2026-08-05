@@ -253,3 +253,22 @@ async def test_complete_rejects_final_object_checksum_mismatch() -> None:
                 MultipartPart(part_number=index, etag=f'"etag-{index}"') for index in range(1, 9)
             ),
         )
+
+
+@pytest.mark.asyncio
+async def test_cancel_aborts_each_pending_multipart_upload_exactly_once() -> None:
+    service, store = _service()
+    await _create(service)
+    access = AgentExecutionAccess(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        lease_expires_at=NOW + timedelta(seconds=60),
+    )
+
+    await service.abort_execution(access=access, now=NOW)
+    await service.abort_execution(access=access, now=NOW)
+
+    assert store.abort_calls == 1

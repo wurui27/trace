@@ -82,6 +82,7 @@
     "created_at": {"type": "string", "format": "date-time"},
     "started_at": {"$ref": "#/$defs/nullableDateTime"},
     "completed_at": {"$ref": "#/$defs/nullableDateTime"},
+    "cancel_requested_at": {"$ref": "#/$defs/nullableDateTime"},
     "failure": {
       "oneOf": [
         {"type": "null"},

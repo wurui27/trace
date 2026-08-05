@@ -218,6 +218,31 @@ class AgentUploadRepository(Protocol):
         now: datetime,
     ) -> None: ...
 
+    async def pending_execution_uploads(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+    ) -> tuple[StoredAgentUpload, ...]: ...
+
+    async def mark_upload_aborted(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        upload_id: UUID,
+        now: datetime,
+    ) -> None: ...
+
+    async def project_cancellation(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        reason_code: str,
+        now: datetime,
+    ) -> None: ...
+
 
 class InMemoryAgentUploadRepository:
     def __init__(self) -> None:
@@ -366,6 +391,54 @@ class InMemoryAgentUploadRepository:
         now: datetime,
     ) -> None:
         del tenant, access, manifest, now
+
+    async def pending_execution_uploads(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+    ) -> tuple[StoredAgentUpload, ...]:
+        del tenant
+        return tuple(
+            item
+            for item in self._uploads.values()
+            if item.analysis_id == access.analysis_id
+            and item.execution_id == access.execution_id
+            and item.state == "pending"
+        )
+
+    async def mark_upload_aborted(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        upload_id: UUID,
+        now: datetime,
+    ) -> None:
+        del tenant, now
+        stored = self._uploads.get(upload_id)
+        if (
+            stored is None
+            or stored.analysis_id != access.analysis_id
+            or stored.execution_id != access.execution_id
+        ):
+            raise AgentUploadNotFound("upload was not found")
+        if stored.state == "pending":
+            self._uploads[upload_id] = replace(
+                stored,
+                state="aborted",
+                version=stored.version + 1,
+            )
+
+    async def project_cancellation(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        del tenant, access, reason_code, now
 
 
 class SQLAlchemyAgentUploadRepository:
@@ -716,6 +789,108 @@ class SQLAlchemyAgentUploadRepository:
                 result.updated_at = now
             await session.flush()
 
+    async def pending_execution_uploads(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+    ) -> tuple[StoredAgentUpload, ...]:
+        async with self._session(tenant) as session:
+            rows = tuple(
+                (
+                    await session.execute(
+                        select(Artifact, ArtifactMultipartUpload)
+                        .join(
+                            ArtifactMultipartUpload,
+                            ArtifactMultipartUpload.artifact_id == Artifact.id,
+                        )
+                        .where(
+                            Artifact.analysis_id == access.analysis_id,
+                            ArtifactMultipartUpload.execution_id == access.execution_id,
+                            ArtifactMultipartUpload.state == "pending",
+                            Artifact.deleted_at.is_(None),
+                        )
+                        .order_by(ArtifactMultipartUpload.created_at, ArtifactMultipartUpload.id)
+                    )
+                ).all()
+            )
+        return tuple(self._stored(*row) for row in rows)
+
+    async def mark_upload_aborted(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        upload_id: UUID,
+        now: datetime,
+    ) -> None:
+        async with self._session(tenant) as session:
+            artifact, multipart = await self._load_rows(
+                session,
+                access=access,
+                upload_id=upload_id,
+                lock=True,
+            )
+            if multipart.state == "aborted":
+                return
+            if multipart.state != "pending":
+                return
+            multipart.state = "aborted"
+            multipart.completed_parts = []
+            multipart.version += 1
+            multipart.updated_at = now
+            artifact.state = "expired"
+            artifact.version += 1
+            artifact.updated_at = now
+            await session.flush()
+
+    async def project_cancellation(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        if reason_code != "analysis_canceled":
+            raise AgentUploadInvalidRequest("cancellation reason is invalid")
+        async with self._session(tenant) as session:
+            analysis = await session.scalar(
+                select(Analysis)
+                .where(
+                    Analysis.id == access.analysis_id,
+                    Analysis.analysis_mode == "device",
+                    Analysis.tombstoned_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if analysis is None:
+                raise AgentUploadNotFound("analysis was not found")
+            if analysis.state not in ("completed", "partially_completed", "failed", "canceled"):
+                analysis.state = "canceled"
+                analysis.completed_at = now
+                analysis.failure_code = None
+                analysis.version += 1
+                analysis.updated_at = now
+            scenario_rows = tuple(
+                (
+                    await session.scalars(
+                        select(ScenarioResult)
+                        .where(ScenarioResult.analysis_id == access.analysis_id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for result in scenario_rows:
+                if result.state in ("completed", "failed", "canceled"):
+                    continue
+                result.state = "canceled"
+                result.completed_at = now
+                result.failure_code = None
+                result.version += 1
+                result.updated_at = now
+            await session.flush()
+
 
 class AgentUploadService:
     def __init__(
@@ -946,6 +1121,54 @@ class AgentUploadService:
                 access=access,
                 manifest=manifest,
                 now=now,
+            )
+        )
+
+    async def abort_execution(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> None:
+        canonical_now = _aware(now)
+        tenant = await _available(self._bucket_resolver.active_for_team(access.team_id))
+        uploads = await _available(
+            self._repository.pending_execution_uploads(
+                tenant=tenant,
+                access=access,
+            )
+        )
+        for upload in uploads:
+            await _available(
+                self._artifact_store.abort_multipart(
+                    location=ObjectLocation(bucket=tenant.bucket, key=upload.object_key),
+                    storage_upload_id=upload.storage_upload_id,
+                )
+            )
+            await _available(
+                self._repository.mark_upload_aborted(
+                    tenant=tenant,
+                    access=access,
+                    upload_id=upload.upload_id,
+                    now=canonical_now,
+                )
+            )
+
+    async def project_cancellation(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        canonical_now = _aware(now)
+        tenant = await _available(self._bucket_resolver.active_for_team(access.team_id))
+        await _available(
+            self._repository.project_cancellation(
+                tenant=tenant,
+                access=access,
+                reason_code=reason_code,
+                now=canonical_now,
             )
         )
 
