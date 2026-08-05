@@ -2,24 +2,37 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import secrets
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Literal, Protocol, cast
-from uuid import UUID, uuid4
+from uuid import UUID, uuid4, uuid5
 
+from jsonschema import Draft202012Validator, FormatChecker
+from jsonschema.exceptions import SchemaError, ValidationError
 from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfpilot_api.db.control.models import Agent, AgentLease, Device, GlobalJob, ScenarioJob
+from perfpilot_api.db.control.models import (
+    Agent,
+    AgentLease,
+    Device,
+    GlobalJob,
+    OutboxEvent,
+    ScenarioJob,
+)
 from perfpilot_api.db.tenant.models import Analysis, ApplicationVersion, Artifact, ScenarioResult
 from perfpilot_api.db.tenant.router import TenantRouter
 from perfpilot_api.security.task_snapshots import (
     TaskSnapshotSigner,
     snapshot_digest,
 )
+from perfpilot_api.services.analyses import trace_analysis_ready_event_id
 
 _LEASE_TTL = timedelta(seconds=60)
 _FRESHNESS = timedelta(seconds=30)
@@ -30,6 +43,16 @@ _ALLOWED_UPLOADS = (
     "memory_evidence",
     "agent_log",
 )
+_COMPLETION_CONTRACT = (
+    Path(__file__).resolve().parents[5]
+    / "contracts"
+    / "v1"
+    / "agents"
+    / "execution-manifest.schema.json"
+)
+_EVENT_NAMESPACE = UUID("0e34d746-295e-5d1c-bf2c-98333435f5e7")
+_MAXIMUM_EXECUTION_DURATION = timedelta(hours=24)
+_MAXIMUM_COMPLETION_SKEW = timedelta(minutes=5)
 
 TaskScenarioType = Literal["startup", "scroll", "memory_cycle"]
 TaskInputKind = Literal["apk", "scenario_fixture", "dataset"]
@@ -49,6 +72,10 @@ class StaleLeaseVersion(AgentTaskError):
 
 
 class AgentTaskUnavailable(AgentTaskError):
+    pass
+
+
+class AgentTaskConflict(AgentTaskError):
     pass
 
 
@@ -129,6 +156,232 @@ class AgentExecutionAccess:
     lease_version: int
     lease_expires_at: datetime
     allowed_uploads: tuple[str, ...] = _ALLOWED_UPLOADS
+    scenario_types: tuple[TaskScenarioType, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionArtifact:
+    artifact_id: UUID
+    kind: str
+    mime: str
+    size: int
+    sha256_b64: str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionScenario:
+    scenario_type: TaskScenarioType
+    state: Literal["completed", "failed", "skipped"]
+    started_at: datetime
+    completed_at: datetime
+    temperature_start_c: int | float | None
+    temperature_end_c: int | float | None
+    artifact_ids: tuple[UUID, ...]
+    diagnostic_code: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ValidatedAgentExecutionManifest:
+    execution_id: UUID
+    lease_version: int
+    state: Literal["completed", "failed"]
+    started_at: datetime
+    completed_at: datetime
+    agent_version: str
+    adb_version: str
+    artifacts: tuple[AgentExecutionArtifact, ...]
+    scenarios: tuple[AgentExecutionScenario, ...]
+    diagnostic_code: str | None
+    document_hash: str
+
+
+@dataclass(frozen=True, slots=True)
+class AgentExecutionCompletion:
+    execution_id: UUID
+    analysis_id: UUID
+    lease_version: int
+    analysis_state: Literal["analyzing", "failed"]
+    accepted_at: datetime
+
+
+class AgentCompletionArtifactValidator(Protocol):
+    async def validate_completion(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+    ) -> None: ...
+
+
+@lru_cache(maxsize=1)
+def _execution_manifest_validator() -> Draft202012Validator:
+    try:
+        schema = json.loads(_COMPLETION_CONTRACT.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(schema)
+    except (OSError, UnicodeError, json.JSONDecodeError, SchemaError):
+        raise AgentTaskUnavailable("Execution manifest contract is unavailable") from None
+    return Draft202012Validator(schema, format_checker=FormatChecker())
+
+
+def _manifest_time(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise AgentTaskConflict("Execution manifest is invalid")
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        raise AgentTaskConflict("Execution manifest is invalid") from None
+    if parsed.tzinfo is None:
+        raise AgentTaskConflict("Execution manifest is invalid")
+    return parsed.astimezone(UTC)
+
+
+def validate_agent_execution_manifest(
+    document: Mapping[str, object],
+    *,
+    execution_id: UUID,
+    lease_version: int,
+    expected_scenarios: tuple[TaskScenarioType, ...],
+    now: datetime,
+) -> ValidatedAgentExecutionManifest:
+    if not isinstance(document, Mapping):
+        raise AgentTaskConflict("Execution manifest is invalid")
+    normalized = dict(document)
+    try:
+        _execution_manifest_validator().validate(normalized)
+        canonical = json.dumps(
+            normalized,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+    except ValidationError:
+        raise AgentTaskConflict("Execution manifest is invalid") from None
+    except (TypeError, ValueError, UnicodeError):
+        raise AgentTaskConflict("Execution manifest is invalid") from None
+
+    try:
+        manifest_execution_id = UUID(str(normalized["execution_id"]))
+        manifest_lease_version = int(normalized["lease_version"])
+    except (KeyError, TypeError, ValueError, AttributeError):
+        raise AgentTaskConflict("Execution manifest is invalid") from None
+    if manifest_execution_id != execution_id or manifest_lease_version != lease_version:
+        raise AgentTaskConflict("Execution manifest does not match the lease")
+
+    started_at = _manifest_time(normalized["started_at"])
+    completed_at = _manifest_time(normalized["completed_at"])
+    if (
+        completed_at < started_at
+        or completed_at - started_at > _MAXIMUM_EXECUTION_DURATION
+        or completed_at > now + _MAXIMUM_COMPLETION_SKEW
+    ):
+        raise AgentTaskConflict("Execution manifest timestamps are invalid")
+
+    artifacts: list[AgentExecutionArtifact] = []
+    artifact_ids: set[UUID] = set()
+    artifact_kinds: set[str] = set()
+    for item in cast(list[dict[str, object]], normalized["artifacts"]):
+        artifact_id = UUID(cast(str, item["artifact_id"]))
+        kind = cast(str, item["kind"])
+        if artifact_id in artifact_ids or kind in artifact_kinds:
+            raise AgentTaskConflict("Execution artifacts are duplicated")
+        artifact_ids.add(artifact_id)
+        artifact_kinds.add(kind)
+        artifacts.append(
+            AgentExecutionArtifact(
+                artifact_id=artifact_id,
+                kind=kind,
+                mime=cast(str, item["mime"]),
+                size=cast(int, item["size"]),
+                sha256_b64=cast(str, item["sha256_b64"]),
+            )
+        )
+
+    scenarios: list[AgentExecutionScenario] = []
+    scenario_types: set[TaskScenarioType] = set()
+    referenced_artifacts: set[UUID] = set()
+    by_artifact_id = {item.artifact_id: item for item in artifacts}
+    expected_kind = {
+        "startup": "startup_trace",
+        "scroll": "scroll_trace",
+        "memory_cycle": "memory_evidence",
+    }
+    for item in cast(list[dict[str, object]], normalized["scenarios"]):
+        scenario_type = cast(TaskScenarioType, item["scenario_type"])
+        if scenario_type in scenario_types:
+            raise AgentTaskConflict("Execution scenarios are duplicated")
+        scenario_types.add(scenario_type)
+        state = cast(Literal["completed", "failed", "skipped"], item["state"])
+        scenario_started_at = _manifest_time(item["started_at"])
+        scenario_completed_at = _manifest_time(item["completed_at"])
+        if (
+            scenario_started_at < started_at
+            or scenario_completed_at < scenario_started_at
+            or scenario_completed_at > completed_at
+        ):
+            raise AgentTaskConflict("Execution scenario timestamps are invalid")
+        ids = tuple(UUID(value) for value in cast(list[str], item["artifact_ids"]))
+        if any(artifact_id not in artifact_ids for artifact_id in ids):
+            raise AgentTaskConflict("Execution scenario artifacts are invalid")
+        diagnostic_code = cast(str | None, item["diagnostic_code"])
+        if state == "completed":
+            if diagnostic_code is not None or not any(
+                by_artifact_id[artifact_id].kind == expected_kind[scenario_type]
+                for artifact_id in ids
+            ):
+                raise AgentTaskConflict("Completed scenario evidence is invalid")
+        elif diagnostic_code is None:
+            raise AgentTaskConflict("Failed scenario diagnostic is missing")
+        referenced_artifacts.update(ids)
+        scenarios.append(
+            AgentExecutionScenario(
+                scenario_type=scenario_type,
+                state=state,
+                started_at=scenario_started_at,
+                completed_at=scenario_completed_at,
+                temperature_start_c=cast(int | float | None, item["temperature_start_c"]),
+                temperature_end_c=cast(int | float | None, item["temperature_end_c"]),
+                artifact_ids=ids,
+                diagnostic_code=diagnostic_code,
+            )
+        )
+
+    if expected_scenarios and scenario_types != set(expected_scenarios):
+        raise AgentTaskConflict("Execution scenarios do not match the signed task")
+    if any(
+        artifact.artifact_id not in referenced_artifacts and artifact.kind != "agent_log"
+        for artifact in artifacts
+    ):
+        raise AgentTaskConflict("Execution artifact is not owned by a scenario")
+    manifest_state = cast(Literal["completed", "failed"], normalized["state"])
+    diagnostic_code = cast(str | None, normalized["diagnostic_code"])
+    if manifest_state == "completed":
+        if diagnostic_code is not None or not any(item.state == "completed" for item in scenarios):
+            raise AgentTaskConflict("Completed execution state is invalid")
+    elif diagnostic_code is None:
+        raise AgentTaskConflict("Failed execution diagnostic is missing")
+
+    return ValidatedAgentExecutionManifest(
+        execution_id=manifest_execution_id,
+        lease_version=manifest_lease_version,
+        state=manifest_state,
+        started_at=started_at,
+        completed_at=completed_at,
+        agent_version=cast(str, normalized["agent_version"]),
+        adb_version=cast(str, normalized["adb_version"]),
+        artifacts=tuple(artifacts),
+        scenarios=tuple(scenarios),
+        diagnostic_code=diagnostic_code,
+        document_hash=hashlib.sha256(canonical).hexdigest(),
+    )
+
+    async def project_completion(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None: ...
 
 
 class AgentTaskRepository(Protocol):
@@ -174,6 +427,24 @@ class AgentTaskRepository(Protocol):
         now: datetime,
     ) -> AgentExecutionAccess: ...
 
+    async def authorize_completion(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        manifest_digest: str,
+        now: datetime,
+    ) -> AgentExecutionAccess: ...
+
+    async def complete_execution(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> AgentExecutionCompletion: ...
+
 
 class AgentTaskWakeup(Protocol):
     async def wake(self, agent_id: UUID) -> None: ...
@@ -190,6 +461,9 @@ class _MemoryLease:
     acquired_at: datetime
     expires_at: datetime
     task_snapshot_digest: str | None = None
+    state: Literal["active", "released"] = "active"
+    completion_manifest_digest: str | None = None
+    completion: AgentExecutionCompletion | None = None
 
 
 class InMemoryAgentTaskRepository:
@@ -235,6 +509,7 @@ class InMemoryAgentTaskRepository:
                     lease
                     for lease in self._leases.values()
                     if lease.definition.analysis_id == definition.analysis_id
+                    and lease.state == "active"
                     and lease.expires_at > now
                 ),
                 None,
@@ -243,6 +518,7 @@ class InMemoryAgentTaskRepository:
                 return _scheduled(existing)
             if any(
                 lease.expires_at > now
+                and lease.state == "active"
                 and (
                     lease.definition.device_id == definition.device_id
                     or lease.definition.agent_id == definition.agent_id
@@ -270,7 +546,11 @@ class InMemoryAgentTaskRepository:
     ) -> ActiveAgentTask | None:
         _require_aware(now)
         for lease in self._leases.values():
-            if lease.definition.agent_id == agent_id and lease.expires_at > now:
+            if (
+                lease.definition.agent_id == agent_id
+                and lease.state == "active"
+                and lease.expires_at > now
+            ):
                 return ActiveAgentTask(
                     definition=lease.definition,
                     lease_id=lease.lease_id,
@@ -293,6 +573,7 @@ class InMemoryAgentTaskRepository:
         if (
             lease is None
             or lease.definition.agent_id != agent_id
+            or lease.state != "active"
             or lease.lease_version != lease_version
             or lease.expires_at <= now
         ):
@@ -309,7 +590,12 @@ class InMemoryAgentTaskRepository:
     ) -> LeaseRenewal:
         _require_aware(now)
         lease = self._leases.get(execution_id)
-        if lease is None or lease.definition.agent_id != agent_id or lease.expires_at <= now:
+        if (
+            lease is None
+            or lease.definition.agent_id != agent_id
+            or lease.state != "active"
+            or lease.expires_at <= now
+        ):
             raise AgentTaskNotFound
         if lease.lease_version != lease_version:
             raise StaleLeaseVersion
@@ -331,7 +617,12 @@ class InMemoryAgentTaskRepository:
     ) -> AgentExecutionAccess:
         _require_aware(now)
         lease = self._leases.get(execution_id)
-        if lease is None or lease.definition.agent_id != agent_id or lease.expires_at <= now:
+        if (
+            lease is None
+            or lease.definition.agent_id != agent_id
+            or lease.state != "active"
+            or lease.expires_at <= now
+        ):
             raise AgentTaskNotFound
         if lease.lease_version != lease_version:
             raise StaleLeaseVersion
@@ -342,7 +633,74 @@ class InMemoryAgentTaskRepository:
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
+            scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
         )
+
+    async def authorize_completion(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        manifest_digest: str,
+        now: datetime,
+    ) -> AgentExecutionAccess:
+        _require_aware(now)
+        lease = self._leases.get(execution_id)
+        if lease is None or lease.definition.agent_id != agent_id:
+            raise AgentTaskNotFound
+        if lease.lease_version != lease_version:
+            raise StaleLeaseVersion
+        if lease.state == "active" and lease.expires_at <= now:
+            raise AgentTaskNotFound
+        if lease.state == "released" and lease.completion_manifest_digest != manifest_digest:
+            raise AgentTaskConflict("Execution was already completed with another manifest")
+        return AgentExecutionAccess(
+            team_id=lease.definition.team_id,
+            analysis_id=lease.definition.analysis_id,
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            lease_expires_at=lease.expires_at,
+            scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
+        )
+
+    async def complete_execution(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> AgentExecutionCompletion:
+        lease = self._leases.get(access.execution_id)
+        if lease is None or lease.definition.agent_id != access.agent_id:
+            raise AgentTaskNotFound
+        if lease.state == "released":
+            if lease.completion_manifest_digest != manifest.document_hash:
+                raise AgentTaskConflict("Execution was already completed with another manifest")
+            if lease.completion is None:
+                raise AgentTaskUnavailable("Execution completion is unavailable")
+            return lease.completion
+        if (
+            lease.state != "active"
+            or lease.lease_version != access.lease_version
+            or lease.expires_at <= now
+        ):
+            raise AgentTaskNotFound
+        completion = AgentExecutionCompletion(
+            execution_id=access.execution_id,
+            analysis_id=access.analysis_id,
+            lease_version=access.lease_version,
+            analysis_state="analyzing" if manifest.state == "completed" else "failed",
+            accepted_at=now,
+        )
+        self._leases[access.execution_id] = replace(
+            lease,
+            state="released",
+            completion_manifest_digest=manifest.document_hash,
+            completion=completion,
+        )
+        return completion
 
     def snapshot_digest(self, execution_id: UUID) -> str | None:
         lease = self._leases.get(execution_id)
@@ -484,6 +842,59 @@ class AgentTaskService:
             lease_version=lease_version,
             now=_aware_now(now),
         )
+
+    async def complete(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        manifest_document: Mapping[str, object],
+        artifact_validator: AgentCompletionArtifactValidator,
+    ) -> AgentExecutionCompletion:
+        if (
+            isinstance(lease_version, bool)
+            or not isinstance(lease_version, int)
+            or lease_version < 1
+        ):
+            raise StaleLeaseVersion
+        now = _aware_now(self._clock())
+        preliminary = validate_agent_execution_manifest(
+            manifest_document,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            expected_scenarios=(),
+            now=now,
+        )
+        access = await self._repository.authorize_completion(
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            manifest_digest=preliminary.document_hash,
+            now=now,
+        )
+        manifest = validate_agent_execution_manifest(
+            manifest_document,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            expected_scenarios=access.scenario_types,
+            now=now,
+        )
+        await artifact_validator.validate_completion(
+            access=access,
+            manifest=manifest,
+        )
+        completion = await self._repository.complete_execution(
+            access=access,
+            manifest=manifest,
+            now=now,
+        )
+        await artifact_validator.project_completion(
+            access=access,
+            manifest=manifest,
+            now=now,
+        )
+        return completion
 
 
 class SQLAlchemyAgentTaskRepository:
@@ -788,6 +1199,17 @@ class SQLAlchemyAgentTaskRepository:
                     .where(AgentLease.execution_id == execution_id)
                 )
             ).one_or_none()
+            scenario_rows = (
+                ()
+                if row is None
+                else tuple(
+                    (
+                        await session.scalars(
+                            select(ScenarioJob).where(ScenarioJob.analysis_id == row[1].id)
+                        )
+                    ).all()
+                )
+            )
         if row is None:
             raise AgentTaskNotFound
         lease, job = row
@@ -807,7 +1229,235 @@ class SQLAlchemyAgentTaskRepository:
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
+            scenario_types=_control_scenario_types(scenario_rows),
         )
+
+    async def authorize_completion(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        manifest_digest: str,
+        now: datetime,
+    ) -> AgentExecutionAccess:
+        _require_aware(now)
+        async with self._control_sessions() as session:
+            row = (
+                await session.execute(
+                    select(AgentLease, GlobalJob)
+                    .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
+                    .where(AgentLease.execution_id == execution_id)
+                )
+            ).one_or_none()
+            scenario_rows = (
+                ()
+                if row is None
+                else tuple(
+                    (
+                        await session.scalars(
+                            select(ScenarioJob).where(ScenarioJob.analysis_id == row[1].id)
+                        )
+                    ).all()
+                )
+            )
+        if row is None:
+            raise AgentTaskNotFound
+        lease, job = row
+        if lease.agent_id != agent_id:
+            raise AgentTaskNotFound
+        if lease.version != lease_version:
+            raise StaleLeaseVersion
+        if lease.state == "active":
+            if lease.expires_at <= now or job.state not in ("scheduled", "running"):
+                raise AgentTaskNotFound
+        elif lease.state == "released":
+            if (
+                lease.completion_manifest_digest is None
+                or not secrets.compare_digest(
+                    lease.completion_manifest_digest,
+                    manifest_digest,
+                )
+                or job.state not in ("analyzing", "failed")
+            ):
+                raise AgentTaskConflict("Execution was already completed with another manifest")
+        else:
+            raise AgentTaskNotFound
+        return AgentExecutionAccess(
+            team_id=job.team_id,
+            analysis_id=job.id,
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            lease_expires_at=lease.expires_at,
+            scenario_types=_control_scenario_types(scenario_rows),
+        )
+
+    async def complete_execution(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> AgentExecutionCompletion:
+        async with self._control_sessions() as session:
+            async with session.begin():
+                row = (
+                    await session.execute(
+                        select(AgentLease, GlobalJob, Device)
+                        .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
+                        .join(Device, Device.id == AgentLease.device_id)
+                        .where(AgentLease.execution_id == access.execution_id)
+                        .with_for_update()
+                    )
+                ).one_or_none()
+                if row is None:
+                    raise AgentTaskNotFound
+                lease, job, device = row
+                if (
+                    lease.agent_id != access.agent_id
+                    or job.id != access.analysis_id
+                    or job.team_id != access.team_id
+                    or lease.version != access.lease_version
+                ):
+                    raise AgentTaskNotFound
+                if lease.state == "released":
+                    if (
+                        lease.completion_manifest_digest is None
+                        or not secrets.compare_digest(
+                            lease.completion_manifest_digest,
+                            manifest.document_hash,
+                        )
+                        or lease.released_at is None
+                        or job.state not in ("analyzing", "failed")
+                    ):
+                        raise AgentTaskConflict(
+                            "Execution was already completed with another manifest"
+                        )
+                    return AgentExecutionCompletion(
+                        execution_id=access.execution_id,
+                        analysis_id=access.analysis_id,
+                        lease_version=access.lease_version,
+                        analysis_state=cast(Literal["analyzing", "failed"], job.state),
+                        accepted_at=lease.released_at,
+                    )
+                if lease.state != "active" or lease.expires_at <= now:
+                    raise AgentTaskNotFound
+
+                scenario_rows = tuple(
+                    (
+                        await session.scalars(
+                            select(ScenarioJob)
+                            .where(ScenarioJob.analysis_id == access.analysis_id)
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                if _control_scenario_types(scenario_rows) != access.scenario_types:
+                    raise AgentTaskUnavailable("Execution scenarios are unavailable")
+                by_scenario = {
+                    _agent_scenario_type(row.scenario_type): row for row in scenario_rows
+                }
+                if set(by_scenario) != {item.scenario_type for item in manifest.scenarios}:
+                    raise AgentTaskConflict("Execution scenarios do not match")
+
+                lease.state = "released"
+                lease.released_at = now
+                lease.completion_manifest_digest = manifest.document_hash
+                lease.updated_at = now
+                other_lease = await session.scalar(
+                    select(AgentLease.id)
+                    .where(
+                        AgentLease.device_id == device.id,
+                        AgentLease.id != lease.id,
+                        AgentLease.state.in_(("active", "cancel_requested")),
+                    )
+                    .limit(1)
+                )
+                if other_lease is None:
+                    device.state = "ready"
+                    device.version += 1
+                    device.updated_at = now
+
+                if manifest.state == "failed":
+                    job.state = "failed"
+                    job.completed_at = now
+                    job.failure_code = manifest.diagnostic_code or "agent_execution_failed"
+                else:
+                    job.state = "analyzing"
+                    job.completed_at = None
+                    job.failure_code = None
+                job.version += 1
+                job.updated_at = now
+
+                manifest_scenarios = {item.scenario_type: item for item in manifest.scenarios}
+                for scenario_type, scenario_job in by_scenario.items():
+                    observed = manifest_scenarios[scenario_type]
+                    if manifest.state == "completed" and observed.state == "completed":
+                        scenario_job.state = "analyzing"
+                        scenario_job.failure_code = None
+                        scenario_job.completed_at = None
+                    else:
+                        scenario_job.state = "failed"
+                        scenario_job.failure_code = (
+                            observed.diagnostic_code
+                            or manifest.diagnostic_code
+                            or "agent_scenario_failed"
+                        )
+                        scenario_job.completed_at = now
+                    scenario_job.started_at = scenario_job.started_at or observed.started_at
+                    scenario_job.version += 1
+                    scenario_job.updated_at = now
+
+                completion_event_id = agent_execution_completed_event_id(access.execution_id)
+                if await session.get(OutboxEvent, completion_event_id) is None:
+                    session.add(
+                        OutboxEvent(
+                            id=completion_event_id,
+                            team_id=access.team_id,
+                            global_job_id=access.analysis_id,
+                            scenario_job_id=None,
+                            event_type="agent_execution_completed",
+                            subject_type="agent_execution",
+                            subject_id=access.execution_id,
+                            subject_version=access.lease_version,
+                            ready_at=now,
+                            published_at=None,
+                            dead_lettered_at=None,
+                            retry_count=0,
+                            version=1,
+                        )
+                    )
+                if manifest.state == "completed" and any(
+                    item.kind in ("startup_trace", "scroll_trace") for item in manifest.artifacts
+                ):
+                    trace_event_id = trace_analysis_ready_event_id(access.analysis_id)
+                    if await session.get(OutboxEvent, trace_event_id) is None:
+                        session.add(
+                            OutboxEvent(
+                                id=trace_event_id,
+                                team_id=access.team_id,
+                                global_job_id=access.analysis_id,
+                                scenario_job_id=None,
+                                event_type="trace_analysis_ready",
+                                subject_type="analysis",
+                                subject_id=access.analysis_id,
+                                subject_version=job.version,
+                                ready_at=now,
+                                published_at=None,
+                                dead_lettered_at=None,
+                                retry_count=0,
+                                version=1,
+                            )
+                        )
+                await session.flush()
+                return AgentExecutionCompletion(
+                    execution_id=access.execution_id,
+                    analysis_id=access.analysis_id,
+                    lease_version=access.lease_version,
+                    analysis_state="analyzing" if manifest.state == "completed" else "failed",
+                    accepted_at=now,
+                )
 
 
 def _task_claims(task: ActiveAgentTask, *, issued_at: datetime) -> dict[str, object]:
@@ -863,6 +1513,27 @@ def _scheduled(lease: _MemoryLease) -> ScheduledAgentTask:
         lease_version=lease.lease_version,
         lease_expires_at=lease.expires_at,
     )
+
+
+def agent_execution_completed_event_id(execution_id: UUID) -> UUID:
+    return uuid5(_EVENT_NAMESPACE, f"agent_execution_completed:{execution_id}")
+
+
+def _agent_scenario_type(value: str) -> TaskScenarioType:
+    if value == "cold_start":
+        return "startup"
+    if value in ("scroll", "memory_cycle"):
+        return cast(TaskScenarioType, value)
+    raise AgentTaskUnavailable("Execution scenarios are unavailable")
+
+
+def _control_scenario_types(rows: Sequence[ScenarioJob]) -> tuple[TaskScenarioType, ...]:
+    observed = {_agent_scenario_type(row.scenario_type) for row in rows}
+    return tuple(
+        scenario_type
+        for scenario_type in ("startup", "scroll", "memory_cycle")
+        if scenario_type in observed
+    )  # type: ignore[return-value]
 
 
 def _agent_is_idle(agent: Agent) -> bool:
@@ -929,9 +1600,13 @@ def _aware_now(value: datetime) -> datetime:
 
 __all__ = [
     "ActiveAgentTask",
+    "AgentExecutionAccess",
+    "AgentExecutionArtifact",
+    "AgentExecutionCompletion",
+    "AgentExecutionScenario",
     "AgentTaskDefinition",
     "AgentTaskDelivery",
-    "AgentExecutionAccess",
+    "AgentTaskConflict",
     "AgentTaskError",
     "AgentTaskNotFound",
     "AgentTaskService",
@@ -945,4 +1620,7 @@ __all__ = [
     "StaleLeaseVersion",
     "TaskInputArtifact",
     "TaskScenario",
+    "ValidatedAgentExecutionManifest",
+    "agent_execution_completed_event_id",
+    "validate_agent_execution_manifest",
 ]

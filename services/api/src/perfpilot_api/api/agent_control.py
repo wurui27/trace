@@ -23,6 +23,7 @@ from perfpilot_api.services.device_directory import (
     DeviceHeartbeatRejected,
 )
 from perfpilot_api.services.agent_tasks import (
+    AgentTaskConflict,
     AgentTaskNotFound,
     AgentTaskService,
     AgentTaskUnavailable,
@@ -200,6 +201,91 @@ class CompleteAgentUploadRequest(BaseModel):
     schema_version: Literal["1.0"]
     lease_version: int = Field(strict=True, ge=1)
     parts: tuple[AgentUploadCompletedPart, ...] = Field(min_length=1, max_length=10_000)
+
+
+class AgentExecutionArtifactPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_id: UUID
+    kind: Literal["startup_trace", "scroll_trace", "memory_evidence", "agent_log"]
+    mime: str = Field(
+        min_length=3,
+        max_length=255,
+        pattern=r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$",
+    )
+    size: int = Field(strict=True, ge=1, le=512 * 1024 * 1024)
+    sha256_b64: str = Field(
+        min_length=44,
+        max_length=44,
+        pattern=r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$",
+    )
+
+
+class AgentExecutionScenarioPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scenario_type: Literal["startup", "scroll", "memory_cycle"]
+    state: Literal["completed", "failed", "skipped"]
+    started_at: datetime
+    completed_at: datetime
+    temperature_start_c: Decimal | None = Field(default=None, ge=-100, le=200)
+    temperature_end_c: Decimal | None = Field(default=None, ge=-100, le=200)
+    artifact_ids: tuple[UUID, ...] = Field(max_length=16)
+    diagnostic_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=96,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+
+    @field_validator("started_at", "completed_at")
+    @classmethod
+    def require_aware_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("execution timestamps must include a timezone")
+        return value
+
+
+class CompleteAgentExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    execution_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    state: Literal["completed", "failed"]
+    started_at: datetime
+    completed_at: datetime
+    agent_version: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=_AGENT_VERSION_PATTERN,
+    )
+    adb_version: str = Field(
+        min_length=1,
+        max_length=128,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
+    )
+    artifacts: tuple[AgentExecutionArtifactPayload, ...] = Field(
+        min_length=1,
+        max_length=32,
+    )
+    scenarios: tuple[AgentExecutionScenarioPayload, ...] = Field(
+        min_length=1,
+        max_length=3,
+    )
+    diagnostic_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=96,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+
+    @field_validator("started_at", "completed_at")
+    @classmethod
+    def require_aware_time(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("execution timestamps must include a timezone")
+        return value
 
 
 def _reject_browser_credentials(request: Request) -> None:
@@ -466,6 +552,46 @@ async def renew_task(
         "lease_version": renewal.lease_version,
         "lease_expires_at": _utc(renewal.lease_expires_at),
         "renew_after_seconds": renewal.renew_after_seconds,
+    }
+
+
+@router.post("/tasks/{execution_id}/complete")
+async def complete_agent_execution(
+    execution_id: UUID,
+    payload: CompleteAgentExecutionRequest,
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    task_service: Annotated[AgentTaskService, Depends(get_agent_task_service)],
+    upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        completion = await task_service.complete(
+            agent_id=principal.agent_id,
+            execution_id=execution_id,
+            lease_version=payload.lease_version,
+            manifest_document=payload.model_dump(mode="json"),
+            artifact_validator=upload_service,
+        )
+    except StaleLeaseVersion:
+        raise ApiError("stale_lease_version", "租约版本已经变化", 409, True) from None
+    except AgentTaskConflict:
+        raise ApiError("execution_manifest_conflict", "执行结果校验失败", 409, False) from None
+    except AgentTaskNotFound:
+        raise ApiError("resource_not_found", "资源不存在", 404, False) from None
+    except AgentUploadError as error:
+        _raise_agent_upload_error(error)
+    except AgentTaskUnavailable:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "execution_id": str(completion.execution_id),
+        "analysis_id": str(completion.analysis_id),
+        "lease_version": completion.lease_version,
+        "analysis_state": completion.analysis_state,
+        "accepted_at": _utc(completion.accepted_at),
     }
 
 

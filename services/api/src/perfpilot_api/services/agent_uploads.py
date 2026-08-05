@@ -17,12 +17,18 @@ from uuid import UUID, uuid4
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from perfpilot_api.db.tenant.models import Analysis, Artifact, ArtifactMultipartUpload
+from perfpilot_api.db.tenant.models import (
+    Analysis,
+    Artifact,
+    ArtifactMultipartUpload,
+    ScenarioResult,
+)
 from perfpilot_api.db.tenant.router import TenantRouter
 from perfpilot_api.services.agent_tasks import (
     AgentExecutionAccess,
     AgentTaskNotFound,
     StaleLeaseVersion,
+    ValidatedAgentExecutionManifest,
 )
 from perfpilot_api.services.uploads import BucketResolver, TenantBucket
 from perfpilot_api.storage.base import (
@@ -195,6 +201,23 @@ class AgentUploadRepository(Protocol):
         expires_at: datetime,
     ) -> StoredAgentUpload: ...
 
+    async def validate_completion(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+    ) -> None: ...
+
+    async def project_completion(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None: ...
+
 
 class InMemoryAgentUploadRepository:
     def __init__(self) -> None:
@@ -318,6 +341,31 @@ class InMemoryAgentUploadRepository:
         )
         self._uploads[upload_id] = stored
         return stored
+
+    async def validate_completion(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+    ) -> None:
+        del tenant
+        stored = tuple(
+            item
+            for item in self._uploads.values()
+            if item.execution_id == access.execution_id and item.state == "finalized"
+        )
+        _match_completion_artifacts(stored, manifest)
+
+    async def project_completion(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None:
+        del tenant, access, manifest, now
 
 
 class SQLAlchemyAgentUploadRepository:
@@ -572,6 +620,102 @@ class SQLAlchemyAgentUploadRepository:
             await session.flush()
             return self._stored(artifact, multipart)
 
+    async def validate_completion(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+    ) -> None:
+        async with self._session(tenant) as session:
+            rows = tuple(
+                (
+                    await session.execute(
+                        select(Artifact, ArtifactMultipartUpload)
+                        .join(
+                            ArtifactMultipartUpload,
+                            ArtifactMultipartUpload.artifact_id == Artifact.id,
+                        )
+                        .where(
+                            Artifact.analysis_id == access.analysis_id,
+                            ArtifactMultipartUpload.execution_id == access.execution_id,
+                            Artifact.deleted_at.is_(None),
+                        )
+                    )
+                ).all()
+            )
+        stored = tuple(self._stored(*row) for row in rows)
+        _match_completion_artifacts(
+            tuple(item for item in stored if item.state == "finalized"),
+            manifest,
+        )
+
+    async def project_completion(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None:
+        async with self._session(tenant) as session:
+            analysis = await session.scalar(
+                select(Analysis)
+                .where(
+                    Analysis.id == access.analysis_id,
+                    Analysis.analysis_mode == "device",
+                    Analysis.tombstoned_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if analysis is None:
+                raise AgentUploadNotFound("analysis was not found")
+            scenario_rows = tuple(
+                (
+                    await session.scalars(
+                        select(ScenarioResult)
+                        .where(ScenarioResult.analysis_id == access.analysis_id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            by_type = {
+                "startup" if row.scenario_type == "cold_start" else row.scenario_type: row
+                for row in scenario_rows
+            }
+            if set(by_type) != {item.scenario_type for item in manifest.scenarios}:
+                raise AgentUploadUnavailable("scenario projection is unavailable")
+            if manifest.state == "failed":
+                analysis.state = "failed"
+                analysis.completed_at = now
+                analysis.failure_code = manifest.diagnostic_code or "agent_execution_failed"
+            else:
+                analysis.state = "analyzing"
+                analysis.completed_at = None
+                analysis.failure_code = None
+            analysis.started_at = analysis.started_at or manifest.started_at
+            analysis.version += 1
+            analysis.updated_at = now
+            manifest_scenarios = {item.scenario_type: item for item in manifest.scenarios}
+            for scenario_type, result in by_type.items():
+                observed = manifest_scenarios[scenario_type]
+                if manifest.state == "completed" and observed.state == "completed":
+                    result.state = "analyzing"
+                    result.failure_code = None
+                    result.completed_at = None
+                else:
+                    result.state = "failed"
+                    result.failure_code = (
+                        observed.diagnostic_code
+                        or manifest.diagnostic_code
+                        or "agent_scenario_failed"
+                    )
+                    result.completed_at = now
+                result.started_at = result.started_at or observed.started_at
+                result.version += 1
+                result.updated_at = now
+            await session.flush()
+
 
 class AgentUploadService:
     def __init__(
@@ -773,6 +917,38 @@ class AgentUploadService:
         )
         return _slot(finalized)
 
+    async def validate_completion(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+    ) -> None:
+        tenant = await _available(self._bucket_resolver.active_for_team(access.team_id))
+        await _available(
+            self._repository.validate_completion(
+                tenant=tenant,
+                access=access,
+                manifest=manifest,
+            )
+        )
+
+    async def project_completion(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None:
+        tenant = await _available(self._bucket_resolver.active_for_team(access.team_id))
+        await _available(
+            self._repository.project_completion(
+                tenant=tenant,
+                access=access,
+                manifest=manifest,
+                now=now,
+            )
+        )
+
     async def _authorize(
         self,
         *,
@@ -834,6 +1010,26 @@ def _validate_descriptor(
     if part_count < 1 or part_count > _MAX_PARTS:
         raise AgentUploadInvalidRequest("upload request is invalid")
     return AgentUploadDescriptor(artifact_kind, mime, size, sha256_b64)
+
+
+def _match_completion_artifacts(
+    stored: tuple[StoredAgentUpload, ...],
+    manifest: ValidatedAgentExecutionManifest,
+) -> None:
+    by_id = {item.artifact_id: item for item in stored}
+    if len(by_id) != len(stored) or set(by_id) != {item.artifact_id for item in manifest.artifacts}:
+        raise AgentUploadMismatch("execution artifacts do not match finalized uploads")
+    for artifact in manifest.artifacts:
+        observed = by_id[artifact.artifact_id]
+        if (
+            observed.state != "finalized"
+            or observed.execution_id != manifest.execution_id
+            or observed.artifact_kind != artifact.kind
+            or observed.mime != artifact.mime
+            or observed.size != artifact.size
+            or not hmac.compare_digest(observed.sha256_b64, artifact.sha256_b64)
+        ):
+            raise AgentUploadMismatch("execution artifacts do not match finalized uploads")
 
 
 def _validate_parts(

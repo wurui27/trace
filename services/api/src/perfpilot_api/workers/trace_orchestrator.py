@@ -271,7 +271,7 @@ class SQLAlchemyTraceWorkQueueRepository:
             and event.ready_at is not None
             and event.published_at is None
             and event.dead_lettered_at is None
-            and job.analysis_mode == "trace_upload"
+            and job.analysis_mode in ("trace_upload", "device")
             and job.state in _PARENT_TERMINAL_STATES | {"analyzing"}
         )
 
@@ -329,7 +329,7 @@ class SQLAlchemyTraceWorkQueueRepository:
                         OutboxEvent.ready_at <= now,
                         OutboxEvent.published_at.is_(None),
                         OutboxEvent.dead_lettered_at.is_(None),
-                        GlobalJob.analysis_mode == "trace_upload",
+                        GlobalJob.analysis_mode.in_(("trace_upload", "device")),
                         GlobalJob.state.in_(_PARENT_TERMINAL_STATES | {"analyzing"}),
                         ~active_claim,
                     )

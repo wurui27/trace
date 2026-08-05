@@ -226,6 +226,11 @@ class AgentLease(
             "task_snapshot_digest ~ '^[0-9a-f]{64}$'",
             name="ck_agent_leases_task_snapshot_digest",
         ),
+        CheckConstraint(
+            "completion_manifest_digest IS NULL OR "
+            "completion_manifest_digest ~ '^[0-9a-f]{64}$'",
+            name="ck_agent_leases_completion_manifest_digest",
+        ),
         CheckConstraint("version > 0", name="ck_agent_leases_version_positive"),
         UniqueConstraint("execution_id", name="uq_agent_leases_execution_id"),
         Index("ix_agent_leases_agent_id", "agent_id"),
@@ -267,3 +272,4 @@ class AgentLease(
         DateTime(timezone=True)
     )
     task_snapshot_digest: Mapped[str | None] = mapped_column(String(64))
+    completion_manifest_digest: Mapped[str | None] = mapped_column(String(64))

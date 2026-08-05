@@ -264,6 +264,68 @@ async def test_prepare_claims_only_supported_finalized_trace_and_reuses_one_atte
 
 
 @pytest.mark.asyncio
+async def test_device_capture_aliases_finalized_startup_trace_for_smartperfetto() -> None:
+    source = _artifact(
+        TRACE_ID,
+        kind="trace",
+        mime="application/x-perfetto-trace",
+        size=5,
+        checksum=TRACE_CHECKSUM,
+        state="finalized",
+    )
+    source = replace(source, source_artifact_kind="startup_trace")
+
+    class DeviceRepository(FakeRepository):
+        async def load_analysis(self, **_: object) -> LoadedTraceAnalysis:
+            return LoadedTraceAnalysis(
+                analysis_id=ANALYSIS_ID,
+                analysis_mode="device",
+                analysis_state="analyzing",
+                tombstoned_at=None,
+                tenant_resource_version=7,
+                analysis_profile="startup",
+                question=None,
+                input_manifest=(
+                    {
+                        "kind": "trace",
+                        "mime": "application/x-perfetto-trace",
+                        "size": 5,
+                        "sha256_b64": TRACE_CHECKSUM,
+                    },
+                ),
+                input_artifacts=(source,),
+                latest_execution=self.latest,
+            )
+
+    class DeviceUploads(FakeUploads):
+        async def download(self, **kwargs: object) -> DownloadAuthorization:
+            self.calls.append(kwargs)
+            return DownloadAuthorization(
+                artifact_id=TRACE_ID,
+                tenant_resource_version=7,
+                artifact_version=2,
+                artifact_kind="startup_trace",
+                mime="application/x-perfetto-trace",
+                size=5,
+                sha256_b64=TRACE_CHECKSUM,
+                url="https://claims.invalid/device-trace",
+                expires_at=NOW + timedelta(minutes=5),
+            )
+
+    repository = DeviceRepository()
+    uploads = DeviceUploads()
+    executions = FakeEngineExecutions(repository)
+    service = _service(repository, uploads, executions)
+
+    prepared = await service.prepare(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+
+    assert prepared.analysis_profile == "startup"
+    assert len(prepared.inputs) == 1
+    assert prepared.inputs[0].kind == "trace"
+    assert uploads.calls[0]["artifact_id"] == TRACE_ID
+
+
+@pytest.mark.asyncio
 async def test_advance_submits_pending_then_resumes_running_without_another_attempt() -> None:
     repository = FakeRepository()
     uploads = FakeUploads()

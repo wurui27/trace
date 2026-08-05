@@ -83,6 +83,7 @@ class TraceExecutionArtifact:
     state: str
     expires_at: datetime
     deleted_at: datetime | None
+    source_artifact_kind: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -319,7 +320,7 @@ class TraceExecutionService:
         if (
             not isinstance(loaded, LoadedTraceAnalysis)
             or loaded.analysis_id != analysis_id
-            or loaded.analysis_mode != "trace_upload"
+            or loaded.analysis_mode not in ("trace_upload", "device")
             or loaded.analysis_state == "deleted"
             or loaded.tombstoned_at is not None
             or type(loaded.tenant_resource_version) is not int
@@ -432,7 +433,8 @@ class TraceExecutionService:
             or authorization.artifact_id != artifact.artifact_id
             or authorization.tenant_resource_version != resource_version
             or authorization.artifact_version != artifact.version
-            or authorization.artifact_kind != artifact.artifact_kind
+            or authorization.artifact_kind
+            != (artifact.source_artifact_kind or artifact.artifact_kind)
             or authorization.mime != artifact.mime_type
             or authorization.size != artifact.size_bytes
             or not hmac.compare_digest(authorization.sha256_b64, artifact.sha256_b64)
@@ -667,13 +669,18 @@ class SQLAlchemyTraceExecutionRepository:
         )
 
     @staticmethod
-    def _artifact(row: Artifact) -> TraceExecutionArtifact:
+    def _artifact(
+        row: Artifact,
+        *,
+        artifact_kind: str | None = None,
+        source_artifact_kind: str | None = None,
+    ) -> TraceExecutionArtifact:
         if row.analysis_id is None:
             raise TraceExecutionNotFoundError
         return TraceExecutionArtifact(
             artifact_id=row.id,
             analysis_id=row.analysis_id,
-            artifact_kind=row.artifact_kind,
+            artifact_kind=artifact_kind or row.artifact_kind,
             mime_type=row.mime_type,
             size_bytes=row.size_bytes,
             sha256_b64=row.sha256_b64,
@@ -681,6 +688,7 @@ class SQLAlchemyTraceExecutionRepository:
             state=row.state,
             expires_at=row.expires_at,
             deleted_at=row.deleted_at,
+            source_artifact_kind=source_artifact_kind,
         )
 
     async def load_analysis(
@@ -694,7 +702,7 @@ class SQLAlchemyTraceExecutionRepository:
                 select(GlobalJob).where(
                     GlobalJob.id == analysis_id,
                     GlobalJob.team_id == team_id,
-                    GlobalJob.analysis_mode == "trace_upload",
+                    GlobalJob.analysis_mode.in_(("trace_upload", "device")),
                 )
             )
             latest = await session.scalar(
@@ -713,26 +721,68 @@ class SQLAlchemyTraceExecutionRepository:
         async with self._tenant_router.session(team_id) as session:
             routed_version = session.info.get("tenant_resource_version")
             analysis = await session.get(Analysis, analysis_id)
-            artifacts = tuple(
-                self._artifact(row)
-                for row in (
-                    await session.scalars(
-                        select(Artifact).where(
-                            Artifact.analysis_id == analysis_id,
-                            Artifact.idempotency_key.like("input-%"),
-                            Artifact.deleted_at.is_(None),
+            if analysis is None:
+                artifact_rows: tuple[Artifact, ...] = ()
+            elif analysis.analysis_mode == "trace_upload":
+                artifact_rows = tuple(
+                    (
+                        await session.scalars(
+                            select(Artifact).where(
+                                Artifact.analysis_id == analysis_id,
+                                Artifact.idempotency_key.like("input-%"),
+                                Artifact.deleted_at.is_(None),
+                            )
                         )
-                    )
-                ).all()
+                    ).all()
+                )
+            else:
+                artifact_rows = tuple(
+                    (
+                        await session.scalars(
+                            select(Artifact).where(
+                                Artifact.analysis_id == analysis_id,
+                                Artifact.artifact_kind.in_(("startup_trace", "scroll_trace")),
+                                Artifact.state == "finalized",
+                                Artifact.deleted_at.is_(None),
+                            )
+                        )
+                    ).all()
+                )
+        if analysis is None or type(routed_version) is not int or routed_version < 1:
+            raise TraceExecutionNotFoundError
+        if analysis.analysis_mode == "trace_upload":
+            if not isinstance(analysis.input_manifest, list) or not all(
+                isinstance(item, dict) for item in analysis.input_manifest
+            ):
+                raise TraceExecutionNotFoundError
+            manifest = tuple(dict(item) for item in analysis.input_manifest)
+            artifacts = tuple(self._artifact(row) for row in artifact_rows)
+            analysis_profile = analysis.analysis_profile or ""
+            question = analysis.question
+        elif analysis.analysis_mode == "device":
+            by_kind = {row.artifact_kind: row for row in artifact_rows}
+            selected = by_kind.get("startup_trace") or by_kind.get("scroll_trace")
+            if selected is None:
+                raise TraceExecutionNotFoundError
+            profile = "startup" if selected.artifact_kind == "startup_trace" else "scroll"
+            manifest = (
+                {
+                    "kind": "trace",
+                    "mime": selected.mime_type,
+                    "size": selected.size_bytes,
+                    "sha256_b64": selected.sha256_b64,
+                },
             )
-        if (
-            analysis is None
-            or analysis.analysis_mode != "trace_upload"
-            or type(routed_version) is not int
-            or routed_version < 1
-            or not isinstance(analysis.input_manifest, list)
-            or not all(isinstance(item, dict) for item in analysis.input_manifest)
-        ):
+            artifacts = (
+                self._artifact(
+                    selected,
+                    artifact_kind="trace",
+                    source_artifact_kind=selected.artifact_kind,
+                ),
+            )
+            analysis_profile = profile
+            question = None
+        else:
             raise TraceExecutionNotFoundError
         return LoadedTraceAnalysis(
             analysis_id=analysis.id,
@@ -740,9 +790,9 @@ class SQLAlchemyTraceExecutionRepository:
             analysis_state=analysis.state,
             tombstoned_at=analysis.tombstoned_at,
             tenant_resource_version=routed_version,
-            analysis_profile=analysis.analysis_profile or "",
-            question=analysis.question,
-            input_manifest=tuple(dict(item) for item in analysis.input_manifest),
+            analysis_profile=analysis_profile,
+            question=question,
+            input_manifest=manifest,
             input_artifacts=artifacts,
             latest_execution=self._execution(latest) if latest is not None else None,
         )
@@ -844,7 +894,7 @@ class SQLAlchemyTraceExecutionRepository:
             analysis = await session.scalar(
                 select(Analysis).where(Analysis.id == analysis_id).with_for_update()
             )
-            if analysis is None or analysis.analysis_mode != "trace_upload":
+            if analysis is None or analysis.analysis_mode not in ("trace_upload", "device"):
                 raise TraceExecutionNotFoundError
             if self._validate_projection(
                 current_state=analysis.state,
@@ -879,7 +929,7 @@ class SQLAlchemyTraceExecutionRepository:
                     .where(
                         GlobalJob.id == analysis_id,
                         GlobalJob.team_id == team_id,
-                        GlobalJob.analysis_mode == "trace_upload",
+                        GlobalJob.analysis_mode.in_(("trace_upload", "device")),
                     )
                     .with_for_update()
                 )

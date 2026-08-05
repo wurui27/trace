@@ -568,6 +568,7 @@ def test_remote_agent_schema_enforces_identity_states_and_ownership(
         lease_columns[name]["nullable"] is False
         for name in ("execution_id", "device_id", "agent_id", "renewed_at", "state")
     )
+    assert lease_columns["completion_manifest_digest"]["nullable"] is True
     assert "serial" not in device_columns
 
     checks = {
@@ -603,6 +604,7 @@ def test_remote_agent_schema_enforces_identity_states_and_ownership(
         "expired",
         "revoked",
     }
+    assert "ck_agent_leases_completion_manifest_digest" in checks["agent_leases"]
     device_selection = checks["global_jobs"]["ck_global_jobs_device_selection"]
     assert "analysis_mode<>'device'andselected_device_idisnull" in device_selection
     assert "analysis_mode='device'" in device_selection
@@ -885,7 +887,7 @@ def test_control_execution_tenant_version_migration_round_trips_empty_table(
     assert tenant_version["default"] is None
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0010_device_task_leases"
+            "0011_agent_execution_completion"
         )
 
     command.downgrade(config, "0005_memory_upload_mode")
@@ -988,7 +990,7 @@ def test_control_execution_tenant_version_downgrade_refuses_rows(
 
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0010_device_task_leases"
+            "0011_agent_execution_completion"
         )
     assert "tenant_resource_version" in {
         column["name"]
@@ -2059,7 +2061,7 @@ def test_control_ai_synthesis_downgrade_refuses_audit_records(
         assert connection.scalar(text("SELECT count(*) FROM synthesis_executions")) == 1
         assert connection.scalar(text("SELECT count(*) FROM ai_invocations")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0010_device_task_leases"
+            "0011_agent_execution_completion"
         )
 
 
@@ -2112,7 +2114,7 @@ def test_control_ai_synthesis_downgrade_refuses_retained_outbox_authority(
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM outbox_events")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0010_device_task_leases"
+            "0011_agent_execution_completion"
         )
 
 
@@ -2236,7 +2238,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
 @pytest.mark.parametrize(
     ("tree", "downgrade_revision", "head_revision"),
     [
-        ("control", "0004_external_engine_foundation", "0010_device_task_leases"),
+        ("control", "0004_external_engine_foundation", "0011_agent_execution_completion"),
         ("tenant", "0003_analysis_orchestration", "0008_agent_multipart_uploads"),
     ],
 )
@@ -2292,7 +2294,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "control",
             "0004_external_engine_foundation",
-            "0010_device_task_leases",
+            "0011_agent_execution_completion",
             "global_jobs",
             "ck_global_jobs_analysis_mode",
         ),

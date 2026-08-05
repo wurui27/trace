@@ -85,6 +85,11 @@ from perfpilot_api.services.agent_tasks import (
     AgentTaskService,
     InMemoryAgentTaskWakeup,
     SQLAlchemyAgentTaskRepository,
+    agent_execution_completed_event_id,
+)
+from perfpilot_api.services.agent_uploads import (
+    AgentUploadDescriptor,
+    SQLAlchemyAgentUploadRepository,
 )
 from perfpilot_api.reports.writer import (
     AnalysisReportWriteRequest,
@@ -100,6 +105,7 @@ from perfpilot_api.services.uploads import (
     TenantBucket,
     UploadDescriptor,
 )
+from perfpilot_api.storage.base import MultipartPart
 from perfpilot_api.workers.trace_orchestrator import (
     SQLAlchemyTraceWorkQueueRepository,
 )
@@ -2530,6 +2536,234 @@ async def test_scheduler_leases_selected_device_and_persists_only_snapshot_diges
     assert lease is not None
     assert lease.task_snapshot_digest == snapshot_digest(task.snapshot_jws)
     assert task.snapshot_jws not in repr(lease)
+
+
+@pytest.mark.asyncio
+async def test_agent_completion_releases_device_and_queues_trace_analysis_exactly_once(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    prepared = await _persist_metadata_and_stage(analysis_databases)
+    scheduled_at = NOW + timedelta(minutes=3)
+    completion_at = scheduled_at + timedelta(seconds=30)
+    await analysis_databases.repository.queue_control_scenarios(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=ARTIFACT_ID,
+        scenarios=prepared,
+        requirements=SchedulingRequirements(
+            min_api_level=28,
+            supported_abis=("arm64-v8a", "x86_64"),
+        ),
+        now=scheduled_at,
+    )
+    async with analysis_databases.control_sessions.begin() as session:
+        agent = await session.get(Agent, AGENT_ID)
+        device = await session.get(Device, DEVICE_ID)
+        assert agent is not None and device is not None
+        agent.last_heartbeat_at = scheduled_at
+        agent.state = "online"
+        device.last_seen_at = scheduled_at
+        device.state = "ready"
+        device.adb_state = "device"
+
+    execution_id = UUID("73000000-0000-4000-8000-000000000011")
+    clock = [scheduled_at]
+    service = AgentTaskService(
+        repository=SQLAlchemyAgentTaskRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+            lease_id_source=lambda: UUID("75000000-0000-4000-8000-000000000011"),
+            execution_id_source=lambda: execution_id,
+            lease_token_source=lambda: b"completion-token" * 2,
+        ),
+        signer=TaskSnapshotSigner(
+            private_key=Ed25519PrivateKey.generate(),
+            kid="lan-completion",
+            clock=lambda: clock[0],
+        ),
+        wakeup=InMemoryAgentTaskWakeup(),
+        clock=lambda: clock[0],
+    )
+    scheduled = await service.schedule(analysis_id=ANALYSIS_ID)
+    assert scheduled is not None
+    access = await service.authorize_execution(
+        agent_id=AGENT_ID,
+        execution_id=execution_id,
+        lease_version=1,
+        now=scheduled_at,
+    )
+    tenant = TenantBucket(team_id=TEAM_ID, bucket="unused", resource_version=1)
+    upload_repository = SQLAlchemyAgentUploadRepository(
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    )
+    artifact_specs = (
+        (
+            UUID("76000000-0000-4000-8000-000000000011"),
+            UUID("77000000-0000-4000-8000-000000000011"),
+            "startup_trace",
+            "application/x-perfetto-trace",
+        ),
+        (
+            UUID("76000000-0000-4000-8000-000000000012"),
+            UUID("77000000-0000-4000-8000-000000000012"),
+            "scroll_trace",
+            "application/x-perfetto-trace",
+        ),
+        (
+            UUID("76000000-0000-4000-8000-000000000013"),
+            UUID("77000000-0000-4000-8000-000000000013"),
+            "memory_evidence",
+            "application/zip",
+        ),
+    )
+    for artifact_id, upload_id, kind, mime in artifact_specs:
+        await upload_repository.reserve_upload(
+            tenant=tenant,
+            access=access,
+            descriptor=AgentUploadDescriptor(kind, mime, 4, CHECKSUM),
+            artifact_id=artifact_id,
+            upload_id=upload_id,
+            object_key=f"raw/agent/{execution_id}/{kind}",
+            storage_upload_id=f"storage-{kind}",
+            part_size_bytes=64 * 1024 * 1024,
+            part_count=1,
+            now=scheduled_at,
+            expires_at=scheduled_at + timedelta(minutes=15),
+        )
+        await upload_repository.prepare_completion(
+            tenant=tenant,
+            access=access,
+            upload_id=upload_id,
+            parts=(MultipartPart(part_number=1, etag='"etag-1"'),),
+            now=scheduled_at,
+        )
+        await upload_repository.finalize_upload(
+            tenant=tenant,
+            access=access,
+            upload_id=upload_id,
+            storage_version_id=f"version-{kind}",
+            now=scheduled_at,
+            expires_at=scheduled_at + timedelta(days=30),
+        )
+
+    class CompletionArtifacts:
+        async def validate_completion(self, **kwargs: object) -> None:
+            await upload_repository.validate_completion(tenant=tenant, **kwargs)
+
+        async def project_completion(self, **kwargs: object) -> None:
+            await upload_repository.project_completion(tenant=tenant, **kwargs)
+
+    manifest = {
+        "schema_version": "1.0",
+        "execution_id": str(execution_id),
+        "lease_version": 1,
+        "state": "completed",
+        "started_at": scheduled_at.isoformat(),
+        "completed_at": completion_at.isoformat(),
+        "agent_version": "0.1.0",
+        "adb_version": "Android Debug Bridge version 1.0.41",
+        "artifacts": [
+            {
+                "artifact_id": str(artifact_id),
+                "kind": kind,
+                "mime": mime,
+                "size": 4,
+                "sha256_b64": CHECKSUM,
+            }
+            for artifact_id, _upload_id, kind, mime in artifact_specs
+        ],
+        "scenarios": [
+            {
+                "scenario_type": scenario_type,
+                "state": "completed",
+                "started_at": scheduled_at.isoformat(),
+                "completed_at": completion_at.isoformat(),
+                "temperature_start_c": 31.0,
+                "temperature_end_c": 32.0,
+                "artifact_ids": [str(artifact_specs[index][0])],
+                "diagnostic_code": None,
+            }
+            for index, scenario_type in enumerate(("startup", "scroll", "memory_cycle"))
+        ],
+        "diagnostic_code": None,
+    }
+    clock[0] = completion_at
+    completion = await service.complete(
+        agent_id=AGENT_ID,
+        execution_id=execution_id,
+        lease_version=1,
+        manifest_document=manifest,
+        artifact_validator=CompletionArtifacts(),
+    )
+    replayed = await service.complete(
+        agent_id=AGENT_ID,
+        execution_id=execution_id,
+        lease_version=1,
+        manifest_document=manifest,
+        artifact_validator=CompletionArtifacts(),
+    )
+
+    assert replayed == completion
+    assert completion.analysis_state == "analyzing"
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        device = await session.get(Device, DEVICE_ID)
+        lease = await session.scalar(
+            select(AgentLease).where(AgentLease.execution_id == execution_id)
+        )
+        scenarios = tuple(
+            (
+                await session.scalars(
+                    select(ScenarioJob).where(ScenarioJob.analysis_id == ANALYSIS_ID)
+                )
+            ).all()
+        )
+        events = tuple(
+            (
+                await session.scalars(
+                    select(OutboxEvent).where(OutboxEvent.global_job_id == ANALYSIS_ID)
+                )
+            ).all()
+        )
+    async with analysis_databases.tenant_sessions() as session:
+        tenant_analysis = await session.get(Analysis, ANALYSIS_ID)
+        tenant_scenarios = tuple(
+            (
+                await session.scalars(
+                    select(ScenarioResult).where(ScenarioResult.analysis_id == ANALYSIS_ID)
+                )
+            ).all()
+        )
+    assert job is not None and job.state == "analyzing"
+    assert device is not None and device.state == "ready"
+    assert lease is not None and lease.state == "released"
+    assert lease.completion_manifest_digest is not None
+    assert {item.state for item in scenarios} == {"analyzing"}
+    assert tenant_analysis is not None and tenant_analysis.state == "analyzing"
+    assert {item.state for item in tenant_scenarios} == {"analyzing"}
+    assert {event.id for event in events} >= {
+        agent_execution_completed_event_id(execution_id),
+        trace_analysis_ready_event_id(ANALYSIS_ID),
+    }
+    trace_inputs = await SQLAlchemyTraceExecutionRepository(
+        control_session_factory=analysis_databases.control_sessions,
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    ).load_analysis(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+    assert trace_inputs.analysis_mode == "device"
+    assert trace_inputs.analysis_profile == "startup"
+    assert len(trace_inputs.input_artifacts) == 1
+    assert trace_inputs.input_artifacts[0].artifact_kind == "trace"
+    assert trace_inputs.input_artifacts[0].source_artifact_kind == "startup_trace"
+    queue = SQLAlchemyTraceWorkQueueRepository(
+        session_factory=analysis_databases.control_sessions,
+        lease_seconds=30,
+        clock=lambda: completion_at,
+        uuid_source=lambda: UUID("78000000-0000-4000-8000-000000000011"),
+        token_source=lambda: "q" * 32,
+    )
+    claim = await queue.claim_next(consumer_id="device-trace-worker")
+    assert claim is not None
+    assert claim.analysis_id == ANALYSIS_ID
 
 
 @pytest.mark.asyncio
