@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/agents/registration-code-response.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "agent_id", "registration_code", "expires_at"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "agent_id": {"$ref": "#/$defs/uuid"},
+    "registration_code": {
+      "type": "string",
+      "pattern": "^ppreg_[A-Za-z0-9_-]{43}$"
+    },
+    "expires_at": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    }
+  }
+}

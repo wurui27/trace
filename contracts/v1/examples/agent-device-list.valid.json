@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "devices": [
+    {
+      "device_id": "72000000-0000-4000-8000-000000000001",
+      "agent_id": "71000000-0000-4000-8000-000000000001",
+      "agent_name": "Ray Mac",
+      "serial_suffix": "7K2A",
+      "manufacturer": "UNISOC",
+      "model": "ums9620",
+      "android_release": "15",
+      "api_level": 35,
+      "connection_type": "usb",
+      "adb_state": "device",
+      "state": "ready",
+      "last_seen_at": "2026-08-05T08:00:00Z"
+    }
+  ]
+}

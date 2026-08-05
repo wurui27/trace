@@ -1,0 +1,55 @@
+{
+  "schema_version": "1.0",
+  "aud": "perfpilot-agent",
+  "agent_id": "71000000-0000-4000-8000-000000000001",
+  "device_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "execution_id": "73000000-0000-4000-8000-000000000001",
+  "lease_version": 1,
+  "analysis_id": "30000000-0000-4000-8000-000000000001",
+  "issued_at": "2026-08-05T08:00:00Z",
+  "expires_at": "2026-08-05T08:01:30Z",
+  "package_name": "dev.perfpilot.demo",
+  "launch_activity": "dev.perfpilot.demo/dev.perfpilot.demo.MainActivity",
+  "cleanup_policy": "uninstall",
+  "input_artifacts": [
+    {
+      "artifact_id": "50000000-0000-4000-8000-000000000001",
+      "kind": "apk",
+      "mime": "application/vnd.android.package-archive",
+      "size": 1048576,
+      "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    }
+  ],
+  "scenarios": [
+    {
+      "scenario_type": "startup",
+      "recipe_version": 1,
+      "recipe_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "duration_seconds": 15,
+      "memory_rounds": 0,
+      "swipe_count": 0
+    },
+    {
+      "scenario_type": "scroll",
+      "recipe_version": 1,
+      "recipe_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "duration_seconds": 30,
+      "memory_rounds": 0,
+      "swipe_count": 20
+    },
+    {
+      "scenario_type": "memory_cycle",
+      "recipe_version": 1,
+      "recipe_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "duration_seconds": 120,
+      "memory_rounds": 10,
+      "swipe_count": 0
+    }
+  ],
+  "allowed_uploads": [
+    "startup_trace",
+    "scroll_trace",
+    "memory_evidence",
+    "agent_log"
+  ]
+}

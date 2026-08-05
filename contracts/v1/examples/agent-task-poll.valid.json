@@ -1,0 +1,7 @@
+{
+  "schema_version": "1.0",
+  "action": "execute",
+  "snapshot_jws": "eyJhbGciOiJFZERTQSIsImtpZCI6Imxhbi0yMDI2LTA4In0.eyJhdWQiOiJwZXJmcGlsb3QtYWdlbnQifQ.c2lnbmF0dXJl",
+  "lease_expires_at": "2026-08-05T08:01:00Z",
+  "renew_after_seconds": 20
+}

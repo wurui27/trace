@@ -1,0 +1,9 @@
+{
+  "schema_version": "1.0",
+  "registration_code": "ppreg_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "public_key_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+  "platform": "macos",
+  "agent_version": "0.1.0",
+  "hostname": "Ray Mac",
+  "os_version": "macOS 15.6"
+}

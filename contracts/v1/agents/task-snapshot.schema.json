@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/agents/task-snapshot.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "aud",
+    "agent_id",
+    "device_digest",
+    "execution_id",
+    "lease_version",
+    "analysis_id",
+    "issued_at",
+    "expires_at",
+    "package_name",
+    "launch_activity",
+    "cleanup_policy",
+    "input_artifacts",
+    "scenarios",
+    "allowed_uploads"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "aud": {"const": "perfpilot-agent"},
+    "agent_id": {"$ref": "#/$defs/uuid"},
+    "device_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "execution_id": {"$ref": "#/$defs/uuid"},
+    "lease_version": {"type": "integer", "minimum": 1},
+    "analysis_id": {"$ref": "#/$defs/uuid"},
+    "issued_at": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"},
+    "package_name": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+    },
+    "launch_activity": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$"
+    },
+    "cleanup_policy": {"enum": ["keep_installed", "uninstall"]},
+    "input_artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {"$ref": "#/$defs/inputArtifact"}
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 3,
+      "items": {"$ref": "#/$defs/scenario"}
+    },
+    "allowed_uploads": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "uniqueItems": true,
+      "items": {
+        "enum": ["startup_trace", "scroll_trace", "memory_evidence", "agent_log"]
+      }
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 44,
+      "maxLength": 44,
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
+    },
+    "inputArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "kind", "mime", "size", "sha256_b64"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/uuid"},
+        "kind": {"enum": ["apk", "scenario_fixture", "dataset"]},
+        "mime": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$"
+        },
+        "size": {"type": "integer", "minimum": 1, "maximum": 5368709120},
+        "sha256_b64": {"$ref": "#/$defs/sha256"}
+      }
+    },
+    "scenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_type",
+        "recipe_version",
+        "recipe_hash",
+        "duration_seconds",
+        "memory_rounds",
+        "swipe_count"
+      ],
+      "properties": {
+        "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]},
+        "recipe_version": {"type": "integer", "minimum": 1},
+        "recipe_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "duration_seconds": {"type": "integer", "minimum": 0, "maximum": 300},
+        "memory_rounds": {"type": "integer", "minimum": 0, "maximum": 20},
+        "swipe_count": {"type": "integer", "minimum": 0, "maximum": 120}
+      }
+    }
+  }
+}

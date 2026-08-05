@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/agents/task-poll-response.schema.json",
+  "oneOf": [
+    {"$ref": "#/$defs/wait"},
+    {"$ref": "#/$defs/execute"},
+    {"$ref": "#/$defs/cancel"}
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "wait": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "action", "retry_after_seconds"],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "action": {"const": "wait"},
+        "retry_after_seconds": {"type": "integer", "minimum": 1, "maximum": 20}
+      }
+    },
+    "execute": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "action",
+        "snapshot_jws",
+        "lease_expires_at",
+        "renew_after_seconds"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "action": {"const": "execute"},
+        "snapshot_jws": {
+          "type": "string",
+          "minLength": 32,
+          "maxLength": 32768,
+          "pattern": "^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$"
+        },
+        "lease_expires_at": {"type": "string", "format": "date-time"},
+        "renew_after_seconds": {"const": 20}
+      }
+    },
+    "cancel": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "action",
+        "execution_id",
+        "lease_version",
+        "reason_code"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "action": {"const": "cancel"},
+        "execution_id": {"$ref": "#/$defs/uuid"},
+        "lease_version": {"type": "integer", "minimum": 1},
+        "reason_code": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 96,
+          "pattern": "^[a-z][a-z0-9_]*$"
+        }
+      }
+    }
+  }
+}

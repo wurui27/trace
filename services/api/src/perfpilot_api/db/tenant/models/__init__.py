@@ -7,7 +7,7 @@ from perfpilot_api.db.tenant.models.apps import (
     ScenarioRecipe,
     ScenarioResult,
 )
-from perfpilot_api.db.tenant.models.artifacts import Artifact
+from perfpilot_api.db.tenant.models.artifacts import Artifact, ArtifactMultipartUpload
 from perfpilot_api.db.tenant.models.reports import (
     Evidence,
     Finding,
@@ -21,6 +21,7 @@ __all__ = [
     "Application",
     "ApplicationVersion",
     "Artifact",
+    "ArtifactMultipartUpload",
     "Evidence",
     "Finding",
     "Metric",

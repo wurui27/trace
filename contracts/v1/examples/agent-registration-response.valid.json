@@ -1,0 +1,13 @@
+{
+  "schema_version": "1.0",
+  "agent_id": "71000000-0000-4000-8000-000000000001",
+  "access_token": "ppat_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+  "access_token_expires_at": "2026-08-05T08:15:00Z",
+  "refresh_token": "pprt_BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+  "refresh_token_expires_at": "2026-09-04T08:00:00Z",
+  "task_signing_key": {
+    "kid": "lan-2026-08",
+    "public_key_b64": "CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCA="
+  },
+  "heartbeat_interval_seconds": 10
+}

@@ -56,6 +56,7 @@ TENANT_TABLES = {
     "scenario_results",
     "sample_attempts",
     "artifacts",
+    "artifact_multipart_uploads",
     "report_versions",
     "metrics",
     "findings",
@@ -279,6 +280,65 @@ def test_numeric_models_use_decimal_python_types() -> None:
     assert Metric.__table__.c.numeric_value.type.python_type is Decimal
 
 
+def test_remote_agent_orm_contains_only_sanitized_device_identity_and_multipart_state() -> None:
+    from perfpilot_api.db.control.models import Agent, AgentLease, Device, GlobalJob
+    from perfpilot_api.db.tenant.models import ArtifactMultipartUpload
+
+    agent_columns = set(Agent.__table__.columns.keys())
+    device_columns = set(Device.__table__.columns.keys())
+    lease_columns = set(AgentLease.__table__.columns.keys())
+    job_columns = set(GlobalJob.__table__.columns.keys())
+    multipart_columns = set(ArtifactMultipartUpload.__table__.columns.keys())
+
+    assert {
+        "team_id",
+        "owner_user_id",
+        "public_key_b64",
+        "platform",
+        "agent_version",
+        "hostname",
+        "os_version",
+        "access_token_expires_at",
+        "refresh_token_digest",
+        "refresh_token_expires_at",
+    } <= agent_columns
+    assert "serial" not in device_columns
+    assert {
+        "team_id",
+        "serial_digest",
+        "serial_suffix",
+        "manufacturer",
+        "model",
+        "android_release",
+        "connection_type",
+        "adb_state",
+        "battery_percent",
+        "last_property_error_code",
+    } <= device_columns
+    assert {
+        "execution_id",
+        "renewed_at",
+        "cancel_acknowledged_at",
+        "task_snapshot_digest",
+    } <= lease_columns
+    assert "selected_device_id" in job_columns
+    assert multipart_columns == {
+        "id",
+        "artifact_id",
+        "execution_id",
+        "storage_upload_id",
+        "part_size_bytes",
+        "part_count",
+        "completed_parts",
+        "state",
+        "expires_at",
+        "completed_at",
+        "version",
+        "created_at",
+        "updated_at",
+    }
+
+
 def test_engine_execution_orm_uses_external_run_identifiers_and_tenant_version() -> None:
     from perfpilot_api.db.control.models import EngineExecution
 
@@ -368,7 +428,7 @@ def test_trace_execution_state_downgrade_refuses_active_trace(
 
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_analysis_report_versions"
+            "0008_agent_multipart_uploads"
         )
 
 
@@ -470,8 +530,163 @@ def test_control_schema_enforces_required_uniqueness(
     assert ("analysis_id", "scenario_type") in _unique_column_sets(
         control_inspector, "scenario_jobs"
     )
-    assert ("serial",) in _unique_column_sets(control_inspector, "devices")
+    assert ("team_id", "name") in _unique_column_sets(control_inspector, "agents")
+    assert ("serial_digest",) in _unique_column_sets(control_inspector, "devices")
+    assert ("id", "team_id") in _unique_column_sets(control_inspector, "devices")
+    assert ("execution_id",) in _unique_column_sets(control_inspector, "agent_leases")
     assert ("consumer_name", "event_id") in _unique_column_sets(control_inspector, "inbox_events")
+
+
+def test_remote_agent_schema_enforces_identity_states_and_ownership(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    control_inspector = inspect(migration_databases.control_engine)
+
+    agent_columns = {
+        column["name"]: column for column in control_inspector.get_columns("agents")
+    }
+    device_columns = {
+        column["name"]: column for column in control_inspector.get_columns("devices")
+    }
+    lease_columns = {
+        column["name"]: column for column in control_inspector.get_columns("agent_leases")
+    }
+    assert all(
+        agent_columns[name]["nullable"] is False
+        for name in ("team_id", "owner_user_id", "name", "state")
+    )
+    assert all(
+        device_columns[name]["nullable"] is False
+        for name in (
+            "team_id",
+            "agent_id",
+            "serial_digest",
+            "serial_suffix",
+            "connection_type",
+            "adb_state",
+            "state",
+        )
+    )
+    assert all(
+        lease_columns[name]["nullable"] is False
+        for name in ("execution_id", "device_id", "agent_id", "renewed_at", "state")
+    )
+    assert "serial" not in device_columns
+
+    checks = {
+        table: {
+            constraint["name"]: _normalize_postgresql_predicate(constraint["sqltext"])
+            for constraint in control_inspector.get_check_constraints(table)
+        }
+        for table in ("agents", "devices", "agent_leases", "global_jobs")
+    }
+    assert _check_string_literals(checks["agents"]["ck_agents_platform"]) == {
+        "macos",
+        "windows",
+        "linux",
+    }
+    assert _check_string_literals(checks["devices"]["ck_devices_state"]) == {
+        "ready",
+        "busy",
+        "unauthorized",
+        "booting",
+        "quarantined",
+        "offline",
+    }
+    assert _check_string_literals(checks["devices"]["ck_devices_adb_state"]) == {
+        "device",
+        "unauthorized",
+        "offline",
+        "booting",
+    }
+    assert _check_string_literals(checks["agent_leases"]["ck_agent_leases_state"]) == {
+        "active",
+        "cancel_requested",
+        "released",
+        "expired",
+        "revoked",
+    }
+    assert checks["global_jobs"]["ck_global_jobs_device_selection"] == (
+        "selected_device_idisnulloranalysis_mode='device'"
+    )
+
+    device_owner_fk = next(
+        foreign_key
+        for foreign_key in control_inspector.get_foreign_keys("global_jobs")
+        if foreign_key["name"] == "fk_global_jobs_selected_device_team"
+    )
+    assert device_owner_fk["constrained_columns"] == ["selected_device_id", "team_id"]
+    assert device_owner_fk["referred_table"] == "devices"
+    assert device_owner_fk["referred_columns"] == ["id", "team_id"]
+
+
+def test_agent_multipart_schema_keeps_transport_state_in_tenant_database(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("tenant", migration_databases.tenant_url)
+    tenant_inspector = inspect(migration_databases.tenant_engine)
+
+    columns = {
+        column["name"]: column
+        for column in tenant_inspector.get_columns("artifact_multipart_uploads")
+    }
+    assert columns["artifact_id"]["nullable"] is False
+    assert columns["execution_id"]["nullable"] is False
+    assert columns["storage_upload_id"]["nullable"] is False
+    assert columns["part_size_bytes"]["nullable"] is False
+    assert columns["part_count"]["nullable"] is False
+    assert columns["completed_parts"]["nullable"] is False
+    assert columns["state"]["nullable"] is False
+    assert columns["expires_at"]["nullable"] is False
+    assert columns["completed_at"]["nullable"] is True
+    assert ("artifact_id",) in _unique_column_sets(
+        tenant_inspector, "artifact_multipart_uploads"
+    )
+    assert ("storage_upload_id",) in _unique_column_sets(
+        tenant_inspector, "artifact_multipart_uploads"
+    )
+    checks = {
+        constraint["name"]: _normalize_postgresql_predicate(constraint["sqltext"])
+        for constraint in tenant_inspector.get_check_constraints(
+            "artifact_multipart_uploads"
+        )
+    }
+    assert _check_string_literals(
+        checks["ck_artifact_multipart_uploads_state"]
+    ) == {"pending", "completed", "aborted", "expired"}
+    assert checks["ck_artifact_multipart_uploads_part_size_positive"] == (
+        "part_size_bytes>0"
+    )
+    assert checks["ck_artifact_multipart_uploads_part_count_range"] == (
+        "part_count>=1andpart_count<=10000"
+    )
+
+
+def test_remote_agent_upgrade_refuses_legacy_identity_rows(
+    migration_databases: MigrationDatabases,
+) -> None:
+    config = _alembic_config("control", migration_databases.control_url)
+    command.upgrade(config, "0008_ai_synthesis")
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(
+            text("INSERT INTO agents (name) VALUES ('legacy-agent')")
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="remote Agent migration preflight failed",
+    ):
+        command.upgrade(config, "head")
+
+    with migration_databases.control_engine.connect() as connection:
+        assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+            "0008_ai_synthesis"
+        )
+    assert "team_id" not in {
+        column["name"]
+        for column in inspect(migration_databases.control_engine).get_columns("agents")
+    }
 
 
 def test_control_schema_persists_external_engine_authority(
@@ -677,7 +892,7 @@ def test_control_execution_tenant_version_migration_round_trips_empty_table(
     assert tenant_version["default"] is None
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_ai_synthesis"
+            "0009_remote_device_agents"
         )
 
     command.downgrade(config, "0005_memory_upload_mode")
@@ -780,7 +995,7 @@ def test_control_execution_tenant_version_downgrade_refuses_rows(
 
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_ai_synthesis"
+            "0009_remote_device_agents"
         )
     assert "tenant_resource_version" in {
         column["name"]
@@ -843,7 +1058,10 @@ def test_control_execution_tenant_version_migration_requests_exclusive_lock(
 def test_control_external_engine_downgrade_refuses_nonempty_metadata(
     migration_databases: MigrationDatabases,
 ) -> None:
-    _upgrade("control", migration_databases.control_url)
+    command.upgrade(
+        _alembic_config("control", migration_databases.control_url),
+        "0008_ai_synthesis",
+    )
     team_id = UUID("98000000-0000-4000-8000-000000000001")
     analysis_id = UUID("98000000-0000-4000-8000-000000000002")
     with migration_databases.control_engine.begin() as connection:
@@ -912,7 +1130,10 @@ def test_control_external_engine_downgrade_refuses_nonempty_metadata(
 def test_control_external_engine_downgrade_serializes_with_concurrent_writers(
     migration_databases: MigrationDatabases,
 ) -> None:
-    _upgrade("control", migration_databases.control_url)
+    command.upgrade(
+        _alembic_config("control", migration_databases.control_url),
+        "0008_ai_synthesis",
+    )
     team_id = UUID("98100000-0000-4000-8000-000000000001")
     with migration_databases.control_engine.begin() as connection:
         connection.execute(
@@ -1200,7 +1421,7 @@ def test_tenant_ai_report_downgrade_refuses_new_content_or_artifact_references(
 
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_analysis_report_versions"
+            "0008_agent_multipart_uploads"
         )
 
 
@@ -1828,7 +2049,7 @@ def test_control_ai_synthesis_downgrade_refuses_audit_records(
         assert connection.scalar(text("SELECT count(*) FROM synthesis_executions")) == 1
         assert connection.scalar(text("SELECT count(*) FROM ai_invocations")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_ai_synthesis"
+            "0009_remote_device_agents"
         )
 
 
@@ -1881,7 +2102,7 @@ def test_control_ai_synthesis_downgrade_refuses_retained_outbox_authority(
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM outbox_events")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_ai_synthesis"
+            "0009_remote_device_agents"
         )
 
 
@@ -2009,8 +2230,8 @@ def test_memory_upload_mode_is_present_in_both_databases(
 @pytest.mark.parametrize(
     ("tree", "downgrade_revision", "head_revision"),
     [
-        ("control", "0004_external_engine_foundation", "0008_ai_synthesis"),
-        ("tenant", "0003_analysis_orchestration", "0007_analysis_report_versions"),
+        ("control", "0004_external_engine_foundation", "0009_remote_device_agents"),
+        ("tenant", "0003_analysis_orchestration", "0008_agent_multipart_uploads"),
     ],
 )
 def test_memory_upload_downgrade_refuses_existing_rows(
@@ -2067,14 +2288,14 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "control",
             "0004_external_engine_foundation",
-                "0008_ai_synthesis",
+            "0009_remote_device_agents",
             "global_jobs",
             "ck_global_jobs_analysis_mode",
         ),
         (
             "tenant",
             "0003_analysis_orchestration",
-                "0007_analysis_report_versions",
+            "0008_agent_multipart_uploads",
             "analyses",
             "ck_analyses_mode",
         ),
@@ -2206,7 +2427,10 @@ def test_migration_round_trip_returns_to_base_and_reupgrades(
 def test_control_task7_downgrade_refuses_to_drop_scheduling_data(
     migration_databases: MigrationDatabases,
 ) -> None:
-    _upgrade("control", migration_databases.control_url)
+    command.upgrade(
+        _alembic_config("control", migration_databases.control_url),
+        "0003_analysis_orchestration",
+    )
     team_id = UUID("91000000-0000-4000-8000-000000000001")
     analysis_id = UUID("92000000-0000-4000-8000-000000000001")
     scenario_id = UUID("93000000-0000-4000-8000-000000000001")
@@ -2420,7 +2644,7 @@ def test_tenant_task7_downgrade_serializes_with_concurrent_metadata_writers(
     }
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0007_analysis_report_versions"
+            "0008_agent_multipart_uploads"
         )
 
 

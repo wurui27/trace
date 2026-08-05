@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/agents/registration-request.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "registration_code",
+    "public_key_b64",
+    "platform",
+    "agent_version",
+    "hostname",
+    "os_version"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "registration_code": {
+      "type": "string",
+      "pattern": "^ppreg_[A-Za-z0-9_-]{43}$"
+    },
+    "public_key_b64": {
+      "type": "string",
+      "minLength": 44,
+      "maxLength": 44,
+      "pattern": "^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
+    },
+    "platform": {"enum": ["macos", "windows", "linux"]},
+    "agent_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "hostname": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "os_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    }
+  }
+}

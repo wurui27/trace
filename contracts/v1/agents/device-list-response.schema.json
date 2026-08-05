@@ -1,0 +1,71 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/agents/device-list-response.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "devices"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "devices": {
+      "type": "array",
+      "maxItems": 256,
+      "items": {"$ref": "#/$defs/device"}
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "device_id",
+        "agent_id",
+        "agent_name",
+        "serial_suffix",
+        "manufacturer",
+        "model",
+        "android_release",
+        "api_level",
+        "connection_type",
+        "adb_state",
+        "state",
+        "last_seen_at"
+      ],
+      "properties": {
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "agent_id": {"$ref": "#/$defs/uuid"},
+        "agent_name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "serial_suffix": {"type": "string", "pattern": "^[!-~]{1,4}$"},
+        "manufacturer": {"type": ["string", "null"], "maxLength": 128},
+        "model": {"type": ["string", "null"], "maxLength": 128},
+        "android_release": {"type": ["string", "null"], "maxLength": 64},
+        "api_level": {
+          "oneOf": [
+            {"type": "integer", "minimum": 1, "maximum": 1000},
+            {"type": "null"}
+          ]
+        },
+        "connection_type": {"enum": ["usb", "wifi", "unknown"]},
+        "adb_state": {"enum": ["device", "unauthorized", "offline", "booting"]},
+        "state": {
+          "enum": ["ready", "busy", "unauthorized", "booting", "quarantined", "offline"]
+        },
+        "last_seen_at": {
+          "oneOf": [
+            {"type": "string", "format": "date-time"},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  }
+}

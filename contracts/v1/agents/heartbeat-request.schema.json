@@ -1,0 +1,152 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/agents/heartbeat-request.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "agent_version",
+    "platform",
+    "hostname",
+    "observed_at",
+    "clock_skew_ms",
+    "disk_available_bytes",
+    "execution_slot",
+    "devices"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "agent_version": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+    },
+    "platform": {"enum": ["macos", "windows", "linux"]},
+    "hostname": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+    },
+    "observed_at": {"type": "string", "format": "date-time"},
+    "clock_skew_ms": {"type": "integer", "minimum": -300000, "maximum": 300000},
+    "disk_available_bytes": {"type": "integer", "minimum": 0},
+    "execution_slot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "execution_id"],
+      "properties": {
+        "state": {"enum": ["idle", "busy"]},
+        "execution_id": {
+          "oneOf": [
+            {"$ref": "#/$defs/uuid"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"const": "idle"}}, "required": ["state"]},
+          "then": {"properties": {"execution_id": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"state": {"const": "busy"}}, "required": ["state"]},
+          "then": {"properties": {"execution_id": {"$ref": "#/$defs/uuid"}}}
+        }
+      ]
+    },
+    "devices": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {"$ref": "#/$defs/device"}
+    }
+  },
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "stableCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "device": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "client_ref",
+        "serial",
+        "manufacturer",
+        "model",
+        "android_release",
+        "api_level",
+        "connection_type",
+        "adb_state",
+        "battery_percent",
+        "temperature_c",
+        "storage_available_bytes",
+        "property_error_code"
+      ],
+      "properties": {
+        "client_ref": {"$ref": "#/$defs/uuid"},
+        "serial": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 255,
+          "pattern": "^[!-~]+$"
+        },
+        "manufacturer": {
+          "type": ["string", "null"],
+          "maxLength": 128,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+        },
+        "model": {
+          "type": ["string", "null"],
+          "maxLength": 128,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+        },
+        "android_release": {
+          "type": ["string", "null"],
+          "maxLength": 64,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]*$"
+        },
+        "api_level": {
+          "oneOf": [
+            {"type": "integer", "minimum": 1, "maximum": 1000},
+            {"type": "null"}
+          ]
+        },
+        "connection_type": {"enum": ["usb", "wifi", "unknown"]},
+        "adb_state": {"enum": ["device", "unauthorized", "offline", "booting"]},
+        "battery_percent": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0, "maximum": 100},
+            {"type": "null"}
+          ]
+        },
+        "temperature_c": {
+          "oneOf": [
+            {"type": "number", "minimum": -100, "maximum": 200},
+            {"type": "null"}
+          ]
+        },
+        "storage_available_bytes": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "null"}
+          ]
+        },
+        "property_error_code": {
+          "oneOf": [
+            {"$ref": "#/$defs/stableCode"},
+            {"type": "null"}
+          ]
+        }
+      }
+    }
+  }
+}

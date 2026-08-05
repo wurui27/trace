@@ -6,6 +6,7 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    ForeignKeyConstraint,
     Index,
     Integer,
     String,
@@ -43,11 +44,26 @@ class GlobalJob(
             name="ck_global_jobs_state",
         ),
         CheckConstraint(
+            "selected_device_id IS NULL OR analysis_mode = 'device'",
+            name="ck_global_jobs_device_selection",
+        ),
+        CheckConstraint(
             "attempt_count >= 0 AND valid_sample_count >= 0 AND invalid_sample_count >= 0 "
             "AND retry_count >= 0 AND valid_sample_count + invalid_sample_count <= attempt_count",
             name="ck_global_jobs_counts_nonnegative",
         ),
         CheckConstraint("version > 0", name="ck_global_jobs_version_positive"),
+        ForeignKeyConstraint(
+            ["selected_device_id", "team_id"],
+            ["devices.id", "devices.team_id"],
+            name="fk_global_jobs_selected_device_team",
+            ondelete="RESTRICT",
+        ),
+        Index(
+            "ix_global_jobs_selected_device_team",
+            "selected_device_id",
+            "team_id",
+        ),
         Index("ix_global_jobs_team_state_created", "team_id", "state", "created_at"),
     )
 
@@ -60,6 +76,9 @@ class GlobalJob(
     analysis_mode: Mapped[str] = mapped_column(String(32), nullable=False)
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     input_artifact_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    selected_device_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True)
+    )
     required_abi: Mapped[str | None] = mapped_column(String(64))
     supported_abis: Mapped[list[str]] = mapped_column(
         ARRAY(String(64)), nullable=False, default=list, server_default=text("'{}'::varchar[]")

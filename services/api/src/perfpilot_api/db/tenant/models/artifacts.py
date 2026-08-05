@@ -7,11 +7,12 @@ from sqlalchemy import (
     DateTime,
     ForeignKey,
     Index,
+    Integer,
     String,
     UniqueConstraint,
     text,
 )
-from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from perfpilot_api.db.base import (
@@ -101,3 +102,74 @@ class Artifact(
     finalized_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     deleted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class ArtifactMultipartUpload(
+    UUIDPrimaryKeyMixin,
+    TimestampMixin,
+    VersionedMixin,
+    TenantBase,
+):
+    __tablename__ = "artifact_multipart_uploads"
+    __table_args__ = (
+        UniqueConstraint("artifact_id", name="uq_artifact_multipart_uploads_artifact"),
+        UniqueConstraint(
+            "storage_upload_id",
+            name="uq_artifact_multipart_uploads_storage_upload",
+        ),
+        CheckConstraint(
+            "state IN ('pending', 'completed', 'aborted', 'expired')",
+            name="ck_artifact_multipart_uploads_state",
+        ),
+        CheckConstraint(
+            "part_size_bytes > 0",
+            name="ck_artifact_multipart_uploads_part_size_positive",
+        ),
+        CheckConstraint(
+            "part_count >= 1 AND part_count <= 10000",
+            name="ck_artifact_multipart_uploads_part_count_range",
+        ),
+        CheckConstraint(
+            "jsonb_typeof(completed_parts) = 'array'",
+            name="ck_artifact_multipart_uploads_completed_parts_array",
+        ),
+        CheckConstraint(
+            "(state = 'completed' AND completed_at IS NOT NULL) OR "
+            "(state <> 'completed' AND completed_at IS NULL)",
+            name="ck_artifact_multipart_uploads_completion_state",
+        ),
+        CheckConstraint(
+            "version > 0",
+            name="ck_artifact_multipart_uploads_version_positive",
+        ),
+        Index(
+            "ix_artifact_multipart_uploads_execution_id",
+            "execution_id",
+        ),
+        Index(
+            "ix_artifact_multipart_uploads_state_expires",
+            "state",
+            "expires_at",
+        ),
+    )
+
+    artifact_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("artifacts.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    execution_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), nullable=False
+    )
+    storage_upload_id: Mapped[str] = mapped_column(String(1024), nullable=False)
+    part_size_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    part_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    completed_parts: Mapped[list[object]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        server_default=text("'[]'::jsonb"),
+    )
+    state: Mapped[str] = mapped_column(String(32), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
