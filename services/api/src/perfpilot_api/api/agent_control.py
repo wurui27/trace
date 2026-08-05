@@ -1,13 +1,14 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Annotated, Literal
+from decimal import Decimal
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
-from perfpilot_api.api.agents import get_agent_service
+from perfpilot_api.api.agents import get_agent_service, get_device_directory
 from perfpilot_api.errors import ApiError
 from perfpilot_api.services.agents import (
     AgentAuthenticationRejected,
@@ -15,6 +16,11 @@ from perfpilot_api.services.agents import (
     AgentRegistrationRejected,
     AgentService,
     IssuedAgentCredentials,
+)
+from perfpilot_api.services.device_directory import (
+    AgentHeartbeat,
+    DeviceDirectory,
+    DeviceHeartbeatRejected,
 )
 
 _PUBLIC_KEY_PATTERN = r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
@@ -48,6 +54,87 @@ class RefreshAgentTokenRequest(BaseModel):
     signature_b64: str = Field(pattern=_SIGNATURE_PATTERN)
 
 
+class ExecutionSlot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    state: Literal["idle", "busy"]
+    execution_id: UUID | None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> Self:
+        if (self.state == "idle") != (self.execution_id is None):
+            raise ValueError("execution slot state is invalid")
+        return self
+
+
+class HeartbeatDevice(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    client_ref: UUID
+    serial: str = Field(min_length=1, max_length=255, pattern=r"^[!-~]+$")
+    manufacturer: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[^\x00-\x1f\x7f]*$",
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[^\x00-\x1f\x7f]*$",
+    )
+    android_release: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^[^\x00-\x1f\x7f]*$",
+    )
+    api_level: int | None = Field(default=None, strict=True, ge=1, le=1000)
+    connection_type: Literal["usb", "wifi", "unknown"]
+    adb_state: Literal["device", "unauthorized", "offline", "booting"]
+    battery_percent: int | None = Field(default=None, strict=True, ge=0, le=100)
+    temperature_c: Decimal | None = Field(default=None, ge=-100, le=200)
+    storage_available_bytes: int | None = Field(
+        default=None,
+        strict=True,
+        ge=0,
+        le=2**63 - 1,
+    )
+    property_error_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=96,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+
+
+class AgentHeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    agent_version: str = Field(
+        min_length=1,
+        max_length=64,
+        pattern=_AGENT_VERSION_PATTERN,
+    )
+    platform: Literal["macos", "windows", "linux"]
+    hostname: str = Field(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
+    )
+    observed_at: datetime
+    clock_skew_ms: int = Field(strict=True, ge=-300_000, le=300_000)
+    disk_available_bytes: int = Field(strict=True, ge=0, le=2**63 - 1)
+    execution_slot: ExecutionSlot
+    devices: tuple[HeartbeatDevice, ...] = Field(max_length=32)
+
+    @field_validator("observed_at")
+    @classmethod
+    def require_aware_observed_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None:
+            raise ValueError("observed_at must include a timezone")
+        return value
+
+
 def _reject_browser_credentials(request: Request) -> None:
     forbidden = (
         "cookie",
@@ -78,6 +165,22 @@ def _credentials_payload(credentials: IssuedAgentCredentials) -> dict[str, objec
         },
         "heartbeat_interval_seconds": credentials.heartbeat_interval_seconds,
     }
+
+
+async def _authenticate_access(
+    request: Request,
+    agent_service: AgentService,
+):
+    authorization_values = request.headers.getlist("authorization")
+    if len(authorization_values) != 1:
+        raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False)
+    scheme, separator, token = authorization_values[0].partition(" ")
+    if separator != " " or scheme.casefold() != "bearer" or not token or " " in token:
+        raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False)
+    try:
+        return await agent_service.authenticate_access(token)
+    except AgentAuthenticationRejected:
+        raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
 
 
 router = APIRouter(
@@ -127,6 +230,65 @@ async def refresh_agent_token(
         raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
     response.headers["cache-control"] = "no-store"
     return _credentials_payload(credentials)
+
+
+@router.post("/heartbeat")
+async def heartbeat(
+    payload: AgentHeartbeatRequest,
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    device_directory: Annotated[DeviceDirectory, Depends(get_device_directory)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        observations = tuple(
+            device_directory.sanitize_observation(
+                client_ref=device.client_ref,
+                serial=device.serial,
+                manufacturer=device.manufacturer,
+                model=device.model,
+                android_release=device.android_release,
+                api_level=device.api_level,
+                connection_type=device.connection_type,
+                adb_state=device.adb_state,
+                battery_percent=device.battery_percent,
+                temperature_c=device.temperature_c,
+                storage_available_bytes=device.storage_available_bytes,
+                property_error_code=device.property_error_code,
+            )
+            for device in payload.devices
+        )
+        receipt = await device_directory.replace_heartbeat(
+            agent_id=principal.agent_id,
+            heartbeat=AgentHeartbeat(
+                agent_version=payload.agent_version,
+                platform=payload.platform,
+                hostname=payload.hostname,
+                observed_at=payload.observed_at,
+                clock_skew_ms=payload.clock_skew_ms,
+                disk_available_bytes=payload.disk_available_bytes,
+                execution_state=payload.execution_slot.state,
+                execution_id=payload.execution_slot.execution_id,
+            ),
+            devices=observations,
+        )
+    except DeviceHeartbeatRejected:
+        raise ApiError("heartbeat_rejected", "设备状态上报失败", 409, False) from None
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "accepted_at": _utc(receipt.accepted_at),
+        "next_heartbeat_seconds": receipt.next_heartbeat_seconds,
+        "devices": [
+            {
+                "client_ref": str(device.client_ref),
+                "device_id": str(device.device_id),
+                "device_digest": device.device_digest,
+            }
+            for device in receipt.devices
+        ],
+    }
 
 
 __all__ = ["router"]

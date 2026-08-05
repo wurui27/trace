@@ -23,6 +23,10 @@ from perfpilot_api.services.agents import (
     InMemoryAgentRepository,
     TaskSigningKey,
 )
+from perfpilot_api.services.device_directory import (
+    DeviceDirectory,
+    InMemoryDeviceDirectoryRepository,
+)
 from perfpilot_api.services.auth import TeamRequestContext
 
 TEAM_A_ID = UUID("20000000-0000-4000-8000-000000000001")
@@ -60,10 +64,11 @@ class CountingEntropy:
         return self.calls.to_bytes(4, "big") * (size // 4)
 
 
-def _agent_service() -> AgentService:
+def _services() -> tuple[AgentService, DeviceDirectory]:
     task_key = Ed25519PrivateKey.from_private_bytes(bytes(reversed(range(32))))
-    return AgentService(
-        repository=InMemoryAgentRepository(uuid_factory=uuid4),
+    repository = InMemoryAgentRepository(uuid_factory=uuid4)
+    agent_service = AgentService(
+        repository=repository,
         credentials=AgentCredentialCodec(
             b"agent-api-credential-secret-12345",
             entropy=CountingEntropy(),
@@ -77,6 +82,14 @@ def _agent_service() -> AgentService:
             public_key_b64=encode_ed25519_public_key(task_key.public_key()),
         ),
         clock=lambda: NOW,
+    )
+    return (
+        agent_service,
+        DeviceDirectory(
+            repository=InMemoryDeviceDirectoryRepository(repository),
+            serial_hmac_key=b"s" * 32,
+            clock=lambda: NOW,
+        ),
     )
 
 
@@ -112,12 +125,14 @@ def _proxy_headers(*, method: str, target: str, body: bytes, request_id: str) ->
 
 
 def _client(*, role: str = "team_owner") -> TestClient:
+    agent_service, device_directory = _services()
     return TestClient(
         create_app(
             testing=True,
             settings_override=_settings(),
             auth_service=FakeAuthService(role=role),  # type: ignore[arg-type]
-            agent_service=_agent_service(),
+            agent_service=agent_service,
+            device_directory=device_directory,
             replay_store=InMemoryReplayStore(clock=lambda: NOW.timestamp()),
             proxy_clock=lambda: NOW.timestamp(),
         )
@@ -362,6 +377,93 @@ def test_agent_endpoint_rejects_browser_cookie_before_registration() -> None:
     assert registration_code not in response.text
 
 
+def test_authenticated_heartbeat_publishes_only_sanitized_browser_device() -> None:
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    raw_serial = "R3CN30ABC7K2A"
+    with _client() as client:
+        issued = _create_code(client)
+        registered = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.0",
+                "registration_code": issued["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "Ray Mac",
+                "os_version": "macOS 15.6",
+            },
+        ).json()
+        heartbeat_response = client.post(
+            "/v1/agent/heartbeat",
+            headers={"authorization": f"Bearer {registered['access_token']}"},
+            json={
+                "schema_version": "1.0",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "Ray Mac",
+                "observed_at": "2026-08-05T08:00:00Z",
+                "clock_skew_ms": 12,
+                "disk_available_bytes": 107374182400,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [
+                    {
+                        "client_ref": "74000000-0000-4000-8000-000000000001",
+                        "serial": raw_serial,
+                        "manufacturer": "UNISOC",
+                        "model": "ums9620",
+                        "android_release": "15",
+                        "api_level": 35,
+                        "connection_type": "usb",
+                        "adb_state": "device",
+                        "battery_percent": 82,
+                        "temperature_c": 31.5,
+                        "storage_available_bytes": 42949672960,
+                        "property_error_code": None,
+                    }
+                ],
+            },
+        )
+        list_target = f"/v1/teams/{TEAM_A_ID}/devices"
+        listed = _browser_request(
+            client,
+            method="GET",
+            target=list_target,
+            payload={},
+            request_id="req-list-devices",
+        )
+
+    assert heartbeat_response.status_code == 200
+    assert heartbeat_response.json()["devices"][0]["device_digest"]
+    assert listed.status_code == 200
+    assert listed.json()["devices"][0]["serial_suffix"] == "7K2A"
+    assert listed.json()["devices"][0]["model"] == "ums9620"
+    assert raw_serial not in heartbeat_response.text
+    assert raw_serial not in listed.text
+    assert heartbeat_response.json()["devices"][0]["device_digest"] not in listed.text
+
+
+def test_heartbeat_rejects_missing_agent_access_token_without_proxy_headers() -> None:
+    with _client() as client:
+        response = client.post(
+            "/v1/agent/heartbeat",
+            json={
+                "schema_version": "1.0",
+                "agent_version": "1.2.3",
+                "platform": "linux",
+                "hostname": "Ubuntu Agent",
+                "observed_at": "2026-08-05T08:00:00Z",
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [],
+            },
+        )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "agent_authentication_failed"
+
+
 def test_default_runtime_composes_sql_agent_service(monkeypatch) -> None:
     class FakeEngine:
         async def dispose(self) -> None:
@@ -390,3 +492,4 @@ def test_default_runtime_composes_sql_agent_service(monkeypatch) -> None:
     )
 
     assert isinstance(app.state.agent_service, AgentService)
+    assert isinstance(app.state.device_directory, DeviceDirectory)

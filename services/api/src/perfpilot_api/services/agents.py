@@ -308,7 +308,7 @@ class InMemoryAgentRepository:
                 return None
             registered = replace(
                 candidate,
-                state="online",
+                state="offline",
                 registration_code_digest=None,
                 registration_code_used_at=now,
                 public_key_b64=public_key_b64,
@@ -542,7 +542,7 @@ class SQLAlchemyAgentRepository:
             stored.agent_version = agent_version
             stored.hostname = hostname
             stored.os_version = os_version
-            stored.state = "online"
+            stored.state = "offline"
             stored.updated_at = now
             await session.flush()
             return _stored_agent_record(stored)

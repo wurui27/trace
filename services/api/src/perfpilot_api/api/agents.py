@@ -28,6 +28,7 @@ from perfpilot_api.services.auth import (
     RoleForbiddenError,
     TeamAccessNotFoundError,
 )
+from perfpilot_api.services.device_directory import DeviceDirectory, DeviceView
 
 
 class CreateRegistrationCodeRequest(BaseModel):
@@ -55,6 +56,13 @@ def get_agent_service(request: Request) -> AgentService:
     if service is None:
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
     return service
+
+
+def get_device_directory(request: Request) -> DeviceDirectory:
+    directory: DeviceDirectory | None = request.app.state.device_directory
+    if directory is None:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    return directory
 
 
 def _require_origin(request: Request) -> None:
@@ -130,6 +138,23 @@ def _agent_payload(agent: AgentView) -> dict[str, object]:
     }
 
 
+def _device_payload(device: DeviceView) -> dict[str, object]:
+    return {
+        "device_id": str(device.device_id),
+        "agent_id": str(device.agent_id),
+        "agent_name": device.agent_name,
+        "serial_suffix": device.serial_suffix,
+        "manufacturer": device.manufacturer,
+        "model": device.model,
+        "android_release": device.android_release,
+        "api_level": device.api_level,
+        "connection_type": device.connection_type,
+        "adb_state": device.adb_state,
+        "state": device.state,
+        "last_seen_at": _utc(device.last_seen_at),
+    }
+
+
 router = APIRouter(
     prefix="/v1/teams",
     dependencies=proxy_router_dependencies(),
@@ -192,6 +217,29 @@ async def list_agents(
     }
 
 
+@router.get("/{team_id}/devices")
+async def list_devices(
+    team_id: UUID,
+    request: Request,
+    response: Response,
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    device_directory: Annotated[DeviceDirectory, Depends(get_device_directory)],
+) -> dict[str, object]:
+    await _authorize_team(
+        request=request,
+        auth_service=auth_service,
+        team_id=team_id,
+        access="read",
+        owner_required=False,
+    )
+    devices = await device_directory.list_devices(team_id=team_id)
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "devices": [_device_payload(device) for device in devices],
+    }
+
+
 @router.patch("/{team_id}/agents/{agent_id}")
 async def rename_agent(
     team_id: UUID,
@@ -246,4 +294,4 @@ async def revoke_agent(
     return {"schema_version": "1.0", "agent": _agent_payload(agent)}
 
 
-__all__ = ["get_agent_service", "router"]
+__all__ = ["get_agent_service", "get_device_directory", "router"]

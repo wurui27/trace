@@ -74,6 +74,10 @@ from perfpilot_api.services.agents import (
     SQLAlchemyAgentRepository,
     TaskSigningKey,
 )
+from perfpilot_api.services.device_directory import (
+    DeviceDirectory,
+    SQLAlchemyDeviceDirectoryRepository,
+)
 from perfpilot_api.services.analyses import (
     AnalysisService,
     ApkInspector,
@@ -201,6 +205,7 @@ def create_app(
     synthesis_run_service: SynthesisRunService | None = None,
     memory_capture_service: MemoryCaptureService | None = None,
     agent_service: AgentService | None = None,
+    device_directory: DeviceDirectory | None = None,
     android_memory_worker: AndroidMemoryWorker | None = None,
     apk_inspector: ApkInspector | None = None,
     replay_store: ReplayStore | None = None,
@@ -230,6 +235,7 @@ def create_app(
     resolved_synthesis_run_service = synthesis_run_service
     resolved_memory_capture_service = memory_capture_service
     resolved_agent_service = agent_service
+    resolved_device_directory = device_directory
     resolved_android_memory_worker = android_memory_worker
     active_android_memory_worker: AndroidMemoryWorker | None = None
     owned_android_memory_artifact_client: httpx.AsyncClient | None = None
@@ -312,6 +318,17 @@ def create_app(
             task_signing_key=TaskSigningKey(
                 kid=f"lan-{hashlib.sha256(task_public_key_b64.encode('ascii')).hexdigest()[:16]}",
                 public_key_b64=task_public_key_b64,
+            ),
+        )
+    if not testing and resolved_device_directory is None and control_session_factory is not None:
+        root_secret = settings.session_secret.get_secret_value().encode("utf-8")
+        credential_reference = settings.agent_registration_secret_reference.get_secret_value()
+        resolved_device_directory = DeviceDirectory(
+            repository=SQLAlchemyDeviceDirectoryRepository(control_session_factory),
+            serial_hmac_key=_derive_agent_runtime_key(
+                root_secret,
+                purpose=b"perfpilot-device-serial-v1",
+                key_reference=credential_reference,
             ),
         )
 
@@ -511,6 +528,7 @@ def create_app(
     app.state.synthesis_run_service = resolved_synthesis_run_service
     app.state.memory_capture_service = resolved_memory_capture_service
     app.state.agent_service = resolved_agent_service
+    app.state.device_directory = resolved_device_directory
     app.state.engine_adapter_registry = engine_adapter_registry
     app.state.android_memory_worker = None
     app.state.android_memory_artifact_client = None
