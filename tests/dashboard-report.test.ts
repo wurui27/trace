@@ -369,4 +369,64 @@ describe("projectDashboardReport", () => {
       context: "RSS/Swap 增长趋势：rss_growth_pct",
     });
   });
+
+  it("projects a device report into the same dashboard result slots", () => {
+    const base = report();
+    const scenario = base.scenario_reports[0];
+    const deviceSnapshot: LatestReportSnapshot = {
+      teamId: "team-1",
+      analysis: {
+        ...analysis,
+        analysis_mode: "device",
+        device_id: "device-1",
+        analysis_profile: undefined,
+        question: undefined,
+        stages: [],
+        input_uploads: [],
+        source_analysis: undefined,
+        ai_rounds: undefined,
+      },
+      report: {
+        ...base,
+        schema_version: "1.0",
+        analysis_mode: "device",
+        synthesis: {
+          state: "not_requested",
+          output: null,
+          synthesis_artifact_id: null,
+          failure_code: null,
+          provenance: null,
+        },
+        scenario_reports: [
+          {
+            ...scenario,
+            scenario_type: "cold_start",
+            bundle: scenario.bundle
+              ? {
+                  ...scenario.bundle,
+                  metrics: [
+                    metric(
+                      "startup.time_to_initial_display_ms",
+                      812.4,
+                      "ms",
+                      "真机冷启动首帧耗时",
+                    ),
+                  ],
+                }
+              : null,
+          },
+        ],
+      },
+    };
+
+    const projection = projectDashboardReport(deviceSnapshot);
+
+    expect(projection.startup).toMatchObject({
+      state: "measured",
+      value: "812.4 ms",
+      context: "真机冷启动首帧耗时",
+    });
+    expect(projection.conclusion.source).toBe("smartperfetto");
+    expect(projection.credibility.aiState).toBe("not_requested");
+  });
 });

@@ -36,6 +36,23 @@ const stageStates: Record<AnalysisStage["state"], string> = {
   not_requested: "未执行",
 };
 
+const scenarioNames = {
+  cold_start: "冷启动采集",
+  scroll: "滑动采集",
+  memory_cycle: "内存循环采集",
+} as const;
+
+const scenarioStates = {
+  awaiting_input: "等待 APK",
+  queued: "等待设备",
+  scheduled: "已分配设备",
+  running: "采集中",
+  analyzing: "内核分析中",
+  completed: "已完成",
+  failed: "失败",
+  canceled: "已取消",
+} as const;
+
 export function activeAnalysisStageLabel(analysis: AnalysisResponse): string {
   if (analysis.state === "completed") return "分析已完成";
   if (analysis.state === "partially_completed") return "分析完成，部分证据不足";
@@ -44,7 +61,19 @@ export function activeAnalysisStageLabel(analysis: AnalysisResponse): string {
   if (analysis.state === "deleted") return "分析已删除";
   if (analysis.cancel_requested_at) return "正在取消分析";
   if (["creating", "created", "uploading"].includes(analysis.state)) {
-    return "正在准备分析输入";
+    return analysis.analysis_mode === "device" ? "正在上传并校验 APK" : "正在准备分析输入";
+  }
+  if (analysis.analysis_mode === "device") {
+    if (analysis.state === "queued") return "等待设备 Agent 接收任务";
+    if (analysis.state === "scheduled") return "设备 Agent 已接收任务";
+    if (analysis.state === "running") {
+      const running = analysis.scenarios?.find((scenario) => scenario.state === "running");
+      return running
+        ? `设备 Agent 正在执行${scenarioNames[running.scenario_type]}`
+        : "设备 Agent 正在自动采集";
+    }
+    if (analysis.state === "analyzing") return "SmartPerfetto 正在解析真机 Trace";
+    return "等待真机分析资源";
   }
   const smartPerfetto = analysis.stages.find(
     (stage) => stage.stage === "smartperfetto",
@@ -138,7 +167,7 @@ export function ActiveAnalysisTaskCard({
         <p className="active-analysis-stage">{stage}</p>
         {isActive ? (
           <p className="active-analysis-estimate">
-            通常需要 3–8 分钟，复杂 Trace 可能更久
+            通常需要 3-8 分钟，复杂任务可能更久
           </p>
         ) : null}
         {stale ? (
@@ -148,12 +177,19 @@ export function ActiveAnalysisTaskCard({
         <details className="active-analysis-details">
           <summary>查看阶段详情</summary>
           <ol>
-            {analysis.stages.map((item) => (
-              <li key={item.stage} className={`is-${item.state}`}>
-                <span>{stageNames[item.stage]}</span>
-                <strong>{stageStates[item.state]}</strong>
-              </li>
-            ))}
+            {analysis.analysis_mode === "device"
+              ? analysis.scenarios?.map((item) => (
+                  <li key={item.scenario_type} className={`is-${item.state}`}>
+                    <span>{scenarioNames[item.scenario_type]}</span>
+                    <strong>{scenarioStates[item.state]}</strong>
+                  </li>
+                ))
+              : analysis.stages.map((item) => (
+                  <li key={item.stage} className={`is-${item.state}`}>
+                    <span>{stageNames[item.stage]}</span>
+                    <strong>{stageStates[item.state]}</strong>
+                  </li>
+                ))}
           </ol>
         </details>
       </div>

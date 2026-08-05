@@ -181,18 +181,28 @@ export function FullAnalysisReport({
               <dd>
                 {report.synthesis.state === "completed"
                   ? `${completedAiRounds} 轮 PerfPilot AI 已完成`
-                  : "PerfPilot AI 未完成"}
+                  : report.synthesis.state === "not_requested"
+                    ? "当前报告未包含 AI"
+                    : "PerfPilot AI 未完成"}
               </dd>
               <span>
                 {report.synthesis.state === "completed"
                   ? "提取、复核、定稿"
-                  : "SmartPerfetto 基础报告仍可查看"}
+                  : report.synthesis.state === "not_requested"
+                    ? "SmartPerfetto 三场景报告"
+                    : "SmartPerfetto 基础报告仍可查看"}
               </span>
             </div>
             <div>
               <dt>报告版本</dt>
               <dd>v{report.report_version}</dd>
-              <span>{analysis.analysis_profile === "auto" ? "自动识别场景" : analysis.analysis_profile}</span>
+              <span>
+                {analysis.analysis_mode === "device"
+                  ? "真机三场景"
+                  : analysis.analysis_profile === "auto"
+                    ? "自动识别场景"
+                    : analysis.analysis_profile}
+              </span>
             </div>
           </dl>
         </section>

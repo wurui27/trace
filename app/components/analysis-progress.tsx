@@ -98,6 +98,29 @@ const inputStateLabels = {
   finalized: "已校验",
 } as const;
 
+const activeStates = new Set<AnalysisState>([
+  "creating",
+  "created",
+  "uploading",
+  "queued",
+  "scheduled",
+  "running",
+  "analyzing",
+]);
+
+function analysisStillChanging(analysis: AnalysisResponse): boolean {
+  return (
+    activeStates.has(analysis.state) ||
+    analysis.stages.some((stage) => stage.state === "pending" || stage.state === "running")
+  );
+}
+
+const scenarioCopy = {
+  cold_start: { label: "冷启动采集", description: "采集应用冷启动与首帧证据。" },
+  scroll: { label: "滑动采集", description: "采集页面滑动与卡顿证据。" },
+  memory_cycle: { label: "内存循环采集", description: "采集内存增长与回收证据。" },
+} as const;
+
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 ** 3).toFixed(1)} GB`;
   if (bytes >= 1024 * 1024) return `${(bytes / 1024 ** 2).toFixed(1)} MB`;
@@ -184,7 +207,7 @@ export function createAnalysisLoader(
 
     await publish();
     let delay = 2_000;
-    while (current.stages.some((stage) => stage.state === "pending" || stage.state === "running")) {
+    while (analysisStillChanging(current)) {
       await sleep(delay, signal);
       try {
         current = await client.analysis(teamId, analysisId, signal);
@@ -344,13 +367,14 @@ export function AnalysisProgressView({
   retrying = false,
 }: AnalysisProgressViewProps) {
   const copy = stateCopy[analysis.state];
+  const deviceMode = analysis.analysis_mode === "device";
 
   return (
     <div className="analysis-detail-stack">
       <article className="analysis-progress-card">
       <header className="analysis-progress-header">
         <div>
-          <p className="page-eyebrow">TRACE ANALYSIS</p>
+          <p className="page-eyebrow">{deviceMode ? "DEVICE ANALYSIS" : "TRACE ANALYSIS"}</p>
           <h1 className={`analysis-state-title is-${copy.tone}`}>{copy.title}</h1>
           <p>{copy.description}</p>
         </div>
@@ -363,8 +387,16 @@ export function AnalysisProgressView({
           <dd><code>{analysis.analysis_id}</code></dd>
         </div>
         <div>
-          <dt>分析重点</dt>
-          <dd>{analysis.analysis_profile === "auto" ? "自动识别" : analysis.analysis_profile === "startup" ? "启动性能" : "滑动与卡顿"}</dd>
+          <dt>分析方式</dt>
+          <dd>
+            {deviceMode
+              ? "真机自动测试"
+              : analysis.analysis_profile === "auto"
+                ? "自动识别"
+                : analysis.analysis_profile === "startup"
+                  ? "启动性能"
+                  : "滑动与卡顿"}
+          </dd>
         </div>
         <div>
           <dt>版本</dt>
@@ -375,37 +407,76 @@ export function AnalysisProgressView({
       <section className="analysis-stage-section" aria-labelledby="analysis-stage-title">
         <h2 id="analysis-stage-title">处理进度</h2>
         <ol className="analysis-stage-list">
-          {analysis.stages.map((stage) => {
-            const content = stageCopy[stage.stage];
-            return (
-              <li className={stageClass(stage)} key={stage.stage}>
-                <span aria-hidden="true" />
-                <div>
-                  <strong>{content.label}</strong>
-                  <p>{stage.failure?.message ?? content.description}</p>
-                </div>
-              </li>
-            );
-          })}
+          {deviceMode
+            ? analysis.scenarios?.map((scenario) => {
+                const content = scenarioCopy[scenario.scenario_type];
+                const className =
+                  scenario.state === "completed"
+                    ? "is-complete"
+                    : ["running", "analyzing"].includes(scenario.state)
+                      ? "is-current"
+                      : scenario.state === "failed"
+                        ? "is-failed"
+                        : scenario.state === "canceled"
+                          ? "is-canceled"
+                          : "";
+                return (
+                  <li className={className} key={scenario.scenario_type}>
+                    <span aria-hidden="true" />
+                    <div>
+                      <strong>{content.label}</strong>
+                      <p>{scenario.failure?.message ?? content.description}</p>
+                    </div>
+                  </li>
+                );
+              })
+            : analysis.stages.map((stage) => {
+                const content = stageCopy[stage.stage];
+                return (
+                  <li className={stageClass(stage)} key={stage.stage}>
+                    <span aria-hidden="true" />
+                    <div>
+                      <strong>{content.label}</strong>
+                      <p>{stage.failure?.message ?? content.description}</p>
+                    </div>
+                  </li>
+                );
+              })}
         </ol>
       </section>
 
       <section className="analysis-input-section" aria-labelledby="analysis-input-title">
         <div className="analysis-section-heading">
           <h2 id="analysis-input-title">输入文件</h2>
-          <span>{analysis.input_uploads.length} 项</span>
+          <span>{deviceMode ? (analysis.apk_upload ? 1 : 0) : analysis.input_uploads.length} 项</span>
         </div>
         <ul className="analysis-input-list">
-          {analysis.input_uploads.map((input) => (
-            <li key={input.artifact_kind}>
-              <span className={`analysis-input-state is-${input.state}`} aria-hidden="true" />
+          {deviceMode && analysis.apk_upload ? (
+            <li>
+              <span
+                className={`analysis-input-state is-${analysis.apk_upload.state}`}
+                aria-hidden="true"
+              />
               <div>
-                <strong>{inputLabels[input.artifact_kind]}</strong>
-                <span>{input.mime} · {formatBytes(input.size)}</span>
+                <strong>APK</strong>
+                <span>{analysis.apk_upload.mime} · {formatBytes(analysis.apk_upload.size)}</span>
               </div>
-              <span>{inputStateLabels[input.state]}</span>
+              <span>
+                {analysis.apk_upload.state === "finalized" ? "已校验" : "上传中"}
+              </span>
             </li>
-          ))}
+          ) : (
+            analysis.input_uploads.map((input) => (
+              <li key={input.artifact_kind}>
+                <span className={`analysis-input-state is-${input.state}`} aria-hidden="true" />
+                <div>
+                  <strong>{inputLabels[input.artifact_kind]}</strong>
+                  <span>{input.mime} · {formatBytes(input.size)}</span>
+                </div>
+                <span>{inputStateLabels[input.state]}</span>
+              </li>
+            ))
+          )}
         </ul>
       </section>
 

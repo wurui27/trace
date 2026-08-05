@@ -45,7 +45,7 @@ export interface DashboardReportProjection {
     readonly evidenceCount: number;
     readonly sourceVerification: "passed" | "failed" | "unknown";
     readonly failedStages: number;
-    readonly aiState: "completed" | "failed";
+    readonly aiState: "completed" | "failed" | "not_requested";
   };
 }
 
@@ -192,8 +192,9 @@ export function projectDashboardReport(
       "startup.startup_detail_startup_info.dur_ms",
       "startup.startup_slow_reasons_startup_overview.dur_ms",
       "startup.startup_analysis_analyze_startups.dur_ms",
+      "startup.time_to_initial_display_ms",
     ],
-    [".startup_info.dur_ms", ".startup_overview.dur_ms"],
+    [".startup_info.dur_ms", ".startup_overview.dur_ms", ".time_to_initial_display_ms"],
   );
   const ttid = selectMetric(
     metrics,

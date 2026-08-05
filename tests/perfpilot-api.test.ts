@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   createPerfPilotClient,
+  enqueueDeviceAnalysis,
   sha256Base64,
   submitTraceAnalysis,
   type AnalysisResponse,
@@ -9,6 +10,8 @@ import {
 
 const ANALYSIS_ID = "82000000-0000-4000-8000-000000000001";
 const TEAM_ID = "81000000-0000-4000-8000-000000000001";
+const DEVICE_ID = "74000000-0000-4000-8000-000000000001";
+const AGENT_ID = "73000000-0000-4000-8000-000000000001";
 
 function analysis(state: AnalysisResponse["state"]): AnalysisResponse {
   return {
@@ -109,6 +112,214 @@ function reportPayload(): Record<string, unknown> {
 }
 
 describe("PerfPilot browser API", () => {
+  it("validates remote Agent and device control-plane responses", async () => {
+    const agent = {
+      agent_id: AGENT_ID,
+      name: "Ubuntu 实验室",
+      platform: "linux",
+      agent_version: "1.2.3",
+      hostname: "rivotek",
+      os_version: "Ubuntu 24.04",
+      state: "online",
+      last_heartbeat_at: "2026-08-05T08:00:00Z",
+      created_at: "2026-08-05T07:00:00Z",
+      updated_at: "2026-08-05T08:00:00Z",
+    };
+    const device = {
+      device_id: DEVICE_ID,
+      agent_id: AGENT_ID,
+      agent_name: agent.name,
+      serial_suffix: "7K2A",
+      manufacturer: "UNISOC",
+      model: "ums9620",
+      android_release: "15",
+      api_level: 35,
+      connection_type: "usb",
+      adb_state: "device",
+      state: "ready",
+      last_seen_at: "2026-08-05T08:00:00Z",
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", csrf_token: "csrf-agent" }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", devices: [device] }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", agents: [agent] }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          schema_version: "1.0",
+          agent_id: AGENT_ID,
+          registration_code: `ppreg_${"A".repeat(43)}`,
+          expires_at: "2026-08-05T08:10:00Z",
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", agent: { ...agent, name: "Mac Agent" } }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", agent: { ...agent, state: "revoked" } }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await client.csrf();
+    await expect(client.devices(TEAM_ID)).resolves.toEqual({
+      schema_version: "1.0",
+      devices: [device],
+    });
+    await expect(client.agents(TEAM_ID)).resolves.toEqual({
+      schema_version: "1.0",
+      agents: [agent],
+    });
+    await expect(
+      client.createAgentRegistrationCode(TEAM_ID, "Ubuntu 实验室"),
+    ).resolves.toMatchObject({ agent_id: AGENT_ID });
+    await expect(client.renameAgent(TEAM_ID, AGENT_ID, "Mac Agent")).resolves.toMatchObject({
+      name: "Mac Agent",
+    });
+    await expect(client.revokeAgent(TEAM_ID, AGENT_ID)).resolves.toMatchObject({
+      state: "revoked",
+    });
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      `/api/v1/teams/${TEAM_ID}/devices`,
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    for (const call of fetcher.mock.calls.slice(1)) {
+      expect(new Headers(call[1]?.headers).get("x-csrf-token")).toBe("csrf-agent");
+    }
+    expect(JSON.parse(String(fetcher.mock.calls[3]?.[1]?.body))).toEqual({
+      schema_version: "1.0",
+      name: "Ubuntu 实验室",
+    });
+  });
+
+  it("creates a device analysis for the selected device and uploads its APK", async () => {
+    const calls: Array<{ url: string; init: RequestInit }> = [];
+    const checksum = "A5BYxvLAy0ksUzsKTRTvd8wPeKvMztUofYShogEc+4E=";
+    const deviceAnalysis = {
+      schema_version: "1.0",
+      analysis_id: ANALYSIS_ID,
+      team_id: TEAM_ID,
+      analysis_mode: "device",
+      device_id: DEVICE_ID,
+      state: "created",
+      version: 2,
+      application_version_id: null,
+      application_metadata: null,
+      apk_upload: {
+        state: "pending",
+        upload_id: "85000000-0000-4000-8000-000000000001",
+        artifact_kind: "apk",
+        mime: "application/vnd.android.package-archive",
+        size: 3,
+        sha256_b64: checksum,
+        expires_at: "2026-08-05T08:15:00Z",
+        put_url: "https://objects.example/device-apk?signature=private",
+        required_headers: {
+          "Content-Type": "application/vnd.android.package-archive",
+          "x-amz-checksum-sha256": checksum,
+        },
+      },
+      scenarios: ["cold_start", "scroll", "memory_cycle"].map((scenario_type) => ({
+        scenario_job_id: null,
+        scenario_type,
+        state: "awaiting_input",
+        version: null,
+        device_group_id: null,
+        sample_verdict_counts: {
+          valid: 0,
+          invalid: 0,
+          pending: 0,
+          validation_error: 0,
+          total: 0,
+        },
+        started_at: null,
+        completed_at: null,
+        failure: null,
+      })),
+      sample_verdict_counts: {
+        valid: 0,
+        invalid: 0,
+        pending: 0,
+        validation_error: 0,
+        total: 0,
+      },
+      active_lease: null,
+      report_available: false,
+      created_at: "2026-08-05T08:00:00Z",
+      started_at: null,
+      completed_at: null,
+      failure: null,
+    };
+    const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input);
+      calls.push({ url, init });
+      if (url === "/api/v1/auth/csrf") {
+        return Response.json({ schema_version: "1.0", csrf_token: "csrf-device" });
+      }
+      if (url.endsWith("/analyses") && init.method === "POST") {
+        return Response.json(deviceAnalysis, { status: 201 });
+      }
+      if (url.startsWith("https://objects.example/")) {
+        return new Response(null, { status: 200 });
+      }
+      if (url.endsWith("/finalize-upload")) {
+        return Response.json({
+          schema_version: "1.0",
+          upload: {
+            state: "finalized",
+            upload_id: deviceAnalysis.apk_upload.upload_id,
+            artifact_id: "86000000-0000-4000-8000-000000000001",
+            artifact_kind: "apk",
+            mime: deviceAnalysis.apk_upload.mime,
+            size: 3,
+            sha256_b64: checksum,
+            finalized_at: "2026-08-05T08:01:00Z",
+          },
+        });
+      }
+      if (url.endsWith(`/analyses/${ANALYSIS_ID}`)) {
+        return Response.json({ ...deviceAnalysis, state: "queued", version: 4 });
+      }
+      throw new Error(`undeclared request: ${url}`);
+    });
+    const client = createPerfPilotClient({ fetcher });
+    const apk = new File([new Uint8Array([1, 2, 3])], "demo.apk", {
+      type: "application/vnd.android.package-archive",
+    });
+
+    const result = await enqueueDeviceAnalysis(
+      { teamId: TEAM_ID, deviceId: DEVICE_ID, apk },
+      { client, randomUUID: () => "device-analysis-fixed" },
+    );
+
+    expect(result.analysis).toMatchObject({ analysis_mode: "device", state: "queued" });
+    const create = calls.find((call) => call.url.endsWith("/analyses"));
+    expect(JSON.parse(String(create?.init.body))).toEqual({
+      schema_version: "1.0",
+      analysis_mode: "device",
+      device_id: DEVICE_ID,
+      scenarios: ["cold_start", "scroll", "memory_cycle"],
+      apk: {
+        artifact_kind: "apk",
+        mime: "application/vnd.android.package-archive",
+        size: 3,
+        sha256_b64: checksum,
+      },
+    });
+    expect(new Headers(create?.init.headers).get("idempotency-key")).toBe(
+      "device-analysis-fixed",
+    );
+    expect(calls.some((call) => call.url.startsWith("https://objects.example/"))).toBe(true);
+    expect(calls.some((call) => call.url.endsWith("/finalize-upload"))).toBe(true);
+  });
+
   it("lists only validated report-bearing analyses for the requested team", async () => {
     const latest = {
       ...analysis("completed"),
@@ -547,6 +758,33 @@ describe("PerfPilot browser API", () => {
     expect(new Headers(rerunCall?.init.headers).get("idempotency-key")).toBe(
       "ai-rerun-fixed",
     );
+  });
+
+  it("normalizes a three-scenario device report without inventing AI output", async () => {
+    const legacy = reportPayload();
+    legacy.schema_version = "1.0";
+    legacy.analysis_mode = "device";
+    legacy.scenario_reports = ["cold_start", "scroll", "memory_cycle"].map(
+      (scenario_type, index) => ({
+        ...(legacy.scenario_reports as Array<Record<string, unknown>>)[0],
+        scenario_job_id: `83000000-0000-4000-8000-00000000000${index + 1}`,
+        scenario_type,
+      }),
+    );
+    delete legacy.synthesis;
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(legacy));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      schema_version: "1.0",
+      analysis_mode: "device",
+      synthesis: { state: "not_requested", output: null },
+      scenario_reports: [
+        { scenario_type: "cold_start" },
+        { scenario_type: "scroll" },
+        { scenario_type: "memory_cycle" },
+      ],
+    });
   });
 
   it("rejects unknown or transport-private report fields", async () => {

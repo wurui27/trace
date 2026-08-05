@@ -88,6 +88,7 @@ const report = {
 describe("LatestAnalysisReportEntry", () => {
   it("loads the current team list and its final report", async () => {
     const client = {
+      csrf: vi.fn().mockResolvedValue("csrf-report"),
       me: vi.fn().mockResolvedValue({
         schema_version: "1.0",
         memberships: [{ team: { id: "team-real-1", name: "Ray" }, role: "owner" }],
@@ -105,6 +106,7 @@ describe("LatestAnalysisReportEntry", () => {
       analysis,
       report,
     });
+    expect(client.csrf).toHaveBeenCalledWith(controller.signal);
     expect(client.analyses).toHaveBeenCalledWith("team-real-1", 1, controller.signal);
     expect(client.report).toHaveBeenCalledWith(
       "team-real-1",

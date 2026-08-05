@@ -1902,7 +1902,7 @@ class SQLAlchemyAnalysisRepository:
                 .where(
                     Analysis.tombstoned_at.is_(None),
                     Analysis.state != "deleted",
-                    Analysis.analysis_mode == "trace_upload",
+                    Analysis.analysis_mode.in_(("device", "trace_upload")),
                     ReportVersion.scenario_result_id.is_(None),
                     ReportVersion.report.is_not(None),
                 )

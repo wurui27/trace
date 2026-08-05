@@ -16,10 +16,12 @@ import {
 import { ActiveAnalysisTaskCard } from "./active-analysis-task-card";
 import { NewAnalysisDialog } from "./new-analysis-dialog";
 import {
+  createLatestReportLoader,
   LatestAnalysisReportEntry,
   type LatestReportLoader,
   type LatestReportSnapshot,
 } from "./latest-analysis-report-entry";
+import { useOptionalPerfPilotSession } from "./perfpilot-session-provider";
 
 const activeStates = new Set<AnalysisState>([
   "creating",
@@ -81,12 +83,14 @@ const confidenceLabels = {
 } as const;
 
 export function Dashboard({
-  client = defaultClient,
+  client: providedClient,
   pollDelay = wait,
   latestReportLoader,
   confirmCancel = () =>
     window.confirm("确定取消当前分析吗？这会停止 SmartPerfetto 和后续 AI 分析。"),
 }: DashboardProps = {}) {
+  const session = useOptionalPerfPilotSession();
+  const client = providedClient ?? session?.client ?? defaultClient;
   const [teamId, setTeamId] = useState<string | null>(null);
   const [currentAnalysis, setCurrentAnalysis] = useState<AnalysisResponse | null>(null);
   const [stale, setStale] = useState(false);
@@ -105,6 +109,10 @@ export function Dashboard({
   const reportProjection = useMemo(
     () => (latestSnapshot ? projectDashboardReport(latestSnapshot) : null),
     [latestSnapshot],
+  );
+  const resolvedLatestReportLoader = useMemo(
+    () => latestReportLoader ?? createLatestReportLoader(client),
+    [client, latestReportLoader],
   );
 
   useEffect(() => {
@@ -254,7 +262,7 @@ export function Dashboard({
       ) : null}
 
       <LatestAnalysisReportEntry
-        loader={latestReportLoader}
+        loader={resolvedLatestReportLoader}
         refreshToken={reportRefreshToken}
         onSnapshot={handleLatestSnapshot}
       />
@@ -453,7 +461,9 @@ export function Dashboard({
               <li>
                 AI 建议 {reportProjection.credibility.aiState === "completed"
                   ? "已完成"
-                  : "未完成"}
+                  : reportProjection.credibility.aiState === "not_requested"
+                    ? "当前报告未包含"
+                    : "未完成"}
               </li>
             </>
           ) : (

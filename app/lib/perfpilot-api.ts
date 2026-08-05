@@ -38,6 +38,7 @@ export type TraceInputKind =
   | "native_symbols"
   | "log";
 export type TraceProfile = "auto" | "startup" | "scroll";
+export type AnalysisMode = "device" | "trace_upload" | "memory_upload";
 export type AnalysisState =
   | "creating"
   | "created"
@@ -121,7 +122,7 @@ export interface ReportEvidence {
 
 export interface ReportScenario {
   readonly scenario_job_id: string;
-  readonly scenario_type: "startup" | "scroll" | "memory_cycle";
+  readonly scenario_type: "cold_start" | "startup" | "scroll" | "memory_cycle";
   readonly result_state: "completed" | "failed" | "canceled";
   readonly device_group_id: string | null;
   readonly device_group_reason: string | null;
@@ -181,9 +182,9 @@ export interface SynthesisProvenance {
 }
 
 export interface AnalysisReport {
-  readonly schema_version: "1.1";
+  readonly schema_version: "1.0" | "1.1";
   readonly analysis_id: string;
-  readonly analysis_mode: "trace_upload";
+  readonly analysis_mode: "device" | "trace_upload";
   readonly state: "completed" | "partially_completed" | "failed" | "canceled";
   readonly report_version: number;
   readonly generated_at: string;
@@ -201,6 +202,13 @@ export interface AnalysisReport {
         readonly output: null;
         readonly synthesis_artifact_id: null;
         readonly failure_code: string;
+        readonly provenance: null;
+      }
+    | {
+        readonly state: "not_requested";
+        readonly output: null;
+        readonly synthesis_artifact_id: null;
+        readonly failure_code: null;
         readonly provenance: null;
       };
 }
@@ -221,9 +229,9 @@ export interface AnalysisResponse {
   readonly schema_version: "1.0";
   readonly analysis_id: string;
   readonly team_id: string;
-  readonly analysis_mode: "trace_upload";
-  readonly analysis_profile: TraceProfile;
-  readonly question: string | null;
+  readonly analysis_mode: AnalysisMode;
+  readonly analysis_profile?: TraceProfile;
+  readonly question?: string | null;
   readonly state: AnalysisState;
   readonly version: number;
   readonly created_at?: string;
@@ -242,6 +250,15 @@ export interface AnalysisResponse {
   readonly failure: AnalysisFailure | null;
   readonly ai_rounds?: readonly AnalysisAiRound[];
   readonly source_analysis?: AnalysisSource;
+  readonly device_id?: string;
+  readonly application_version_id?: string | null;
+  readonly application_metadata?: ApplicationMetadata | null;
+  readonly apk_upload?: UploadPayload | null;
+  readonly scenarios?: readonly AnalysisScenario[];
+  readonly sample_verdict_counts?: SampleVerdictCounts;
+  readonly active_lease?: ActiveAnalysisLease | null;
+  readonly started_at?: string | null;
+  readonly completed_at?: string | null;
 }
 
 export interface AnalysisListItem extends AnalysisResponse {
@@ -259,6 +276,108 @@ export interface MeResponse {
     readonly team: { readonly id: string; readonly name: string };
     readonly role: string;
   }>;
+}
+
+export interface ApplicationMetadata {
+  readonly package_name: string;
+  readonly version_name: string | null;
+  readonly version_code: number;
+  readonly launch_activity: string | null;
+  readonly min_sdk: number | null;
+  readonly target_sdk: number | null;
+  readonly supported_abis: readonly string[];
+  readonly has_native_libraries: boolean;
+}
+
+export interface SampleVerdictCounts {
+  readonly valid: number;
+  readonly invalid: number;
+  readonly pending: number;
+  readonly validation_error: number;
+  readonly total: number;
+}
+
+export interface AnalysisScenario {
+  readonly scenario_job_id: string | null;
+  readonly scenario_type: "cold_start" | "scroll" | "memory_cycle";
+  readonly state:
+    | "awaiting_input"
+    | "queued"
+    | "scheduled"
+    | "running"
+    | "analyzing"
+    | "completed"
+    | "failed"
+    | "canceled";
+  readonly version: number | null;
+  readonly device_group_id: string | null;
+  readonly sample_verdict_counts: SampleVerdictCounts;
+  readonly started_at: string | null;
+  readonly completed_at: string | null;
+  readonly failure: AnalysisFailure | null;
+}
+
+export interface ActiveAnalysisLease {
+  readonly lease_id: string;
+  readonly device_id: string;
+  readonly state: "active";
+  readonly expires_at: string;
+}
+
+export type AgentPlatform = "macos" | "windows" | "linux";
+export type AgentState = "pending" | "online" | "offline" | "revoked";
+
+export interface AgentView {
+  readonly agent_id: string;
+  readonly name: string;
+  readonly platform: AgentPlatform | null;
+  readonly agent_version: string | null;
+  readonly hostname: string | null;
+  readonly os_version: string | null;
+  readonly state: AgentState;
+  readonly last_heartbeat_at: string | null;
+  readonly created_at: string;
+  readonly updated_at: string;
+}
+
+export interface AgentListResponse {
+  readonly schema_version: "1.0";
+  readonly agents: readonly AgentView[];
+}
+
+export interface AgentRegistrationCodeResponse {
+  readonly schema_version: "1.0";
+  readonly agent_id: string;
+  readonly registration_code: string;
+  readonly expires_at: string;
+}
+
+export type RemoteDeviceState =
+  | "ready"
+  | "busy"
+  | "unauthorized"
+  | "booting"
+  | "quarantined"
+  | "offline";
+
+export interface RemoteDeviceView {
+  readonly device_id: string;
+  readonly agent_id: string;
+  readonly agent_name: string;
+  readonly serial_suffix: string;
+  readonly manufacturer: string | null;
+  readonly model: string | null;
+  readonly android_release: string | null;
+  readonly api_level: number | null;
+  readonly connection_type: "usb" | "wifi" | "unknown";
+  readonly adb_state: "device" | "unauthorized" | "offline" | "booting";
+  readonly state: RemoteDeviceState;
+  readonly last_seen_at: string | null;
+}
+
+export interface RemoteDeviceListResponse {
+  readonly schema_version: "1.0";
+  readonly devices: readonly RemoteDeviceView[];
 }
 
 export type LocalDeviceState =
@@ -281,19 +400,23 @@ export interface LocalDeviceStatusResponse {
   } | null;
 }
 
+export interface UploadPayload {
+  readonly state: "pending" | "finalized";
+  readonly upload_id: string;
+  readonly artifact_id?: string;
+  readonly artifact_kind: TraceInputKind;
+  readonly mime: string;
+  readonly size: number;
+  readonly sha256_b64: string;
+  readonly expires_at?: string;
+  readonly finalized_at?: string;
+  readonly put_url?: string;
+  readonly required_headers?: Record<string, string>;
+}
+
 interface UploadSlot {
   readonly schema_version: "1.0";
-  readonly upload: {
-    readonly state: "pending" | "finalized";
-    readonly upload_id: string;
-    readonly artifact_id?: string;
-    readonly artifact_kind: TraceInputKind;
-    readonly mime: string;
-    readonly size: number;
-    readonly sha256_b64: string;
-    readonly put_url?: string;
-    readonly required_headers?: Record<string, string>;
-  };
+  readonly upload: UploadPayload;
 }
 
 interface InputDescriptor {
@@ -329,6 +452,27 @@ export interface PerfPilotClient {
   device(signal?: AbortSignal): Promise<LocalDeviceStatusResponse>;
   csrf(signal?: AbortSignal): Promise<string>;
   me(signal?: AbortSignal): Promise<MeResponse>;
+  devices(teamId: string, signal?: AbortSignal): Promise<RemoteDeviceListResponse>;
+  agents(teamId: string, signal?: AbortSignal): Promise<AgentListResponse>;
+  createAgentRegistrationCode(
+    teamId: string,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<AgentRegistrationCodeResponse>;
+  renameAgent(
+    teamId: string,
+    agentId: string,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<AgentView>;
+  revokeAgent(teamId: string, agentId: string, signal?: AbortSignal): Promise<AgentView>;
+  createDeviceAnalysis(
+    teamId: string,
+    deviceId: string,
+    apk: InputDescriptor,
+    idempotencyKey: string,
+    signal?: AbortSignal,
+  ): Promise<AnalysisResponse>;
   createTrace(
     teamId: string,
     profile: TraceProfile,
@@ -750,7 +894,9 @@ function validScenarioReport(value: unknown): boolean {
       "failure",
     ]) &&
     typeof value.scenario_job_id === "string" &&
-    ["startup", "scroll", "memory_cycle"].includes(String(value.scenario_type)) &&
+    ["cold_start", "startup", "scroll", "memory_cycle"].includes(
+      String(value.scenario_type),
+    ) &&
     ["completed", "failed", "canceled"].includes(String(value.result_state)) &&
     (value.bundle === null || validReportBundle(value.bundle)) &&
     (value.failure === null || validFailure(value.failure))
@@ -881,8 +1027,8 @@ function analysisReportResponse(value: unknown): AnalysisReport {
       "scenario_reports",
       "synthesis",
     ]) ||
-    value.schema_version !== "1.1" ||
-    value.analysis_mode !== "trace_upload" ||
+    !["1.0", "1.1"].includes(String(value.schema_version)) ||
+    !["device", "trace_upload"].includes(String(value.analysis_mode)) ||
     typeof value.analysis_id !== "string" ||
     !["completed", "partially_completed", "failed", "canceled"].includes(
       String(value.state),
@@ -893,7 +1039,39 @@ function analysisReportResponse(value: unknown): AnalysisReport {
     !Array.isArray(value.scenario_reports) ||
     value.scenario_reports.length < 1 ||
     value.scenario_reports.length > 3 ||
-    !value.scenario_reports.every(validScenarioReport) ||
+    !value.scenario_reports.every(validScenarioReport)
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  if (value.schema_version === "1.0") {
+    if (value.synthesis !== undefined) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    if (value.analysis_mode === "device") {
+      const expected = ["cold_start", "scroll", "memory_cycle"];
+      if (
+        value.scenario_reports.length !== expected.length ||
+        !value.scenario_reports.every(
+          (scenario, index) =>
+            object(scenario) && scenario.scenario_type === expected[index],
+        )
+      ) {
+        throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+      }
+    }
+    return {
+      ...value,
+      synthesis: {
+        state: "not_requested",
+        output: null,
+        synthesis_artifact_id: null,
+        failure_code: null,
+        provenance: null,
+      },
+    } as unknown as AnalysisReport;
+  }
+  if (
+    value.analysis_mode !== "trace_upload" ||
     !object(value.synthesis) ||
     !exactKeys(value.synthesis, [
       "state",
@@ -937,6 +1115,159 @@ function synthesisRunResponse(value: unknown): SynthesisRunResponse {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
   return value as unknown as SynthesisRunResponse;
+}
+
+function validDateTime(value: unknown, nullable = false): boolean {
+  return (
+    (nullable && value === null) ||
+    (typeof value === "string" && value.length <= 64 && !Number.isNaN(Date.parse(value)))
+  );
+}
+
+function validNullableString(value: unknown, maximum: number): boolean {
+  return value === null || (typeof value === "string" && value.length <= maximum);
+}
+
+function agentView(value: unknown): AgentView {
+  if (
+    !object(value) ||
+    !exactKeys(value, [
+      "agent_id",
+      "name",
+      "platform",
+      "agent_version",
+      "hostname",
+      "os_version",
+      "state",
+      "last_heartbeat_at",
+      "created_at",
+      "updated_at",
+    ]) ||
+    typeof value.agent_id !== "string" ||
+    typeof value.name !== "string" ||
+    value.name.length < 1 ||
+    value.name.length > 200 ||
+    ![null, "macos", "windows", "linux"].includes(value.platform as string | null) ||
+    !validNullableString(value.agent_version, 64) ||
+    !validNullableString(value.hostname, 200) ||
+    !validNullableString(value.os_version, 128) ||
+    !["pending", "online", "offline", "revoked"].includes(String(value.state)) ||
+    !validDateTime(value.last_heartbeat_at, true) ||
+    !validDateTime(value.created_at) ||
+    !validDateTime(value.updated_at)
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as AgentView;
+}
+
+function agentListResponse(value: unknown): AgentListResponse {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "agents"]) ||
+    value.schema_version !== "1.0" ||
+    !Array.isArray(value.agents) ||
+    value.agents.length > 256
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  const agents = value.agents.map(agentView);
+  if (new Set(agents.map((agent) => agent.agent_id)).size !== agents.length) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return { schema_version: "1.0", agents };
+}
+
+function registrationCodeResponse(value: unknown): AgentRegistrationCodeResponse {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "agent_id", "registration_code", "expires_at"]) ||
+    value.schema_version !== "1.0" ||
+    typeof value.agent_id !== "string" ||
+    typeof value.registration_code !== "string" ||
+    !/^ppreg_[A-Za-z0-9_-]{43}$/.test(value.registration_code) ||
+    !validDateTime(value.expires_at)
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as AgentRegistrationCodeResponse;
+}
+
+function agentMutationResponse(value: unknown): AgentView {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "agent"]) ||
+    value.schema_version !== "1.0"
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return agentView(value.agent);
+}
+
+function normalizedAgentName(name: string): string {
+  const normalized = name.trim();
+  if (normalized.length < 1 || normalized.length > 200 || /[\u0000-\u001f\u007f]/.test(normalized)) {
+    throw new PerfPilotApiError("invalid_agent_name", "请输入有效的 Agent 名称", false, null);
+  }
+  return normalized;
+}
+
+function remoteDeviceView(value: unknown): RemoteDeviceView {
+  if (
+    !object(value) ||
+    !exactKeys(value, [
+      "device_id",
+      "agent_id",
+      "agent_name",
+      "serial_suffix",
+      "manufacturer",
+      "model",
+      "android_release",
+      "api_level",
+      "connection_type",
+      "adb_state",
+      "state",
+      "last_seen_at",
+    ]) ||
+    typeof value.device_id !== "string" ||
+    typeof value.agent_id !== "string" ||
+    typeof value.agent_name !== "string" ||
+    value.agent_name.length < 1 ||
+    value.agent_name.length > 200 ||
+    typeof value.serial_suffix !== "string" ||
+    !/^[!-~]{1,4}$/.test(value.serial_suffix) ||
+    !validNullableString(value.manufacturer, 128) ||
+    !validNullableString(value.model, 128) ||
+    !validNullableString(value.android_release, 64) ||
+    (value.api_level !== null &&
+      (!Number.isSafeInteger(value.api_level) || Number(value.api_level) < 1)) ||
+    !["usb", "wifi", "unknown"].includes(String(value.connection_type)) ||
+    !["device", "unauthorized", "offline", "booting"].includes(String(value.adb_state)) ||
+    !["ready", "busy", "unauthorized", "booting", "quarantined", "offline"].includes(
+      String(value.state),
+    ) ||
+    !validDateTime(value.last_seen_at, true)
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as RemoteDeviceView;
+}
+
+function remoteDeviceListResponse(value: unknown): RemoteDeviceListResponse {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "devices"]) ||
+    value.schema_version !== "1.0" ||
+    !Array.isArray(value.devices) ||
+    value.devices.length > 256
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  const devices = value.devices.map(remoteDeviceView);
+  if (new Set(devices.map((device) => device.device_id)).size !== devices.length) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return { schema_version: "1.0", devices };
 }
 
 function localDeviceResponse(value: unknown): LocalDeviceStatusResponse {
@@ -983,6 +1314,148 @@ function localDeviceResponse(value: unknown): LocalDeviceStatusResponse {
   return value as unknown as LocalDeviceStatusResponse;
 }
 
+function validVerdictCounts(value: unknown): value is SampleVerdictCounts {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["valid", "invalid", "pending", "validation_error", "total"])
+  ) {
+    return false;
+  }
+  const counts = [
+    value.valid,
+    value.invalid,
+    value.pending,
+    value.validation_error,
+    value.total,
+  ];
+  return (
+    counts.every((count) => Number.isSafeInteger(count) && Number(count) >= 0) &&
+    Number(value.valid) +
+      Number(value.invalid) +
+      Number(value.pending) +
+      Number(value.validation_error) ===
+      Number(value.total)
+  );
+}
+
+function validApplicationMetadata(value: unknown): value is ApplicationMetadata {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "package_name",
+      "version_name",
+      "version_code",
+      "launch_activity",
+      "min_sdk",
+      "target_sdk",
+      "supported_abis",
+      "has_native_libraries",
+    ]) &&
+    typeof value.package_name === "string" &&
+    validNullableString(value.version_name, 255) &&
+    Number.isSafeInteger(value.version_code) &&
+    validNullableString(value.launch_activity, 512) &&
+    (value.min_sdk === null || Number.isSafeInteger(value.min_sdk)) &&
+    (value.target_sdk === null || Number.isSafeInteger(value.target_sdk)) &&
+    stringArray(value.supported_abis, 32) &&
+    typeof value.has_native_libraries === "boolean"
+  );
+}
+
+function validUploadPayload(value: unknown): value is UploadPayload {
+  if (
+    !object(value) ||
+    !exactKeys(value, [
+      "state",
+      "upload_id",
+      "artifact_id",
+      "artifact_kind",
+      "mime",
+      "size",
+      "sha256_b64",
+      "expires_at",
+      "finalized_at",
+      "put_url",
+      "required_headers",
+    ]) ||
+    !["pending", "finalized"].includes(String(value.state)) ||
+    typeof value.upload_id !== "string" ||
+    typeof value.artifact_kind !== "string" ||
+    typeof value.mime !== "string" ||
+    !Number.isSafeInteger(value.size) ||
+    Number(value.size) < 1 ||
+    typeof value.sha256_b64 !== "string"
+  ) {
+    return false;
+  }
+  if (value.state === "pending") {
+    const hasPutUrl = value.put_url !== undefined;
+    const hasHeaders = value.required_headers !== undefined;
+    return (
+      value.artifact_id === undefined &&
+      value.finalized_at === undefined &&
+      validDateTime(value.expires_at) &&
+      hasPutUrl === hasHeaders &&
+      (!hasPutUrl ||
+        (typeof value.put_url === "string" && object(value.required_headers)))
+    );
+  }
+  return (
+    typeof value.artifact_id === "string" &&
+    value.expires_at === undefined &&
+    value.put_url === undefined &&
+    value.required_headers === undefined &&
+    validDateTime(value.finalized_at)
+  );
+}
+
+function validAnalysisScenario(value: unknown, expectedType: string): value is AnalysisScenario {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "scenario_job_id",
+      "scenario_type",
+      "state",
+      "version",
+      "device_group_id",
+      "sample_verdict_counts",
+      "started_at",
+      "completed_at",
+      "failure",
+    ]) &&
+    (value.scenario_job_id === null || typeof value.scenario_job_id === "string") &&
+    value.scenario_type === expectedType &&
+    [
+      "awaiting_input",
+      "queued",
+      "scheduled",
+      "running",
+      "analyzing",
+      "completed",
+      "failed",
+      "canceled",
+    ].includes(String(value.state)) &&
+    (value.version === null ||
+      (Number.isSafeInteger(value.version) && Number(value.version) >= 1)) &&
+    (value.device_group_id === null || typeof value.device_group_id === "string") &&
+    validVerdictCounts(value.sample_verdict_counts) &&
+    validDateTime(value.started_at, true) &&
+    validDateTime(value.completed_at, true) &&
+    (value.failure === null || validFailure(value.failure))
+  );
+}
+
+function validActiveLease(value: unknown): value is ActiveAnalysisLease {
+  return (
+    object(value) &&
+    exactKeys(value, ["lease_id", "device_id", "state", "expires_at"]) &&
+    typeof value.lease_id === "string" &&
+    typeof value.device_id === "string" &&
+    value.state === "active" &&
+    validDateTime(value.expires_at)
+  );
+}
+
 function analysisResponse(value: unknown): AnalysisResponse {
   const hasAiRounds = object(value) && "ai_rounds" in value;
   const hasSource = object(value) && "source_analysis" in value;
@@ -991,11 +1464,9 @@ function analysisResponse(value: unknown): AnalysisResponse {
   if (
     !object(value) ||
     value.schema_version !== "1.0" ||
-    value.analysis_mode !== "trace_upload" ||
+    !["device", "trace_upload", "memory_upload"].includes(String(value.analysis_mode)) ||
     typeof value.analysis_id !== "string" ||
     typeof value.team_id !== "string" ||
-    !["auto", "startup", "scroll"].includes(String(value.analysis_profile)) ||
-    !Array.isArray(value.input_uploads) ||
     !ANALYSIS_STATES.has(value.state as AnalysisState) ||
     typeof value.version !== "number" ||
     typeof value.report_available !== "boolean" ||
@@ -1008,14 +1479,66 @@ function analysisResponse(value: unknown): AnalysisResponse {
       (typeof cancelRequestedAt !== "string" ||
         cancelRequestedAt.length > 64 ||
         Number.isNaN(Date.parse(cancelRequestedAt)))) ||
-    !validStages(value.stages) ||
-    hasAiRounds !== hasSource ||
-    (hasAiRounds && !validAiRounds(value.ai_rounds)) ||
-    (hasSource && !validAnalysisSource(value.source_analysis))
+    (value.failure !== null && !validFailure(value.failure))
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
-  return value as unknown as AnalysisResponse;
+  if (value.analysis_mode === "trace_upload") {
+    if (
+      !["auto", "startup", "scroll"].includes(String(value.analysis_profile)) ||
+      (value.question !== null && typeof value.question !== "string") ||
+      !Array.isArray(value.input_uploads) ||
+      !validStages(value.stages) ||
+      hasAiRounds !== hasSource ||
+      (hasAiRounds && !validAiRounds(value.ai_rounds)) ||
+      (hasSource && !validAnalysisSource(value.source_analysis))
+    ) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    return value as unknown as AnalysisResponse;
+  }
+  if (hasAiRounds || hasSource) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  if (value.analysis_mode === "device") {
+    const scenarioTypes = ["cold_start", "scroll", "memory_cycle"] as const;
+    if (
+      typeof value.device_id !== "string" ||
+      (value.application_version_id !== null &&
+        typeof value.application_version_id !== "string") ||
+      (value.application_metadata !== null &&
+        !validApplicationMetadata(value.application_metadata)) ||
+      !validUploadPayload(value.apk_upload) ||
+      !Array.isArray(value.scenarios) ||
+      value.scenarios.length !== scenarioTypes.length ||
+      !value.scenarios.every((scenario, index) =>
+        validAnalysisScenario(scenario, scenarioTypes[index]),
+      ) ||
+      !validVerdictCounts(value.sample_verdict_counts) ||
+      (value.active_lease !== null && !validActiveLease(value.active_lease)) ||
+      !validDateTime(value.started_at, true) ||
+      !validDateTime(value.completed_at, true)
+    ) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    return {
+      ...value,
+      stages: [],
+      input_uploads: [],
+    } as unknown as AnalysisResponse;
+  }
+  if (
+    (value.application_version_id !== null && typeof value.application_version_id !== "string") ||
+    !validApplicationMetadata(value.application_metadata) ||
+    (value.question !== null && typeof value.question !== "string")
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return {
+    ...value,
+    stages: [],
+    input_uploads: [],
+  } as unknown as AnalysisResponse;
 }
 
 function analysisListResponse(
@@ -1037,6 +1560,7 @@ function analysisListResponse(
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
   const ids = new Set<string>();
+  const analyses: AnalysisListItem[] = [];
   for (const rawAnalysis of value.analyses) {
     const parsed = analysisResponse(rawAnalysis);
     const createdAt = object(rawAnalysis) ? rawAnalysis.created_at : null;
@@ -1052,20 +1576,16 @@ function analysisListResponse(
       throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
     }
     ids.add(parsed.analysis_id);
+    analyses.push({ ...parsed, created_at: createdAt });
   }
-  return value as unknown as AnalysisListResponse;
+  return { schema_version: "1.0", analyses };
 }
 
 function uploadSlot(value: unknown): UploadSlot {
   if (
     !object(value) ||
     value.schema_version !== "1.0" ||
-    !object(value.upload) ||
-    typeof value.upload.upload_id !== "string" ||
-    typeof value.upload.artifact_kind !== "string" ||
-    typeof value.upload.mime !== "string" ||
-    typeof value.upload.size !== "number" ||
-    typeof value.upload.sha256_b64 !== "string"
+    !validUploadPayload(value.upload)
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
@@ -1148,6 +1668,66 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
       }
       return payload as unknown as MeResponse;
     },
+    async devices(teamId, signal) {
+      return remoteDeviceListResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/devices`,
+          {},
+          signal,
+        ),
+      );
+    },
+    async agents(teamId, signal) {
+      return agentListResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/agents`,
+          {},
+          signal,
+        ),
+      );
+    },
+    async createAgentRegistrationCode(teamId, name, signal) {
+      return registrationCodeResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/agents/registration-codes`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              schema_version: "1.0",
+              name: normalizedAgentName(name),
+            }),
+          },
+          signal,
+        ),
+      );
+    },
+    async renameAgent(teamId, agentId, name, signal) {
+      return agentMutationResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/agents/${encodeURIComponent(agentId)}`,
+          {
+            method: "PATCH",
+            body: JSON.stringify({
+              schema_version: "1.0",
+              name: normalizedAgentName(name),
+            }),
+          },
+          signal,
+        ),
+      );
+    },
+    async revokeAgent(teamId, agentId, signal) {
+      return agentMutationResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/agents/${encodeURIComponent(agentId)}/revoke`,
+          {
+            method: "POST",
+            body: JSON.stringify({ schema_version: "1.0" }),
+          },
+          signal,
+        ),
+      );
+    },
     async createTrace(teamId, profile, question, inputs, idempotencyKey, signal) {
       const payload = await requestJson(
         `/api/v1/teams/${encodeURIComponent(teamId)}/analyses`,
@@ -1170,6 +1750,37 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         idempotencyKey,
       );
       return analysisResponse(payload);
+    },
+    async createDeviceAnalysis(teamId, deviceId, apk, idempotencyKey, signal) {
+      const payload = await requestJson(
+        `/api/v1/teams/${encodeURIComponent(teamId)}/analyses`,
+        {
+          method: "POST",
+          body: JSON.stringify({
+            schema_version: "1.0",
+            analysis_mode: "device",
+            device_id: deviceId,
+            scenarios: ["cold_start", "scroll", "memory_cycle"],
+            apk: {
+              artifact_kind: "apk",
+              mime: apk.mime,
+              size: apk.size,
+              sha256_b64: apk.sha256_b64,
+            },
+          }),
+        },
+        signal,
+        idempotencyKey,
+      );
+      const created = analysisResponse(payload);
+      if (
+        created.analysis_mode !== "device" ||
+        created.team_id !== teamId ||
+        created.device_id !== deviceId
+      ) {
+        throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+      }
+      return created;
     },
     async reserveInput(teamId, analysisId, input, signal) {
       const payload = await requestJson(
@@ -1455,3 +2066,86 @@ export async function enqueueTraceAnalysis(
 }
 
 export const submitTraceAnalysis = enqueueTraceAnalysis;
+
+export type DeviceSubmissionPhase =
+  | "session"
+  | "hashing"
+  | "creating"
+  | "uploading"
+  | "submitted";
+
+export interface SubmitDeviceAnalysisInput {
+  readonly teamId: string;
+  readonly deviceId: string;
+  readonly apk: File;
+  readonly signal?: AbortSignal;
+  readonly onProgress?: (phase: DeviceSubmissionPhase) => void;
+}
+
+export interface SubmitDeviceAnalysisDependencies {
+  readonly client?: PerfPilotClient;
+  readonly randomUUID?: () => string;
+}
+
+export async function enqueueDeviceAnalysis(
+  submission: SubmitDeviceAnalysisInput,
+  dependencies: SubmitDeviceAnalysisDependencies = {},
+): Promise<SubmittedTraceAnalysis> {
+  const client = dependencies.client ?? createPerfPilotClient();
+  const randomUUID = dependencies.randomUUID ?? (() => crypto.randomUUID());
+  const { signal, onProgress } = submission;
+  if (!submission.teamId || !submission.deviceId) {
+    throw new PerfPilotApiError("device_required", "请选择可用的 Android 设备", false, null);
+  }
+  if (!(submission.apk instanceof File) || !submission.apk.name.toLowerCase().endsWith(".apk")) {
+    throw new PerfPilotApiError("apk_required", "请选择 APK 文件", false, null);
+  }
+
+  onProgress?.("session");
+  await client.csrf(signal);
+  onProgress?.("hashing");
+  const apk: InputDescriptor = {
+    kind: "apk",
+    file: submission.apk,
+    mime: "application/vnd.android.package-archive",
+    size: submission.apk.size,
+    sha256_b64: await sha256Base64(submission.apk, signal),
+  };
+
+  onProgress?.("creating");
+  const created = await client.createDeviceAnalysis(
+    submission.teamId,
+    submission.deviceId,
+    apk,
+    randomUUID(),
+    signal,
+  );
+  const authorization = created.apk_upload;
+  if (created.analysis_mode !== "device" || authorization === null || authorization === undefined) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+
+  if (authorization.state === "pending") {
+    onProgress?.("uploading");
+    const slot: UploadSlot = { schema_version: "1.0", upload: authorization };
+    await client.putInput(slot, apk, signal);
+    await client.finalizeInput(
+      submission.teamId,
+      created.analysis_id,
+      apk,
+      authorization.upload_id,
+      signal,
+    );
+  }
+
+  const current = await client.analysis(submission.teamId, created.analysis_id, signal);
+  if (
+    current.analysis_mode !== "device" ||
+    current.team_id !== submission.teamId ||
+    current.device_id !== submission.deviceId
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  onProgress?.("submitted");
+  return { teamId: submission.teamId, analysis: current };
+}

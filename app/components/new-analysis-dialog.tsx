@@ -11,20 +11,24 @@ import {
 import { Smartphone, Upload, X } from "lucide-react";
 
 import type { SubmittedTraceAnalysis } from "../lib/perfpilot-api";
+import { DeviceAnalysisForm, type DeviceSubmitter } from "./device-analysis-form";
 import { TraceUploadForm, type TraceSubmitter } from "./trace-upload-form";
 
 interface NewAnalysisDialogProps {
   readonly disabled?: boolean;
   readonly submitter?: TraceSubmitter;
+  readonly deviceSubmitter?: DeviceSubmitter;
   readonly onSubmitted?: (result: SubmittedTraceAnalysis) => void;
 }
 
 export function NewAnalysisDialog({
   disabled = false,
   submitter,
+  deviceSubmitter,
   onSubmitted,
 }: NewAnalysisDialogProps = {}) {
   const [isOpen, setIsOpen] = useState(false);
+  const [mode, setMode] = useState<"device" | "trace">("trace");
   const triggerRef = useRef<HTMLButtonElement>(null);
   const closeButtonRef = useRef<HTMLButtonElement>(null);
   const dialogRef = useRef<HTMLDivElement>(null);
@@ -33,6 +37,7 @@ export function NewAnalysisDialog({
 
   const closeDialog = useCallback(() => {
     setIsOpen(false);
+    setMode("trace");
   }, []);
 
   const handleSubmitted = useCallback(
@@ -121,7 +126,7 @@ export function NewAnalysisDialog({
               <div>
                 <p className="section-label">分析入口</p>
                 <h2 id={titleId}>新建性能分析</h2>
-                <p>上传 Trace，SmartPerfetto 将自动解析并生成优化建议。</p>
+                <p>选择真机自动采集，或直接上传已有 Trace。</p>
               </div>
               <button
                 ref={closeButtonRef}
@@ -137,9 +142,10 @@ export function NewAnalysisDialog({
             <div className="new-analysis-mode-grid" role="group" aria-label="分析方式">
               <button
                 type="button"
-                className="new-analysis-mode-card is-unavailable"
+                className={`new-analysis-mode-card${mode === "device" ? " is-selected" : ""}`}
                 aria-label="真机自动测试"
-                disabled
+                aria-pressed={mode === "device"}
+                onClick={() => setMode("device")}
               >
                 <span className="new-analysis-mode-icon">
                   <Smartphone aria-hidden="true" />
@@ -147,33 +153,42 @@ export function NewAnalysisDialog({
                 <span className="new-analysis-mode-copy">
                   <span className="new-analysis-mode-heading">
                     <strong>真机自动测试</strong>
-                    <span className="new-analysis-recommended-badge">待接入</span>
+                    <span className="new-analysis-recommended-badge">自动采集</span>
                   </span>
-                  <span>ADB Agent 与设备调度完成后开放。</span>
+                  <span>安装 APK，依次采集启动、滑动和内存证据。</span>
                 </span>
               </button>
 
               <button
                 type="button"
-                className="new-analysis-mode-card is-selected"
+                className={`new-analysis-mode-card${mode === "trace" ? " is-selected" : ""}`}
                 aria-label="上传 Trace 分析"
-                aria-pressed="true"
+                aria-pressed={mode === "trace"}
+                onClick={() => setMode("trace")}
               >
                 <span className="new-analysis-mode-icon">
                   <Upload aria-hidden="true" />
                 </span>
                 <span className="new-analysis-mode-copy">
                   <strong>上传 Trace 分析</strong>
-                  <span>当前可用 · Trace 必填，辅助文件按需添加。</span>
+                  <span>Trace 必填，辅助文件按需添加。</span>
                 </span>
               </button>
             </div>
 
-            <TraceUploadForm
-              submitter={submitter}
-              onCancel={closeDialog}
-              onSubmitted={handleSubmitted}
-            />
+            {mode === "trace" ? (
+              <TraceUploadForm
+                submitter={submitter}
+                onCancel={closeDialog}
+                onSubmitted={handleSubmitted}
+              />
+            ) : (
+              <DeviceAnalysisForm
+                submitter={deviceSubmitter}
+                onCancel={closeDialog}
+                onSubmitted={handleSubmitted}
+              />
+            )}
           </div>
         </div>
       ) : null}

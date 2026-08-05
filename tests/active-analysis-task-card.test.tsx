@@ -48,6 +48,90 @@ function activeAnalysis(): AnalysisResponse {
   };
 }
 
+function activeDeviceAnalysis(): AnalysisResponse {
+  return {
+    schema_version: "1.0",
+    analysis_id: "analysis-device-1",
+    team_id: "team-1",
+    analysis_mode: "device",
+    device_id: "device-1",
+    state: "queued",
+    version: 4,
+    application_version_id: null,
+    application_metadata: null,
+    apk_upload: null,
+    scenarios: [
+      {
+        scenario_job_id: null,
+        scenario_type: "cold_start",
+        state: "queued",
+        version: null,
+        device_group_id: null,
+        sample_verdict_counts: {
+          valid: 0,
+          invalid: 0,
+          pending: 0,
+          validation_error: 0,
+          total: 0,
+        },
+        started_at: null,
+        completed_at: null,
+        failure: null,
+      },
+      {
+        scenario_job_id: null,
+        scenario_type: "scroll",
+        state: "queued",
+        version: null,
+        device_group_id: null,
+        sample_verdict_counts: {
+          valid: 0,
+          invalid: 0,
+          pending: 0,
+          validation_error: 0,
+          total: 0,
+        },
+        started_at: null,
+        completed_at: null,
+        failure: null,
+      },
+      {
+        scenario_job_id: null,
+        scenario_type: "memory_cycle",
+        state: "queued",
+        version: null,
+        device_group_id: null,
+        sample_verdict_counts: {
+          valid: 0,
+          invalid: 0,
+          pending: 0,
+          validation_error: 0,
+          total: 0,
+        },
+        started_at: null,
+        completed_at: null,
+        failure: null,
+      },
+    ],
+    sample_verdict_counts: {
+      valid: 0,
+      invalid: 0,
+      pending: 0,
+      validation_error: 0,
+      total: 0,
+    },
+    active_lease: null,
+    report_available: false,
+    created_at: "2026-08-04T08:00:00Z",
+    started_at: null,
+    completed_at: null,
+    cancel_requested_at: null,
+    failure: null,
+    input_uploads: [],
+    stages: [],
+  };
+}
+
 describe("ActiveAnalysisTaskCard", () => {
   it("shows the real stage, elapsed time, honest estimate and actions", async () => {
     const user = userEvent.setup();
@@ -66,7 +150,7 @@ describe("ActiveAnalysisTaskCard", () => {
     expect(screen.getByText("SmartPerfetto 正在解析 Trace")).toBeInTheDocument();
     expect(screen.getByText("已用时 2 分钟")).toBeInTheDocument();
     expect(
-      screen.getByText("通常需要 3–8 分钟，复杂 Trace 可能更久"),
+      screen.getByText("通常需要 3-8 分钟，复杂任务可能更久"),
     ).toBeInTheDocument();
     expect(screen.getByRole("link", { name: "查看详情" })).toHaveAttribute(
       "href",
@@ -74,6 +158,23 @@ describe("ActiveAnalysisTaskCard", () => {
     );
     await user.click(screen.getByRole("button", { name: "取消分析" }));
     expect(cancel).toHaveBeenCalledOnce();
+  });
+
+  it("shows Agent dispatch and all fixed device scenarios", () => {
+    render(
+      <ActiveAnalysisTaskCard
+        analysis={activeDeviceAnalysis()}
+        now={new Date("2026-08-04T08:01:00Z").valueOf()}
+        canceling={false}
+        stale={false}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByText("等待设备 Agent 接收任务")).toBeInTheDocument();
+    expect(screen.getByText("冷启动采集")).toBeInTheDocument();
+    expect(screen.getByText("滑动采集")).toBeInTheDocument();
+    expect(screen.getByText("内存循环采集")).toBeInTheDocument();
   });
 
   it("derives AI and cancel stages only from authoritative analysis fields", () => {

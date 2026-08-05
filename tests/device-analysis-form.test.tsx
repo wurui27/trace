@@ -3,16 +3,13 @@ import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 
-import { AppShell } from "../app/components/app-shell";
+import { DeviceAnalysisForm } from "../app/components/device-analysis-form";
 import { PerfPilotSessionProvider } from "../app/components/perfpilot-session-provider";
 import type { PerfPilotClient } from "../app/lib/perfpilot-api";
 
-afterEach(() => {
-  cleanup();
-  vi.unstubAllGlobals();
-});
+afterEach(cleanup);
 
-it("shows real remote devices without rendering a demo Pixel or raw serial", async () => {
+it("requires one ready device and explains how to make a device available", async () => {
   const client = {
     csrf: vi.fn().mockResolvedValue("csrf"),
     me: vi.fn().mockResolvedValue({
@@ -25,32 +22,27 @@ it("shows real remote devices without rendering a demo Pixel or raw serial", asy
         {
           device_id: "device-1",
           agent_id: "agent-1",
-          agent_name: "Ubuntu 实验室",
-          serial_suffix: "7K2A",
-          manufacturer: "UNISOC",
-          model: "ums9620",
-          android_release: "15",
-          api_level: 35,
+          agent_name: "Windows Agent",
+          serial_suffix: "42AA",
+          manufacturer: "Google",
+          model: "Pixel 7",
+          android_release: "14",
+          api_level: 34,
           connection_type: "usb",
-          adb_state: "device",
-          state: "ready",
+          adb_state: "unauthorized",
+          state: "unauthorized",
           last_seen_at: "2026-08-05T08:00:00Z",
         },
       ],
     }),
   } as unknown as PerfPilotClient;
+
   render(
     <PerfPilotSessionProvider client={client}>
-      <AppShell activeItem="overview">
-        <p>内容</p>
-      </AppShell>
+      <DeviceAnalysisForm />
     </PerfPilotSessionProvider>,
   );
 
-  expect(await screen.findByText("UNISOC ums9620")).toBeInTheDocument();
-  expect(screen.getByText("设备已就绪")).toBeInTheDocument();
-  expect(screen.getByText("Android 15")).toBeInTheDocument();
-  expect(screen.queryByText("Pixel 8")).not.toBeInTheDocument();
-  expect(screen.queryByText("R3CN30SECRET7K2A")).not.toBeInTheDocument();
-  expect(screen.getByText("尚未选择应用")).toBeInTheDocument();
+  expect(await screen.findByText("等待 USB 调试授权")).toBeInTheDocument();
+  expect(screen.getByRole("button", { name: "开始真机分析" })).toBeDisabled();
 });

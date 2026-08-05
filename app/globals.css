@@ -316,6 +316,22 @@ select:disabled {
   font-size: 12px;
 }
 
+.connected-device-selector {
+  display: block;
+  margin-top: 6px;
+}
+
+.connected-device-selector select {
+  width: 100%;
+  min-height: 30px;
+  padding: 0 7px;
+  border: 1px solid #36506b;
+  border-radius: 6px;
+  background: #12253a;
+  color: #d8e5f2;
+  font-size: 11px;
+}
+
 .app-workspace {
   min-width: 0;
   min-height: 100vh;
@@ -1827,6 +1843,332 @@ select:disabled {
 .new-analysis-dialog-actions .primary-action:not(:disabled):hover {
   border-color: var(--primary-dark);
   background: var(--primary-dark);
+}
+
+.device-analysis-target {
+  display: grid;
+  gap: 3px;
+  padding: 12px 13px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fafbfd;
+}
+
+.device-analysis-target strong {
+  color: var(--text);
+  font-size: 13px;
+}
+
+.device-analysis-target span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.new-analysis-progress,
+.new-analysis-error {
+  margin: 0;
+  padding: 11px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.new-analysis-progress {
+  background: var(--primary-soft);
+  color: var(--primary-dark);
+}
+
+.new-analysis-error {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+/* Agent management */
+
+.agent-management {
+  display: grid;
+  gap: 20px;
+}
+
+.agent-page-header {
+  margin-bottom: 0;
+}
+
+.agent-registration-panel,
+.agent-list-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.agent-registration-panel {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.72fr) minmax(360px, 1.28fr);
+  align-items: end;
+  gap: 28px;
+  padding: 22px 24px;
+}
+
+.agent-registration-panel h2,
+.agent-list-heading h2 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 740;
+  letter-spacing: -0.02em;
+}
+
+.agent-registration-panel p,
+.agent-list-heading p {
+  margin: 4px 0 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.agent-registration-form {
+  display: grid;
+  gap: 7px;
+}
+
+.agent-registration-form > label {
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.agent-registration-form > div {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.agent-registration-form input,
+.agent-rename-form input {
+  min-width: 0;
+  min-height: 40px;
+  padding: 0 11px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.agent-registration-form .primary-action,
+.icon-text-action {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 7px;
+  padding: 0 14px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  color: var(--surface);
+  font-size: 12px;
+  font-weight: 730;
+  cursor: pointer;
+}
+
+.agent-registration-form .primary-action:disabled {
+  border-color: var(--border-strong);
+  background: #e7ebef;
+  color: var(--text-muted);
+}
+
+.agent-registration-code {
+  display: grid;
+  grid-template-columns: minmax(150px, 0.65fr) minmax(0, 1.35fr) auto;
+  align-items: center;
+  gap: 18px;
+  padding: 16px 18px;
+  border: 1px solid #b8d5ca;
+  border-radius: var(--radius-md);
+  background: var(--success-soft);
+}
+
+.agent-registration-code > div {
+  display: grid;
+  gap: 2px;
+}
+
+.agent-registration-code strong {
+  color: var(--success);
+}
+
+.agent-registration-code span {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.agent-registration-code code {
+  min-width: 0;
+  overflow-x: auto;
+  padding: 7px 9px;
+  border: 1px solid #cce3da;
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-secondary);
+  font-size: 12px;
+  white-space: nowrap;
+}
+
+.agent-registration-code .secondary-action,
+.agent-row-actions button,
+.agent-rename-form button,
+.icon-text-action {
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--text-secondary);
+}
+
+.agent-registration-code .secondary-action {
+  min-height: 38px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 0 11px;
+  font-size: 12px;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.agent-registration-code svg,
+.icon-text-action svg,
+.agent-row-actions svg {
+  width: 15px;
+  height: 15px;
+}
+
+.agent-management-error {
+  margin: 0;
+  padding: 11px 13px;
+  border-radius: var(--radius-sm);
+  background: var(--danger-soft);
+  color: var(--danger);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.agent-list-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+  padding: 19px 22px;
+  border-bottom: 1px solid var(--border);
+}
+
+.icon-text-action {
+  background: var(--surface);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.agent-list-state {
+  margin: 0;
+  padding: 34px 22px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.agent-list-state.is-error {
+  color: var(--danger);
+}
+
+.agent-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.agent-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(360px, 1.6fr) auto;
+  align-items: center;
+  gap: 22px;
+  min-height: 82px;
+  padding: 15px 22px;
+}
+
+.agent-row + .agent-row {
+  border-top: 1px solid var(--border);
+}
+
+.agent-row.is-revoked {
+  background: #fafbfd;
+}
+
+.agent-row-primary {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.agent-row-primary strong,
+.agent-row-primary span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.agent-row-primary span,
+.agent-row-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.agent-row-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.agent-state {
+  color: var(--text-secondary);
+  font-weight: 720;
+}
+
+.agent-state.is-online {
+  color: var(--success);
+}
+
+.agent-state.is-offline,
+.agent-state.is-revoked {
+  color: var(--text-muted);
+}
+
+.agent-state.is-pending {
+  color: var(--warning);
+}
+
+.agent-row-actions {
+  display: flex;
+  gap: 7px;
+}
+
+.agent-row-actions button,
+.agent-rename-form button {
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 9px;
+  font-size: 12px;
+  font-weight: 680;
+  cursor: pointer;
+}
+
+.agent-row-actions button:disabled {
+  color: var(--text-muted);
+  opacity: 0.58;
+}
+
+.agent-rename-form {
+  display: grid;
+  grid-template-columns: minmax(120px, 1fr) auto auto;
+  gap: 6px;
 }
 
 /* Live trace analysis */

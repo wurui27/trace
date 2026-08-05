@@ -15,6 +15,7 @@ interface AnalysisReportViewProps {
 
 const priorityOrder = { p0: 0, p1: 1, p2: 2, p3: 3 } as const;
 const scenarioLabels = {
+  cold_start: "冷启动",
   startup: "启动",
   scroll: "滑动",
   memory_cycle: "内存循环",
@@ -136,12 +137,22 @@ export function AnalysisReportView({
       {output === null ? (
         <div className="analysis-report-partial" role="status">
           <div>
-            <strong>内核分析已完成，AI 建议暂未生成</strong>
-            <p>SmartPerfetto 的指标、问题和证据仍可查看。你可以只重新生成 AI 建议。</p>
+            <strong>
+              {report.synthesis.state === "not_requested"
+                ? "真机内核报告已生成"
+                : "内核分析已完成，AI 建议暂未生成"}
+            </strong>
+            <p>
+              {report.synthesis.state === "not_requested"
+                ? "当前报告包含 SmartPerfetto 的指标、问题和证据。"
+                : "SmartPerfetto 的指标、问题和证据仍可查看。你可以只重新生成 AI 建议。"}
+            </p>
           </div>
-          <button type="button" onClick={onRetrySynthesis} disabled={retrying}>
-            {retrying ? "正在重新生成" : "重新生成 AI 建议"}
-          </button>
+          {report.synthesis.state === "failed" ? (
+            <button type="button" onClick={onRetrySynthesis} disabled={retrying}>
+              {retrying ? "正在重新生成" : "重新生成 AI 建议"}
+            </button>
+          ) : null}
         </div>
       ) : null}
 
@@ -308,7 +319,10 @@ export function AnalysisReportView({
               <div><dt>内核归一化</dt><dd>{report.synthesis.provenance.normalizer_version}</dd></div>
             </>
           ) : (
-            <div><dt>AI 生成</dt><dd>未完成</dd></div>
+            <div>
+              <dt>AI 生成</dt>
+              <dd>{report.synthesis.state === "not_requested" ? "当前报告未包含" : "未完成"}</dd>
+            </div>
           )}
         </dl>
       </details>

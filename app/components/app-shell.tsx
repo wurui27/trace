@@ -7,6 +7,7 @@ import {
   Layers3,
   LayoutDashboard,
   PackageOpen,
+  ServerCog,
   UserRound,
 } from "lucide-react";
 
@@ -17,7 +18,8 @@ type ActiveItem =
   | "tests"
   | "scenarios"
   | "problems"
-  | "comparisons";
+  | "comparisons"
+  | "agents";
 
 interface AppShellProps {
   readonly activeItem: ActiveItem;
@@ -58,6 +60,12 @@ const navigationItems = [
     label: "对比",
     href: "/comparisons",
     icon: GitCompare,
+  },
+  {
+    id: "agents",
+    label: "设备 Agent",
+    href: "/agents",
+    icon: ServerCog,
   },
 ] as const;
 

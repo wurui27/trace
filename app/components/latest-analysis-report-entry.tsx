@@ -26,6 +26,7 @@ export function createLatestReportLoader(
   client: PerfPilotClient = createPerfPilotClient(),
 ): LatestReportLoader {
   return async (signal) => {
+    await client.csrf(signal);
     const me = await client.me(signal);
     const teamId = me.memberships[0]?.team.id;
     if (teamId === undefined) return null;
@@ -135,11 +136,20 @@ export const LatestAnalysisReportEntry = memo(function LatestAnalysisReportEntry
   }
 
   const { analysis, report } = view.snapshot;
-  const title = analysis.question?.trim() || profileLabels[analysis.analysis_profile];
+  const profileLabel =
+    analysis.analysis_mode === "device"
+      ? "真机综合性能分析"
+      : profileLabels[analysis.analysis_profile ?? "auto"];
+  const title =
+    analysis.question?.trim() ||
+    analysis.application_metadata?.package_name ||
+    profileLabel;
   const summary =
     report.synthesis.state === "completed"
       ? report.synthesis.output.executive_summary
-      : "报告已保留可验证证据，AI 总结暂未完成。";
+      : report.synthesis.state === "not_requested"
+        ? "三类真机性能证据已经归档，可打开报告查看完整内核结论。"
+        : "报告已保留可验证证据，AI 总结暂未完成。";
   const completedAiRounds =
     analysis.ai_rounds?.filter((round) => round.state === "completed").length;
   const smartPerfettoLabel =
@@ -147,7 +157,9 @@ export const LatestAnalysisReportEntry = memo(function LatestAnalysisReportEntry
       ? "SmartPerfetto 已完成"
       : `SmartPerfetto ${analysis.source_analysis.rounds} 轮`;
   const aiLabel =
-    report.synthesis.state === "failed"
+    report.synthesis.state === "not_requested"
+      ? "当前报告未包含 AI"
+      : report.synthesis.state === "failed"
       ? "PerfPilot AI 未完成"
       : completedAiRounds === undefined
         ? "PerfPilot AI 已完成"
@@ -167,7 +179,7 @@ export const LatestAnalysisReportEntry = memo(function LatestAnalysisReportEntry
         <h2 id="latest-report-title">{title}</h2>
         <p className="latest-report-summary">{summary}</p>
         <div className="latest-report-meta" aria-label="报告处理信息">
-          <span>{profileLabels[analysis.analysis_profile]}</span>
+          <span>{profileLabel}</span>
           <span>{smartPerfettoLabel}</span>
           <span>{aiLabel}</span>
           <span>报告 v{report.report_version}</span>
