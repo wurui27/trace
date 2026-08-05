@@ -6,6 +6,7 @@ from typing import Any
 import boto3
 import pytest
 from botocore.stub import Stubber
+from botocore.exceptions import ClientError
 
 from perfpilot_api.storage.base import (
     ArtifactAuthorizationError,
@@ -239,6 +240,22 @@ def test_multipart_lifecycle_is_strictly_scoped_and_runs_off_event_loop() -> Non
             },
         ),
     ]
+
+
+def test_abort_multipart_treats_already_missing_upload_as_success() -> None:
+    client = RecordingS3Client(
+        failure=ClientError(
+            {"Error": {"Code": "NoSuchUpload", "Message": "private upstream text"}},
+            "AbortMultipartUpload",
+        )
+    )
+
+    asyncio.run(
+        S3ArtifactStore(client=client).abort_multipart(
+            location=ObjectLocation(bucket=BUCKET, key=OBJECT_KEY),
+            storage_upload_id="private-storage-upload-id",
+        )
+    )
 
 
 @pytest.mark.parametrize("expires_in_seconds", [0, -1, 901, True])

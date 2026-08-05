@@ -214,6 +214,7 @@ class AgentExecutionCompletion:
 
 @dataclass(frozen=True, slots=True)
 class AgentCancellationRequest:
+    team_id: UUID
     analysis_id: UUID
     analysis_state: str
     cancel_requested_at: datetime | None
@@ -475,6 +476,13 @@ class AgentTaskRepository(Protocol):
         now: datetime,
     ) -> AgentCancellationRequest: ...
 
+    async def project_unleased_cancellation(
+        self,
+        *,
+        cancellation: AgentCancellationRequest,
+        now: datetime,
+    ) -> None: ...
+
     async def authorize_cancellation(
         self,
         *,
@@ -732,6 +740,7 @@ class InMemoryAgentTaskRepository:
         )
         if lease is None:
             return AgentCancellationRequest(
+                team_id=team_id,
                 analysis_id=analysis_id,
                 analysis_state="canceled",
                 cancel_requested_at=now,
@@ -746,6 +755,7 @@ class InMemoryAgentTaskRepository:
             cancel_requested_at=requested_at,
         )
         return AgentCancellationRequest(
+            team_id=team_id,
             analysis_id=analysis_id,
             analysis_state="scheduled",
             cancel_requested_at=requested_at,
@@ -753,6 +763,15 @@ class InMemoryAgentTaskRepository:
             execution_id=lease.execution_id,
             lease_version=lease.lease_version,
         )
+
+    async def project_unleased_cancellation(
+        self,
+        *,
+        cancellation: AgentCancellationRequest,
+        now: datetime,
+    ) -> None:
+        del cancellation
+        _require_aware(now)
 
     async def authorize_cancellation(
         self,
@@ -1053,6 +1072,15 @@ class AgentTaskService:
             analysis_id=analysis_id,
             now=_aware_now(self._clock()),
         )
+        if (
+            cancellation.analysis_state == "canceled"
+            and cancellation.execution_id is None
+            and cancellation.cancel_requested_at is not None
+        ):
+            await self._repository.project_unleased_cancellation(
+                cancellation=cancellation,
+                now=_aware_now(self._clock()),
+            )
         if cancellation.agent_id is not None:
             await self._wakeup.wake(cancellation.agent_id)
         return cancellation
@@ -1519,6 +1547,7 @@ class SQLAlchemyAgentTaskRepository:
                     raise AgentTaskNotFound
                 if job.state in ("completed", "partially_completed", "failed", "canceled"):
                     return AgentCancellationRequest(
+                        team_id=team_id,
                         analysis_id=analysis_id,
                         analysis_state=job.state,
                         cancel_requested_at=job.cancel_requested_at,
@@ -1583,6 +1612,7 @@ class SQLAlchemyAgentTaskRepository:
                     )
                 await session.flush()
                 return AgentCancellationRequest(
+                    team_id=team_id,
                     analysis_id=analysis_id,
                     analysis_state=job.state,
                     cancel_requested_at=requested_at,
@@ -1590,6 +1620,60 @@ class SQLAlchemyAgentTaskRepository:
                     execution_id=None if lease is None else lease.execution_id,
                     lease_version=None if lease is None else lease.version,
                 )
+
+    async def project_unleased_cancellation(
+        self,
+        *,
+        cancellation: AgentCancellationRequest,
+        now: datetime,
+    ) -> None:
+        _require_aware(now)
+        if (
+            cancellation.analysis_state != "canceled"
+            or cancellation.cancel_requested_at is None
+            or cancellation.execution_id is not None
+        ):
+            raise AgentTaskUnavailable("Cancellation projection is unavailable")
+        async with self._tenant_router.session(cancellation.team_id) as session:
+            analysis = await session.scalar(
+                select(Analysis)
+                .where(
+                    Analysis.id == cancellation.analysis_id,
+                    Analysis.tombstoned_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if analysis is None:
+                raise AgentTaskNotFound
+            if analysis.state not in (
+                "completed",
+                "partially_completed",
+                "failed",
+                "canceled",
+            ):
+                analysis.state = "canceled"
+                analysis.completed_at = now
+                analysis.failure_code = None
+                analysis.version += 1
+                analysis.updated_at = now
+            scenarios = tuple(
+                (
+                    await session.scalars(
+                        select(ScenarioResult)
+                        .where(ScenarioResult.analysis_id == cancellation.analysis_id)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            for scenario in scenarios:
+                if scenario.state in ("completed", "failed", "canceled"):
+                    continue
+                scenario.state = "canceled"
+                scenario.completed_at = now
+                scenario.failure_code = None
+                scenario.version += 1
+                scenario.updated_at = now
+            await session.flush()
 
     async def authorize_cancellation(
         self,

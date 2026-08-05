@@ -261,7 +261,9 @@ class S3ArtifactStore:
                 Key=location.key,
                 UploadId=storage_upload_id,
             )
-        except Exception:
+        except Exception as error:
+            if _error_code(error) == "NoSuchUpload":
+                return
             failed = True
         if failed:
             raise ArtifactStorageError

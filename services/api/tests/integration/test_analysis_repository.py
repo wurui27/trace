@@ -112,6 +112,14 @@ from perfpilot_api.storage.base import MultipartPart
 from perfpilot_api.workers.trace_orchestrator import (
     SQLAlchemyTraceWorkQueueRepository,
 )
+from perfpilot_api.workers.dispatcher import (
+    Dispatcher,
+    SQLAlchemyDispatcherRepository,
+)
+from perfpilot_api.workers.reconciler import (
+    Reconciler,
+    SQLAlchemyLeaseReconciliationRepository,
+)
 
 TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 OTHER_TEAM_ID = UUID("10000000-0000-4000-8000-000000000002")
@@ -2931,6 +2939,253 @@ async def test_agent_cancellation_is_fenced_cleans_uploads_and_releases_device(
     assert {item.state for item in tenant_scenarios} == {"canceled"}
     assert multipart is not None and multipart.state == "aborted"
     assert event is not None
+
+
+@pytest.mark.asyncio
+async def test_cancel_before_agent_lease_immediately_projects_both_databases(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    prepared = await _persist_metadata_and_stage(analysis_databases)
+    queued_at = NOW + timedelta(minutes=3)
+    await analysis_databases.repository.queue_control_scenarios(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=ARTIFACT_ID,
+        scenarios=prepared,
+        requirements=SchedulingRequirements(
+            min_api_level=28,
+            supported_abis=("arm64-v8a", "x86_64"),
+        ),
+        now=queued_at,
+    )
+    service = AgentTaskService(
+        repository=SQLAlchemyAgentTaskRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+        ),
+        signer=TaskSnapshotSigner(
+            private_key=Ed25519PrivateKey.generate(),
+            kid="lan-unleased-cancellation",
+            clock=lambda: queued_at,
+        ),
+        wakeup=InMemoryAgentTaskWakeup(),
+        clock=lambda: queued_at,
+    )
+
+    cancellation = await service.request_cancel(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+
+    assert cancellation.analysis_state == "canceled"
+    assert cancellation.execution_id is None
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        control_scenarios = tuple(
+            (
+                await session.scalars(
+                    select(ScenarioJob).where(ScenarioJob.analysis_id == ANALYSIS_ID)
+                )
+            ).all()
+        )
+    async with analysis_databases.tenant_sessions() as session:
+        tenant_analysis = await session.get(Analysis, ANALYSIS_ID)
+        tenant_scenarios = tuple(
+            (
+                await session.scalars(
+                    select(ScenarioResult).where(ScenarioResult.analysis_id == ANALYSIS_ID)
+                )
+            ).all()
+        )
+    assert job is not None and job.state == "canceled"
+    assert {item.state for item in control_scenarios} == {"canceled"}
+    assert tenant_analysis is not None and tenant_analysis.state == "canceled"
+    assert {item.state for item in tenant_scenarios} == {"canceled"}
+
+
+@pytest.mark.asyncio
+async def test_reconciler_requeues_an_expired_agent_lease_and_releases_device(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    prepared = await _persist_metadata_and_stage(analysis_databases)
+    scheduled_at = NOW + timedelta(minutes=3)
+    expired_at = scheduled_at + timedelta(seconds=61)
+    await analysis_databases.repository.queue_control_scenarios(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=ARTIFACT_ID,
+        scenarios=prepared,
+        requirements=SchedulingRequirements(
+            min_api_level=28,
+            supported_abis=("arm64-v8a", "x86_64"),
+        ),
+        now=scheduled_at,
+    )
+    async with analysis_databases.control_sessions.begin() as session:
+        agent = await session.get(Agent, AGENT_ID)
+        device = await session.get(Device, DEVICE_ID)
+        assert agent is not None and device is not None
+        agent.last_heartbeat_at = scheduled_at
+        agent.state = "online"
+        device.last_seen_at = scheduled_at
+        device.state = "ready"
+        device.adb_state = "device"
+    task_service = AgentTaskService(
+        repository=SQLAlchemyAgentTaskRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+            lease_id_source=lambda: UUID("75000000-0000-4000-8000-000000000031"),
+            execution_id_source=lambda: UUID("73000000-0000-4000-8000-000000000031"),
+        ),
+        signer=TaskSnapshotSigner(
+            private_key=Ed25519PrivateKey.generate(),
+            kid="lan-expiration",
+            clock=lambda: scheduled_at,
+        ),
+        wakeup=InMemoryAgentTaskWakeup(),
+        clock=lambda: scheduled_at,
+    )
+    scheduled = await task_service.schedule(analysis_id=ANALYSIS_ID)
+    assert scheduled is not None
+
+    class RecordingArtifacts:
+        def __init__(self) -> None:
+            self.executions: list[UUID] = []
+
+        async def abort_execution(self, **kwargs: object) -> None:
+            self.executions.append(kwargs["access"].execution_id)  # type: ignore[union-attr]
+
+    artifacts = RecordingArtifacts()
+    reconciler = Reconciler(
+        repository=SQLAlchemyLeaseReconciliationRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+        ),
+        artifact_coordinator=artifacts,
+        clock=lambda: expired_at,
+    )
+
+    result = await reconciler.run_once()
+    repeated = await reconciler.run_once()
+
+    assert result is not None and result.outcome == "requeued"
+    assert repeated is None
+    assert artifacts.executions == [scheduled.execution_id]
+    async with analysis_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, ANALYSIS_ID)
+        device = await session.get(Device, DEVICE_ID)
+        lease = await session.scalar(
+            select(AgentLease).where(AgentLease.execution_id == scheduled.execution_id)
+        )
+        scenarios = tuple(
+            (
+                await session.scalars(
+                    select(ScenarioJob).where(ScenarioJob.analysis_id == ANALYSIS_ID)
+                )
+            ).all()
+        )
+    assert job is not None and job.state == "queued" and job.retry_count == 1
+    assert device is not None and device.state == "ready"
+    assert lease is not None and lease.state == "expired" and lease.released_at == expired_at
+    assert {item.state for item in scenarios} == {"queued"}
+
+    second_scheduled_at = expired_at + timedelta(seconds=1)
+    second_expired_at = second_scheduled_at + timedelta(seconds=61)
+    async with analysis_databases.control_sessions.begin() as session:
+        agent = await session.get(Agent, AGENT_ID)
+        device = await session.get(Device, DEVICE_ID)
+        assert agent is not None and device is not None
+        agent.last_heartbeat_at = second_scheduled_at
+        device.last_seen_at = second_scheduled_at
+    second_service = AgentTaskService(
+        repository=SQLAlchemyAgentTaskRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+            lease_id_source=lambda: UUID("75000000-0000-4000-8000-000000000032"),
+            execution_id_source=lambda: UUID("73000000-0000-4000-8000-000000000032"),
+        ),
+        signer=TaskSnapshotSigner(
+            private_key=Ed25519PrivateKey.generate(),
+            kid="lan-expired-cancellation",
+            clock=lambda: second_scheduled_at,
+        ),
+        wakeup=InMemoryAgentTaskWakeup(),
+        clock=lambda: second_scheduled_at,
+    )
+    second = await second_service.schedule(analysis_id=ANALYSIS_ID)
+    assert second is not None
+    await second_service.request_cancel(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+    canceled_reconciler = Reconciler(
+        repository=SQLAlchemyLeaseReconciliationRepository(
+            control_session_factory=analysis_databases.control_sessions,
+            tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+        ),
+        artifact_coordinator=artifacts,
+        clock=lambda: second_expired_at,
+    )
+
+    canceled = await canceled_reconciler.run_once()
+
+    assert canceled is not None and canceled.outcome == "canceled"
+    async with analysis_databases.control_sessions() as session:
+        canceled_job = await session.get(GlobalJob, ANALYSIS_ID)
+        canceled_device = await session.get(Device, DEVICE_ID)
+        canceled_lease = await session.scalar(
+            select(AgentLease).where(AgentLease.execution_id == second.execution_id)
+        )
+    async with analysis_databases.tenant_sessions() as session:
+        canceled_tenant_analysis = await session.get(Analysis, ANALYSIS_ID)
+    assert canceled_job is not None and canceled_job.state == "canceled"
+    assert canceled_device is not None and canceled_device.state == "ready"
+    assert canceled_lease is not None and canceled_lease.state == "expired"
+    assert canceled_lease.released_at == second_expired_at
+    assert canceled_tenant_analysis is not None and canceled_tenant_analysis.state == "canceled"
+
+
+@pytest.mark.asyncio
+async def test_dispatcher_publishes_an_outbox_event_once(
+    analysis_databases: AnalysisDatabases,
+) -> None:
+    event_id = UUID("70000000-0000-4000-8000-000000000091")
+    async with analysis_databases.control_sessions.begin() as session:
+        session.add(
+            OutboxEvent(
+                id=event_id,
+                team_id=TEAM_ID,
+                global_job_id=None,
+                scenario_job_id=None,
+                event_type="analysis_queued",
+                subject_type="analysis",
+                subject_id=ANALYSIS_ID,
+                subject_version=1,
+                ready_at=NOW,
+                published_at=None,
+                dead_lettered_at=None,
+                retry_count=0,
+                version=1,
+            )
+        )
+
+    class RecordingPublisher:
+        def __init__(self) -> None:
+            self.event_ids: list[str] = []
+
+        async def publish(self, **kwargs: object) -> None:
+            self.event_ids.append(kwargs["envelope"]["event_id"])  # type: ignore[index]
+
+    publisher = RecordingPublisher()
+    dispatcher = Dispatcher(
+        repository=SQLAlchemyDispatcherRepository(analysis_databases.control_sessions),
+        publisher=publisher,
+        clock=lambda: NOW,
+    )
+
+    first = await dispatcher.run_once()
+    second = await dispatcher.run_once()
+
+    assert first is not None and first.event_id == event_id
+    assert second is None
+    assert publisher.event_ids == [str(event_id)]
+    async with analysis_databases.control_sessions() as session:
+        stored = await session.get(OutboxEvent, event_id)
+    assert stored is not None and stored.published_at == NOW
 
 
 @pytest.mark.asyncio
