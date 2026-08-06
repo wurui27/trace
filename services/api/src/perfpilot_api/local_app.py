@@ -11,6 +11,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import logging
 import os
 import secrets
@@ -557,16 +558,23 @@ def _blocked_ai_projection(
 
 def _public_origin(value: str) -> str:
     parsed = urlsplit(value)
+    hostname = parsed.hostname
+    private_hostname = hostname in {"localhost", "127.0.0.1", "::1"}
+    if hostname is not None and not private_hostname:
+        try:
+            private_hostname = ipaddress.ip_address(hostname).is_private
+        except ValueError:
+            private_hostname = False
     if (
         parsed.scheme != "http"
-        or parsed.hostname not in {"localhost", "127.0.0.1", "::1"}
+        or not private_hostname
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("local public origin must be loopback HTTP")
+        raise ValueError("local public origin must be loopback or private LAN HTTP")
     return value.rstrip("/")
 
 
@@ -2327,9 +2335,13 @@ def create_local_app(
 
     app = FastAPI(lifespan=lifespan)
     app.state.local_runtime = runtime
+    allowed_web_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
+    configured_web_origin = os.getenv("PERFPILOT_LOCAL_WEB_ORIGIN")
+    if configured_web_origin:
+        allowed_web_origins.append(_public_origin(configured_web_origin))
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+        allow_origins=allowed_web_origins,
         allow_credentials=False,
         allow_methods=["PUT", "OPTIONS"],
         allow_headers=["Content-Type", "x-amz-checksum-sha256"],

@@ -17,7 +17,7 @@ from fastapi.testclient import TestClient
 from perfpilot_api.ai.local_multiround import LocalMultiRoundSynthesizer
 from perfpilot_api.ai.openai_compatible import SynthesisCandidate
 from perfpilot_api.engines.contracts import EngineResult
-from perfpilot_api.local_app import LocalEngineRun, create_local_app
+from perfpilot_api.local_app import LocalEngineRun, _public_origin, create_local_app
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
 from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapture
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
@@ -52,6 +52,40 @@ class _FakeSmartPerfettoGateway:
 
     async def aclose(self) -> None:
         return None
+
+
+def test_local_runtime_accepts_only_loopback_or_private_lan_http_origins() -> None:
+    assert _public_origin("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
+    assert _public_origin("http://10.166.0.125:8000") == "http://10.166.0.125:8000"
+
+    with pytest.raises(ValueError, match="loopback or private LAN HTTP"):
+        _public_origin("http://8.8.8.8:8000")
+
+
+def test_local_runtime_allows_configured_private_lan_web_origin(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("PERFPILOT_LOCAL_WEB_ORIGIN", "http://10.166.0.125:3000")
+    app = create_local_app(
+        data_root=tmp_path,
+        public_origin="http://10.166.0.125:8000",
+    )
+
+    with TestClient(app) as client:
+        response = client.options(
+            "/local/v1/uploads/example",
+            headers={
+                "Origin": "http://10.166.0.125:3000",
+                "Access-Control-Request-Method": "PUT",
+                "Access-Control-Request-Headers": (
+                    "content-type,x-amz-checksum-sha256"
+                ),
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://10.166.0.125:3000"
 
 
 class _BlockingSmartPerfettoGateway(_FakeSmartPerfettoGateway):

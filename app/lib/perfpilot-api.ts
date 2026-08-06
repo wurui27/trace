@@ -638,19 +638,49 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function validUploadUrl(value: string): boolean {
+function privateLanHostname(value: string): boolean {
+  const hostname = value.toLowerCase().replace(/^\[|\]$/g, "");
+  if (hostname === "localhost" || hostname === "::1") return true;
+  if (hostname.startsWith("fc") || hostname.startsWith("fd") || hostname.startsWith("fe80:")) {
+    return true;
+  }
+  const octets = hostname.split(".").map(Number);
+  if (
+    octets.length !== 4 ||
+    octets.some((octet) => !Number.isInteger(octet) || octet < 0 || octet > 255)
+  ) {
+    return false;
+  }
+  return (
+    octets[0] === 10 ||
+    (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+    (octets[0] === 192 && octets[1] === 168) ||
+    octets[0] === 127
+  );
+}
+
+export function validUploadUrl(
+  value: string,
+  pageOrigin = typeof location === "undefined" ? undefined : location.origin,
+): boolean {
   try {
     const url = new URL(value);
     if (url.username || url.password || url.hash) return false;
     if (url.protocol === "https:") return true;
-    const loopback =
-      url.hostname === "localhost" ||
-      url.hostname === "127.0.0.1" ||
-      url.hostname === "[::1]";
+    if (
+      url.protocol !== "http:" ||
+      !url.pathname.startsWith("/local/v1/uploads/") ||
+      !privateLanHostname(url.hostname)
+    ) {
+      return false;
+    }
+    if (["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) return true;
+    if (pageOrigin === undefined) return false;
+    const page = new URL(pageOrigin);
     return (
-      url.protocol === "http:" &&
-      loopback &&
-      url.pathname.startsWith("/local/v1/uploads/")
+      page.protocol === "http:" &&
+      privateLanHostname(page.hostname) &&
+      page.hostname === url.hostname
     );
   } catch {
     return false;

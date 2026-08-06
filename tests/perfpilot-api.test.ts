@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import {
   createPerfPilotClient,
+  validUploadUrl,
   enqueueDeviceAnalysis,
   sha256Base64,
   submitTraceAnalysis,
@@ -112,6 +113,20 @@ function reportPayload(): Record<string, unknown> {
 }
 
 describe("PerfPilot browser API", () => {
+  it("accepts a private-LAN upload URL only when it matches the web host", () => {
+    const uploadUrl =
+      "http://10.166.0.125:8000/local/v1/uploads/upload-1?token=opaque-token";
+
+    expect(validUploadUrl(uploadUrl, "http://10.166.0.125:3000")).toBe(true);
+    expect(validUploadUrl(uploadUrl, "http://10.166.0.126:3000")).toBe(false);
+    expect(
+      validUploadUrl(
+        "http://public.example:8000/local/v1/uploads/upload-1?token=opaque-token",
+        "http://public.example:3000",
+      ),
+    ).toBe(false);
+  });
+
   it("validates remote Agent and device control-plane responses", async () => {
     const agent = {
       agent_id: AGENT_ID,
