@@ -61,7 +61,10 @@ jobs:
             --python "$PWD/.venv/bin/python"
       - name: Install and run doctor
         run: |
-          sudo installer -pkg "$PWD/build/device-agent-macos.pkg" -target /
+          if ! sudo installer -verboseR -pkg "$PWD/build/device-agent-macos.pkg" -target /; then
+            sudo tail -n 200 /var/log/install.log
+            exit 1
+          fi
           sudo launchctl print system/com.perfpilot.agent >/dev/null
           sudo launchctl bootout system/com.perfpilot.agent || true
           sudo "/Library/PerfPilot Agent/perfpilot-agent" doctor --json

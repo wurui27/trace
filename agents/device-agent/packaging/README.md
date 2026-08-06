@@ -10,6 +10,9 @@ paths to `config.json`, `perfpilot-ca.crt`, and the matching `platform-tools`
 directory. They reject a configuration whose native install paths do not match the
 target package.
 
+The Agent pins HTTPS connections to the packaged CA file. Installers do not add that
+CA to the operating system's global trust store.
+
 ## First internal release warning
 
 These internal `.pkg`, `.msi`, and `.deb` files are unsigned. macOS may show an

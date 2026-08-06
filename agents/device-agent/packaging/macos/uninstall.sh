@@ -15,11 +15,7 @@ case "${1:-}" in
 esac
 
 STATE_DIR="/Library/Application Support/PerfPilot Agent"
-CA_FILE="$STATE_DIR/perfpilot-ca.crt"
 /bin/launchctl bootout system/com.perfpilot.agent >/dev/null 2>&1 || true
-if [ -f "$CA_FILE" ]; then
-  /usr/bin/security remove-trusted-cert -d "$CA_FILE" >/dev/null 2>&1 || true
-fi
 /bin/rm -f "/Library/LaunchDaemons/com.perfpilot.agent.plist"
 /bin/rm -rf "/Library/PerfPilot Agent" "/Library/Logs/PerfPilot Agent"
 if [ "$REMOVE_DATA" = "true" ]; then

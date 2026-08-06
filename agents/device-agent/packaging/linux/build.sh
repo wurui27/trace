@@ -33,7 +33,7 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] ||
 fi
 if [ ! -f "$CONFIG_PATH" ] || [ -L "$CONFIG_PATH" ] ||
    [ ! -f "$CA_PATH" ] || [ -L "$CA_PATH" ] ||
-   [ ! -x "$ADB_DIR/adb" ] || [ -L "$ADB_DIR/adb" ]; then
+   [ ! -x "$ADB_DIR/adb" ]; then
   echo "Package inputs are invalid" >&2
   exit 2
 fi

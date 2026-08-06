@@ -77,12 +77,16 @@ def test_native_services_have_required_security_and_lifecycle_settings() -> None
 def test_install_scripts_are_idempotent_and_never_delete_credentials_on_upgrade() -> None:
     mac_preinstall = _text("macos/scripts/preinstall")
     mac_postinstall = _text("macos/scripts/postinstall")
+    mac_uninstall = _text("macos/uninstall.sh")
+    linux_builder = _text("linux/build.sh")
     linux_postinstall = _text("linux/postinst")
     linux_prerm = _text("linux/prerm")
 
     assert "bootout system/com.perfpilot.agent" in mac_preinstall
     assert "bootstrap system" in mac_postinstall
-    assert "add-trusted-cert" in mac_postinstall
+    assert "add-trusted-cert" not in mac_postinstall
+    assert "remove-trusted-cert" not in mac_uninstall
+    assert '[ -L "$ADB_DIR/adb" ]' not in linux_builder
     assert "systemctl daemon-reload" in linux_postinstall
     assert "systemctl enable" in linux_postinstall
     assert 'if [ "${1:-}" = "remove" ]' in linux_prerm
