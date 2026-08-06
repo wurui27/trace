@@ -19,6 +19,9 @@ describe("Ubuntu user deployment", () => {
     expect(script).toContain("wait_for_url http://127.0.0.1:3001/health");
     expect(script).toContain('wait_for_url "http://$SERVER_IP:8000/v1/health"');
     expect(script).toContain('wait_for_url "http://$SERVER_IP:3000"');
+    expect(script).toContain('--editable "$PROJECT_DIR/agents/device-agent"');
+    expect(script).toContain("for key in PORT SMARTPERFETTO_BACKEND_PORT");
+    expect(script).toContain("printf '%s=3001\\n'");
     expect(script).not.toMatch(/\bsudo\b/);
     expect(script).not.toMatch(/rm\s+-rf[^\n]*data/);
   });

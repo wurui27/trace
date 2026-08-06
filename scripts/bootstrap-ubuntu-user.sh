@@ -109,6 +109,23 @@ sync_engine() {
   fi
 }
 
+configure_smartperfetto_environment() {
+  local environment_file="$ENGINE_ROOT/SmartPerfetto/backend/.env"
+  local key
+
+  if [[ ! -f "$environment_file" ]]; then
+    install -m 0600 /dev/null "$environment_file"
+  fi
+  for key in PORT SMARTPERFETTO_BACKEND_PORT; do
+    if grep -q "^$key=" "$environment_file"; then
+      sed -i -E "s/^$key=.*/$key=3001/" "$environment_file"
+    else
+      printf '%s=3001\n' "$key" >> "$environment_file"
+    fi
+  done
+  chmod 600 "$environment_file"
+}
+
 write_initial_environment() {
   local environment_file="$CONFIG_ROOT/perfpilot.env"
   local proxy_secret
@@ -146,13 +163,15 @@ sync_engine \
   Android-App-Memory-Analysis \
   https://github.com/Gracker/Android-App-Memory-Analysis.git \
   "$ANDROID_MEMORY_COMMIT"
+configure_smartperfetto_environment
 
 printf '%s\n' '正在安装 PerfPilot Python 依赖……'
 if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then
   python3 -m venv "$PROJECT_DIR/.venv"
 fi
 "$PROJECT_DIR/.venv/bin/python" -m pip install --disable-pip-version-check --quiet \
-  --editable "$PROJECT_DIR/services/api"
+  --editable "$PROJECT_DIR/services/api" \
+  --editable "$PROJECT_DIR/agents/device-agent"
 
 printf '%s\n' '正在构建 PerfPilot 网页……'
 (
