@@ -37,7 +37,7 @@ _JSON_MIME = "application/json"
 _RETENTION = timedelta(days=30)
 _REQUEST_HASH = re.compile(r"[0-9a-f]{64}\Z")
 _ENGINE_ANALYSIS_MODES = {
-    "android_memory": frozenset({"memory_upload"}),
+    "android_memory": frozenset({"memory_upload", "device"}),
     "smartperfetto": frozenset({"trace_upload", "device"}),
 }
 _T = TypeVar("_T")

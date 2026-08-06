@@ -18,6 +18,7 @@ from perfpilot_api.services.memory_analyses import (
     MemoryCaptureNotFoundError,
     MemoryCaptureService,
     ReferencedArtifact,
+    device_memory_capture_id,
 )
 
 
@@ -52,15 +53,18 @@ def _artifact(
 def _context(
     *artifacts: ReferencedArtifact,
     tenant_resource_version: int = 1,
+    analysis_mode: str = "memory_upload",
+    memory_scenario_state: str | None = None,
 ) -> MemoryAnalysisContext:
     return MemoryAnalysisContext(
         analysis_id=ANALYSIS_ID,
-        analysis_mode="memory_upload",
+        analysis_mode=analysis_mode,
         state="created",
         tombstoned_at=None,
         tenant_resource_version=tenant_resource_version,
         package_name="com.example.app",
         artifacts=artifacts or (_artifact(),),
+        memory_scenario_state=memory_scenario_state,
     )
 
 
@@ -71,6 +75,12 @@ class FakeRepository:
         self.error: Exception | None = None
 
     async def load_context(self, **kwargs: object) -> MemoryAnalysisContext:
+        self.calls.append(kwargs)
+        if self.error is not None:
+            raise self.error
+        return self.context
+
+    async def load_device_context(self, **kwargs: object) -> MemoryAnalysisContext:
         self.calls.append(kwargs)
         if self.error is not None:
             raise self.error
@@ -140,6 +150,67 @@ async def test_create_capture_rebinds_artifacts_and_writes_canonical_manifest() 
     assert b"bucket" not in payload
     assert b"object_key" not in payload
     assert b"sha256" not in payload
+
+
+@pytest.mark.asyncio
+async def test_device_capture_is_deterministic_and_uses_agent_handoff_archive() -> None:
+    repository = FakeRepository(
+        _context(
+            analysis_mode="device",
+            memory_scenario_state="analyzing",
+            tenant_resource_version=7,
+        )
+    )
+    sink = FakeSink()
+    service = _service(repository, sink)
+
+    created = await service.create_device_capture(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+    )
+    replay = await service.create_device_capture(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+    )
+
+    expected_capture_id = device_memory_capture_id(ANALYSIS_ID, ARTIFACT_ID)
+    assert created == replay
+    assert created.manifest.capture_id == expected_capture_id
+    assert created.manifest.source == "adb_agent"
+    assert created.manifest.phase == "single"
+    assert created.manifest.subject == MemorySubject(package="com.example.app")
+    assert created.manifest.artifacts == (
+        MemoryArtifactRef(artifact_id=ARTIFACT_ID, role="handoff_archive"),
+    )
+    assert repository.calls == [
+        {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID},
+        {"team_id": TEAM_ID, "analysis_id": ANALYSIS_ID},
+    ]
+    assert len(sink.calls) == 2
+    assert all(call["expected_tenant_resource_version"] == 7 for call in sink.calls)
+    assert sink.calls[0]["payload"] == sink.calls[1]["payload"]
+
+
+@pytest.mark.parametrize("scenario_state", ["failed", "canceled", "queued", None])
+@pytest.mark.asyncio
+async def test_device_capture_requires_completed_agent_memory_evidence(
+    scenario_state: str | None,
+) -> None:
+    repository = FakeRepository(
+        _context(
+            analysis_mode="device",
+            memory_scenario_state=scenario_state,
+        )
+    )
+    sink = FakeSink()
+
+    with pytest.raises(MemoryCaptureNotFoundError):
+        await _service(repository, sink).create_device_capture(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+        )
+
+    assert sink.calls == []
 
 
 @pytest.mark.asyncio

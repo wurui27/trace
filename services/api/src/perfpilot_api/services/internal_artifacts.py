@@ -159,7 +159,7 @@ class SQLAlchemyInternalArtifactRepository:
             analysis = await session.scalar(
                 select(Analysis.id).where(
                     Analysis.id == analysis_id,
-                    Analysis.analysis_mode == "memory_upload",
+                    Analysis.analysis_mode.in_(("memory_upload", "device")),
                     Analysis.tombstoned_at.is_(None),
                     Analysis.state != "deleted",
                 )

@@ -59,7 +59,7 @@ _OBSERVABLE_STATES = {"running", "awaiting_user"}
 _ANALYSIS_ENGINE_PAIRS = {
     "trace_upload": frozenset({"smartperfetto"}),
     "memory_upload": frozenset({"android_memory"}),
-    "device": frozenset({"smartperfetto"}),
+    "device": frozenset({"smartperfetto", "android_memory"}),
 }
 _NEW_ATTEMPT_CODES = frozenset({"capacity_exceeded", "worker_unavailable", "engine_timeout"})
 _TERMINAL_ADAPTER_CODES = frozenset(

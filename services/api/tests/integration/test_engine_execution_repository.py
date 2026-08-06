@@ -257,10 +257,16 @@ async def test_allocation_accepts_only_the_analysis_engine_pair(
         now=NOW,
     )
     assert device_trace.engine_id == "smartperfetto"
+    device_memory = await execution_database.repository.allocate_attempt(
+        team_id=TEAM_ID,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        seed=_seed(engine_id="android_memory"),
+        now=NOW,
+    )
+    assert device_memory.engine_id == "android_memory"
     for analysis_id, engine_id in (
         (ANALYSIS_ID, "android_memory"),
         (MEMORY_ANALYSIS_ID, "smartperfetto"),
-        (DEVICE_ANALYSIS_ID, "android_memory"),
     ):
         with pytest.raises(EngineExecutionNotFoundError):
             await execution_database.repository.allocate_attempt(

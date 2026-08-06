@@ -14,7 +14,7 @@ import pytest
 from alembic import command
 from alembic.config import Config
 from psycopg import sql
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -247,6 +247,33 @@ async def test_repository_resource_mismatch_fails_before_insert_or_s3(
     assert await _artifact_rows(tenant_database) == (0, None)
     assert "private-generation-one-bucket" not in str(caught.value)
     assert "private-generation-one-bucket" not in repr(caught.value)
+
+
+@pytest.mark.asyncio
+async def test_repository_allows_device_analysis_memory_manifest(
+    tenant_database: async_sessionmaker[AsyncSession],
+) -> None:
+    async with tenant_database.begin() as session:
+        await session.execute(
+            update(Analysis)
+            .where(Analysis.id == ANALYSIS_ID)
+            .values(analysis_mode="device")
+        )
+    payload = _payload()
+    router = MutableTenantRouter(tenant_database, resource_version=1)
+    client = RecordingS3Client(payload=payload, router=router)
+
+    artifact_id = await _sink(router, client).write_json(
+        team_id=TEAM_ID,
+        expected_tenant_resource_version=1,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=manifest_artifact_id(CAPTURE_ID),
+        artifact_kind="memory_capture_manifest",
+        payload=payload,
+    )
+
+    assert artifact_id == manifest_artifact_id(CAPTURE_ID)
+    assert client.events == ["put", "head"]
 
 
 @pytest.mark.asyncio

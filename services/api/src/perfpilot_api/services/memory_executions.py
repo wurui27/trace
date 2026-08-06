@@ -40,6 +40,10 @@ _MANIFEST_MIME = "application/json"
 _MAX_MANIFEST_BYTES = 2 * 1024 * 1024
 _EVIDENCE_KINDS = frozenset({"memory_evidence", "capture_manifest", "log", "screenshot", "trace"})
 _MIME_TYPE = re.compile(r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\Z")
+_CAPTURE_SOURCES_BY_MODE = {
+    "device": "adb_agent",
+    "memory_upload": "manual_upload",
+}
 
 
 class MemoryExecutionError(RuntimeError):
@@ -431,7 +435,7 @@ class SQLAlchemyMemoryExecutionRepository:
             raise MemoryExecutionUnavailableError from None
 
         if (
-            analysis_mode != "memory_upload"
+            analysis_mode not in _CAPTURE_SOURCES_BY_MODE
             or analysis_state == "deleted"
             or tombstoned_at is not None
             or (question is not None and (not isinstance(question, str) or len(question) > 2_000))
@@ -446,6 +450,7 @@ class SQLAlchemyMemoryExecutionRepository:
         if (
             manifest.analysis_id != analysis_id
             or manifest.capture_id != capture_id
+            or manifest.source != _CAPTURE_SOURCES_BY_MODE[analysis_mode]
             or manifest_artifact_id(manifest.capture_id) != stored_manifest.public.artifact_id
             or manifest.canonical_bytes() != payload
             or not hmac.compare_digest(
@@ -554,7 +559,7 @@ class MemoryExecutionService:
         if (
             not isinstance(capture, LoadedMemoryCapture)
             or capture.analysis_id != analysis_id
-            or capture.analysis_mode != "memory_upload"
+            or capture.analysis_mode not in _CAPTURE_SOURCES_BY_MODE
             or capture.analysis_state == "deleted"
             or capture.tombstoned_at is not None
             or type(capture.tenant_resource_version) is not int
@@ -567,6 +572,8 @@ class MemoryExecutionService:
             or type(capture.manifest_bytes) is not bytes
             or capture.manifest.analysis_id != analysis_id
             or capture.manifest.capture_id != capture_id
+            or capture.manifest.source
+            != _CAPTURE_SOURCES_BY_MODE.get(capture.analysis_mode)
             or manifest_artifact_id(capture_id) != capture.manifest_artifact.artifact_id
             or capture.manifest.canonical_bytes() != capture.manifest_bytes
             or not self._valid_artifact(
@@ -581,6 +588,13 @@ class MemoryExecutionService:
                 capture.manifest_artifact.sha256_b64,
                 _sha256_b64(capture.manifest_bytes),
             )
+        ):
+            raise MemoryExecutionNotFoundError
+        if capture.analysis_mode == "device" and (
+            len(capture.manifest.artifacts) != 1
+            or capture.manifest.artifacts[0].role != "handoff_archive"
+            or len(capture.evidence_artifacts) != 1
+            or capture.evidence_artifacts[0].artifact_kind != "memory_evidence"
         ):
             raise MemoryExecutionNotFoundError
         referenced_ids = tuple(reference.artifact_id for reference in capture.manifest.artifacts)

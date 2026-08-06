@@ -400,6 +400,14 @@ async def test_engine_mode_pairs_reserve_only_in_the_selected_tenant_database(
         artifact_id=result_artifact_id(device_execution),
         engine_id="smartperfetto",
     )
+    device_memory_execution = UUID("83000000-0000-4000-8000-000000000004")
+    device_memory = await _reserve(
+        artifact_harness,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        execution_id=device_memory_execution,
+        artifact_id=result_artifact_id(device_memory_execution),
+        engine_id="android_memory",
+    )
 
     assert memory.artifact_id == ARTIFACT_ID
     assert memory.analysis_id == MEMORY_ANALYSIS_ID
@@ -417,9 +425,10 @@ async def test_engine_mode_pairs_reserve_only_in_the_selected_tenant_database(
     assert "raw/analyses" not in repr(memory)
     assert trace.analysis_id == TRACE_ANALYSIS_ID
     assert device_trace.analysis_id == DEVICE_ANALYSIS_ID
-    assert len(await artifact_harness.rows(TEAM_A)) == 3
+    assert device_memory.analysis_id == DEVICE_ANALYSIS_ID
+    assert len(await artifact_harness.rows(TEAM_A)) == 4
     assert await artifact_harness.rows(TEAM_B) == []
-    assert artifact_harness.router.calls == [TEAM_A, TEAM_A, TEAM_A]
+    assert artifact_harness.router.calls == [TEAM_A, TEAM_A, TEAM_A, TEAM_A]
 
 
 @pytest.mark.asyncio
@@ -532,7 +541,6 @@ async def test_other_route_missing_analysis_and_cross_mode_are_stable_conflicts(
         (TENANT_A, MISSING_ANALYSIS_ID, "android_memory"),
         (TENANT_A, MEMORY_ANALYSIS_ID, "smartperfetto"),
         (TENANT_A, TRACE_ANALYSIS_ID, "android_memory"),
-        (TENANT_A, DEVICE_ANALYSIS_ID, "android_memory"),
     )
     for tenant, analysis_id, engine_id in cases:
         with pytest.raises(EngineResultConflictError) as caught:

@@ -40,15 +40,19 @@ def _sha256_b64(payload: bytes) -> str:
     return base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
 
 
-def _manifest() -> MemoryCaptureManifest:
+def _manifest(
+    *,
+    source: str = "manual_upload",
+    role: str = "meminfo",
+) -> MemoryCaptureManifest:
     return MemoryCaptureManifest(
         schema_version="1.0",
         analysis_id=ANALYSIS_ID,
         capture_id=CAPTURE_ID,
         phase="single",
-        source="manual_upload",
+        source=source,
         subject=MemorySubject(package="com.example.app", android_sdk=37),
-        artifacts=(MemoryArtifactRef(artifact_id=EVIDENCE_ID, role="meminfo"),),
+        artifacts=(MemoryArtifactRef(artifact_id=EVIDENCE_ID, role=role),),
     )
 
 
@@ -76,13 +80,18 @@ def _artifact(
     )
 
 
-def _capture() -> LoadedMemoryCapture:
-    manifest = _manifest()
+def _capture(
+    *,
+    analysis_mode: str = "memory_upload",
+    source: str = "manual_upload",
+    role: str = "meminfo",
+) -> LoadedMemoryCapture:
+    manifest = _manifest(source=source, role=role)
     payload = manifest.canonical_bytes()
     evidence_payload = b"meminfo"
     return LoadedMemoryCapture(
         analysis_id=ANALYSIS_ID,
-        analysis_mode="memory_upload",
+        analysis_mode=analysis_mode,
         analysis_state="created",
         tombstoned_at=None,
         tenant_resource_version=7,
@@ -153,10 +162,16 @@ class FakeRepository:
 
 
 class FakeUploads:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        source: str = "manual_upload",
+        role: str = "meminfo",
+    ) -> None:
         self.calls: list[dict[str, object]] = []
         self.expires_at = NOW + timedelta(minutes=5)
         self.authorization_overrides: dict[str, object] = {}
+        self.manifest = _manifest(source=source, role=role)
 
     async def download(self, **kwargs: object) -> DownloadAuthorization:
         self.calls.append(kwargs)
@@ -177,12 +192,12 @@ class FakeUploads:
                 else "text/plain"
             ),
             size=(
-                len(_manifest().canonical_bytes())
+                len(self.manifest.canonical_bytes())
                 if artifact_id == manifest_artifact_id(CAPTURE_ID)
                 else len(b"meminfo")
             ),
             sha256_b64=(
-                _sha256_b64(_manifest().canonical_bytes())
+                _sha256_b64(self.manifest.canonical_bytes())
                 if artifact_id == manifest_artifact_id(CAPTURE_ID)
                 else _sha256_b64(b"meminfo")
             ),
@@ -267,6 +282,57 @@ async def test_prepare_claims_manifest_first_and_creates_pinned_attempt() -> Non
         }
     ]
     assert repository.fence_calls == [(TEAM_ID, 7), (TEAM_ID, 7), (TEAM_ID, 7)]
+
+
+@pytest.mark.asyncio
+async def test_prepare_accepts_device_agent_capture_for_android_memory() -> None:
+    capture = _capture(
+        analysis_mode="device",
+        source="adb_agent",
+        role="handoff_archive",
+    )
+    repository = FakeRepository(capture)
+    executions = FakeExecutions()
+
+    prepared = await _service(
+        repository,
+        FakeUploads(source="adb_agent", role="handoff_archive"),
+        executions,
+    ).prepare(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        capture_id=CAPTURE_ID,
+    )
+
+    assert prepared.execution.engine_id == "android_memory"
+    assert tuple(item.kind for item in prepared.inputs) == (
+        "memory_capture_manifest",
+        "memory_evidence",
+    )
+    assert executions.calls[0]["engine_id"] == "android_memory"
+
+
+@pytest.mark.parametrize(
+    "capture",
+    [
+        _capture(analysis_mode="device"),
+        _capture(source="adb_agent", role="handoff_archive"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_prepare_rejects_mismatched_analysis_mode_and_capture_source(
+    capture: LoadedMemoryCapture,
+) -> None:
+    with pytest.raises(MemoryExecutionNotFoundError):
+        await _service(
+            FakeRepository(capture),
+            FakeUploads(),
+            FakeExecutions(),
+        ).prepare(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            capture_id=CAPTURE_ID,
+        )
 
 
 @pytest.mark.parametrize(
