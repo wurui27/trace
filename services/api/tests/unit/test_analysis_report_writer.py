@@ -108,6 +108,22 @@ def test_composer_builds_valid_ordered_v11_report_and_exact_provenance() -> None
     ).decode("ascii")
 
 
+def test_composer_preserves_device_mode_in_v11_report() -> None:
+    core = _load("normalized-trace-report.valid.json")
+    core["analysis_mode"] = "device"
+
+    result = compose_analysis_report(
+        replace(_request(), core_document=core),
+        report_version=1,
+    )
+
+    assert result.document["schema_version"] == "1.1"
+    assert result.document["analysis_mode"] == "device"
+    assert [item["scenario_type"] for item in result.document["scenario_reports"]] == [
+        "startup"
+    ]
+
+
 def test_composer_publishes_stable_core_report_when_synthesis_failed() -> None:
     result = compose_analysis_report(_request(failed=True), report_version=1)
 

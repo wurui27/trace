@@ -59,6 +59,20 @@ def test_normalizer_is_byte_stable_and_sorts_public_ids() -> None:
             assert [item[identifier] for item in scenario[key]] == sorted(item[identifier] for item in scenario[key])  # type: ignore[index]
 
 
+def test_normalizer_carries_authoritative_device_analysis_mode() -> None:
+    report = normalize_smartperfetto_result(_source(), analysis_mode="device")
+
+    assert report.document["analysis_mode"] == "device"
+
+
+def test_normalizer_rejects_unknown_analysis_mode() -> None:
+    with pytest.raises(
+        SmartPerfettoNormalizationError,
+        match="^SmartPerfetto result cannot be normalized$",
+    ):
+        normalize_smartperfetto_result(_source(), analysis_mode="memory_upload")  # type: ignore[arg-type]
+
+
 def test_production_sanitizer_canonicalizer_and_normalizer_preserve_only_required_typed_fields() -> None:
     document = json.loads(FIXTURE.read_text())
     report = _report(document)

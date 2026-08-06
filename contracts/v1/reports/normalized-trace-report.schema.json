@@ -8,7 +8,7 @@
   "properties": {
     "schema_version": {"const": "1.0"},
     "analysis_id": {"$ref": "#/$defs/uuid"},
-    "analysis_mode": {"const": "trace_upload"},
+    "analysis_mode": {"enum": ["trace_upload", "device"]},
     "core_state": {"enum": ["complete", "partial"]},
     "scenario_reports": {"type": "array", "minItems": 1, "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/scenario"}},
     "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}},

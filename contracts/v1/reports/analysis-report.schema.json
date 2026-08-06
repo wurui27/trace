@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/reports/analysis-report.schema.json",
-  "$comment": "AnalysisReport is an immutable parent view. Version 1.0 preserves legacy device and single-scenario Trace reports; version 1.1 adds explicit Trace synthesis.",
+  "$comment": "AnalysisReport is an immutable parent view. Version 1.0 preserves legacy reports; version 1.1 adds explicit SmartPerfetto and PerfPilot synthesis for Trace upload and device analyses.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -61,10 +61,14 @@
         "properties": {
           "analysis_mode": {
             "const": "device"
+          },
+          "schema_version": {
+            "const": "1.0"
           }
         },
         "required": [
-          "analysis_mode"
+          "analysis_mode",
+          "schema_version"
         ]
       },
       "then": {
@@ -147,7 +151,7 @@
       "then": {
         "required": ["synthesis"],
         "properties": {
-          "analysis_mode": {"const": "trace_upload"},
+          "analysis_mode": {"enum": ["trace_upload", "device"]},
           "scenario_reports": {
             "oneOf": [
               {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}], "items": false},

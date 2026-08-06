@@ -257,9 +257,10 @@ def compose_analysis_report(
         _checksum(value)
     core = validate_contract("normalized-trace-report", request.core_document)
     provenance = core.get("provenance")
+    analysis_mode = core.get("analysis_mode")
     if (
         core.get("analysis_id") != str(request.analysis_id)
-        or core.get("analysis_mode") != "trace_upload"
+        or analysis_mode not in {"trace_upload", "device"}
         or not isinstance(provenance, Mapping)
         or provenance.get("canonical_artifact_id") != str(request.canonical_artifact_id)
         or provenance.get("canonical_sha256_b64") != request.canonical_sha256_b64
@@ -372,7 +373,7 @@ def compose_analysis_report(
         {
             "schema_version": "1.1",
             "analysis_id": str(request.analysis_id),
-            "analysis_mode": "trace_upload",
+            "analysis_mode": analysis_mode,
             "state": state,
             "report_version": report_version,
             "generated_at": generated_at,
@@ -418,7 +419,8 @@ class AnalysisReportWriter:
 
     async def publish(self, request: AnalysisReportWriteRequest) -> PublishedAnalysisReport:
         # Validate all caller-controlled content before acquiring the tenant write lock.
-        compose_analysis_report(request, report_version=1)
+        preview = compose_analysis_report(request, report_version=1)
+        analysis_mode = preview.document["analysis_mode"]
         async with self._tenant_router.session(request.team_id) as session:
             if session.info.get("tenant_resource_version") != request.tenant_resource_version:
                 raise ReportSourceError("report source is invalid")
@@ -427,7 +429,7 @@ class AnalysisReportWriter:
                 .where(Analysis.id == request.analysis_id)
                 .with_for_update()
             )
-            if analysis is None or analysis.analysis_mode != "trace_upload":
+            if analysis is None or analysis.analysis_mode != analysis_mode:
                 raise ReportSourceError("report source is invalid")
             identity = report_version_id(request.synthesis_execution_id)
             existing = await session.get(ReportVersion, identity, with_for_update=True)

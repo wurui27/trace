@@ -9,6 +9,7 @@ import math
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 from uuid import UUID, uuid5
 
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
@@ -172,7 +173,13 @@ def _claims(report: Mapping[str, object]) -> dict[str, dict[str, object]]:
     return accepted
 
 
-def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
+def _build_core(
+    source: LoadedCanonicalResult,
+    *,
+    analysis_mode: Literal["trace_upload", "device"],
+) -> dict[str, object]:
+    if analysis_mode not in {"trace_upload", "device"}:
+        raise _fail()
     document = _mapping(validated_canonical_document(source))
     engine, result = _mapping(document.get("engine")), _mapping(document.get("result"))
     if (
@@ -273,7 +280,7 @@ def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
     return {
         "schema_version": "1.0",
         "analysis_id": str(source.analysis_id),
-        "analysis_mode": "trace_upload",
+        "analysis_mode": analysis_mode,
         "core_state": "partial" if result["state"] == "insufficient_data" or any(item["core_state"] == "partial" for item in scenario_reports) else "complete",
         "scenario_reports": scenario_reports,
         "limitations": _sort(limitations, "limitation_id"),
@@ -367,9 +374,13 @@ def _limitation(analysis_id: UUID, value: Mapping[str, object], source_id: str) 
     return {"limitation_id": str(_stable_id("limitation", analysis_id, source_id)), "code": _text(value.get("ruleId"), public=True), "summary": _text(value.get("summary")), "evidence_ids": []}
 
 
-def normalize_smartperfetto_result(source: LoadedCanonicalResult) -> NormalizedTraceReport:
+def normalize_smartperfetto_result(
+    source: LoadedCanonicalResult,
+    *,
+    analysis_mode: Literal["trace_upload", "device"] = "trace_upload",
+) -> NormalizedTraceReport:
     try:
-        document = _build_core(source)
+        document = _build_core(source, analysis_mode=analysis_mode)
         validated = validate_contract("normalized-trace-report", document)
         payload = canonical_json_bytes(validated)
         return NormalizedTraceReport(
