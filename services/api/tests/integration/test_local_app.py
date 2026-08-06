@@ -436,6 +436,95 @@ def test_local_team_device_directory_is_empty_without_one_ready_device(
     assert response.json() == {"schema_version": "1.0", "devices": []}
 
 
+def test_local_app_creates_device_analysis_with_embedded_apk_upload(
+    tmp_path: Path,
+) -> None:
+    serial = "0123456789ABCDEF"
+    device_probe = _FakeDeviceProbe(
+        _FakeDeviceStatus(
+            state="connected",
+            device=_FakeDevice(
+                serial=serial,
+                manufacturer="UNISOC",
+                model="uis7870_2h10_car_c200_6",
+                android_version="13",
+                api_level=33,
+            ),
+        )
+    )
+    apk = b"local-device-apk"
+    checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        device_probe=device_probe,
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+    )
+
+    with TestClient(app) as client:
+        csrf = client.get("/v1/auth/csrf").json()["csrf_token"]
+        headers = {"x-csrf-token": csrf}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        device_id = client.get(f"/v1/teams/{team_id}/devices").json()["devices"][0][
+            "device_id"
+        ]
+        created = client.post(
+            f"/v1/teams/{team_id}/analyses",
+            headers=headers,
+            json={
+                "schema_version": "1.0",
+                "analysis_mode": "device",
+                "device_id": device_id,
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": len(apk),
+                    "sha256_b64": checksum,
+                },
+            },
+        )
+
+    assert created.status_code == 201, created.text
+    payload = created.json()
+    assert payload["analysis_mode"] == "device"
+    assert payload["device_id"] == device_id
+    assert payload["application_version_id"] is None
+    assert payload["application_metadata"] is None
+    assert payload["active_lease"] is None
+    assert payload["started_at"] is None
+    assert payload["completed_at"] is None
+    assert payload["report_available"] is False
+    assert [item["scenario_type"] for item in payload["scenarios"]] == [
+        "cold_start",
+        "scroll",
+        "memory_cycle",
+    ]
+    assert {item["state"] for item in payload["scenarios"]} == {"awaiting_input"}
+    assert payload["sample_verdict_counts"] == {
+        "valid": 0,
+        "invalid": 0,
+        "pending": 0,
+        "validation_error": 0,
+        "total": 0,
+    }
+    upload = payload["apk_upload"]
+    assert upload["state"] == "pending"
+    assert upload["artifact_kind"] == "apk"
+    assert upload["mime"] == "application/vnd.android.package-archive"
+    assert upload["size"] == len(apk)
+    assert upload["sha256_b64"] == checksum
+    assert datetime.fromisoformat(upload["expires_at"]).tzinfo is not None
+    assert urlsplit(upload["put_url"]).path.startswith("/local/v1/uploads/")
+    assert upload["required_headers"] == {
+        "Content-Type": "application/vnd.android.package-archive",
+        "x-amz-checksum-sha256": checksum,
+    }
+    assert "ai_rounds" not in payload
+    assert "source_analysis" not in payload
+    assert serial not in json.dumps(payload)
+
+
 def test_local_app_lists_one_active_analysis_and_rejects_a_second(
     tmp_path: Path,
 ) -> None:

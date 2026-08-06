@@ -17,7 +17,7 @@ import secrets
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Literal, Protocol
 from urllib.parse import urlsplit
@@ -287,7 +287,7 @@ class _InputDescriptor(_StrictModel):
         return _validated_checksum(value)
 
 
-class _CreateAnalysisRequest(_StrictModel):
+class _CreateTraceAnalysisRequest(_StrictModel):
     schema_version: Literal["1.0"]
     analysis_mode: Literal["trace_upload"]
     analysis_profile: str
@@ -308,6 +308,42 @@ class _CreateAnalysisRequest(_StrictModel):
         if "trace" not in kinds or len(kinds) != len(set(kinds)):
             raise ValueError("one Trace and unique input kinds are required")
         return value
+
+
+class _ApkDescriptor(_StrictModel):
+    artifact_kind: Literal["apk"]
+    mime: Literal["application/vnd.android.package-archive"]
+    size: int = Field(gt=0, le=_MAX_UPLOAD_BYTES)
+    sha256_b64: str
+
+    @field_validator("sha256_b64")
+    @classmethod
+    def valid_checksum(cls, value: str) -> str:
+        return _validated_checksum(value)
+
+
+class _CreateDeviceAnalysisRequest(_StrictModel):
+    schema_version: Literal["1.0"]
+    analysis_mode: Literal["device"]
+    device_id: UUID = Field(strict=False)
+    scenarios: list[Literal["cold_start", "scroll", "memory_cycle"]]
+    apk: _ApkDescriptor
+
+    @field_validator("scenarios")
+    @classmethod
+    def valid_scenarios(
+        cls,
+        value: list[Literal["cold_start", "scroll", "memory_cycle"]],
+    ) -> list[Literal["cold_start", "scroll", "memory_cycle"]]:
+        if value != ["cold_start", "scroll", "memory_cycle"]:
+            raise ValueError("fixed device scenarios are required")
+        return value
+
+
+_CreateAnalysisRequest = Annotated[
+    _CreateTraceAnalysisRequest | _CreateDeviceAnalysisRequest,
+    Field(discriminator="analysis_mode"),
+]
 
 
 class _ReserveUploadRequest(_StrictModel):
@@ -380,6 +416,9 @@ class _LocalUpload:
     sha256_b64: str
     token: str
     path: Path
+    expires_at: datetime = field(
+        default_factory=lambda: datetime.now(UTC) + timedelta(hours=1)
+    )
     bytes_ready: bool = False
 
 
@@ -397,7 +436,13 @@ class _LocalAnalysis:
     profile: str
     question: str | None
     inputs: dict[str, _LocalInput]
+    analysis_mode: Literal["trace_upload", "device"] = "trace_upload"
+    device_id: UUID | None = None
+    application_version_id: UUID | None = None
+    application_metadata: dict[str, object] | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
     state: str = "created"
     version: int = 1
     generation: int = 1
@@ -838,9 +883,25 @@ class _LocalRuntime:
         return {
             "schema_version": "1.0",
             "analysis_id": str(analysis.analysis_id),
+            "analysis_mode": analysis.analysis_mode,
+            "device_id": str(analysis.device_id) if analysis.device_id is not None else None,
+            "application_version_id": (
+                str(analysis.application_version_id)
+                if analysis.application_version_id is not None
+                else None
+            ),
+            "application_metadata": analysis.application_metadata,
             "profile": analysis.profile,
             "question": analysis.question,
             "created_at": analysis.created_at.isoformat(),
+            "started_at": (
+                analysis.started_at.isoformat() if analysis.started_at is not None else None
+            ),
+            "completed_at": (
+                analysis.completed_at.isoformat()
+                if analysis.completed_at is not None
+                else None
+            ),
             "state": analysis.state,
             "version": analysis.version,
             "generation": analysis.generation,
@@ -957,6 +1018,17 @@ class _LocalRuntime:
         cancel_requested_at = _parse_utc_datetime(raw_cancel_requested_at)
         if raw_cancel_requested_at is not None and cancel_requested_at is None:
             raise ValueError("invalid persisted local analysis")
+        analysis_mode = str(document.get("analysis_mode", "trace_upload"))
+        if analysis_mode not in {"trace_upload", "device"}:
+            raise ValueError("invalid persisted local analysis")
+        raw_started_at = document.get("started_at")
+        started_at = _parse_utc_datetime(raw_started_at)
+        if raw_started_at is not None and started_at is None:
+            raise ValueError("invalid persisted local analysis")
+        raw_completed_at = document.get("completed_at")
+        completed_at = _parse_utc_datetime(raw_completed_at)
+        if raw_completed_at is not None and completed_at is None:
+            raise ValueError("invalid persisted local analysis")
         analysis = _LocalAnalysis(
             analysis_id=analysis_id,
             profile=str(document["profile"]),
@@ -966,7 +1038,25 @@ class _LocalRuntime:
                 else None
             ),
             inputs=inputs,
+            analysis_mode=analysis_mode,  # type: ignore[arg-type]
+            device_id=(
+                UUID(str(document["device_id"]))
+                if document.get("device_id") is not None
+                else None
+            ),
+            application_version_id=(
+                UUID(str(document["application_version_id"]))
+                if document.get("application_version_id") is not None
+                else None
+            ),
+            application_metadata=(
+                dict(document["application_metadata"])
+                if isinstance(document.get("application_metadata"), Mapping)
+                else None
+            ),
             created_at=created_at or _EARLIEST_LOCAL_ANALYSIS_TIME,
+            started_at=started_at,
+            completed_at=completed_at,
             state=str(document["state"]),
             version=int(document["version"]),
             generation=int(document.get("generation", 1)),
@@ -1049,12 +1139,32 @@ class _LocalRuntime:
             await self.synthesizer.aclose()
 
     async def create(self, request: _CreateAnalysisRequest) -> _LocalAnalysis:
-        analysis = _LocalAnalysis(
-            analysis_id=uuid4(),
-            profile=request.analysis_profile,
-            question=request.question.strip() if request.question and request.question.strip() else None,
-            inputs={item.kind: _LocalInput(item) for item in request.inputs},
-        )
+        if isinstance(request, _CreateDeviceAnalysisRequest):
+            descriptor = _InputDescriptor(
+                kind="apk",
+                mime=request.apk.mime,
+                size=request.apk.size,
+                sha256_b64=request.apk.sha256_b64,
+            )
+            analysis = _LocalAnalysis(
+                analysis_id=uuid4(),
+                profile="startup",
+                question=None,
+                inputs={"apk": _LocalInput(descriptor)},
+                analysis_mode="device",
+                device_id=request.device_id,
+            )
+        else:
+            analysis = _LocalAnalysis(
+                analysis_id=uuid4(),
+                profile=request.analysis_profile,
+                question=(
+                    request.question.strip()
+                    if request.question and request.question.strip()
+                    else None
+                ),
+                inputs={item.kind: _LocalInput(item) for item in request.inputs},
+            )
         async with self.lock:
             if any(
                 current.state in _ACTIVE_ANALYSIS_STATES
@@ -1065,6 +1175,21 @@ class _LocalRuntime:
                     "analysis already active",
                 )
             self.analyses[analysis.analysis_id] = analysis
+            if analysis.analysis_mode == "device":
+                target = analysis.inputs["apk"]
+                upload_id = str(uuid4())
+                upload = _LocalUpload(
+                    upload_id=upload_id,
+                    analysis_id=analysis.analysis_id,
+                    kind="apk",
+                    mime=target.descriptor.mime,
+                    size=target.descriptor.size,
+                    sha256_b64=target.descriptor.sha256_b64,
+                    token=secrets.token_urlsafe(32),
+                    path=self.upload_root / f"{upload_id}.bin",
+                )
+                self.uploads[upload_id] = upload
+                target.upload_id = upload_id
         await self._persist(analysis)
         return analysis
 
@@ -1524,6 +1649,91 @@ class _LocalRuntime:
         await self._persist(analysis)
 
     def response(self, analysis: _LocalAnalysis) -> dict[str, object]:
+        if analysis.analysis_mode == "device":
+            target = analysis.inputs["apk"]
+            if target.upload_id is None:
+                raise RuntimeError("local APK upload is unavailable")
+            upload = self.uploads[target.upload_id]
+            verdicts = {
+                "valid": 0,
+                "invalid": 0,
+                "pending": 0,
+                "validation_error": 0,
+                "total": 0,
+            }
+            if analysis.state in {"creating", "created", "uploading"}:
+                scenario_state = "awaiting_input"
+                scenario_version = None
+            elif analysis.state in {"queued", "scheduled"}:
+                scenario_state = analysis.state
+                scenario_version = analysis.version
+            elif analysis.state in {"running", "analyzing"}:
+                scenario_state = "analyzing"
+                scenario_version = analysis.version
+            elif analysis.state == "partially_completed":
+                scenario_state = "completed"
+                scenario_version = analysis.version
+            else:
+                scenario_state = analysis.state
+                scenario_version = analysis.version
+            return {
+                "schema_version": "1.0",
+                "analysis_id": str(analysis.analysis_id),
+                "team_id": str(LOCAL_TEAM_ID),
+                "analysis_mode": "device",
+                "device_id": str(analysis.device_id),
+                "state": analysis.state,
+                "version": analysis.version,
+                "application_version_id": (
+                    str(analysis.application_version_id)
+                    if analysis.application_version_id is not None
+                    else None
+                ),
+                "application_metadata": analysis.application_metadata,
+                "apk_upload": self.slot(upload, finalized=target.finalized)["upload"],
+                "scenarios": [
+                    {
+                        "scenario_job_id": None,
+                        "scenario_type": scenario_type,
+                        "state": scenario_state,
+                        "version": scenario_version,
+                        "device_group_id": None,
+                        "sample_verdict_counts": dict(verdicts),
+                        "started_at": (
+                            analysis.started_at.isoformat()
+                            if analysis.started_at is not None
+                            else None
+                        ),
+                        "completed_at": (
+                            analysis.completed_at.isoformat()
+                            if analysis.completed_at is not None
+                            else None
+                        ),
+                        "failure": analysis.failure if scenario_state == "failed" else None,
+                    }
+                    for scenario_type in ("cold_start", "scroll", "memory_cycle")
+                ],
+                "sample_verdict_counts": verdicts,
+                "active_lease": None,
+                "report_available": analysis.report is not None,
+                "created_at": analysis.created_at.isoformat(),
+                "started_at": (
+                    analysis.started_at.isoformat()
+                    if analysis.started_at is not None
+                    else None
+                ),
+                "completed_at": (
+                    analysis.completed_at.isoformat()
+                    if analysis.completed_at is not None
+                    else None
+                ),
+                "cancel_requested_at": (
+                    analysis.cancel_requested_at.isoformat()
+                    if analysis.cancel_requested_at is not None
+                    else None
+                ),
+                "failure": analysis.failure,
+            }
         stage_failure = analysis.failure
         input_uploads: list[dict[str, object]] = []
         for item in analysis.inputs.values():
@@ -1603,6 +1813,7 @@ class _LocalRuntime:
             result["artifact_id"] = target.artifact_id
             result["finalized_at"] = datetime.now(UTC).isoformat()
         else:
+            result["expires_at"] = upload.expires_at.isoformat()
             result["put_url"] = (
                 f"{self.public_origin}/local/v1/uploads/{upload.upload_id}?token={upload.token}"
             )
@@ -1743,6 +1954,17 @@ def create_local_app(
     ) -> dict[str, object]:
         check_team(team_id)
         check_csrf(x_csrf_token)
+        if isinstance(body, _CreateDeviceAnalysisRequest):
+            detected = await resolved_device_probe.inspect()
+            if (
+                detected.state != "connected"
+                or detected.device is None
+                or UUID(str(_team_device(detected.device)["device_id"])) != body.device_id
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "selected Android device is unavailable",
+                )
         return runtime.response(await runtime.create(body))
 
     @app.get("/v1/teams/{team_id}/analyses")
