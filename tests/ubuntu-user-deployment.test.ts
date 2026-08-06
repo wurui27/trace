@@ -1,0 +1,37 @@
+import { readFile } from "node:fs/promises";
+import path from "node:path";
+
+import { describe, expect, it } from "vitest";
+
+const root = path.resolve(import.meta.dirname, "..");
+
+async function source(relativePath: string): Promise<string> {
+  return readFile(path.join(root, relativePath), "utf8");
+}
+
+describe("Ubuntu user deployment", () => {
+  it("bootstraps pinned user-local runtimes without sudo or data deletion", async () => {
+    const script = await source("scripts/bootstrap-ubuntu-user.sh");
+
+    expect(script).toContain("NODE_VERSION=24.15.0");
+    expect(script).toContain("1508f99788bfcf18cc861e4bf4f8b472e84240c3");
+    expect(script).toContain("d5514972ced78c3faa7fc17589c1ea9231645056");
+    expect(script).toContain("wait_for_url http://127.0.0.1:3001/health");
+    expect(script).toContain('wait_for_url "http://$SERVER_IP:8000/v1/health"');
+    expect(script).toContain('wait_for_url "http://$SERVER_IP:3000"');
+    expect(script).not.toMatch(/\bsudo\b/);
+    expect(script).not.toMatch(/rm\s+-rf[^\n]*data/);
+  });
+
+  it.each([
+    ["perfpilot-smartperfetto.service", "PORT=3001"],
+    ["perfpilot-api.service", "--host 10.166.0.125 --port 8000"],
+    ["perfpilot-web.service", "--port 3000"],
+  ])("keeps %s supervised and bound to its declared port", async (unit, marker) => {
+    const service = await source(`infra/ubuntu-user/systemd/${unit}`);
+
+    expect(service).toContain("Restart=always");
+    expect(service).toContain(marker);
+    expect(service).not.toMatch(/\bsudo\b/);
+  });
+});

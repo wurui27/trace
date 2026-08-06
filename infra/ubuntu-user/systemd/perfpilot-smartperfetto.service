@@ -1,0 +1,21 @@
+[Unit]
+Description=PerfPilot SmartPerfetto analysis engine
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/perfpilot/engines/SmartPerfetto/backend
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=NODE_ENV=production
+Environment=PORT=3001
+Environment=SMARTPERFETTO_BACKEND_PORT=3001
+ExecStart=/usr/bin/env npm run start
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=PerfPilot production web server
+Wants=network-online.target perfpilot-api.service
+After=network-online.target perfpilot-api.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/perfpilot/platform
+EnvironmentFile=%h/perfpilot/config/perfpilot.env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+Environment=NODE_ENV=production
+ExecStart=/usr/bin/env npm run start -- --port 3000
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=default.target

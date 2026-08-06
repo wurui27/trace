@@ -1,0 +1,19 @@
+[Unit]
+Description=PerfPilot server test API
+Wants=network-online.target perfpilot-smartperfetto.service
+After=network-online.target perfpilot-smartperfetto.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/perfpilot/platform
+EnvironmentFile=%h/perfpilot/config/perfpilot.env
+EnvironmentFile=-%h/perfpilot/config/perfpilot-ai.env
+ExecStart=%h/perfpilot/platform/.venv/bin/uvicorn --factory perfpilot_api.local_app:create_local_app --host 10.166.0.125 --port 8000
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillMode=mixed
+UMask=0077
+
+[Install]
+WantedBy=default.target
