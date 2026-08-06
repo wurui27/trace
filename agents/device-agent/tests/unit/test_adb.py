@@ -10,6 +10,7 @@ from perfpilot_agent.adb import (
     AdbUnavailable,
     ProcessResult,
     parse_devices,
+    process_group_options,
     resolve_adb,
 )
 
@@ -32,6 +33,12 @@ class FakeRunner:
     ) -> ProcessResult:
         self.calls.append((argv, timeout_seconds, maximum_output_bytes))
         return self.result
+
+
+def test_processes_start_in_a_dedicated_platform_group() -> None:
+    assert process_group_options("darwin") == {"start_new_session": True}
+    assert process_group_options("linux") == {"start_new_session": True}
+    assert process_group_options("win32") == {"creationflags": 0x00000200}
 
 
 @pytest.mark.asyncio

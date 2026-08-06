@@ -12,6 +12,7 @@ from perfpilot_api.api.agents import get_agent_service, get_device_directory
 from perfpilot_api.errors import ApiError
 from perfpilot_api.services.agents import (
     AgentAuthenticationRejected,
+    AgentNotFoundError,
     AgentRegistration,
     AgentRegistrationRejected,
     AgentService,
@@ -449,6 +450,28 @@ async def refresh_agent_token(
         raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
     response.headers["cache-control"] = "no-store"
     return _credentials_payload(credentials)
+
+
+@router.post("/unregister")
+async def unregister_agent(
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        agent = await agent_service.revoke(
+            team_id=principal.team_id,
+            agent_id=principal.agent_id,
+        )
+    except AgentNotFoundError:
+        raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "agent_id": str(agent.agent_id),
+        "state": "revoked",
+    }
 
 
 @router.post("/heartbeat")

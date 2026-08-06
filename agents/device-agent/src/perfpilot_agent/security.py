@@ -185,7 +185,7 @@ class TaskVerifier:
         compact: str,
         *,
         expected_agent_id: UUID,
-        expected_lease_version: int,
+        expected_lease_version: int | None,
         known_device_digests: Collection[str],
     ) -> TaskSnapshot:
         try:
@@ -223,7 +223,10 @@ class TaskVerifier:
                 or task.issued_at > normalized_now + _MAXIMUM_ISSUED_AT_SKEW
                 or task.expires_at <= normalized_now
                 or task.agent_id != expected_agent_id
-                or task.lease_version != expected_lease_version
+                or (
+                    expected_lease_version is not None
+                    and task.lease_version != expected_lease_version
+                )
                 or task.device_digest not in known_device_digests
             ):
                 raise TaskRejected

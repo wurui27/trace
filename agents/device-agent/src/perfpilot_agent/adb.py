@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import signal
 import shutil
 import stat
 import sys
@@ -63,6 +64,13 @@ class ProcessRunner(Protocol):
     ) -> ProcessResult: ...
 
 
+def process_group_options(platform_name: str | None = None) -> dict[str, bool | int]:
+    current = sys.platform if platform_name is None else platform_name
+    if current == "win32":
+        return {"creationflags": 0x00000200}
+    return {"start_new_session": True}
+
+
 async def run_process(
     argv: list[str],
     *,
@@ -82,6 +90,7 @@ async def run_process(
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            **process_group_options(),
         )
     except OSError:
         raise AdbUnavailable from None
@@ -107,8 +116,11 @@ async def run_process(
     async def stop_process() -> None:
         if process.returncode is None:
             try:
-                process.kill()
-            except ProcessLookupError:
+                if sys.platform == "win32":
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
                 pass
         await process.wait()
 
@@ -362,6 +374,7 @@ __all__ = [
     "ProcessResult",
     "ProcessRunner",
     "parse_devices",
+    "process_group_options",
     "resolve_adb",
     "run_process",
 ]

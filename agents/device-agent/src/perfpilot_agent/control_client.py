@@ -1,26 +1,62 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
 import re
-from datetime import datetime
-from typing import Literal, Mapping, Self
+import secrets
+from collections.abc import Awaitable, Callable, Mapping
+from datetime import UTC, datetime, timedelta
+from typing import Annotated, Literal, Self
 from uuid import UUID
 
 import httpx
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from perfpilot_agent.config import AgentConfig
+from perfpilot_agent.credentials import (
+    AgentCredentials,
+    CredentialStore,
+    TaskSigningKey,
+)
 from perfpilot_agent.platform.base import AgentPlatform
 
 _MAXIMUM_RESPONSE_BYTES = 64 * 1024
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _AGENT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
+_ACCESS_TOKEN = re.compile(r"^ppat_[A-Za-z0-9_-]{43}$")
+_NONCE = re.compile(r"^[A-Za-z0-9_-]{22,128}$")
+_STABLE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
+_RETRYABLE_STATUSES = frozenset({408, 425, 429})
+_MAXIMUM_ATTEMPTS = 4
 
 
 class ControlClientError(RuntimeError):
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        status_code: int | None = None,
+        code: str | None = None,
+        retryable: bool = False,
+    ) -> None:
         super().__init__("PerfPilot Agent control request failed")
+        self.status_code = status_code
+        self.code = code
+        self.retryable = retryable
+
+
+class LeaseLost(ControlClientError):
+    def __init__(self) -> None:
+        super().__init__(code="lease_lost", retryable=False)
 
 
 def _validate_raw_public_key(value: str) -> str:
@@ -36,6 +72,12 @@ def _validate_raw_public_key(value: str) -> str:
 def _aware(value: datetime) -> datetime:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp must include a timezone")
+    return value
+
+
+def _require_string_timestamp(value: object) -> object:
+    if not isinstance(value, str):
+        raise ValueError("timestamp must be an ISO 8601 string")
     return value
 
 
@@ -106,6 +148,24 @@ class RegistrationResponse(BaseModel):
         return self
 
 
+class RefreshRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    agent_id: UUID
+    refresh_token: str = Field(pattern=r"^pprt_[A-Za-z0-9_-]{43}$", repr=False)
+    nonce: str
+    timestamp: int = Field(strict=True)
+    signature_b64: str = Field(pattern=r"^[A-Za-z0-9+/]{86}==$", repr=False)
+
+    @field_validator("nonce")
+    @classmethod
+    def validate_nonce(cls, value: str) -> str:
+        if _NONCE.fullmatch(value) is None:
+            raise ValueError("refresh nonce is invalid")
+        return value
+
+
 class ExecutionSlot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -123,12 +183,7 @@ class HeartbeatDevice(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     client_ref: UUID
-    serial: str = Field(
-        min_length=1,
-        max_length=255,
-        pattern=r"^[!-~]+$",
-        repr=False,
-    )
+    serial: str = Field(min_length=1, max_length=255, pattern=r"^[!-~]+$", repr=False)
     manufacturer: str | None = Field(
         default=None,
         max_length=128,
@@ -203,14 +258,157 @@ class HeartbeatResponse(BaseModel):
     @field_validator("accepted_at", mode="before")
     @classmethod
     def require_string_timestamp(cls, value: object) -> object:
-        if not isinstance(value, str):
-            raise ValueError("heartbeat timestamp must be an ISO 8601 string")
-        return value
+        return _require_string_timestamp(value)
 
     @field_validator("accepted_at")
     @classmethod
     def validate_accepted_at(cls, value: datetime) -> datetime:
         return _aware(value)
+
+
+class TaskWaitResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    action: Literal["wait"]
+    retry_after_seconds: int = Field(strict=True, ge=1, le=20)
+
+
+class TaskExecuteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    action: Literal["execute"]
+    snapshot_jws: str = Field(
+        min_length=32,
+        max_length=32_768,
+        pattern=r"^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$",
+        repr=False,
+    )
+    lease_expires_at: datetime
+    renew_after_seconds: Literal[20]
+
+    @field_validator("lease_expires_at", mode="before")
+    @classmethod
+    def require_string_timestamp(cls, value: object) -> object:
+        return _require_string_timestamp(value)
+
+    @field_validator("lease_expires_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class TaskCancellationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    action: Literal["cancel"]
+    execution_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    reason_code: str = Field(min_length=1, max_length=96)
+
+    @field_validator("reason_code")
+    @classmethod
+    def validate_reason_code(cls, value: str) -> str:
+        if _STABLE_CODE.fullmatch(value) is None:
+            raise ValueError("cancellation reason is invalid")
+        return value
+
+
+class TaskRenewalResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    execution_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    lease_expires_at: datetime
+    renew_after_seconds: Literal[20]
+
+    @field_validator("lease_expires_at", mode="before")
+    @classmethod
+    def require_string_timestamp(cls, value: object) -> object:
+        return _require_string_timestamp(value)
+
+    @field_validator("lease_expires_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class CancellationAcknowledgementResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    execution_id: UUID
+    analysis_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    state: Literal["canceled"]
+    acknowledged_at: datetime
+
+    @field_validator("acknowledged_at", mode="before")
+    @classmethod
+    def require_string_timestamp(cls, value: object) -> object:
+        return _require_string_timestamp(value)
+
+    @field_validator("acknowledged_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class CompletionAcknowledgementResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    execution_id: UUID
+    analysis_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    analysis_state: Literal["completed", "partially_completed", "failed"]
+    accepted_at: datetime
+
+    @field_validator("accepted_at", mode="before")
+    @classmethod
+    def require_string_timestamp(cls, value: object) -> object:
+        return _require_string_timestamp(value)
+
+    @field_validator("accepted_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class UnregistrationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    agent_id: UUID
+    state: Literal["revoked"]
+
+
+class _ErrorDetail(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    code: str = Field(min_length=1, max_length=96)
+    message: str = Field(min_length=1, max_length=512)
+    retryable: bool
+    request_id: str = Field(min_length=1, max_length=128)
+
+
+class _ErrorEnvelope(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    error: _ErrorDetail
+
+
+TaskPollResponse = Annotated[
+    TaskWaitResponse | TaskExecuteResponse | TaskCancellationResponse,
+    Field(discriminator="action"),
+]
+TaskRenewResponse = TaskRenewalResponse | TaskCancellationResponse
+_TASK_POLL_ADAPTER = TypeAdapter(TaskPollResponse)
+_TASK_RENEW_ADAPTER = TypeAdapter(TaskRenewResponse)
 
 
 class ControlClient:
@@ -219,6 +417,14 @@ class ControlClient:
         config: AgentConfig,
         *,
         http_client: httpx.AsyncClient | None = None,
+        credentials: AgentCredentials | None = None,
+        credential_store: CredentialStore | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        jitter: Callable[[], float] = lambda: secrets.randbelow(250) / 1_000,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        nonce_factory: Callable[[], str] = lambda: base64.urlsafe_b64encode(secrets.token_bytes(24))
+        .rstrip(b"=")
+        .decode("ascii"),
     ) -> None:
         self._config = config
         self._owns_client = http_client is None
@@ -229,6 +435,31 @@ class ControlClient:
             trust_env=False,
             headers={"accept": "application/json"},
         )
+        self._credential_store = credential_store
+        self._credentials = credentials
+        if self._credentials is None and credential_store is not None:
+            self._credentials = credential_store.load()
+        self._sleep = sleep
+        self._jitter = jitter
+        self._clock = clock
+        self._nonce_factory = nonce_factory
+        self._refresh_lock = asyncio.Lock()
+
+    @property
+    def credentials(self) -> AgentCredentials:
+        if self._credentials is None:
+            raise ControlClientError
+        return self._credentials
+
+    def bind_credentials(
+        self,
+        credentials: AgentCredentials,
+        *,
+        store: CredentialStore | None = None,
+    ) -> None:
+        self._credentials = AgentCredentials.model_validate(credentials)
+        if store is not None:
+            self._credential_store = store
 
     async def __aenter__(self) -> Self:
         return self
@@ -240,55 +471,373 @@ class ControlClient:
         if self._owns_client:
             await self._client.aclose()
 
+    @staticmethod
+    def _payload(response: httpx.Response) -> bytes:
+        payload = response.content
+        if not payload or len(payload) > _MAXIMUM_RESPONSE_BYTES:
+            raise ControlClientError
+        return payload
+
+    @staticmethod
+    def _error(response: httpx.Response) -> ControlClientError:
+        try:
+            envelope = _ErrorEnvelope.model_validate_json(ControlClient._payload(response))
+        except (ControlClientError, ValidationError, ValueError, TypeError, UnicodeError):
+            return ControlClientError(status_code=response.status_code)
+        return ControlClientError(
+            status_code=response.status_code,
+            code=envelope.error.code,
+            retryable=envelope.error.retryable,
+        )
+
+    async def _backoff(self, attempt: int) -> None:
+        jitter = self._jitter()
+        if not isinstance(jitter, (int, float)) or isinstance(jitter, bool):
+            jitter = 0
+        await self._sleep(min(2.0, 0.25 * (2**attempt)) + max(0.0, min(0.25, jitter)))
+
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        *,
+        expected_status: int,
+        json: Mapping[str, object] | None = None,
+        params: Mapping[str, object] | None = None,
+        access_token: str | None = None,
+        retry: bool,
+        lease_fenced: bool = False,
+    ) -> bytes:
+        headers = None
+        if access_token is not None:
+            if _ACCESS_TOKEN.fullmatch(access_token) is None:
+                raise ControlClientError
+            headers = {"authorization": f"Bearer {access_token}"}
+        attempts = _MAXIMUM_ATTEMPTS if retry else 1
+        for attempt in range(attempts):
+            try:
+                response = await self._client.request(
+                    method,
+                    f"{self._config.server_url}{path}",
+                    json=json,
+                    params=params,
+                    headers=headers,
+                )
+            except (httpx.ConnectError, httpx.ConnectTimeout):
+                if attempt + 1 == attempts:
+                    raise ControlClientError(retryable=True) from None
+                await self._backoff(attempt)
+                continue
+            except httpx.HTTPError:
+                raise ControlClientError from None
+            if response.status_code == expected_status:
+                return self._payload(response)
+            retryable_status = (
+                response.status_code in _RETRYABLE_STATUSES or response.status_code >= 500
+            )
+            if retryable_status and attempt + 1 < attempts:
+                await self._backoff(attempt)
+                continue
+            error = self._error(response)
+            if lease_fenced and error.code in {"resource_not_found", "stale_lease_version"}:
+                raise LeaseLost from None
+            if retryable_status:
+                raise ControlClientError(
+                    status_code=response.status_code,
+                    code=error.code,
+                    retryable=True,
+                ) from None
+            raise error
+        raise ControlClientError
+
+    async def _authorized_request(
+        self,
+        method: str,
+        path: str,
+        *,
+        expected_status: int,
+        json: Mapping[str, object] | None = None,
+        params: Mapping[str, object] | None = None,
+        access_token: str | None = None,
+        lease_fenced: bool = False,
+        retry: bool = True,
+    ) -> bytes:
+        bound = self._credentials
+        token = bound.access_token if bound is not None else access_token
+        if token is None:
+            raise ControlClientError
+        try:
+            return await self._request(
+                method,
+                path,
+                expected_status=expected_status,
+                json=json,
+                params=params,
+                access_token=token,
+                retry=retry,
+                lease_fenced=lease_fenced,
+            )
+        except ControlClientError as error:
+            if error.status_code != 401 or bound is None:
+                raise
+        await self._refresh_after_unauthorized(token)
+        return await self._request(
+            method,
+            path,
+            expected_status=expected_status,
+            json=json,
+            params=params,
+            access_token=self.credentials.access_token,
+            retry=retry,
+            lease_fenced=lease_fenced,
+        )
+
     async def register(
         self,
         request: RegistrationRequest | Mapping[str, object],
     ) -> RegistrationResponse:
         try:
             normalized = RegistrationRequest.model_validate(request)
-            response = await self._client.post(
-                f"{self._config.server_url}/v1/agent/register",
+            payload = await self._request(
+                "POST",
+                "/v1/agent/register",
+                expected_status=201,
                 json=normalized.model_dump(mode="json"),
+                retry=False,
             )
-            if response.status_code != 201:
-                raise ControlClientError
-            payload = response.content
-            if not payload or len(payload) > _MAXIMUM_RESPONSE_BYTES:
-                raise ControlClientError
             return RegistrationResponse.model_validate_json(payload)
         except ControlClientError:
             raise
-        except (httpx.HTTPError, ValidationError, ValueError, TypeError, UnicodeError):
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def _refresh_after_unauthorized(self, failed_access_token: str) -> None:
+        async with self._refresh_lock:
+            if self.credentials.access_token != failed_access_token:
+                return
+            await self._refresh_locked()
+
+    async def refresh_credentials(self, *, force: bool = False) -> AgentCredentials:
+        async with self._refresh_lock:
+            current = self.credentials
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ControlClientError
+            if not force and current.access_token_expires_at > now + timedelta(minutes=2):
+                return current
+            return await self._refresh_locked()
+
+    async def _refresh_locked(self) -> AgentCredentials:
+        try:
+            current = self.credentials
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise ControlClientError
+            nonce = self._nonce_factory()
+            timestamp = int(now.timestamp())
+            message = f"{current.agent_id}\n{nonce}\n{timestamp}".encode("ascii")
+            private_key = Ed25519PrivateKey.from_private_bytes(
+                base64.b64decode(current.private_key_b64, validate=True)
+            )
+            request = RefreshRequest(
+                schema_version="1.0",
+                agent_id=current.agent_id,
+                refresh_token=current.refresh_token,
+                nonce=nonce,
+                timestamp=timestamp,
+                signature_b64=base64.b64encode(private_key.sign(message)).decode("ascii"),
+            )
+            payload = await self._request(
+                "POST",
+                "/v1/agent/token/refresh",
+                expected_status=200,
+                json=request.model_dump(mode="json"),
+                retry=False,
+            )
+            response = RegistrationResponse.model_validate_json(payload)
+            if response.agent_id != current.agent_id:
+                raise ControlClientError
+            refreshed = AgentCredentials(
+                schema_version="1.0",
+                agent_id=current.agent_id,
+                private_key_b64=current.private_key_b64,
+                access_token=response.access_token,
+                access_token_expires_at=response.access_token_expires_at,
+                refresh_token=response.refresh_token,
+                refresh_token_expires_at=response.refresh_token_expires_at,
+                task_signing_key=TaskSigningKey(
+                    kid=response.task_signing_key.kid,
+                    public_key_b64=response.task_signing_key.public_key_b64,
+                ),
+                heartbeat_interval_seconds=response.heartbeat_interval_seconds,
+            )
+            if self._credential_store is not None:
+                self._credential_store.save(refreshed)
+            self._credentials = refreshed
+            return refreshed
+        except ControlClientError:
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError, binascii.Error):
             raise ControlClientError from None
 
     async def heartbeat(
         self,
         request: HeartbeatRequest | Mapping[str, object],
         *,
-        access_token: str,
+        access_token: str | None = None,
     ) -> HeartbeatResponse:
         try:
-            if re.fullmatch(r"ppat_[A-Za-z0-9_-]{43}", access_token) is None:
-                raise ControlClientError
             normalized = HeartbeatRequest.model_validate(request)
-            response = await self._client.post(
-                f"{self._config.server_url}/v1/agent/heartbeat",
+            payload = await self._authorized_request(
+                "POST",
+                "/v1/agent/heartbeat",
+                expected_status=200,
                 json=normalized.model_dump(mode="json"),
-                headers={"authorization": f"Bearer {access_token}"},
+                access_token=access_token,
             )
-            if response.status_code != 200:
-                raise ControlClientError
-            payload = response.content
-            if not payload or len(payload) > _MAXIMUM_RESPONSE_BYTES:
-                raise ControlClientError
             return HeartbeatResponse.model_validate_json(payload)
         except ControlClientError:
             raise
-        except (httpx.HTTPError, ValidationError, ValueError, TypeError, UnicodeError):
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def unregister(
+        self,
+        *,
+        access_token: str | None = None,
+    ) -> UnregistrationResponse:
+        try:
+            credentials = self._credentials
+            payload = await self._authorized_request(
+                "POST",
+                "/v1/agent/unregister",
+                expected_status=200,
+                access_token=access_token,
+                retry=False,
+            )
+            response = UnregistrationResponse.model_validate_json(payload)
+            if credentials is not None and response.agent_id != credentials.agent_id:
+                raise ControlClientError
+            return response
+        except ControlClientError:
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def poll_task(
+        self,
+        *,
+        wait_seconds: int = 20,
+        access_token: str | None = None,
+    ) -> TaskPollResponse:
+        try:
+            if isinstance(wait_seconds, bool) or not 0 <= wait_seconds <= 20:
+                raise ControlClientError
+            payload = await self._authorized_request(
+                "GET",
+                "/v1/agent/tasks/next",
+                expected_status=200,
+                params={"wait_seconds": wait_seconds},
+                access_token=access_token,
+            )
+            return _TASK_POLL_ADAPTER.validate_json(payload)
+        except ControlClientError:
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def renew_task(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        access_token: str | None = None,
+    ) -> TaskRenewResponse:
+        try:
+            if isinstance(lease_version, bool) or lease_version < 1:
+                raise ControlClientError
+            payload = await self._authorized_request(
+                "POST",
+                f"/v1/agent/tasks/{execution_id}/renew",
+                expected_status=200,
+                json={"schema_version": "1.0", "lease_version": lease_version},
+                access_token=access_token,
+                lease_fenced=True,
+            )
+            response = _TASK_RENEW_ADAPTER.validate_json(payload)
+            if response.execution_id != execution_id or response.lease_version != lease_version:
+                raise ControlClientError
+            return response
+        except (ControlClientError, LeaseLost):
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def acknowledge_cancellation(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        access_token: str | None = None,
+    ) -> CancellationAcknowledgementResponse:
+        try:
+            payload = await self._authorized_request(
+                "POST",
+                f"/v1/agent/tasks/{execution_id}/cancel-ack",
+                expected_status=200,
+                json={
+                    "schema_version": "1.0",
+                    "lease_version": lease_version,
+                    "reason_code": "analysis_canceled",
+                },
+                access_token=access_token,
+                lease_fenced=True,
+            )
+            response = CancellationAcknowledgementResponse.model_validate_json(payload)
+            if response.execution_id != execution_id or response.lease_version != lease_version:
+                raise ControlClientError
+            return response
+        except (ControlClientError, LeaseLost):
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def complete_execution(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        manifest: Mapping[str, object],
+        access_token: str | None = None,
+    ) -> CompletionAcknowledgementResponse:
+        try:
+            document = dict(manifest)
+            if (
+                document.get("execution_id") not in {execution_id, str(execution_id)}
+                or document.get("lease_version") != lease_version
+            ):
+                raise ControlClientError
+            payload = await self._authorized_request(
+                "POST",
+                f"/v1/agent/tasks/{execution_id}/complete",
+                expected_status=200,
+                json=document,
+                access_token=access_token,
+                lease_fenced=True,
+            )
+            response = CompletionAcknowledgementResponse.model_validate_json(payload)
+            if response.execution_id != execution_id or response.lease_version != lease_version:
+                raise ControlClientError
+            return response
+        except (ControlClientError, LeaseLost):
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
             raise ControlClientError from None
 
 
 __all__ = [
+    "CancellationAcknowledgementResponse",
+    "CompletionAcknowledgementResponse",
     "ControlClient",
     "ControlClientError",
     "ExecutionSlot",
@@ -296,7 +845,16 @@ __all__ = [
     "HeartbeatDeviceReceipt",
     "HeartbeatRequest",
     "HeartbeatResponse",
+    "LeaseLost",
+    "RefreshRequest",
     "RegistrationRequest",
     "RegistrationResponse",
+    "TaskCancellationResponse",
+    "TaskExecuteResponse",
+    "TaskPollResponse",
+    "TaskRenewResponse",
+    "TaskRenewalResponse",
     "TaskSigningKeyResponse",
+    "TaskWaitResponse",
+    "UnregistrationResponse",
 ]

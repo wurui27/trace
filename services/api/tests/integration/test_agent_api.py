@@ -199,6 +199,36 @@ def test_agent_registers_without_browser_proxy_headers_and_response_is_no_store(
     assert response.headers["cache-control"] == "no-store"
 
 
+def test_agent_can_revoke_its_own_credentials() -> None:
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    with _client() as client:
+        issued = _create_code(client)
+        registered = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.0",
+                "registration_code": issued["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "linux",
+                "agent_version": "1.2.3",
+                "hostname": "Ubuntu Agent",
+                "os_version": "Ubuntu 24.04",
+            },
+        ).json()
+        headers = {"authorization": f"Bearer {registered['access_token']}"}
+        revoked = client.post("/v1/agent/unregister", headers=headers)
+        replay = client.post("/v1/agent/unregister", headers=headers)
+
+    assert revoked.status_code == 200
+    assert revoked.json() == {
+        "schema_version": "1.0",
+        "agent_id": registered["agent_id"],
+        "state": "revoked",
+    }
+    assert revoked.headers["cache-control"] == "no-store"
+    assert replay.status_code == 401
+
+
 def test_browser_agent_routes_reject_missing_proxy_headers() -> None:
     with _client() as client:
         response = client.get(f"/v1/teams/{TEAM_A_ID}/agents")
