@@ -13,6 +13,7 @@ export PERFPILOT_LOCAL_AI_BASE_URL="https://your-provider.example/v1/"
 export PERFPILOT_LOCAL_AI_MODEL="your-model"
 export PERFPILOT_LOCAL_AI_TOKEN="your-token"
 export PERFPILOT_LOCAL_AI_PROVIDER_NAME="local-provider"
+export PERFPILOT_LOCAL_AI_THINKING="disabled"
 cp .dev.vars.example .dev.vars
 npm run dev:restart
 ```

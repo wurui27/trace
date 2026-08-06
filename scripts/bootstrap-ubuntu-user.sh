@@ -148,6 +148,7 @@ write_initial_ai_environment() {
     printf 'PERFPILOT_LOCAL_AI_MODEL=%s\n' "${model_line#*=}"
     printf 'PERFPILOT_LOCAL_AI_TOKEN=%s\n' "${token_line#*=}"
     printf 'PERFPILOT_LOCAL_AI_PROVIDER_NAME=deepseek\n'
+    printf 'PERFPILOT_LOCAL_AI_THINKING=disabled\n'
   } > "$temporary_file"
   chmod 600 "$temporary_file"
   mv "$temporary_file" "$target_file"

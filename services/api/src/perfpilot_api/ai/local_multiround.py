@@ -10,7 +10,7 @@ from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from importlib.resources import files
 from typing import Mapping
-from typing import Literal, Protocol
+from typing import Literal, Protocol, cast
 
 import httpx
 from pydantic import SecretStr
@@ -144,6 +144,7 @@ class LocalOpenAICompatibleRoundProvider:
         model: str,
         token: SecretStr,
         provider_name: str,
+        thinking_mode: Literal["enabled", "disabled"] | None = None,
     ) -> None:
         if not provider_name.strip() or len(provider_name) > 128:
             raise ValueError("local AI provider name is invalid")
@@ -171,6 +172,7 @@ class LocalOpenAICompatibleRoundProvider:
                 max_response_bytes=128 * 1024,
                 response_format="json_object",
                 max_completion_tokens=8192,
+                thinking_mode=thinking_mode,
                 client=self._client,
             )
             for role, prompt in prompts.items()
@@ -206,11 +208,19 @@ def build_local_multiround_synthesizer(
     provider_name = values.get(
         "PERFPILOT_LOCAL_AI_PROVIDER_NAME", "openai-compatible-local"
     ).strip()
+    thinking_value = values.get("PERFPILOT_LOCAL_AI_THINKING", "").strip()
+    if thinking_value not in {"", "enabled", "disabled"}:
+        raise ValueError("local AI thinking mode is invalid")
+    thinking_mode = cast(
+        Literal["enabled", "disabled"] | None,
+        thinking_value or None,
+    )
     provider = LocalOpenAICompatibleRoundProvider(
         base_url=SecretStr(base_url),
         model=model,
         token=SecretStr(token),
         provider_name=provider_name,
+        thinking_mode=thinking_mode,
     )
     return LocalMultiRoundSynthesizer(provider=provider)
 

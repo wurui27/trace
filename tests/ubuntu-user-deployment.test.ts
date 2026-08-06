@@ -25,6 +25,7 @@ describe("Ubuntu user deployment", () => {
     expect(script).toContain("PERFPILOT_LOCAL_AI_BASE_URL=https://api.deepseek.com/v1/");
     expect(script).toContain("PERFPILOT_LOCAL_AI_MODEL");
     expect(script).toContain("PERFPILOT_LOCAL_AI_TOKEN");
+    expect(script).toContain("PERFPILOT_LOCAL_AI_THINKING=disabled");
     expect(script).not.toMatch(/\bsudo\b/);
     expect(script).not.toMatch(/rm\s+-rf[^\n]*data/);
   });

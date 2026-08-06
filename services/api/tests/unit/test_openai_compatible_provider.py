@@ -140,6 +140,7 @@ async def test_provider_supports_json_object_mode_for_compatible_endpoints() -> 
             max_response_bytes=128 * 1024,
             response_format="json_object",
             max_completion_tokens=8192,
+            thinking_mode="disabled",
             client=client,
         )
         await provider.synthesize(_projection())
@@ -147,6 +148,7 @@ async def test_provider_supports_json_object_mode_for_compatible_endpoints() -> 
     body = json.loads(requests[0].content)
     assert body["response_format"] == {"type": "json_object"}
     assert body["max_tokens"] == 8192
+    assert body["thinking"] == {"type": "disabled"}
 
 
 @pytest.mark.asyncio

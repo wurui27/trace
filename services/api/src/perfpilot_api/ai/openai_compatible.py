@@ -102,6 +102,7 @@ class OpenAICompatibleSynthesisProvider:
         max_response_bytes: int,
         response_format: Literal["json_schema", "json_object"] = "json_schema",
         max_completion_tokens: int | None = None,
+        thinking_mode: Literal["enabled", "disabled"] | None = None,
         client: httpx.AsyncClient | None = None,
         timeout: httpx.Timeout | None = None,
     ) -> None:
@@ -118,6 +119,8 @@ class OpenAICompatibleSynthesisProvider:
             or not 1 <= max_completion_tokens <= 65_536
         ):
             raise ValueError("AI provider token limit is invalid")
+        if thinking_mode not in {None, "enabled", "disabled"}:
+            raise ValueError("AI provider thinking mode is invalid")
         if not token.get_secret_value().strip():
             raise ValueError("AI provider token is invalid")
         if client is not None and client.follow_redirects:
@@ -129,6 +132,7 @@ class OpenAICompatibleSynthesisProvider:
         self._max_response_bytes = max_response_bytes
         self._response_format = response_format
         self._max_completion_tokens = max_completion_tokens
+        self._thinking_mode = thinking_mode
         self._owns_client = client is None
         self._client = client or httpx.AsyncClient(
             follow_redirects=False,
@@ -312,6 +316,8 @@ class OpenAICompatibleSynthesisProvider:
         }
         if self._max_completion_tokens is not None:
             request_json["max_tokens"] = self._max_completion_tokens
+        if self._thinking_mode is not None:
+            request_json["thinking"] = {"type": self._thinking_mode}
         started = time.monotonic_ns()
         try:
             async with self._client.stream(

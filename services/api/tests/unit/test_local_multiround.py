@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+import perfpilot_api.ai.local_multiround as local_multiround
 from perfpilot_api.ai.local_multiround import (
     LocalMultiRoundSynthesizer,
     LocalSynthesisError,
@@ -159,6 +160,36 @@ def test_local_provider_factory_exposes_non_secret_report_metadata() -> None:
     assert runner.model == "model-a"
     assert runner.prompt_version == "perfpilot-local-multiround-v1"
     assert "not-a-real-token" not in repr(runner)
+
+
+def test_local_provider_factory_forwards_explicit_thinking_mode(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingProvider:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        local_multiround,
+        "LocalOpenAICompatibleRoundProvider",
+        CapturingProvider,
+    )
+
+    runner = build_local_multiround_synthesizer(
+        {
+            "PERFPILOT_LOCAL_AI_BASE_URL": "https://api.example.com/v1/",
+            "PERFPILOT_LOCAL_AI_MODEL": "model-a",
+            "PERFPILOT_LOCAL_AI_TOKEN": "not-a-real-token",
+            "PERFPILOT_LOCAL_AI_PROVIDER_NAME": "provider-a",
+            "PERFPILOT_LOCAL_AI_THINKING": "disabled",
+        }
+    )
+
+    assert runner is not None
+    assert captured["thinking_mode"] == "disabled"
 
 
 def test_json_object_round_envelope_supplies_the_output_schema() -> None:
