@@ -14,10 +14,15 @@ from uuid import UUID
 import pytest
 from fastapi.testclient import TestClient
 
-from perfpilot_api.ai.local_multiround import LocalMultiRoundSynthesizer
+from perfpilot_api.ai.local_report import LocalReportSynthesizer
 from perfpilot_api.ai.openai_compatible import SynthesisCandidate
 from perfpilot_api.engines.contracts import EngineResult
-from perfpilot_api.local_app import LocalEngineRun, _public_origin, create_local_app
+from perfpilot_api.local_app import (
+    LocalEngineRun,
+    _public_origin,
+    _restore_ai_rounds,
+    create_local_app,
+)
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
 from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapture
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
@@ -60,6 +65,13 @@ def test_local_runtime_accepts_only_loopback_or_private_lan_http_origins() -> No
 
     with pytest.raises(ValueError, match="loopback or private LAN HTTP"):
         _public_origin("http://8.8.8.8:8000")
+
+
+def test_local_runtime_rejects_malformed_persisted_ai_round_state() -> None:
+    with pytest.raises(ValueError, match="^invalid persisted local analysis$"):
+        _restore_ai_rounds(
+            [{"round": 1, "role": "report", "state": [], "attempts": 0}]
+        )
 
 
 def test_local_runtime_allows_configured_private_lan_web_origin(
@@ -170,16 +182,15 @@ class _FakeLocalMemoryAnalysisGateway:
         self.close_calls += 1
 
 
-class _ProjectionRoundProvider:
+class _ProjectionReportProvider:
     provider_name = "test-provider"
     model = "test-model"
-    prompt_version = "perfpilot-local-multiround-test"
+    prompt_version = "perfpilot-local-report-v2-test"
     prompt_sha256_b64 = base64.b64encode(hashlib.sha256(b"test-prompt").digest()).decode(
         "ascii"
     )
 
-    async def complete(self, *, role, projection, prior_outputs) -> SynthesisCandidate:
-        del role, prior_outputs
+    async def complete(self, *, projection) -> SynthesisCandidate:
         projected = projection.document
         findings = []
         recommendations = []
@@ -224,7 +235,7 @@ class _ProjectionRoundProvider:
                 )
         document = {
             "schema_version": "1.0",
-            "executive_summary": "三轮测试 AI 已完成证据复核。",
+            "executive_summary": "单次测试 AI 已完成证据复核。",
             "top_findings": findings[:5],
             "recommendations": recommendations[:10],
             "retest_plan": retest_plan[:5],
@@ -247,8 +258,33 @@ class _ProjectionRoundProvider:
         return None
 
 
-def _test_synthesizer() -> LocalMultiRoundSynthesizer:
-    return LocalMultiRoundSynthesizer(provider=_ProjectionRoundProvider())
+def _test_synthesizer() -> LocalReportSynthesizer:
+    return LocalReportSynthesizer(provider=_ProjectionReportProvider())
+
+
+class _InvalidReportProvider:
+    provider_name = "invalid-test-provider"
+    model = "invalid-test-model"
+    prompt_version = "perfpilot-local-report-v2-test"
+    prompt_sha256_b64 = base64.b64encode(
+        hashlib.sha256(b"invalid-test-prompt").digest()
+    ).decode("ascii")
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, *, projection) -> SynthesisCandidate:
+        del projection
+        self.calls += 1
+        return SynthesisCandidate(
+            candidate_json=b"{}",
+            prompt_tokens=1,
+            completion_tokens=1,
+            latency_ms=1,
+        )
+
+    async def aclose(self) -> None:
+        return None
 
 
 def _smartperfetto_result() -> EngineResult:
@@ -1060,9 +1096,7 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
         assert terminal.json()["state"] == expected_state
         assert terminal.json()["report_available"] is True
         assert terminal.json()["ai_rounds"] == [
-            {"round": 1, "role": "extract", "state": "completed", "attempts": 1},
-            {"round": 2, "role": "review", "state": "completed", "attempts": 1},
-            {"round": 3, "role": "finalize", "state": "completed", "attempts": 1},
+            {"round": 1, "role": "report", "state": "completed", "attempts": 1}
         ]
         assert gateway.submissions == [(trace, "startup", "首帧为什么慢？")]
 
@@ -1074,7 +1108,15 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
         validated = validate_contract("analysis-report", report.json())
         assert validated["analysis_id"] == analysis_id
         assert validated["synthesis"]["state"] == "completed"
+        assert (
+            validated["synthesis"]["provenance"]["prompt_template_version"]
+            == "perfpilot-local-report-v2-test"
+        )
         assert validated["synthesis"]["output"]["recommendations"]
+        analysis_directory = tmp_path / "analyses" / analysis_id
+        assert (analysis_directory / "round-1.json").is_file()
+        assert not (analysis_directory / "round-2.json").exists()
+        assert not (analysis_directory / "round-3.json").exists()
         if expected_finding is not None:
             bundle = validated["scenario_reports"][0]["bundle"]
             assert bundle is not None
@@ -1160,6 +1202,58 @@ def test_local_app_publishes_core_report_when_ai_projection_is_privacy_blocked(
     assert "/Users/example/private/trace.pb" not in json.dumps(projection)
 
 
+def test_local_app_persists_bounded_single_pass_failure(tmp_path: Path) -> None:
+    provider = _InvalidReportProvider()
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+        )
+
+        terminal = None
+        for _ in range(200):
+            terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if terminal["state"] in {"completed", "partially_completed", "failed"}:
+                break
+            time.sleep(0.01)
+
+        assert terminal is not None
+        assert terminal["state"] == "partially_completed"
+        assert terminal["ai_rounds"] == [
+            {"round": 1, "role": "report", "state": "failed", "attempts": 2}
+        ]
+        published = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert provider.calls == 2
+    assert published.status_code == 200
+    report = validate_contract("analysis-report", published.json())
+    assert report["synthesis"]["state"] == "failed"
+    assert report["synthesis"]["failure_code"] == "ai_output_invalid"
+    assert report["scenario_reports"][0]["bundle"] is not None
+
+
 def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> None:
     trace = b"persistent-local-trace"
     checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
@@ -1227,6 +1321,22 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     original_id = UUID(analysis_id)
     original_state = states[original_id]
     assert isinstance(original_state.get("created_at"), str)
+    assert original_state["ai_rounds"] == [
+        {"round": 1, "role": "report", "state": "completed", "attempts": 1}
+    ]
+
+    legacy_id = UUID("92000000-0000-4000-8000-000000000004")
+    legacy_state = copy.deepcopy(original_state)
+    legacy_state["analysis_id"] = str(legacy_id)
+    legacy_state["ai_rounds"] = [
+        {"round": 1, "role": "extract", "state": "completed", "attempts": 1},
+        {"round": 2, "role": "review", "state": "completed", "attempts": 1},
+        {"round": 3, "role": "finalize", "state": "completed", "attempts": 1},
+    ]
+    legacy_report = copy.deepcopy(expected_report)
+    legacy_report["analysis_id"] = str(legacy_id)
+    store.save_state(legacy_id, legacy_state)
+    store.save_document(legacy_id, "report.json", legacy_report)
 
     newer_id = UUID("92000000-0000-4000-8000-000000000002")
     newer_state = copy.deepcopy(original_state)
@@ -1259,6 +1369,9 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         restored = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}")
         assert restored.status_code == 200
         assert restored.json()["report_available"] is True
+        assert restored.json()["ai_rounds"] == [
+            {"round": 1, "role": "report", "state": "completed", "attempts": 1}
+        ]
         assert datetime.fromisoformat(restored.json()["created_at"]) == datetime.fromisoformat(
             expected_report["generated_at"].replace("Z", "+00:00")
         )
@@ -1274,6 +1387,13 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
             str(newer_id)
         ]
         assert all(item["report_available"] for item in latest.json()["analyses"])
+        legacy = client.get(f"/v1/teams/{team_id}/analyses/{legacy_id}")
+        assert legacy.status_code == 200
+        assert [item["role"] for item in legacy.json()["ai_rounds"]] == [
+            "extract",
+            "review",
+            "finalize",
+        ]
 
 
 def test_local_recovery_imports_a_completed_smartperfetto_session_once(
@@ -1342,9 +1462,7 @@ def test_local_recovery_imports_a_completed_smartperfetto_session_once(
             "run_id": "run-local-1",
         }
         assert terminal["ai_rounds"] == [
-            {"round": 1, "role": "extract", "state": "completed", "attempts": 1},
-            {"round": 2, "role": "review", "state": "completed", "attempts": 1},
-            {"round": 3, "role": "finalize", "state": "completed", "attempts": 1},
+            {"round": 1, "role": "report", "state": "completed", "attempts": 1}
         ]
         assert gateway.submissions == []
 
@@ -1366,4 +1484,12 @@ def test_local_recovery_imports_a_completed_smartperfetto_session_once(
             ):
                 break
             time.sleep(0.01)
-        assert rerun_state["ai_rounds"][2]["state"] == "completed"
+        assert rerun_state["ai_rounds"] == [
+            {"round": 1, "role": "report", "state": "completed", "attempts": 1}
+        ]
+        rerun_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+        assert rerun_report.status_code == 200
+        assert rerun_report.json()["report_version"] == 2
+        assert gateway.submissions == []

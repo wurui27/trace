@@ -30,11 +30,11 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
 
-from perfpilot_api.ai.local_multiround import (
-    LocalMultiRoundSynthesizer,
-    LocalRoundUsage,
+from perfpilot_api.ai.local_report import (
+    LocalReportSynthesizer,
+    LocalReportUsage,
     LocalSynthesisError,
-    build_local_multiround_synthesizer,
+    build_local_report_synthesizer,
 )
 from perfpilot_api.ai.synthesis import AISynthesisOutput
 from perfpilot_api.engines.canonical_results import (
@@ -138,6 +138,7 @@ LocalRunStatus = Literal[
     "cancelled",
     "quota_exceeded",
 ]
+LocalAIRole = Literal["report", "extract", "review", "finalize"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,9 +447,51 @@ class _LocalUpload:
 @dataclass(slots=True)
 class _LocalAIRound:
     number: int
-    role: Literal["extract", "review", "finalize"]
+    role: LocalAIRole
     state: Literal["pending", "running", "completed", "failed"] = "pending"
     attempts: int = 0
+
+
+def _default_ai_rounds() -> list[_LocalAIRound]:
+    return [_LocalAIRound(1, "report")]
+
+
+def _restore_ai_rounds(value: object) -> list[_LocalAIRound]:
+    if value is None:
+        return _default_ai_rounds()
+    if not isinstance(value, list):
+        raise ValueError("invalid persisted local analysis")
+    expected_roles: tuple[LocalAIRole, ...]
+    if len(value) == 1:
+        expected_roles = ("report",)
+    elif len(value) == 3:
+        expected_roles = ("extract", "review", "finalize")
+    else:
+        raise ValueError("invalid persisted local analysis")
+    restored: list[_LocalAIRound] = []
+    for number, (raw_round, role) in enumerate(
+        zip(value, expected_roles, strict=True),
+        start=1,
+    ):
+        if not isinstance(raw_round, Mapping):
+            raise ValueError("invalid persisted local analysis")
+        raw_number = raw_round.get("round")
+        state = raw_round.get("state")
+        attempts = raw_round.get("attempts")
+        if (
+            type(raw_number) is not int
+            or raw_number != number
+            or raw_round.get("role") != role
+            or not isinstance(state, str)
+            or state not in {"pending", "running", "completed", "failed"}
+            or type(attempts) is not int
+            or attempts < 0
+        ):
+            raise ValueError("invalid persisted local analysis")
+        restored.append(
+            _LocalAIRound(number, role, state, attempts)  # type: ignore[arg-type]
+        )
+    return restored
 
 
 @dataclass(slots=True)
@@ -474,13 +517,7 @@ class _LocalAnalysis:
     source_run: LocalEngineRun | None = None
     source_rounds: int | None = None
     source_verification: Literal["passed", "failed", "unknown"] = "unknown"
-    ai_rounds: list[_LocalAIRound] = field(
-        default_factory=lambda: [
-            _LocalAIRound(1, "extract"),
-            _LocalAIRound(2, "review"),
-            _LocalAIRound(3, "finalize"),
-        ]
-    )
+    ai_rounds: list[_LocalAIRound] = field(default_factory=_default_ai_rounds)
     stages: dict[str, str] = field(
         default_factory=lambda: {
             "input_validation": "running",
@@ -1033,8 +1070,8 @@ def _compose_local_report(
     *,
     synthesis: AISynthesisOutput | None,
     synthesis_failure_code: str | None,
-    rounds: tuple[LocalRoundUsage, ...],
-    synthesizer: LocalMultiRoundSynthesizer | None,
+    rounds: tuple[LocalReportUsage, ...],
+    synthesizer: LocalReportSynthesizer | None,
 ) -> dict[str, object]:
     synthesis_document = synthesis.document if synthesis is not None else None
     synthesis_bytes = synthesis.canonical_bytes if synthesis is not None else None
@@ -1045,7 +1082,7 @@ def _compose_local_report(
     prompt_version = (
         synthesizer.prompt_version
         if synthesizer is not None
-        else "perfpilot-local-multiround-v1"
+        else "perfpilot-local-report-v2"
     )
     prompt_checksum = synthesizer.prompt_sha256_b64 if synthesizer is not None else ""
     try:
@@ -1116,7 +1153,7 @@ class _LocalRuntime:
         self,
         *,
         gateway: LocalAnalysisGateway,
-        synthesizer: LocalMultiRoundSynthesizer | None,
+        synthesizer: LocalReportSynthesizer | None,
         device_probe: LocalDeviceProbe,
         device_capture_gateway: LocalDeviceCaptureGateway | None,
         memory_analysis_gateway: LocalMemoryAnalysisGateway | None,
@@ -1250,30 +1287,7 @@ class _LocalRuntime:
                 session_id=str(raw_source["session_id"]),
                 run_id=str(raw_source["run_id"]),
             )
-        round_documents = document.get("ai_rounds")
-        ai_rounds = [
-            _LocalAIRound(1, "extract"),
-            _LocalAIRound(2, "review"),
-            _LocalAIRound(3, "finalize"),
-        ]
-        if isinstance(round_documents, list) and len(round_documents) == 3:
-            restored_rounds: list[_LocalAIRound] = []
-            for number, raw_round in enumerate(round_documents, start=1):
-                if not isinstance(raw_round, Mapping):
-                    raise ValueError("invalid persisted local analysis")
-                role = ("extract", "review", "finalize")[number - 1]
-                if raw_round.get("round") != number or raw_round.get("role") != role:
-                    raise ValueError("invalid persisted local analysis")
-                state = str(raw_round.get("state"))
-                if state not in {"pending", "running", "completed", "failed"}:
-                    raise ValueError("invalid persisted local analysis")
-                attempts = raw_round.get("attempts", 0)
-                if type(attempts) is not int or attempts < 0:
-                    raise ValueError("invalid persisted local analysis")
-                restored_rounds.append(
-                    _LocalAIRound(number, role, state, attempts)  # type: ignore[arg-type]
-                )
-            ai_rounds = restored_rounds
+        ai_rounds = _restore_ai_rounds(document.get("ai_rounds"))
         stages = document.get("stages")
         if not isinstance(stages, Mapping):
             raise ValueError("invalid persisted local analysis")
@@ -1535,11 +1549,7 @@ class _LocalRuntime:
             analysis.stages["smartperfetto"] = "completed"
             analysis.stages["perfpilot_ai"] = "running"
             analysis.stages["report"] = "pending"
-            analysis.ai_rounds = [
-                _LocalAIRound(1, "extract"),
-                _LocalAIRound(2, "review"),
-                _LocalAIRound(3, "finalize"),
-            ]
+            analysis.ai_rounds = _default_ai_rounds()
             analysis.version += 1
             generation = analysis.generation
         await self._persist(analysis)
@@ -1955,7 +1965,7 @@ class _LocalRuntime:
             prepared.projection.document,
         )
         synthesis: AISynthesisOutput | None = None
-        rounds: tuple[LocalRoundUsage, ...] = ()
+        rounds: tuple[LocalReportUsage, ...] = ()
         synthesis_failure_code: str | None = None
         try:
             if prepared.projection_failure_code is not None:
@@ -1966,34 +1976,44 @@ class _LocalRuntime:
             if self.synthesizer is None:
                 raise LocalSynthesisError("ai_not_configured", retryable=False)
 
-            async def observe_round(
+            async def observe_report(
                 number: int,
-                role: Literal["extract", "review", "finalize"],
+                role: Literal["report"],
                 state: Literal["running", "completed", "failed"],
+                attempts: int,
                 output: AISynthesisOutput | None,
             ) -> None:
-                round_state = analysis.ai_rounds[number - 1]
                 async with self.lock:
+                    if not 1 <= number <= len(analysis.ai_rounds):
+                        raise LocalSynthesisError(
+                            "ai_state_invalid",
+                            retryable=False,
+                        )
+                    round_state = analysis.ai_rounds[number - 1]
+                    if round_state.role != role:
+                        raise LocalSynthesisError(
+                            "ai_state_invalid",
+                            retryable=False,
+                        )
                     round_state.state = state
+                    round_state.attempts = attempts
                     analysis.version += 1
                 if output is not None:
                     await asyncio.to_thread(
                         self.store.save_document,
                         analysis.analysis_id,
-                        f"round-{number}.json",
+                        "round-1.json",
                         output.document,
                     )
                 await self._persist(analysis)
 
             synthesis_result = await self.synthesizer.synthesize(
                 prepared.projection,
-                on_round=observe_round,
+                on_report=observe_report,
             )
             synthesis = synthesis_result.output
             rounds = synthesis_result.rounds
             async with self.lock:
-                for usage in rounds:
-                    analysis.ai_rounds[usage.number - 1].attempts = usage.attempts
                 analysis.stages["perfpilot_ai"] = "completed"
                 analysis.failure = None
                 analysis.version += 1
@@ -2269,7 +2289,7 @@ class _LocalRuntime:
 def create_local_app(
     *,
     gateway: LocalAnalysisGateway | None = None,
-    synthesizer: LocalMultiRoundSynthesizer | None = None,
+    synthesizer: LocalReportSynthesizer | None = None,
     device_probe: LocalDeviceProbe | None = None,
     device_capture_gateway: LocalDeviceCaptureGateway | None = None,
     memory_analysis_gateway: LocalMemoryAnalysisGateway | None = None,
@@ -2280,7 +2300,7 @@ def create_local_app(
     resolved_gateway = gateway or SmartPerfettoLocalGateway(
         base_url=os.getenv("PERFPILOT_LOCAL_SMARTPERFETTO_URL", "http://127.0.0.1:3001")
     )
-    resolved_synthesizer = synthesizer or build_local_multiround_synthesizer()
+    resolved_synthesizer = synthesizer or build_local_report_synthesizer()
     resolved_data_root = data_root or Path(
         os.getenv("PERFPILOT_LOCAL_DATA_DIR", ".perfpilot/local-runtime")
     )
