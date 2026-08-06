@@ -1126,7 +1126,7 @@ def _compose_local_report(
             total_tokens=(prompt_tokens + completion_tokens) if synthesis is not None else None,
             latency_ms=latency_ms if synthesis is not None else None,
         ),
-        report_version=analysis.generation,
+        report_version=generation,
     )
     return composed.document
 
@@ -1525,23 +1525,41 @@ class _LocalRuntime:
                 "report": "pending",
             },
         )
+        start_gate = asyncio.Event()
+        generation = analysis.generation
+
+        async def execute_recovered() -> None:
+            await start_gate.wait()
+            await self._execute_run(
+                analysis,
+                run,
+                generation=generation,
+            )
+
         async with self.lock:
             raced = self.analyses.get(analysis_id)
             if raced is not None:
                 return raced
-            self.analyses[analysis_id] = analysis
-        await self._persist(analysis)
-        async with self.lock:
-            task = asyncio.create_task(
-                self._execute_run(
-                    analysis,
-                    run,
-                    generation=analysis.generation,
-                )
-            )
+            task = asyncio.create_task(execute_recovered())
             analysis.task = task
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
+            self.analyses[analysis_id] = analysis
+        try:
+            await self._persist(analysis)
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            async with self.lock:
+                if (
+                    self.analyses.get(analysis_id) is analysis
+                    and analysis.task is task
+                ):
+                    analysis.task = None
+                    del self.analyses[analysis_id]
+            self.tasks.discard(task)
+            raise
+        start_gate.set()
         return analysis
 
     async def rerun_synthesis(self, analysis: _LocalAnalysis) -> int:

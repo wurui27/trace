@@ -579,6 +579,21 @@ def _persist_created_trace_analysis(
     return team_id, parsed_analysis_id, state
 
 
+def _recovery_request() -> dict[str, object]:
+    trace = b"recovered-trace"
+    return {
+        "schema_version": "1.0",
+        "session_id": "session-local-1",
+        "run_id": "run-local-1",
+        "analysis_profile": "auto",
+        "question": "给出最终优化方案",
+        "trace_size": len(trace),
+        "trace_sha256_b64": base64.b64encode(hashlib.sha256(trace).digest()).decode(
+            "ascii"
+        ),
+    }
+
+
 def test_local_app_defaults_missing_persisted_ai_rounds_after_restart(
     tmp_path: Path,
 ) -> None:
@@ -1613,6 +1628,129 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     assert restored_gateway.submissions == []
 
 
+def test_local_app_installs_recovery_task_before_persisting_initial_state(
+    tmp_path: Path,
+) -> None:
+    provider = _RerunBarrierReportProvider()
+    provider.release_reruns.set()
+    gateway = _FakeSmartPerfettoGateway(_live_smartperfetto_result())
+    app = create_local_app(
+        gateway=gateway,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+
+    with TestClient(app) as client:
+        runtime = app.state.local_runtime
+        original_persist = runtime._persist
+        recovery_persist_entered = threading.Event()
+        release_recovery_persist = threading.Event()
+        blocked_recovery = False
+
+        async def persist_with_recovery_barrier(analysis) -> None:
+            nonlocal blocked_recovery
+            if (
+                not blocked_recovery
+                and analysis.source_run is not None
+                and analysis.generation == 1
+                and analysis.report is None
+            ):
+                blocked_recovery = True
+                recovery_persist_entered.set()
+                while not release_recovery_persist.is_set():
+                    await asyncio.sleep(0.001)
+            await original_persist(analysis)
+
+        runtime._persist = persist_with_recovery_barrier
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        recovery_path = f"/v1/teams/{team_id}/local-recoveries"
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            first_future = executor.submit(
+                client.post,
+                recovery_path,
+                headers=headers,
+                json=_recovery_request(),
+            )
+            entered = recovery_persist_entered.wait(timeout=2)
+            if not entered:
+                release_recovery_persist.set()
+                first_future.result(timeout=5)
+            assert entered
+            assert provider.calls == 0
+            try:
+                duplicate = client.post(
+                    recovery_path,
+                    headers=headers,
+                    json=_recovery_request(),
+                )
+                assert duplicate.status_code == 201
+                analysis_id = duplicate.json()["analysis_id"]
+                rerun = client.post(
+                    f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",
+                    headers=headers,
+                )
+            finally:
+                release_recovery_persist.set()
+            first = first_future.result(timeout=5)
+
+        assert first.status_code == 201
+        assert first.json()["analysis_id"] == analysis_id
+        assert rerun.status_code == 409
+        assert rerun.json() == {"detail": "analysis is already running"}
+        terminal = first.json()
+        for _ in range(100):
+            terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if terminal["report_available"]:
+                break
+            time.sleep(0.01)
+        report = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}/report")
+
+    assert provider.calls == 1
+    assert report.status_code == 200
+    assert report.json()["report_version"] == 1
+    persisted = LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)]
+    assert persisted["generation"] == 1
+    assert gateway.submissions == []
+
+
+def test_local_app_removes_recovery_when_initial_persistence_fails(
+    tmp_path: Path,
+) -> None:
+    provider = _RerunBarrierReportProvider()
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_live_smartperfetto_result()),
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+    )
+
+    with TestClient(app) as client:
+        runtime = app.state.local_runtime
+
+        async def fail_recovery_persist(_analysis) -> None:
+            raise RuntimeError("recovery persistence failed")
+
+        runtime._persist = fail_recovery_persist
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        with pytest.raises(RuntimeError, match="^recovery persistence failed$"):
+            client.post(
+                f"/v1/teams/{team_id}/local-recoveries",
+                headers=headers,
+                json=_recovery_request(),
+            )
+
+        assert runtime.analyses == {}
+        assert runtime.tasks == set()
+        assert provider.calls == 0
+
+    assert LocalAnalysisStore(tmp_path).load_states() == {}
+
+
 def test_local_app_serializes_simultaneous_ai_rerun_reservations(
     tmp_path: Path,
 ) -> None:
@@ -1781,6 +1919,117 @@ def test_local_app_serializes_simultaneous_ai_rerun_reservations(
     persisted = LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)]
     assert persisted["generation"] == 2
     assert persisted["ai_rounds"] == terminal["ai_rounds"]
+    assert gateway.submissions == []
+
+
+def test_local_app_rolls_back_a_failed_rerun_persistence_reservation(
+    tmp_path: Path,
+) -> None:
+    provider = _RerunBarrierReportProvider()
+    gateway = _FakeSmartPerfettoGateway(_live_smartperfetto_result())
+    app = create_local_app(
+        gateway=gateway,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        recovered = client.post(
+            f"/v1/teams/{team_id}/local-recoveries",
+            headers=headers,
+            json=_recovery_request(),
+        )
+        assert recovered.status_code == 201
+        analysis_id = recovered.json()["analysis_id"]
+        parsed_analysis_id = UUID(analysis_id)
+        before = recovered.json()
+        for _ in range(100):
+            before = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if before["report_available"]:
+                break
+            time.sleep(0.01)
+        runtime = app.state.local_runtime
+        for _ in range(100):
+            initial_task = runtime.analyses[parsed_analysis_id].task
+            if initial_task is not None and initial_task.done():
+                break
+            time.sleep(0.01)
+        persisted_before = copy.deepcopy(
+            LocalAnalysisStore(tmp_path).load_states()[parsed_analysis_id]
+        )
+        original_persist = runtime._persist
+        fail_reservation = True
+
+        async def fail_first_rerun_persist(analysis) -> None:
+            nonlocal fail_reservation
+            if (
+                fail_reservation
+                and analysis.analysis_id == parsed_analysis_id
+                and analysis.generation == 2
+                and analysis.ai_rounds[0].state == "pending"
+            ):
+                fail_reservation = False
+                raise RuntimeError("rerun persistence failed")
+            await original_persist(analysis)
+
+        runtime._persist = fail_first_rerun_persist
+        rerun_path = f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs"
+        with pytest.raises(RuntimeError, match="^rerun persistence failed$"):
+            client.post(rerun_path, headers=headers)
+
+        current = runtime.analyses[parsed_analysis_id]
+        assert current.task is None
+        assert current.generation == persisted_before["generation"]
+        assert current.state == persisted_before["state"]
+        assert current.stages == persisted_before["stages"]
+        assert current.version == persisted_before["version"]
+        assert provider.calls == 1
+        assert provider.rerun_calls == 0
+        assert not provider.first_rerun_started.is_set()
+        restored = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}"
+        ).json()
+        assert restored["state"] == before["state"]
+        assert restored["version"] == before["version"]
+        assert restored["stages"] == before["stages"]
+        assert restored["ai_rounds"] == before["ai_rounds"]
+        assert LocalAnalysisStore(tmp_path).load_states()[parsed_analysis_id] == (
+            persisted_before
+        )
+
+        successful = client.post(rerun_path, headers=headers)
+        assert successful.status_code == 201
+        assert successful.json()["generation"] == 2
+        try:
+            assert provider.first_rerun_started.wait(timeout=2)
+            assert provider.rerun_calls == 1
+        finally:
+            provider.release_reruns.set()
+        terminal = restored
+        for _ in range(100):
+            terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if (
+                terminal["stages"][2]["state"] == "completed"
+                and terminal["stages"][3]["state"] == "completed"
+            ):
+                break
+            time.sleep(0.01)
+        report = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}/report")
+
+    assert terminal["ai_rounds"] == [
+        {"round": 1, "role": "report", "state": "completed", "attempts": 1}
+    ]
+    assert provider.calls == 2
+    assert report.status_code == 200
+    assert report.json()["report_version"] == 2
     assert gateway.submissions == []
 
 
