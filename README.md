@@ -4,24 +4,25 @@ PerfPilot analyzes Android performance evidence and publishes versioned reports.
 
 ## Local report workspace
 
-The local runtime keeps SmartPerfetto and PerfPilot decoupled. Start the
-SmartPerfetto backend on `127.0.0.1:3001`, then configure an OpenAI-compatible
-model for PerfPilot's three report passes:
+The local runtime keeps SmartPerfetto and PerfPilot decoupled. Configure an
+OpenAI-compatible model for PerfPilot's three report passes, then use the
+one-command restart:
 
 ```bash
 export PERFPILOT_LOCAL_AI_BASE_URL="https://your-provider.example/v1/"
 export PERFPILOT_LOCAL_AI_MODEL="your-model"
 export PERFPILOT_LOCAL_AI_TOKEN="your-token"
 export PERFPILOT_LOCAL_AI_PROVIDER_NAME="local-provider"
-npm run dev:api
-```
-
-In a second terminal, start the web workspace:
-
-```bash
 cp .dev.vars.example .dev.vars
-npm run dev
+npm run dev:restart
 ```
+
+`npm run dev:restart` clears all local analysis history and starts
+SmartPerfetto on `127.0.0.1:3001`, the PerfPilot API on `127.0.0.1:8000`, and
+the web workspace on `http://localhost:3000`. It expects the SmartPerfetto
+backend at `~/SmartPerfetto/backend`; when the checkout lives elsewhere, set
+`PERFPILOT_LOCAL_SMARTPERFETTO_ROOT` to its `backend` directory before running
+the command. Logs and managed process IDs are stored in `.perfpilot/run`.
 
 Open `http://localhost:3000`. Completed analyses expose an **打开完整报告**
 link. The report page shows SmartPerfetto provenance, the three PerfPilot AI
@@ -41,10 +42,10 @@ Android Memory engine from `~/Android-App-Memory-Analysis` by default; set
 current checkout commit is pinned for each server process, so pulling an engine
 update only requires restarting the local server.
 
-The optional runtime overrides are `PERFPILOT_LOCAL_SMARTPERFETTO_URL`,
-`PERFPILOT_LOCAL_DATA_DIR`, `PERFPILOT_LOCAL_API_ORIGIN`,
-`PERFPILOT_LOCAL_ADB`, `PERFPILOT_LOCAL_AAPT2`, and
-`PERFPILOT_LOCAL_ANDROID_MEMORY_ROOT`.
+The optional runtime overrides are `PERFPILOT_LOCAL_SMARTPERFETTO_ROOT`,
+`PERFPILOT_LOCAL_SMARTPERFETTO_URL`, `PERFPILOT_LOCAL_DATA_DIR`,
+`PERFPILOT_LOCAL_API_ORIGIN`, `PERFPILOT_LOCAL_ADB`,
+`PERFPILOT_LOCAL_AAPT2`, and `PERFPILOT_LOCAL_ANDROID_MEMORY_ROOT`.
 
 ## Local checks
 
