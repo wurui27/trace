@@ -193,7 +193,8 @@ jobs:
           --platform linux --output "$PWD/build/bootstrap"
       - name: Build Linux package
         run: |
-          ADB_DIR="$(dirname "$(command -v adb)")"
+          ADB_DIR="${ANDROID_HOME:?ANDROID_HOME is required}/platform-tools"
+          test -x "$ADB_DIR/adb"
           bash agents/device-agent/packaging/linux/build.sh \
             --config "$PWD/build/bootstrap/config.json" \
             --ca "$PWD/build/bootstrap/perfpilot-ca.crt" \

@@ -104,6 +104,7 @@ def test_package_workflow_builds_natively_and_publishes_checksums() -> None:
         assert runner in workflow
     for suffix in (".pkg", ".msi", ".deb"):
         assert suffix in workflow
+    assert 'ADB_DIR="${ANDROID_HOME:?ANDROID_HOME is required}/platform-tools"' in workflow
     assert "SHA256SUMS" in workflow
     assert "doctor --json" in workflow
     assert "upgrade-smoke" in workflow

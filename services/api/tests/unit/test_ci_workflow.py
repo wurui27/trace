@@ -66,14 +66,10 @@ def _assert_checkout_policy(workflow: dict[str, object]) -> None:
 
         platform_checkout = steps[0]
         assert platform_checkout.get("uses") == CHECKOUT_ACTION, job_name
-        assert platform_checkout.get("with") == {
-            "persist-credentials": "false"
-        }, job_name
+        assert platform_checkout.get("with") == {"persist-credentials": "false"}, job_name
 
         checkout_steps = [
-            step
-            for step in steps
-            if str(step.get("uses", "")).startswith("actions/checkout@")
+            step for step in steps if str(step.get("uses", "")).startswith("actions/checkout@")
         ]
         expected_checkout_count = 2 if job_name == "python-tests" else 1
         assert len(checkout_steps) == expected_checkout_count, job_name
@@ -148,9 +144,7 @@ def test_actual_workflow_satisfies_checkout_policy(workflow: dict[str, object]) 
 
 def test_workflow_directory_contains_only_approved_workflows() -> None:
     workflow_paths = sorted(
-        path
-        for path in WORKFLOW_PATH.parent.iterdir()
-        if path.suffix in {".yml", ".yaml"}
+        path for path in WORKFLOW_PATH.parent.iterdir() if path.suffix in {".yml", ".yaml"}
     )
     _assert_workflow_paths(workflow_paths)
 
@@ -299,10 +293,7 @@ def test_workflow_has_only_required_jobs_and_pinned_actions(
     assert set(jobs) == {"python-quality", "python-tests", "web", "ci-gate"}
 
     action_references = {
-        step["uses"]
-        for job in jobs.values()
-        for step in job.get("steps", [])
-        if "uses" in step
+        step["uses"] for job in jobs.values() for step in job.get("steps", []) if "uses" in step
     }
     assert action_references == {
         CHECKOUT_ACTION,
@@ -462,9 +453,7 @@ def test_ci_gate_passes_only_when_every_required_job_succeeds(
             text=True,
             timeout=5,
         )
-        assert (completed.returncode == 0) is all(
-            result == "success" for result in results
-        ), (
+        assert (completed.returncode == 0) is all(result == "success" for result in results), (
             f"results={results!r}, returncode={completed.returncode}, "
             f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
         )
