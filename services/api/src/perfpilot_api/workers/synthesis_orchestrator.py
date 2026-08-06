@@ -85,6 +85,12 @@ _WORKER = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
 _FAILURE_CODE = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 _EVENT_NAMESPACE = UUID("9bf739f1-eafc-5ba6-a95b-09fe18c4c315")
 _CONTROL_FLOW_EXCEPTIONS = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
+_ENGINE_TERMINAL_STATES = frozenset(
+    {"completed", "insufficient_data", "failed", "canceled"}
+)
+_MEMORY_SCENARIO_ACTIVE_STATES = frozenset(
+    {"queued", "scheduled", "running", "analyzing"}
+)
 
 
 def analysis_synthesis_requested_event_id(execution_id: UUID) -> UUID:
@@ -237,6 +243,17 @@ class SynthesisCoordinator:
                 event.version += 1
                 event.updated_at = now
 
+    def _reschedule_locked_source_event(
+        self,
+        event: OutboxEvent,
+        *,
+        now: datetime,
+    ) -> None:
+        event.ready_at = now + self._retry_backoff
+        event.retry_count += 1
+        event.version += 1
+        event.updated_at = now
+
     async def coordinate_next(self) -> SynthesisExecutionRecord | None:
         now = self._clock()
         async with self._sessions.begin() as session:
@@ -259,6 +276,41 @@ class SynthesisCoordinator:
             if latest != source.id:
                 self._settle_source_event(event, now=now, dead_letter=False)
                 return None
+            analysis_mode = await session.scalar(
+                select(GlobalJob.analysis_mode).where(
+                    GlobalJob.id == source.analysis_id,
+                    GlobalJob.team_id == source.team_id,
+                )
+            )
+            if analysis_mode is None:
+                self._settle_source_event(event, now=now, dead_letter=True)
+                return None
+            if analysis_mode == "device":
+                memory_scenario_state = await session.scalar(
+                    select(ScenarioJob.state).where(
+                        ScenarioJob.analysis_id == source.analysis_id,
+                        ScenarioJob.scenario_type == "memory_cycle",
+                    )
+                )
+                if memory_scenario_state is None:
+                    self._settle_source_event(event, now=now, dead_letter=True)
+                    return None
+                latest_memory_state = await session.scalar(
+                    select(EngineExecution.state)
+                    .where(
+                        EngineExecution.team_id == source.team_id,
+                        EngineExecution.analysis_id == source.analysis_id,
+                        EngineExecution.engine_id == "android_memory",
+                    )
+                    .order_by(EngineExecution.attempt_number.desc())
+                    .limit(1)
+                )
+                if (
+                    memory_scenario_state in _MEMORY_SCENARIO_ACTIVE_STATES
+                    and latest_memory_state not in _ENGINE_TERMINAL_STATES
+                ):
+                    self._reschedule_locked_source_event(event, now=now)
+                    return None
             existing_execution_id = await session.scalar(
                 select(SynthesisExecution.id).where(
                     SynthesisExecution.team_id == source.team_id,

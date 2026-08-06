@@ -51,6 +51,7 @@ from perfpilot_api.workers.synthesis_orchestrator import (
 
 from test_engine_execution_repository import (  # type: ignore[import-not-found]
     ANALYSIS_ID,
+    DEVICE_ANALYSIS_ID,
     NOW,
     TEAM_ID,
     ExecutionDatabase,
@@ -243,6 +244,110 @@ async def _seed_source_event(
             )
         )
     return source_id, event_id
+
+
+async def _seed_device_source_event(
+    database: ExecutionDatabase,
+    *,
+    memory_execution_state: str | None = None,
+    memory_scenario_state: str = "analyzing",
+) -> tuple[UUID, UUID, UUID | None]:
+    source_id = uuid4()
+    event_id = uuid4()
+    memory_execution_id = uuid4() if memory_execution_state is not None else None
+    async with database.sessions.begin() as session:
+        session.add(
+            TenantResource(
+                team_id=TEAM_ID,
+                resource_version=7,
+                state="active",
+                provisioning_step="active",
+                credential_version=1,
+                retry_count=0,
+                fencing_token=0,
+                write_paused=False,
+            )
+        )
+        session.add(
+            ScenarioJob(
+                id=uuid4(),
+                analysis_id=DEVICE_ANALYSIS_ID,
+                scenario_type="memory_cycle",
+                state=memory_scenario_state,
+                supported_abis=[],
+                attempt_count=0,
+                valid_sample_count=0,
+                invalid_sample_count=0,
+                retry_count=0,
+                max_attempts=10,
+                version=1,
+            )
+        )
+        session.add(
+            EngineExecution(
+                id=source_id,
+                team_id=TEAM_ID,
+                analysis_id=DEVICE_ANALYSIS_ID,
+                engine_id="smartperfetto",
+                attempt_number=1,
+                tenant_resource_version=7,
+                adapter_version="1.0.0",
+                engine_commit_sha="a" * 40,
+                engine_image_digest="sha256:" + "b" * 64,
+                input_manifest_hash="c" * 64,
+                config_hash="d" * 64,
+                state="completed",
+                raw_result_artifact_id=uuid4(),
+                completed_at=NOW,
+                version=3,
+            )
+        )
+        if memory_execution_id is not None:
+            session.add(
+                EngineExecution(
+                    id=memory_execution_id,
+                    team_id=TEAM_ID,
+                    analysis_id=DEVICE_ANALYSIS_ID,
+                    engine_id="android_memory",
+                    attempt_number=1,
+                    tenant_resource_version=7,
+                    adapter_version="1.0.0",
+                    engine_commit_sha="e" * 40,
+                    engine_image_digest="sha256:" + "f" * 64,
+                    input_manifest_hash="1" * 64,
+                    config_hash="2" * 64,
+                    state=memory_execution_state,
+                    raw_result_artifact_id=(
+                        uuid4()
+                        if memory_execution_state in {"completed", "insufficient_data"}
+                        else None
+                    ),
+                    started_at=NOW,
+                    completed_at=(
+                        NOW
+                        if memory_execution_state
+                        in {"completed", "insufficient_data", "failed", "canceled"}
+                        else None
+                    ),
+                    version=3,
+                )
+            )
+        session.add(
+            OutboxEvent(
+                id=event_id,
+                team_id=TEAM_ID,
+                global_job_id=DEVICE_ANALYSIS_ID,
+                scenario_job_id=None,
+                event_type="engine_result_ready",
+                subject_type="engine_execution",
+                subject_id=source_id,
+                subject_version=3,
+                ready_at=NOW,
+                retry_count=0,
+                version=1,
+            )
+        )
+    return source_id, event_id, memory_execution_id
 
 
 def _automatic_request(
@@ -560,6 +665,119 @@ async def test_coordinator_reschedules_tenant_route_failure(
 
     assert record is not None and record.generation == 1
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_device_coordinator_waits_for_android_memory_terminal_state(
+    database: ExecutionDatabase,
+) -> None:
+    source_id, event_id, _memory_id = await _seed_device_source_event(database)
+    clock = Clock()
+    coordinator = SynthesisCoordinator(
+        session_factory=database.sessions,
+        repository=SQLAlchemySynthesisExecutionRepository(
+            database.sessions,
+            clock=clock,  # type: ignore[arg-type]
+        ),
+        request_factory=lambda _source, _generation: _automatic_request(
+            checksum=_checksum(b"canonical")
+        ),
+        clock=clock,  # type: ignore[arg-type]
+        retry_backoff_seconds=5,
+    )
+
+    assert await coordinator.coordinate_next() is None
+
+    async with database.sessions() as session:
+        event = await session.get(OutboxEvent, event_id)
+        assert event is not None
+        assert event.published_at is None
+        assert event.retry_count == 1
+        assert event.ready_at == NOW + timedelta(seconds=5)
+        assert (
+            await session.scalar(
+                select(SynthesisExecution.id).where(
+                    SynthesisExecution.analysis_id == DEVICE_ANALYSIS_ID
+                )
+            )
+            is None
+        )
+
+    clock.now = NOW + timedelta(seconds=5)
+    async with database.sessions.begin() as session:
+        session.add(
+            EngineExecution(
+                id=uuid4(),
+                team_id=TEAM_ID,
+                analysis_id=DEVICE_ANALYSIS_ID,
+                engine_id="android_memory",
+                attempt_number=1,
+                tenant_resource_version=7,
+                adapter_version="1.0.0",
+                engine_commit_sha="e" * 40,
+                engine_image_digest="sha256:" + "f" * 64,
+                input_manifest_hash="1" * 64,
+                config_hash="2" * 64,
+                state="running",
+                started_at=NOW,
+                version=2,
+            )
+        )
+
+    assert await coordinator.coordinate_next() is None
+
+    clock.now = NOW + timedelta(seconds=10)
+    async with database.sessions.begin() as session:
+        memory = await session.scalar(
+            select(EngineExecution).where(
+                EngineExecution.analysis_id == DEVICE_ANALYSIS_ID,
+                EngineExecution.engine_id == "android_memory",
+            )
+        )
+        assert memory is not None
+        memory.state = "completed"
+        memory.raw_result_artifact_id = uuid4()
+        memory.completed_at = clock.now
+        memory.version += 1
+
+    record = await coordinator.coordinate_next()
+
+    assert record is not None
+    assert record.analysis_id == DEVICE_ANALYSIS_ID
+    assert record.source_execution_id == source_id
+
+
+@pytest.mark.parametrize(
+    ("memory_execution_state", "memory_scenario_state"),
+    [("failed", "analyzing"), ("canceled", "analyzing"), (None, "failed")],
+)
+@pytest.mark.asyncio
+async def test_device_coordinator_allows_terminal_memory_failure_for_partial_report(
+    database: ExecutionDatabase,
+    memory_execution_state: str | None,
+    memory_scenario_state: str,
+) -> None:
+    source_id, _event_id, _memory_id = await _seed_device_source_event(
+        database,
+        memory_execution_state=memory_execution_state,
+        memory_scenario_state=memory_scenario_state,
+    )
+    coordinator = SynthesisCoordinator(
+        session_factory=database.sessions,
+        repository=SQLAlchemySynthesisExecutionRepository(
+            database.sessions,
+            clock=lambda: NOW,
+        ),
+        request_factory=lambda _source, _generation: _automatic_request(
+            checksum=_checksum(b"canonical")
+        ),
+        clock=lambda: NOW,
+    )
+
+    record = await coordinator.coordinate_next()
+
+    assert record is not None
+    assert record.source_execution_id == source_id
 
 
 @pytest.mark.asyncio
