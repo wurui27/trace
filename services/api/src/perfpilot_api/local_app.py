@@ -52,8 +52,11 @@ from perfpilot_api.engines.smartperfetto_contracts import (
 from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
 from perfpilot_api.local_device import AdbDeviceProbe, LocalDevice, LocalDeviceProbe
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
+from perfpilot_api.local_device_capture import LocalDeviceCaptureGateway
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
+from perfpilot_api.reports.memory_join import join_unavailable_android_memory
 from perfpilot_api.reports.normalizer import (
+    NormalizedTraceReport,
     SmartPerfettoNormalizationError,
     normalize_smartperfetto_result,
 )
@@ -105,6 +108,7 @@ _TERMINAL_ANALYSIS_STATES = {
 }
 _LOCAL_RECOVERY_NAMESPACE = UUID("e2ac7e9c-50e3-5d78-bd3f-53a56e2b2978")
 _LOCAL_DEVICE_NAMESPACE = UUID("06905aa0-0e0a-55c7-b63a-87e7a93775ca")
+_LOCAL_APPLICATION_NAMESPACE = UUID("60e4336a-f4c6-5aae-b62d-b54627317ccb")
 _EARLIEST_LOCAL_ANALYSIS_TIME = datetime.min.replace(tzinfo=UTC)
 _LOGGER = logging.getLogger(__name__)
 
@@ -481,6 +485,14 @@ class _PreparedLocalReport:
     source_report: dict[str, object]
 
 
+@dataclass(frozen=True, slots=True)
+class _NormalizedLocalResult:
+    report: NormalizedTraceReport
+    artifact_id: UUID
+    canonical_sha256_b64: str
+    source_report: dict[str, object]
+
+
 def _parse_utc_datetime(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -681,13 +693,17 @@ def _synthesis_from_core(
     )
 
 
-def _prepare_local_report(
+def _normalize_local_smartperfetto_result(
     analysis: _LocalAnalysis,
     result: EngineResult,
-) -> _PreparedLocalReport:
+    *,
+    profile: str,
+) -> _NormalizedLocalResult:
     execution_id = uuid4()
     artifact_id = result_artifact_id(execution_id)
-    trace = analysis.inputs["trace"].descriptor
+    source_input = analysis.inputs[
+        "trace" if analysis.analysis_mode == "trace_upload" else "apk"
+    ].descriptor
     canonical = canonicalize_engine_result(
         EngineResultWrite(
             team_id=LOCAL_TEAM_ID,
@@ -701,9 +717,11 @@ def _prepare_local_report(
             engine_commit_sha=_SMARTPERFETTO_COMMIT,
             engine_image_digest=_ENGINE_IMAGE_DIGEST,
             attempt_number=1,
-            input_manifest_hash=hashlib.sha256(trace.sha256_b64.encode()).hexdigest(),
+            input_manifest_hash=hashlib.sha256(
+                source_input.sha256_b64.encode()
+            ).hexdigest(),
             config_hash=hashlib.sha256(
-                f"{analysis.profile}\0{analysis.question or ''}".encode()
+                f"{profile}\0{analysis.question or ''}".encode()
             ).hexdigest(),
             result=result,
         )
@@ -719,18 +737,174 @@ def _prepare_local_report(
         canonical_bytes=canonical.canonical_bytes,
     )
     try:
-        normalized = normalize_smartperfetto_result(loaded)
+        normalized = normalize_smartperfetto_result(
+            loaded,
+            analysis_mode=analysis.analysis_mode,
+        )
     except SmartPerfettoNormalizationError:
-        normalized = normalize_live_smartperfetto_result(loaded)
+        normalized = normalize_live_smartperfetto_result(
+            loaded,
+            analysis_mode=analysis.analysis_mode,
+        )
+    report_payload = result.payload.get("report")
+    if not isinstance(report_payload, Mapping):
+        raise ValueError("SmartPerfetto report is invalid")
+    return _NormalizedLocalResult(
+        report=normalized,
+        artifact_id=artifact_id,
+        canonical_sha256_b64=canonical.checksum_sha256_b64,
+        source_report=dict(report_payload),
+    )
+
+
+def _missing_scroll_scenario(analysis_id: UUID) -> tuple[dict[str, object], dict[str, object]]:
+    scenario_id = str(uuid5(_LOCAL_RECOVERY_NAMESPACE, f"{analysis_id}:scroll-unavailable"))
+    limitation_id = str(
+        uuid5(_LOCAL_RECOVERY_NAMESPACE, f"{analysis_id}:scroll-result-unavailable")
+    )
+    return (
+        {
+            "scenario_id": scenario_id,
+            "scenario_type": "scroll",
+            "core_state": "partial",
+            "metrics": [],
+            "findings": [],
+            "evidence": [],
+            "trace_health": {
+                "parse_status": "failed",
+                "trace_start_ns": None,
+                "trace_end_ns": None,
+                "target_resolution": {
+                    "package_name": None,
+                    "process_name": None,
+                    "upid": None,
+                    "pid": None,
+                    "main_thread_id": None,
+                },
+                "measurement_window": {
+                    "start_ns": None,
+                    "end_ns": None,
+                    "coverage": "missing",
+                },
+                "data_loss": {
+                    "buffer_overruns": 0,
+                    "ftrace_events_lost": 0,
+                    "traced_buf_patches_failed": 0,
+                    "incomplete_slices": 0,
+                    "boundary_truncations": 0,
+                },
+                "frame_timeline_coverage": "unavailable",
+                "target_display_coverage": "unavailable",
+                "refresh_mode_coverage": "unavailable",
+            },
+            "trace_capabilities": [
+                {
+                    "name": "smartperfetto_scroll_result",
+                    "required": True,
+                    "status": "unavailable",
+                    "reason": "SmartPerfetto did not produce a usable scroll result.",
+                }
+            ],
+        },
+        {
+            "limitation_id": limitation_id,
+            "code": "smartperfetto.scroll_result_unavailable",
+            "summary": "滑动 Trace 已采集，但 SmartPerfetto 未返回可用的滑动分析结果。",
+            "evidence_ids": [],
+        },
+    )
+
+
+def _merge_local_smartperfetto_reports(
+    primary: NormalizedTraceReport,
+    secondary: NormalizedTraceReport,
+) -> NormalizedTraceReport:
+    primary_document = validate_contract("normalized-trace-report", primary.document)
+    secondary_document = validate_contract("normalized-trace-report", secondary.document)
+    if (
+        primary_document["analysis_id"] != secondary_document["analysis_id"]
+        or primary_document["analysis_mode"] != "device"
+        or secondary_document["analysis_mode"] != "device"
+    ):
+        raise ValueError("SmartPerfetto device reports cannot be merged")
+    selected: dict[str, dict[str, object]] = {}
+    for raw in primary_document["scenario_reports"]:
+        if isinstance(raw, Mapping):
+            selected[str(raw["scenario_type"])] = dict(raw)
+    for raw in secondary_document["scenario_reports"]:
+        if isinstance(raw, Mapping) and (
+            raw.get("scenario_type") == "scroll"
+            or str(raw.get("scenario_type")) not in selected
+        ):
+            selected[str(raw["scenario_type"])] = dict(raw)
+    limitations: dict[str, dict[str, object]] = {}
+    for raw in [
+        *primary_document["limitations"],
+        *secondary_document["limitations"],
+    ]:
+        if isinstance(raw, Mapping):
+            limitations[str(raw["limitation_id"])] = dict(raw)
+    if "scroll" not in selected:
+        scenario, limitation = _missing_scroll_scenario(
+            UUID(str(primary_document["analysis_id"]))
+        )
+        selected["scroll"] = scenario
+        limitations[str(limitation["limitation_id"])] = limitation
+    order = {"startup": 0, "scroll": 1, "memory_cycle": 2}
+    scenarios = sorted(selected.values(), key=lambda item: order[str(item["scenario_type"])])
+    merged = {
+        **primary_document,
+        "core_state": (
+            "partial"
+            if any(item.get("core_state") == "partial" for item in scenarios)
+            else "complete"
+        ),
+        "scenario_reports": scenarios,
+        "limitations": sorted(
+            limitations.values(),
+            key=lambda item: str(item["limitation_id"]),
+        )[:20],
+    }
+    validated = validate_contract("normalized-trace-report", merged)
+    payload = canonical_json_bytes(validated)
+    return NormalizedTraceReport(
+        canonical_bytes=payload,
+        sha256_b64=_sha256_b64(payload),
+    )
+
+
+def _prepare_local_report(
+    analysis: _LocalAnalysis,
+    result: EngineResult,
+    *,
+    scroll_result: EngineResult | None = None,
+) -> _PreparedLocalReport:
+    primary = _normalize_local_smartperfetto_result(
+        analysis,
+        result,
+        profile=analysis.profile,
+    )
+    normalized = primary.report
+    if analysis.analysis_mode == "device":
+        if scroll_result is not None:
+            scroll = _normalize_local_smartperfetto_result(
+                analysis,
+                scroll_result,
+                profile="scroll",
+            )
+            normalized = _merge_local_smartperfetto_reports(normalized, scroll.report)
+        else:
+            normalized = _merge_local_smartperfetto_reports(normalized, normalized)
+        normalized = join_unavailable_android_memory(
+            normalized,
+            reason="result_unavailable",
+        )
     normalized_provenance = normalized.document.get("provenance")
     if not isinstance(normalized_provenance, Mapping) or not isinstance(
         normalized_provenance.get("normalizer_version"), str
     ):
         raise ValueError("SmartPerfetto normalization provenance is invalid")
     normalizer_version = normalized_provenance["normalizer_version"]
-    report_payload = result.payload.get("report")
-    if not isinstance(report_payload, Mapping):
-        raise ValueError("SmartPerfetto report is invalid")
     projection_failure_code: str | None = None
     try:
         projection = build_ai_projection(
@@ -743,30 +917,30 @@ def _prepare_local_report(
         projection = _blocked_ai_projection(
             analysis_id=analysis.analysis_id,
             analysis_profile=analysis.profile,
-            canonical_artifact_id=artifact_id,
+            canonical_artifact_id=primary.artifact_id,
         )
     except ProjectionQuestionError:
         projection_failure_code = "ai_projection_invalid_question"
         projection = _blocked_ai_projection(
             analysis_id=analysis.analysis_id,
             analysis_profile=analysis.profile,
-            canonical_artifact_id=artifact_id,
+            canonical_artifact_id=primary.artifact_id,
         )
     except ProjectionSizeError:
         projection_failure_code = "ai_projection_too_large"
         projection = _blocked_ai_projection(
             analysis_id=analysis.analysis_id,
             analysis_profile=analysis.profile,
-            canonical_artifact_id=artifact_id,
+            canonical_artifact_id=primary.artifact_id,
         )
     return _PreparedLocalReport(
         core_document=normalized.document,
         projection=projection,
         projection_failure_code=projection_failure_code,
-        canonical_artifact_id=artifact_id,
-        canonical_sha256_b64=canonical.checksum_sha256_b64,
+        canonical_artifact_id=primary.artifact_id,
+        canonical_sha256_b64=primary.canonical_sha256_b64,
         normalizer_version=normalizer_version,
-        source_report=dict(report_payload),
+        source_report=primary.source_report,
     )
 
 
@@ -860,6 +1034,8 @@ class _LocalRuntime:
         *,
         gateway: LocalAnalysisGateway,
         synthesizer: LocalMultiRoundSynthesizer | None,
+        device_probe: LocalDeviceProbe,
+        device_capture_gateway: LocalDeviceCaptureGateway | None,
         data_root: Path,
         public_origin: str,
         poll_interval_seconds: float,
@@ -868,6 +1044,8 @@ class _LocalRuntime:
             raise ValueError("poll interval must not be negative")
         self.gateway = gateway
         self.synthesizer = synthesizer
+        self.device_probe = device_probe
+        self.device_capture_gateway = device_capture_gateway
         self.data_root = data_root.resolve()
         self.store = LocalAnalysisStore(self.data_root)
         self.public_origin = _public_origin(public_origin)
@@ -1468,6 +1646,7 @@ class _LocalRuntime:
                 analysis.stages["input_validation"] = "completed"
                 analysis.stages["smartperfetto"] = "running"
                 analysis.state = "analyzing"
+                analysis.started_at = analysis.started_at or datetime.now(UTC)
                 task = asyncio.create_task(self._execute(analysis))
                 analysis.task = task
                 self.tasks.add(task)
@@ -1477,6 +1656,9 @@ class _LocalRuntime:
 
     async def _execute(self, analysis: _LocalAnalysis) -> None:
         try:
+            if analysis.analysis_mode == "device":
+                await self._execute_device(analysis)
+                return
             trace = analysis.inputs["trace"]
             if trace.upload_id is None:
                 raise RuntimeError("Trace upload is missing")
@@ -1486,22 +1668,120 @@ class _LocalRuntime:
                 profile=analysis.profile,
                 question=analysis.question,
             )
-            async with self.lock:
-                if analysis.cancel_requested_at is not None:
-                    cancel_submitted_run = True
-                else:
-                    cancel_submitted_run = False
-                    analysis.source_run = run
-                    analysis.version += 1
-            if cancel_submitted_run:
-                await self.gateway.cancel(run)
-                return
-            await self._persist(analysis)
+            await self._register_source_run(analysis, run)
             await self._execute_run(analysis, run)
         except asyncio.CancelledError:
             raise
         except Exception:
             await self._fail_analysis(analysis)
+
+    async def _execute_device(self, analysis: _LocalAnalysis) -> None:
+        if self.device_capture_gateway is None or analysis.device_id is None:
+            raise RuntimeError("local device capture is unavailable")
+        detected = await self.device_probe.inspect()
+        if (
+            detected.state != "connected"
+            or detected.device is None
+            or UUID(str(_team_device(detected.device)["device_id"])) != analysis.device_id
+        ):
+            raise RuntimeError("selected Android device is unavailable")
+        apk = analysis.inputs["apk"]
+        if apk.upload_id is None:
+            raise RuntimeError("APK upload is missing")
+        apk_path = self.uploads[apk.upload_id].path
+        workspace = self.data_root / "device-captures" / str(analysis.analysis_id)
+        workspace.mkdir(parents=True, exist_ok=True)
+        capture = await self.device_capture_gateway.capture(
+            apk_path=apk_path,
+            serial=detected.device.serial,
+            workspace=workspace,
+        )
+        metadata = capture.metadata
+        async with self.lock:
+            if analysis.cancel_requested_at is not None:
+                raise asyncio.CancelledError
+            analysis.application_version_id = uuid5(
+                _LOCAL_APPLICATION_NAMESPACE,
+                (
+                    f"{metadata.package_name}\0{metadata.version_code}\0"
+                    f"{apk.descriptor.sha256_b64}"
+                ),
+            )
+            analysis.application_metadata = {
+                "package_name": metadata.package_name,
+                "version_name": metadata.version_name,
+                "version_code": metadata.version_code,
+                "launch_activity": metadata.launch_activity,
+                "min_sdk": metadata.min_sdk,
+                "target_sdk": metadata.target_sdk,
+                "supported_abis": list(metadata.supported_abis),
+                "has_native_libraries": metadata.has_native_libraries,
+            }
+            analysis.version += 1
+        await self._persist(analysis)
+
+        startup_run = await self.gateway.submit(
+            trace_path=capture.startup_trace,
+            profile="startup",
+            question=None,
+        )
+        await self._register_source_run(analysis, startup_run)
+        startup_result = await self._wait_engine_result(analysis, startup_run)
+
+        scroll_run = await self.gateway.submit(
+            trace_path=capture.scroll_trace,
+            profile="scroll",
+            question=None,
+        )
+        await self._register_source_run(analysis, scroll_run)
+        scroll_result = await self._wait_engine_result(analysis, scroll_run)
+        await self._mark_smartperfetto_completed(analysis)
+        prepared = _prepare_local_report(
+            analysis,
+            startup_result,
+            scroll_result=scroll_result,
+        )
+        await self._publish_prepared(analysis, prepared)
+
+    async def _register_source_run(
+        self,
+        analysis: _LocalAnalysis,
+        run: LocalEngineRun,
+    ) -> None:
+        async with self.lock:
+            canceled = analysis.cancel_requested_at is not None
+            if not canceled:
+                analysis.source_run = run
+                analysis.version += 1
+        if canceled:
+            await self.gateway.cancel(run)
+            raise asyncio.CancelledError
+        await self._persist(analysis)
+
+    async def _wait_engine_result(
+        self,
+        analysis: _LocalAnalysis,
+        run: LocalEngineRun,
+    ) -> EngineResult:
+        while True:
+            async with self.lock:
+                if analysis.cancel_requested_at is not None:
+                    raise asyncio.CancelledError
+            current = await self.gateway.status(run)
+            if current == "completed":
+                return await self.gateway.fetch_result(run)
+            if current in {"failed", "cancelled", "quota_exceeded", "awaiting_user"}:
+                raise RuntimeError("SmartPerfetto analysis did not complete")
+            await asyncio.sleep(self.poll_interval_seconds)
+
+    async def _mark_smartperfetto_completed(self, analysis: _LocalAnalysis) -> None:
+        async with self.lock:
+            if analysis.cancel_requested_at is not None:
+                raise asyncio.CancelledError
+            analysis.stages["smartperfetto"] = "completed"
+            analysis.stages["perfpilot_ai"] = "running"
+            analysis.version += 1
+        await self._persist(analysis)
 
     async def _execute_run(
         self,
@@ -1509,125 +1789,117 @@ class _LocalRuntime:
         run: LocalEngineRun,
     ) -> None:
         try:
-            while True:
-                async with self.lock:
-                    if analysis.cancel_requested_at is not None:
-                        return
-                current = await self.gateway.status(run)
-                if current == "completed":
-                    break
-                if current in {"failed", "cancelled", "quota_exceeded", "awaiting_user"}:
-                    raise RuntimeError("SmartPerfetto analysis did not complete")
-                await asyncio.sleep(self.poll_interval_seconds)
-            async with self.lock:
-                if analysis.cancel_requested_at is not None:
-                    return
-                analysis.stages["smartperfetto"] = "completed"
-                analysis.stages["perfpilot_ai"] = "running"
-                analysis.version += 1
-            await self._persist(analysis)
-            result = await self.gateway.fetch_result(run)
+            result = await self._wait_engine_result(analysis, run)
+            await self._mark_smartperfetto_completed(analysis)
             prepared = _prepare_local_report(analysis, result)
-            analysis.source_rounds, analysis.source_verification = _source_metadata(
-                prepared.source_report
-            )
-            await asyncio.to_thread(
-                self.store.save_document,
-                analysis.analysis_id,
-                "smartperfetto-report.json",
-                prepared.source_report,
-            )
-            await asyncio.to_thread(
-                self.store.save_document,
-                analysis.analysis_id,
-                "projection.json",
-                prepared.projection.document,
-            )
-            synthesis: AISynthesisOutput | None = None
-            rounds: tuple[LocalRoundUsage, ...] = ()
-            synthesis_failure_code: str | None = None
-            try:
-                if prepared.projection_failure_code is not None:
-                    raise LocalSynthesisError(
-                        prepared.projection_failure_code,
-                        retryable=False,
-                    )
-                if self.synthesizer is None:
-                    raise LocalSynthesisError("ai_not_configured", retryable=False)
-
-                async def observe_round(
-                    number: int,
-                    role: Literal["extract", "review", "finalize"],
-                    state: Literal["running", "completed", "failed"],
-                    output: AISynthesisOutput | None,
-                ) -> None:
-                    round_state = analysis.ai_rounds[number - 1]
-                    async with self.lock:
-                        round_state.state = state
-                        analysis.version += 1
-                    if output is not None:
-                        await asyncio.to_thread(
-                            self.store.save_document,
-                            analysis.analysis_id,
-                            f"round-{number}.json",
-                            output.document,
-                        )
-                    await self._persist(analysis)
-
-                synthesis_result = await self.synthesizer.synthesize(
-                    prepared.projection,
-                    on_round=observe_round,
-                )
-                synthesis = synthesis_result.output
-                rounds = synthesis_result.rounds
-                async with self.lock:
-                    for usage in rounds:
-                        analysis.ai_rounds[usage.number - 1].attempts = usage.attempts
-                    analysis.stages["perfpilot_ai"] = "completed"
-                    analysis.failure = None
-                    analysis.version += 1
-            except LocalSynthesisError as error:
-                synthesis_failure_code = error.stable_code
-                _LOGGER.warning(
-                    "Local AI synthesis failed code=%s detail=%s round=%s",
-                    error.stable_code,
-                    error.detail_code,
-                    error.round_number,
-                )
-                async with self.lock:
-                    analysis.stages["perfpilot_ai"] = "failed"
-                    analysis.failure = {
-                        "code": error.stable_code,
-                        "message": "PerfPilot AI 最终报告生成失败，SmartPerfetto 基础报告仍可查看",
-                        "retryable": error.retryable,
-                    }
-                    analysis.version += 1
-            report = _compose_local_report(
-                analysis,
-                prepared,
-                synthesis=synthesis,
-                synthesis_failure_code=synthesis_failure_code,
-                rounds=rounds,
-                synthesizer=self.synthesizer,
-            )
-            await asyncio.to_thread(
-                self.store.save_document,
-                analysis.analysis_id,
-                "report.json",
-                report,
-            )
-            async with self.lock:
-                if analysis.cancel_requested_at is not None:
-                    return
-                analysis.report = report
-                analysis.state = str(report["state"])
-                analysis.stages["report"] = "completed"
-                analysis.version += 1
-            await self._persist(analysis)
+            await self._publish_prepared(analysis, prepared)
         except asyncio.CancelledError:
             raise
         except Exception:
             await self._fail_analysis(analysis)
+
+    async def _publish_prepared(
+        self,
+        analysis: _LocalAnalysis,
+        prepared: _PreparedLocalReport,
+    ) -> None:
+        analysis.source_rounds, analysis.source_verification = _source_metadata(
+            prepared.source_report
+        )
+        await asyncio.to_thread(
+            self.store.save_document,
+            analysis.analysis_id,
+            "smartperfetto-report.json",
+            prepared.source_report,
+        )
+        await asyncio.to_thread(
+            self.store.save_document,
+            analysis.analysis_id,
+            "projection.json",
+            prepared.projection.document,
+        )
+        synthesis: AISynthesisOutput | None = None
+        rounds: tuple[LocalRoundUsage, ...] = ()
+        synthesis_failure_code: str | None = None
+        try:
+            if prepared.projection_failure_code is not None:
+                raise LocalSynthesisError(
+                    prepared.projection_failure_code,
+                    retryable=False,
+                )
+            if self.synthesizer is None:
+                raise LocalSynthesisError("ai_not_configured", retryable=False)
+
+            async def observe_round(
+                number: int,
+                role: Literal["extract", "review", "finalize"],
+                state: Literal["running", "completed", "failed"],
+                output: AISynthesisOutput | None,
+            ) -> None:
+                round_state = analysis.ai_rounds[number - 1]
+                async with self.lock:
+                    round_state.state = state
+                    analysis.version += 1
+                if output is not None:
+                    await asyncio.to_thread(
+                        self.store.save_document,
+                        analysis.analysis_id,
+                        f"round-{number}.json",
+                        output.document,
+                    )
+                await self._persist(analysis)
+
+            synthesis_result = await self.synthesizer.synthesize(
+                prepared.projection,
+                on_round=observe_round,
+            )
+            synthesis = synthesis_result.output
+            rounds = synthesis_result.rounds
+            async with self.lock:
+                for usage in rounds:
+                    analysis.ai_rounds[usage.number - 1].attempts = usage.attempts
+                analysis.stages["perfpilot_ai"] = "completed"
+                analysis.failure = None
+                analysis.version += 1
+        except LocalSynthesisError as error:
+            synthesis_failure_code = error.stable_code
+            _LOGGER.warning(
+                "Local AI synthesis failed code=%s detail=%s round=%s",
+                error.stable_code,
+                error.detail_code,
+                error.round_number,
+            )
+            async with self.lock:
+                analysis.stages["perfpilot_ai"] = "failed"
+                analysis.failure = {
+                    "code": error.stable_code,
+                    "message": "PerfPilot AI 最终报告生成失败，SmartPerfetto 基础报告仍可查看",
+                    "retryable": error.retryable,
+                }
+                analysis.version += 1
+        report = _compose_local_report(
+            analysis,
+            prepared,
+            synthesis=synthesis,
+            synthesis_failure_code=synthesis_failure_code,
+            rounds=rounds,
+            synthesizer=self.synthesizer,
+        )
+        await asyncio.to_thread(
+            self.store.save_document,
+            analysis.analysis_id,
+            "report.json",
+            report,
+        )
+        async with self.lock:
+            if analysis.cancel_requested_at is not None:
+                raise asyncio.CancelledError
+            analysis.report = report
+            analysis.state = str(report["state"])
+            analysis.completed_at = datetime.now(UTC)
+            analysis.stages["report"] = "completed"
+            analysis.version += 1
+        await self._persist(analysis)
 
     async def _fail_analysis(self, analysis: _LocalAnalysis) -> None:
         failure = {
@@ -1829,6 +2101,7 @@ def create_local_app(
     gateway: LocalAnalysisGateway | None = None,
     synthesizer: LocalMultiRoundSynthesizer | None = None,
     device_probe: LocalDeviceProbe | None = None,
+    device_capture_gateway: LocalDeviceCaptureGateway | None = None,
     data_root: Path | None = None,
     public_origin: str | None = None,
     poll_interval_seconds: float = 2.0,
@@ -1841,6 +2114,8 @@ def create_local_app(
     runtime = _LocalRuntime(
         gateway=resolved_gateway,
         synthesizer=resolved_synthesizer,
+        device_probe=resolved_device_probe,
+        device_capture_gateway=device_capture_gateway,
         data_root=data_root
         or Path(os.getenv("PERFPILOT_LOCAL_DATA_DIR", ".perfpilot/local-runtime")),
         public_origin=public_origin

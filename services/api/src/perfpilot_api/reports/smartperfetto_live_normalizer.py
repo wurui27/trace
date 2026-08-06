@@ -13,6 +13,7 @@ import hashlib
 import math
 import re
 from collections.abc import Mapping, Sequence
+from typing import Literal
 from uuid import UUID, uuid5
 
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
@@ -421,7 +422,11 @@ def _diagnostic_facts(
     return evidence, findings
 
 
-def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
+def _build_core(
+    source: LoadedCanonicalResult,
+    *,
+    analysis_mode: Literal["trace_upload", "device"],
+) -> dict[str, object]:
     document = _mapping(validated_canonical_document(source))
     engine = _mapping(document.get("engine"))
     result = _mapping(document.get("result"))
@@ -470,7 +475,7 @@ def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
     return {
         "schema_version": "1.0",
         "analysis_id": str(source.analysis_id),
-        "analysis_mode": "trace_upload",
+        "analysis_mode": analysis_mode,
         "core_state": "partial",
         "scenario_reports": [
             {
@@ -548,9 +553,14 @@ def _build_core(source: LoadedCanonicalResult) -> dict[str, object]:
 
 def normalize_live_smartperfetto_result(
     source: LoadedCanonicalResult,
+    *,
+    analysis_mode: Literal["trace_upload", "device"] = "trace_upload",
 ) -> NormalizedTraceReport:
     try:
-        validated = validate_contract("normalized-trace-report", _build_core(source))
+        validated = validate_contract(
+            "normalized-trace-report",
+            _build_core(source, analysis_mode=analysis_mode),
+        )
         payload = canonical_json_bytes(validated)
         return NormalizedTraceReport(
             canonical_bytes=payload,

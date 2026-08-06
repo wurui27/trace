@@ -54,6 +54,16 @@ class LocalDeviceCapture:
     memory_evidence: Path
 
 
+class LocalDeviceCaptureGateway(Protocol):
+    async def capture(
+        self,
+        *,
+        apk_path: Path,
+        serial: str,
+        workspace: Path,
+    ) -> LocalDeviceCapture: ...
+
+
 class LocalApkInspector(Protocol):
     async def inspect(self, apk_path: Path) -> LocalApkMetadata: ...
 
@@ -264,5 +274,6 @@ __all__ = [
     "LocalApkInspector",
     "LocalApkMetadata",
     "LocalDeviceCapture",
+    "LocalDeviceCaptureGateway",
     "LocalDeviceCaptureError",
 ]

@@ -19,6 +19,7 @@ from perfpilot_api.ai.openai_compatible import SynthesisCandidate
 from perfpilot_api.engines.contracts import EngineResult
 from perfpilot_api.local_app import LocalEngineRun, create_local_app
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
+from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapture
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 
 
@@ -82,6 +83,41 @@ class _FakeDeviceProbe:
     async def inspect(self) -> _FakeDeviceStatus:
         self.calls += 1
         return self.status
+
+
+class _FakeLocalDeviceCaptureGateway:
+    def __init__(self) -> None:
+        self.calls: list[tuple[bytes, str, Path]] = []
+
+    async def capture(
+        self,
+        *,
+        apk_path: Path,
+        serial: str,
+        workspace: Path,
+    ) -> LocalDeviceCapture:
+        self.calls.append((apk_path.read_bytes(), serial, workspace))
+        startup_trace = workspace / "startup.perfetto-trace"
+        scroll_trace = workspace / "scroll.perfetto-trace"
+        memory_evidence = workspace / "memory-evidence.tar"
+        startup_trace.write_bytes(b"captured-startup-trace")
+        scroll_trace.write_bytes(b"captured-scroll-trace")
+        memory_evidence.write_bytes(b"captured-memory-evidence")
+        return LocalDeviceCapture(
+            metadata=LocalApkMetadata(
+                package_name="com.example.perfpilot",
+                version_name="1.2.3",
+                version_code=123,
+                launch_activity="com.example.perfpilot/.MainActivity",
+                min_sdk=26,
+                target_sdk=35,
+                supported_abis=("arm64-v8a",),
+                has_native_libraries=True,
+            ),
+            startup_trace=startup_trace,
+            scroll_trace=scroll_trace,
+            memory_evidence=memory_evidence,
+        )
 
 
 class _ProjectionRoundProvider:
@@ -523,6 +559,128 @@ def test_local_app_creates_device_analysis_with_embedded_apk_upload(
     assert "ai_rounds" not in payload
     assert "source_analysis" not in payload
     assert serial not in json.dumps(payload)
+
+
+def test_local_device_analysis_captures_in_background_and_publishes_report(
+    tmp_path: Path,
+) -> None:
+    serial = "0123456789ABCDEF"
+    device_probe = _FakeDeviceProbe(
+        _FakeDeviceStatus(
+            state="connected",
+            device=_FakeDevice(
+                serial=serial,
+                manufacturer="UNISOC",
+                model="uis7870_2h10_car_c200_6",
+                android_version="13",
+                api_level=33,
+            ),
+        )
+    )
+    capture_gateway = _FakeLocalDeviceCaptureGateway()
+    smartperfetto = _FakeSmartPerfettoGateway(_live_smartperfetto_result())
+    apk = b"installable-local-device-apk"
+    checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
+    app = create_local_app(
+        gateway=smartperfetto,
+        synthesizer=_test_synthesizer(),
+        device_probe=device_probe,
+        device_capture_gateway=capture_gateway,
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        device_id = client.get(f"/v1/teams/{team_id}/devices").json()["devices"][0][
+            "device_id"
+        ]
+        created = client.post(
+            f"/v1/teams/{team_id}/analyses",
+            headers=headers,
+            json={
+                "schema_version": "1.0",
+                "analysis_mode": "device",
+                "device_id": device_id,
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": len(apk),
+                    "sha256_b64": checksum,
+                },
+            },
+        ).json()
+        analysis_id = created["analysis_id"]
+        slot = created["apk_upload"]
+        put = urlsplit(slot["put_url"])
+        assert client.put(
+            f"{put.path}?{put.query}", content=apk, headers=slot["required_headers"]
+        ).status_code == 200
+        assert client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/finalize-upload",
+            headers=headers,
+            json={
+                "upload_id": slot["upload_id"],
+                "sha256_b64": checksum,
+                "size": len(apk),
+            },
+        ).status_code == 200
+
+        terminal = None
+        for _ in range(200):
+            terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if terminal["state"] in {"completed", "partially_completed", "failed"}:
+                break
+            time.sleep(0.01)
+        assert terminal is not None
+        assert terminal["state"] == "partially_completed"
+        assert terminal["report_available"] is True
+        assert terminal["application_version_id"] is not None
+        assert terminal["application_metadata"] == {
+            "package_name": "com.example.perfpilot",
+            "version_name": "1.2.3",
+            "version_code": 123,
+            "launch_activity": "com.example.perfpilot/.MainActivity",
+            "min_sdk": 26,
+            "target_sdk": 35,
+            "supported_abis": ["arm64-v8a"],
+            "has_native_libraries": True,
+        }
+        assert terminal["started_at"] is not None
+        assert terminal["completed_at"] is not None
+        assert "ai_rounds" not in terminal
+        assert "source_analysis" not in terminal
+
+        report_response = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert capture_gateway.calls
+    captured_apk, captured_serial, workspace = capture_gateway.calls[0]
+    assert captured_apk == apk
+    assert captured_serial == serial
+    assert workspace.parent.name == "device-captures"
+    assert smartperfetto.submissions == [
+        (b"captured-startup-trace", "startup", None),
+        (b"captured-scroll-trace", "scroll", None),
+    ]
+    assert report_response.status_code == 200
+    report = validate_contract("analysis-report", report_response.json())
+    assert report["analysis_mode"] == "device"
+    assert [item["scenario_type"] for item in report["scenario_reports"]] == [
+        "startup",
+        "scroll",
+        "memory_cycle",
+    ]
+    memory = report["scenario_reports"][2]
+    assert memory["result_state"] == "failed"
+    assert memory["failure"]["code"] == "insufficient_data"
+    assert serial not in json.dumps(report)
 
 
 def test_local_app_lists_one_active_analysis_and_rejects_a_second(
