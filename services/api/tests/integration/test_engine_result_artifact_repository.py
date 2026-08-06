@@ -392,6 +392,14 @@ async def test_engine_mode_pairs_reserve_only_in_the_selected_tenant_database(
         artifact_id=result_artifact_id(trace_execution),
         engine_id="smartperfetto",
     )
+    device_execution = UUID("83000000-0000-4000-8000-000000000003")
+    device_trace = await _reserve(
+        artifact_harness,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        execution_id=device_execution,
+        artifact_id=result_artifact_id(device_execution),
+        engine_id="smartperfetto",
+    )
 
     assert memory.artifact_id == ARTIFACT_ID
     assert memory.analysis_id == MEMORY_ANALYSIS_ID
@@ -408,9 +416,10 @@ async def test_engine_mode_pairs_reserve_only_in_the_selected_tenant_database(
     assert CHECKSUM not in repr(memory)
     assert "raw/analyses" not in repr(memory)
     assert trace.analysis_id == TRACE_ANALYSIS_ID
-    assert len(await artifact_harness.rows(TEAM_A)) == 2
+    assert device_trace.analysis_id == DEVICE_ANALYSIS_ID
+    assert len(await artifact_harness.rows(TEAM_A)) == 3
     assert await artifact_harness.rows(TEAM_B) == []
-    assert artifact_harness.router.calls == [TEAM_A, TEAM_A]
+    assert artifact_harness.router.calls == [TEAM_A, TEAM_A, TEAM_A]
 
 
 @pytest.mark.asyncio

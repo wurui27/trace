@@ -64,8 +64,10 @@ def _provider_fixture(name: str) -> dict[str, object]:
     )
 
 
-def _core() -> NormalizedTraceReport:
-    payload = canonical_json_bytes(_load("normalized-trace-report.valid.json"))
+def _core(analysis_mode: str = "trace_upload") -> NormalizedTraceReport:
+    document = _load("normalized-trace-report.valid.json")
+    document["analysis_mode"] = analysis_mode
+    payload = canonical_json_bytes(document)
     return NormalizedTraceReport(
         canonical_bytes=payload,
         sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii"),
@@ -295,8 +297,15 @@ class FakeWriter:
 
 
 class FakeContexts:
+    def __init__(self, analysis_mode: str = "trace_upload") -> None:
+        self.analysis_mode = analysis_mode
+
     async def load(self, **_: object) -> SynthesisAnalysisContext:
-        return SynthesisAnalysisContext("auto", None)
+        return SimpleNamespace(
+            analysis_profile="auto",
+            question=None,
+            analysis_mode=self.analysis_mode,
+        )  # type: ignore[return-value]
 
 
 class FakeProjector:
@@ -330,6 +339,7 @@ def _pipeline(
     checkpoint=None,
     projection_builder=None,
     max_projection_bytes: int = 256 * 1024,
+    analysis_mode: str = "trace_upload",
 ) -> SynthesisPipeline:
     kwargs = {}
     if projection_builder is not None:
@@ -340,14 +350,33 @@ def _pipeline(
         artifact_store=artifacts,
         provider=provider,
         report_writer=writer,  # type: ignore[arg-type]
-        analysis_contexts=FakeContexts(),
+        analysis_contexts=FakeContexts(analysis_mode),
         parent_projector=projector,
         clock=lambda: NOW,
         checkpoint=checkpoint,
-        normalizer=lambda _loaded: _core(),
+        normalizer=lambda _loaded, *, analysis_mode="trace_upload": _core(analysis_mode),
         max_projection_bytes=max_projection_bytes,
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_device_pipeline_passes_authoritative_mode_to_final_report() -> None:
+    repository = FakeRepository()
+    writer = FakeWriter()
+    pipeline = _pipeline(
+        repository,
+        FakeProvider(),
+        FakeArtifactStore(),
+        writer,
+        FakeProjector(),
+        analysis_mode="device",
+    )
+
+    result = await _finish(pipeline)
+
+    assert result.state == "succeeded"
+    assert writer.requests[-1].core_document["analysis_mode"] == "device"
 
 
 async def _finish(pipeline: SynthesisPipeline, *, limit: int = 10):

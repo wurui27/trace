@@ -119,6 +119,7 @@ def test_composer_preserves_device_mode_in_v11_report() -> None:
 
     assert result.document["schema_version"] == "1.1"
     assert result.document["analysis_mode"] == "device"
+    assert result.document["state"] == "partially_completed"
     assert [item["scenario_type"] for item in result.document["scenario_reports"]] == [
         "startup"
     ]

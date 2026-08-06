@@ -186,7 +186,8 @@
       "then": {
         "anyOf": [
           {"properties": {"synthesis": {"properties": {"state": {"const": "failed"}}}}},
-          {"properties": {"scenario_reports": {"contains": {"properties": {"result_state": {"enum": ["failed", "canceled"]}}, "required": ["result_state"]}, "minContains": 1}}}
+          {"properties": {"scenario_reports": {"contains": {"properties": {"result_state": {"enum": ["failed", "canceled"]}}, "required": ["result_state"]}, "minContains": 1}}},
+          {"properties": {"analysis_mode": {"const": "device"}}, "required": ["analysis_mode"]}
         ]
       }
     },

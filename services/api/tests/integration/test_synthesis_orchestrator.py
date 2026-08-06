@@ -4,7 +4,7 @@ import asyncio
 import base64
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -23,8 +23,15 @@ from perfpilot_api.db.control.models import (
     TenantResource,
     WorkerClaim,
 )
-from perfpilot_api.db.control.models import GlobalJob
-from perfpilot_api.db.tenant.models import Analysis, Artifact, ReportVersion
+from perfpilot_api.db.control.models import GlobalJob, ScenarioJob
+from perfpilot_api.db.tenant.models import (
+    Analysis,
+    Application,
+    ApplicationVersion,
+    Artifact,
+    ReportVersion,
+    ScenarioResult,
+)
 from perfpilot_api.db.tenant.router import TenantRouteError
 from perfpilot_api.reports.writer import (
     AnalysisReportWriteRequest,
@@ -36,6 +43,7 @@ from perfpilot_api.services.synthesis_executions import (
     SynthesisRequest,
 )
 from perfpilot_api.workers.synthesis_orchestrator import (
+    SQLAlchemySynthesisAnalysisContextRepository,
     SQLAlchemySynthesisParentProjector,
     SQLAlchemySynthesisWorkQueue,
     SynthesisCoordinator,
@@ -58,6 +66,7 @@ from test_analysis_repository import (  # type: ignore[import-not-found]
 
 
 ROOT = Path(__file__).resolve().parents[4]
+DEVICE_PARENT_ANALYSIS_ID = UUID("a1000000-0000-4000-8000-000000000099")
 
 
 def _checksum(value: bytes) -> str:
@@ -846,6 +855,178 @@ def _report_request(*, failed: bool, generation: int) -> AnalysisReportWriteRequ
         total_tokens=None if failed else 30,
         latency_ms=None if failed else 40,
     )
+
+
+def _device_report_request() -> AnalysisReportWriteRequest:
+    request = _report_request(failed=False, generation=9)
+    core = dict(request.core_document)
+    core["analysis_id"] = str(DEVICE_PARENT_ANALYSIS_ID)
+    core["analysis_mode"] = "device"
+    return replace(
+        request,
+        analysis_id=DEVICE_PARENT_ANALYSIS_ID,
+        core_document=core,
+    )
+
+
+@pytest.mark.asyncio
+async def test_device_parent_projection_marks_missing_scenarios_and_parent_partial(
+    parent_databases: AnalysisDatabases,
+) -> None:
+    composed = compose_analysis_report(_device_report_request(), report_version=1)
+    application_id = UUID("a4000000-0000-4000-8000-000000000001")
+    application_version_id = UUID("a4000000-0000-4000-8000-000000000002")
+    scenario_ids = {
+        scenario_type: UUID(f"a3000000-0000-4000-8000-{index:012d}")
+        for index, scenario_type in enumerate(
+            ("cold_start", "scroll", "memory_cycle"),
+            start=1,
+        )
+    }
+    async with parent_databases.control_sessions.begin() as session:
+        session.add(
+            GlobalJob(
+                id=DEVICE_PARENT_ANALYSIS_ID,
+                team_id=PARENT_TEAM_ID,
+                idempotency_key="device-synthesis-parent",
+                analysis_mode="device",
+                state="analyzing",
+                retry_count=0,
+                max_retries=2,
+                started_at=PARENT_NOW,
+                version=1,
+            )
+        )
+        session.add_all(
+            ScenarioJob(
+                id=scenario_ids[scenario_type],
+                analysis_id=DEVICE_PARENT_ANALYSIS_ID,
+                scenario_type=scenario_type,
+                state="analyzing",
+                attempt_count=0,
+                valid_sample_count=0,
+                invalid_sample_count=0,
+                retry_count=0,
+                max_attempts=10,
+                started_at=PARENT_NOW,
+                version=1,
+            )
+            for scenario_type in ("cold_start", "scroll", "memory_cycle")
+        )
+    async with parent_databases.tenant_sessions.begin() as session:
+        session.add(
+            Application(
+                id=application_id,
+                name="Device synthesis app",
+                package_name="dev.perfpilot.device.synthesis",
+            )
+        )
+        await session.flush()
+        session.add(
+            ApplicationVersion(
+                id=application_version_id,
+                application_id=application_id,
+                package_name="dev.perfpilot.device.synthesis",
+                version_name="1.0",
+                version_code=1,
+                launch_activity="dev.perfpilot.device.synthesis.MainActivity",
+                supported_abis=["arm64-v8a"],
+            )
+        )
+        await session.flush()
+        session.add(
+            Analysis(
+                id=DEVICE_PARENT_ANALYSIS_ID,
+                application_version_id=application_version_id,
+                analysis_mode="device",
+                state="analyzing",
+                started_at=PARENT_NOW,
+                version=1,
+            )
+        )
+        session.add_all(
+            ScenarioResult(
+                id=scenario_ids[scenario_type],
+                analysis_id=DEVICE_PARENT_ANALYSIS_ID,
+                scenario_type=scenario_type,
+                state="analyzing",
+                started_at=PARENT_NOW,
+                version=1,
+            )
+            for scenario_type in ("cold_start", "scroll", "memory_cycle")
+        )
+        session.add(
+            ReportVersion(
+                id=composed.id,
+                analysis_id=DEVICE_PARENT_ANALYSIS_ID,
+                scenario_result_id=None,
+                report_version=1,
+                state="partial",
+                generated_at=PARENT_NOW,
+                tool_version="writer",
+                rule_version="normalizer",
+                provenance={},
+                report=composed.document,
+                report_sha256_b64=composed.sha256_b64,
+            )
+        )
+    projector = SQLAlchemySynthesisParentProjector(
+        control_session_factory=parent_databases.control_sessions,
+        tenant_router=parent_databases.tenant_router,  # type: ignore[arg-type]
+    )
+
+    target = await projector.project(
+        team_id=PARENT_TEAM_ID,
+        analysis_id=DEVICE_PARENT_ANALYSIS_ID,
+        tenant_resource_version=1,
+        report_id=composed.id,
+        terminal="report",
+        failure_code=None,
+        now=PARENT_NOW + timedelta(minutes=1),
+    )
+
+    assert target == "partially_completed"
+    async with parent_databases.control_sessions() as session:
+        job = await session.get(GlobalJob, DEVICE_PARENT_ANALYSIS_ID)
+        scenarios = list(
+            (
+                await session.scalars(
+                    select(ScenarioJob).where(
+                        ScenarioJob.analysis_id == DEVICE_PARENT_ANALYSIS_ID
+                    )
+                )
+            ).all()
+        )
+    async with parent_databases.tenant_sessions() as session:
+        analysis = await session.get(Analysis, DEVICE_PARENT_ANALYSIS_ID)
+        results = list(
+            (
+                await session.scalars(
+                    select(ScenarioResult).where(
+                        ScenarioResult.analysis_id == DEVICE_PARENT_ANALYSIS_ID
+                    )
+                )
+            ).all()
+        )
+    assert job is not None and job.state == "partially_completed"
+    assert analysis is not None and analysis.state == "partially_completed"
+    expected = {
+        "cold_start": ("completed", None),
+        "scroll": ("failed", "scenario_evidence_unavailable"),
+        "memory_cycle": ("failed", "scenario_evidence_unavailable"),
+    }
+    assert {row.scenario_type: (row.state, row.failure_code) for row in scenarios} == expected
+    assert {row.scenario_type: (row.state, row.failure_code) for row in results} == expected
+    context = await SQLAlchemySynthesisAnalysisContextRepository(
+        tenant_router=parent_databases.tenant_router,  # type: ignore[arg-type]
+    ).load(
+        team_id=PARENT_TEAM_ID,
+        analysis_id=DEVICE_PARENT_ANALYSIS_ID,
+        tenant_resource_version=1,
+    )
+    assert context.analysis_mode == "device"
+    assert context.analysis_profile == "auto"
+    assert context.question is None
 
 
 @pytest.mark.asyncio

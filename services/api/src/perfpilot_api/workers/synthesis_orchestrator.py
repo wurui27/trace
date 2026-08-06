@@ -13,7 +13,7 @@ from collections.abc import Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Literal, Protocol
+from typing import Literal, Protocol
 from uuid import UUID, uuid4, uuid5
 
 from pydantic import SecretStr
@@ -27,10 +27,11 @@ from perfpilot_api.db.control.models import (
     EngineExecution,
     GlobalJob,
     OutboxEvent,
+    ScenarioJob,
     SynthesisExecution,
     WorkerClaim,
 )
-from perfpilot_api.db.tenant.models import Analysis, Artifact, ReportVersion
+from perfpilot_api.db.tenant.models import Analysis, Artifact, ReportVersion, ScenarioResult
 from perfpilot_api.db.tenant.router import TenantRouteError, TenantRouter
 from perfpilot_api.domain.states import AnalysisState
 from perfpilot_api.domain.transitions import (
@@ -81,6 +82,7 @@ from perfpilot_api.services.synthesis_executions import (
 
 
 _WORKER = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
+_FAILURE_CODE = re.compile(r"[a-z][a-z0-9_]{0,95}\Z")
 _EVENT_NAMESPACE = UUID("9bf739f1-eafc-5ba6-a95b-09fe18c4c315")
 _CONTROL_FLOW_EXCEPTIONS = (asyncio.CancelledError, KeyboardInterrupt, SystemExit)
 
@@ -141,7 +143,7 @@ class SQLAlchemyAutomaticSynthesisRequestFactory:
                 session.info.get("tenant_resource_version")
                 != source.tenant_resource_version
                 or analysis is None
-                or analysis.analysis_mode != "trace_upload"
+                or analysis.analysis_mode not in {"trace_upload", "device"}
                 or analysis.tombstoned_at is not None
                 or artifact is None
                 or artifact.analysis_id != source.analysis_id
@@ -460,6 +462,7 @@ class SQLAlchemySynthesisWorkQueue:
 class SynthesisAnalysisContext:
     analysis_profile: Literal["auto", "startup", "scroll"]
     question: str | None
+    analysis_mode: Literal["trace_upload", "device"]
 
 
 class SQLAlchemySynthesisAnalysisContextRepository:
@@ -479,14 +482,20 @@ class SQLAlchemySynthesisAnalysisContextRepository:
             row = await session.get(Analysis, analysis_id)
             if (
                 row is None
-                or row.analysis_mode != "trace_upload"
-                or row.analysis_profile not in {"auto", "startup", "scroll"}
+                or row.analysis_mode not in {"trace_upload", "device"}
+                or row.analysis_mode == "trace_upload"
+                and row.analysis_profile not in {"auto", "startup", "scroll"}
+                or row.analysis_mode == "device"
+                and (row.analysis_profile is not None or row.question is not None)
                 or row.tombstoned_at is not None
             ):
                 raise SynthesisArtifactConflictError
             return SynthesisAnalysisContext(
-                analysis_profile=row.analysis_profile,  # type: ignore[arg-type]
+                analysis_profile=(
+                    row.analysis_profile if row.analysis_mode == "trace_upload" else "auto"
+                ),  # type: ignore[arg-type]
                 question=row.question,
+                analysis_mode=row.analysis_mode,  # type: ignore[arg-type]
             )
 
 
@@ -509,6 +518,68 @@ class SQLAlchemySynthesisParentProjector:
         if target not in {"completed", "partially_completed", "failed", "canceled"}:
             raise InvalidSynthesisProjection("unknown report state")
         return target
+
+    @staticmethod
+    def _device_scenario_targets(
+        report: Mapping[str, object],
+    ) -> dict[str, tuple[str, str | None]]:
+        validated = validate_contract("analysis-report", report)
+        if validated.get("analysis_mode") != "device":
+            raise InvalidSynthesisProjection("device scenario projection is invalid")
+        targets: dict[str, tuple[str, str | None]] = {
+            "cold_start": ("failed", "scenario_evidence_unavailable"),
+            "scroll": ("failed", "scenario_evidence_unavailable"),
+            "memory_cycle": ("failed", "scenario_evidence_unavailable"),
+        }
+        scenarios = validated.get("scenario_reports")
+        if not isinstance(scenarios, list):
+            raise InvalidSynthesisProjection("device scenario projection is invalid")
+        observed: set[str] = set()
+        for item in scenarios:
+            if not isinstance(item, Mapping):
+                raise InvalidSynthesisProjection("device scenario projection is invalid")
+            source_type = item.get("scenario_type")
+            scenario_type = "cold_start" if source_type == "startup" else source_type
+            if scenario_type not in targets or scenario_type in observed:
+                raise InvalidSynthesisProjection("device scenario projection is invalid")
+            observed.add(scenario_type)
+            result_state = item.get("result_state")
+            if result_state == "completed":
+                targets[scenario_type] = ("completed", None)
+            elif result_state == "canceled":
+                targets[scenario_type] = ("canceled", None)
+            elif result_state == "failed":
+                failure = item.get("failure")
+                code = failure.get("code") if isinstance(failure, Mapping) else None
+                targets[scenario_type] = (
+                    "failed",
+                    code
+                    if isinstance(code, str) and _FAILURE_CODE.fullmatch(code)
+                    else "scenario_evidence_unavailable",
+                )
+            else:
+                raise InvalidSynthesisProjection("device scenario projection is invalid")
+        return targets
+
+    @staticmethod
+    def _project_device_scenarios(
+        rows: list[ScenarioJob] | list[ScenarioResult],
+        *,
+        targets: Mapping[str, tuple[str, str | None]],
+        now: datetime,
+    ) -> None:
+        by_type = {row.scenario_type: row for row in rows}
+        if len(by_type) != len(rows) or set(by_type) != set(targets):
+            raise InvalidSynthesisProjection("device scenario projection is invalid")
+        for scenario_type, row in by_type.items():
+            state, failure_code = targets[scenario_type]
+            if row.state == state and row.failure_code == failure_code:
+                continue
+            row.state = state
+            row.failure_code = failure_code
+            row.completed_at = now
+            row.version += 1
+            row.updated_at = now
 
     @staticmethod
     def _values(
@@ -552,14 +623,16 @@ class SQLAlchemySynthesisParentProjector:
         now: datetime,
     ) -> str:
         allow_remediation = False
+        device_scenario_targets: dict[str, tuple[str, str | None]] | None = None
         async with self._tenant_router.session(team_id) as session:
             if session.info.get("tenant_resource_version") != tenant_resource_version:
                 raise SynthesisArtifactUnavailableError
             analysis = await session.scalar(
                 select(Analysis).where(Analysis.id == analysis_id).with_for_update()
             )
-            if analysis is None or analysis.analysis_mode != "trace_upload":
+            if analysis is None or analysis.analysis_mode not in {"trace_upload", "device"}:
                 raise SynthesisArtifactConflictError
+            analysis_mode = analysis.analysis_mode
             if terminal == "report":
                 if report_id is None or failure_code is not None:
                     raise InvalidSynthesisProjection("report projection is invalid")
@@ -573,6 +646,10 @@ class SQLAlchemySynthesisParentProjector:
                 if report_row is None or report_row.report is None:
                     raise ReportIntegrityError("immutable report conflict")
                 target = self._target_from_report(report_row.report)
+                if analysis.analysis_mode == "device":
+                    device_scenario_targets = self._device_scenario_targets(
+                        report_row.report
+                    )
                 if target == "completed":
                     previous = await session.scalar(
                         select(ReportVersion)
@@ -630,6 +707,21 @@ class SQLAlchemySynthesisParentProjector:
                 )
                 if changed is None:
                     raise SynthesisClaimLostError("parent projection authority changed")
+            if device_scenario_targets is not None:
+                scenario_results = list(
+                    (
+                        await session.scalars(
+                            select(ScenarioResult)
+                            .where(ScenarioResult.analysis_id == analysis_id)
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                self._project_device_scenarios(
+                    scenario_results,
+                    targets=device_scenario_targets,
+                    now=now,
+                )
 
         async with self._control_sessions.begin() as session:
             job = await session.scalar(
@@ -637,7 +729,7 @@ class SQLAlchemySynthesisParentProjector:
                 .where(
                     GlobalJob.id == analysis_id,
                     GlobalJob.team_id == team_id,
-                    GlobalJob.analysis_mode == "trace_upload",
+                    GlobalJob.analysis_mode == analysis_mode,
                 )
                 .with_for_update()
             )
@@ -669,6 +761,21 @@ class SQLAlchemySynthesisParentProjector:
                 )
                 if changed is None:
                     raise SynthesisClaimLostError("parent projection authority changed")
+            if device_scenario_targets is not None:
+                scenario_jobs = list(
+                    (
+                        await session.scalars(
+                            select(ScenarioJob)
+                            .where(ScenarioJob.analysis_id == analysis_id)
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                self._project_device_scenarios(
+                    scenario_jobs,
+                    targets=device_scenario_targets,
+                    now=now,
+                )
         return target
 
 
@@ -720,7 +827,7 @@ class SynthesisPipeline:
         parent_projector: _ParentProjector,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         checkpoint: Checkpoint | None = None,
-        normalizer: Callable[[Any], NormalizedTraceReport] = normalize_smartperfetto_result,
+        normalizer: Callable[..., NormalizedTraceReport] = normalize_smartperfetto_result,
         projection_builder: Callable[..., AIProjection] = build_ai_projection,
         max_projection_bytes: int = 256 * 1024,
     ) -> None:
@@ -758,10 +865,15 @@ class SynthesisPipeline:
             token=claim.token,
         )
 
-    async def _core(self, source: object) -> tuple[object, NormalizedTraceReport]:
+    async def _core(
+        self,
+        source: object,
+        *,
+        analysis_mode: Literal["trace_upload", "device"],
+    ) -> tuple[object, NormalizedTraceReport]:
         loaded = await self._canonical_reader.read(source)
         await self._checkpoint("canonical_read")
-        return loaded, self._normalizer(loaded)
+        return loaded, self._normalizer(loaded, analysis_mode=analysis_mode)
 
     async def _projection(
         self,
@@ -769,11 +881,14 @@ class SynthesisPipeline:
         execution: SynthesisExecutionRecord,
         source: object,
     ) -> tuple[object, NormalizedTraceReport, AIProjection]:
-        loaded, core = await self._core(source)
         context = await self._analysis_contexts.load(
             team_id=execution.team_id,
             analysis_id=execution.analysis_id,
             tenant_resource_version=execution.tenant_resource_version,
+        )
+        loaded, core = await self._core(
+            source,
+            analysis_mode=context.analysis_mode,
         )
         projection = self._projection_builder(
             core,
@@ -1032,7 +1147,15 @@ class SynthesisPipeline:
             )
             return SynthesisStepResult("running")
 
-        loaded, core = await self._core(source)
+        context = await self._analysis_contexts.load(
+            team_id=record.team_id,
+            analysis_id=record.analysis_id,
+            tenant_resource_version=record.tenant_resource_version,
+        )
+        loaded, core = await self._core(
+            source,
+            analysis_mode=context.analysis_mode,
+        )
         synthesis_document: Mapping[str, object] | None = None
         if record.candidate_artifact_id is not None:
             artifact = await self._artifact_store.read(

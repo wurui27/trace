@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from perfpilot_api.db.control.models import EngineExecution, GlobalJob, Team
+from perfpilot_api.db.control.models import EngineExecution, GlobalJob, OutboxEvent, Team
 from perfpilot_api.engines.contracts import EngineRunRef
 from perfpilot_api.services.engine_executions import (
     EngineExecutionNotFoundError,
@@ -250,10 +250,16 @@ async def test_allocation_accepts_only_the_analysis_engine_pair(
 
     assert memory.engine_id == "android_memory"
     assert memory.engine_image_digest == "sha256:" + "b" * 64
+    device_trace = await execution_database.repository.allocate_attempt(
+        team_id=TEAM_ID,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        seed=_seed(engine_id="smartperfetto"),
+        now=NOW,
+    )
+    assert device_trace.engine_id == "smartperfetto"
     for analysis_id, engine_id in (
         (ANALYSIS_ID, "android_memory"),
         (MEMORY_ANALYSIS_ID, "smartperfetto"),
-        (DEVICE_ANALYSIS_ID, "smartperfetto"),
         (DEVICE_ANALYSIS_ID, "android_memory"),
     ):
         with pytest.raises(EngineExecutionNotFoundError):
@@ -263,6 +269,53 @@ async def test_allocation_accepts_only_the_analysis_engine_pair(
                 seed=_seed(engine_id=engine_id),
                 now=NOW,
             )
+
+
+@pytest.mark.asyncio
+async def test_device_smartperfetto_completion_can_schedule_synthesis(
+    execution_database: ExecutionDatabase,
+) -> None:
+    pending = await execution_database.repository.allocate_attempt(
+        team_id=TEAM_ID,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        seed=_seed(),
+        now=NOW,
+    )
+    running = await execution_database.repository.mark_submitted(
+        team_id=TEAM_ID,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        execution_id=pending.id,
+        expected_version=pending.version,
+        run_ref=_run_ref(run_id="device-run-1"),
+        now=NOW,
+    )
+    claimed = await execution_database.repository.claim_finalization(
+        team_id=TEAM_ID,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        execution_id=running.id,
+        now=NOW,
+    )
+
+    completed = await execution_database.repository.finalize(
+        team_id=TEAM_ID,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        execution_id=running.id,
+        expected_version=claimed.record.version,
+        artifact_id=claimed.record.raw_result_artifact_id,
+        terminal_state="completed",
+        schedule_synthesis=True,
+        now=NOW,
+    )
+
+    async with execution_database.sessions() as session:
+        event = await session.scalar(
+            select(OutboxEvent).where(
+                OutboxEvent.event_type == "engine_result_ready",
+                OutboxEvent.subject_id == running.id,
+            )
+        )
+    assert completed.state == "completed"
+    assert event is not None
 
 
 @pytest.mark.asyncio

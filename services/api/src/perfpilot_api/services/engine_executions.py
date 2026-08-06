@@ -57,8 +57,9 @@ _CANONICAL_CURSOR = re.compile(r"(?:0|[1-9][0-9]*)\Z")
 _TERMINAL_STATES = {"completed", "insufficient_data", "failed", "canceled"}
 _OBSERVABLE_STATES = {"running", "awaiting_user"}
 _ANALYSIS_ENGINE_PAIRS = {
-    "trace_upload": "smartperfetto",
-    "memory_upload": "android_memory",
+    "trace_upload": frozenset({"smartperfetto"}),
+    "memory_upload": frozenset({"android_memory"}),
+    "device": frozenset({"smartperfetto"}),
 }
 _NEW_ATTEMPT_CODES = frozenset({"capacity_exceeded", "worker_unavailable", "engine_timeout"})
 _TERMINAL_ADAPTER_CODES = frozenset(
@@ -261,7 +262,9 @@ class SQLAlchemyEngineExecutionRepository:
                 analysis_id=analysis_id,
                 for_update=True,
             )
-            if _ANALYSIS_ENGINE_PAIRS.get(job.analysis_mode) != seed.engine_id or job.state in {
+            if seed.engine_id not in _ANALYSIS_ENGINE_PAIRS.get(
+                job.analysis_mode, frozenset()
+            ) or job.state in {
                 "completed",
                 "partially_completed",
                 "failed",
@@ -521,8 +524,10 @@ class SQLAlchemyEngineExecutionRepository:
                     analysis_id=analysis_id,
                     for_update=True,
                 )
-                if job.analysis_mode != "trace_upload":
-                    raise ValueError("only SmartPerfetto trace executions can schedule synthesis")
+                if job.analysis_mode not in {"trace_upload", "device"}:
+                    raise ValueError(
+                        "only SmartPerfetto analysis executions can schedule synthesis"
+                    )
             if row.state in _TERMINAL_STATES:
                 if (
                     row.raw_result_artifact_id != artifact_id

@@ -37,8 +37,8 @@ _JSON_MIME = "application/json"
 _RETENTION = timedelta(days=30)
 _REQUEST_HASH = re.compile(r"[0-9a-f]{64}\Z")
 _ENGINE_ANALYSIS_MODES = {
-    "android_memory": "memory_upload",
-    "smartperfetto": "trace_upload",
+    "android_memory": frozenset({"memory_upload"}),
+    "smartperfetto": frozenset({"trace_upload", "device"}),
 }
 _T = TypeVar("_T")
 
@@ -340,12 +340,12 @@ class SQLAlchemyEngineResultArtifactRepository:
         sha256_b64: str,
         now: datetime,
     ) -> EngineResultArtifactRecord:
-        analysis_mode = _ENGINE_ANALYSIS_MODES.get(engine_id)
+        analysis_modes = _ENGINE_ANALYSIS_MODES.get(engine_id)
         if (
             not isinstance(analysis_id, UUID)
             or not isinstance(execution_id, UUID)
             or not isinstance(artifact_id, UUID)
-            or analysis_mode is None
+            or analysis_modes is None
             or artifact_id != result_artifact_id(execution_id)
             or not isinstance(request_hash, str)
             or _REQUEST_HASH.fullmatch(request_hash) is None
@@ -363,7 +363,7 @@ class SQLAlchemyEngineResultArtifactRepository:
                 select(Analysis.id)
                 .where(
                     Analysis.id == analysis_id,
-                    Analysis.analysis_mode == analysis_mode,
+                    Analysis.analysis_mode.in_(analysis_modes),
                     Analysis.tombstoned_at.is_(None),
                     Analysis.state != "deleted",
                 )
