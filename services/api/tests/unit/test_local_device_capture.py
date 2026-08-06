@@ -11,6 +11,7 @@ from perfpilot_api.local_device_capture import (
     AdbLocalDeviceCaptureGateway,
     LocalApkMetadata,
     LocalDeviceCaptureError,
+    resolve_local_adb,
     resolve_local_android_toolchain,
 )
 
@@ -125,6 +126,18 @@ def test_toolchain_reports_a_stable_error_when_android_tools_are_missing(
         )
 
     assert raised.value.code == "android_toolchain_unavailable"
+
+
+def test_adb_discovery_does_not_require_installed_build_tools(tmp_path: Path) -> None:
+    sdk = tmp_path / "Android" / "Sdk"
+    adb = _executable(sdk / "platform-tools" / "adb")
+
+    assert resolve_local_adb(
+        environ={"ANDROID_SDK_ROOT": str(sdk)},
+        which=lambda _name: None,
+        home=tmp_path / "home",
+        platform_name="linux",
+    ) == adb
 
 
 @pytest.mark.asyncio

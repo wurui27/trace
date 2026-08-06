@@ -735,6 +735,14 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
         assert terminal["completed_at"] is not None
         assert "ai_rounds" not in terminal
         assert "source_analysis" not in terminal
+        assert [item["state"] for item in terminal["scenarios"]] == [
+            "failed",
+            "failed",
+            "completed",
+        ]
+        assert terminal["scenarios"][0]["failure"]["code"] == "insufficient_data"
+        assert terminal["scenarios"][1]["failure"]["code"] == "insufficient_data"
+        assert terminal["scenarios"][2]["failure"] is None
 
         report_response = client.get(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/report"

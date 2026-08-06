@@ -141,26 +141,23 @@ def _sdk_aapt2(root: Path, executable_name: str) -> Path | None:
     return None
 
 
-def resolve_local_android_toolchain(
+def resolve_local_adb(
     *,
     environ: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] = shutil.which,
     home: Path | None = None,
     platform_name: str = sys.platform,
-) -> LocalAndroidToolchain:
+) -> Path:
     values = os.environ if environ is None else environ
     home_directory = Path.home() if home is None else Path(home)
     windows = platform_name == "win32"
     adb_name = "adb.exe" if windows else "adb"
-    aapt2_name = "aapt2.exe" if windows else "aapt2"
     roots = _sdk_roots(
         environ=values,
         home=home_directory,
         platform_name=platform_name,
     )
-
     explicit_adb = values.get("PERFPILOT_LOCAL_ADB")
-    explicit_aapt2 = values.get("PERFPILOT_LOCAL_AAPT2")
     if explicit_adb is not None:
         adb = _executable(Path(explicit_adb))
         if adb is None:
@@ -178,7 +175,35 @@ def resolve_local_android_toolchain(
         if adb is None:
             located = which(adb_name)
             adb = _executable(Path(located)) if located else None
+    if adb is None:
+        raise LocalDeviceCaptureError("android_toolchain_unavailable")
+    return adb
 
+
+def resolve_local_android_toolchain(
+    *,
+    environ: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    home: Path | None = None,
+    platform_name: str = sys.platform,
+) -> LocalAndroidToolchain:
+    values = os.environ if environ is None else environ
+    home_directory = Path.home() if home is None else Path(home)
+    windows = platform_name == "win32"
+    aapt2_name = "aapt2.exe" if windows else "aapt2"
+    roots = _sdk_roots(
+        environ=values,
+        home=home_directory,
+        platform_name=platform_name,
+    )
+    adb = resolve_local_adb(
+        environ=values,
+        which=which,
+        home=home_directory,
+        platform_name=platform_name,
+    )
+
+    explicit_aapt2 = values.get("PERFPILOT_LOCAL_AAPT2")
     if explicit_aapt2 is not None:
         aapt2 = _executable(Path(explicit_aapt2))
         if aapt2 is None:
@@ -196,7 +221,7 @@ def resolve_local_android_toolchain(
             located = which(aapt2_name)
             aapt2 = _executable(Path(located)) if located else None
 
-    if adb is None or aapt2 is None:
+    if aapt2 is None:
         raise LocalDeviceCaptureError("android_toolchain_unavailable")
     return LocalAndroidToolchain(adb_binary=adb, aapt2_binary=aapt2)
 
@@ -401,8 +426,11 @@ class AdbLocalDeviceCaptureGateway:
         )
 
 
-def build_local_device_capture_gateway() -> AdbLocalDeviceCaptureGateway:
-    tools = resolve_local_android_toolchain()
+def build_local_device_capture_gateway(
+    *,
+    toolchain: LocalAndroidToolchain | None = None,
+) -> AdbLocalDeviceCaptureGateway:
+    tools = toolchain or resolve_local_android_toolchain()
     return AdbLocalDeviceCaptureGateway(
         adb_binary=tools.adb_binary,
         inspector=Aapt2LocalApkInspector(binary=tools.aapt2_binary),
@@ -420,5 +448,6 @@ __all__ = [
     "LocalDeviceCaptureGateway",
     "LocalDeviceCaptureError",
     "build_local_device_capture_gateway",
+    "resolve_local_adb",
     "resolve_local_android_toolchain",
 ]

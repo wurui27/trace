@@ -53,9 +53,12 @@ from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
 from perfpilot_api.local_device import AdbDeviceProbe, LocalDevice, LocalDeviceProbe
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
 from perfpilot_api.local_device_capture import (
+    LocalAndroidToolchain,
     LocalDeviceCaptureError,
     LocalDeviceCaptureGateway,
     build_local_device_capture_gateway,
+    resolve_local_adb,
+    resolve_local_android_toolchain,
 )
 from perfpilot_api.local_memory_analysis import (
     LocalMemoryAnalysisError,
@@ -2073,6 +2076,58 @@ class _LocalRuntime:
             else:
                 scenario_state = analysis.state
                 scenario_version = analysis.version
+            report_scenarios: dict[str, Mapping[str, object]] = {}
+            if analysis.report is not None:
+                raw_scenarios = analysis.report.get("scenario_reports")
+                if isinstance(raw_scenarios, list):
+                    report_scenarios = {
+                        str(item["scenario_type"]): item
+                        for item in raw_scenarios
+                        if isinstance(item, Mapping)
+                        and item.get("scenario_type")
+                        in {"startup", "scroll", "memory_cycle"}
+                    }
+
+            def render_scenario(scenario_type: str) -> dict[str, object]:
+                report_type = "startup" if scenario_type == "cold_start" else scenario_type
+                reported = report_scenarios.get(report_type)
+                reported_state = (
+                    str(reported["result_state"])
+                    if reported is not None
+                    and reported.get("result_state")
+                    in {"completed", "failed", "canceled"}
+                    else scenario_state
+                )
+                raw_failure = reported.get("failure") if reported is not None else None
+                failure = (
+                    dict(raw_failure)
+                    if isinstance(raw_failure, Mapping)
+                    else analysis.failure if reported_state == "failed" else None
+                )
+                return {
+                    "scenario_job_id": (
+                        reported.get("scenario_job_id") if reported is not None else None
+                    ),
+                    "scenario_type": scenario_type,
+                    "state": reported_state,
+                    "version": scenario_version,
+                    "device_group_id": (
+                        reported.get("device_group_id") if reported is not None else None
+                    ),
+                    "sample_verdict_counts": dict(verdicts),
+                    "started_at": (
+                        analysis.started_at.isoformat()
+                        if analysis.started_at is not None
+                        else None
+                    ),
+                    "completed_at": (
+                        analysis.completed_at.isoformat()
+                        if analysis.completed_at is not None
+                        else None
+                    ),
+                    "failure": failure,
+                }
+
             return {
                 "schema_version": "1.0",
                 "analysis_id": str(analysis.analysis_id),
@@ -2089,25 +2144,7 @@ class _LocalRuntime:
                 "application_metadata": analysis.application_metadata,
                 "apk_upload": self.slot(upload, finalized=target.finalized)["upload"],
                 "scenarios": [
-                    {
-                        "scenario_job_id": None,
-                        "scenario_type": scenario_type,
-                        "state": scenario_state,
-                        "version": scenario_version,
-                        "device_group_id": None,
-                        "sample_verdict_counts": dict(verdicts),
-                        "started_at": (
-                            analysis.started_at.isoformat()
-                            if analysis.started_at is not None
-                            else None
-                        ),
-                        "completed_at": (
-                            analysis.completed_at.isoformat()
-                            if analysis.completed_at is not None
-                            else None
-                        ),
-                        "failure": analysis.failure if scenario_state == "failed" else None,
-                    }
+                    render_scenario(scenario_type)
                     for scenario_type in ("cold_start", "scroll", "memory_cycle")
                 ],
                 "sample_verdict_counts": verdicts,
@@ -2236,16 +2273,29 @@ def create_local_app(
         base_url=os.getenv("PERFPILOT_LOCAL_SMARTPERFETTO_URL", "http://127.0.0.1:3001")
     )
     resolved_synthesizer = synthesizer or build_local_multiround_synthesizer()
-    resolved_device_probe = device_probe or AdbDeviceProbe()
     resolved_data_root = data_root or Path(
         os.getenv("PERFPILOT_LOCAL_DATA_DIR", ".perfpilot/local-runtime")
     )
-    resolved_device_capture_gateway = device_capture_gateway
-    if resolved_device_capture_gateway is None:
+    resolved_device_probe = device_probe
+    if resolved_device_probe is None:
         try:
-            resolved_device_capture_gateway = build_local_device_capture_gateway()
+            adb_binary = resolve_local_adb()
         except LocalDeviceCaptureError as error:
             _LOGGER.warning("Local Android toolchain unavailable code=%s", error.code)
+            resolved_device_probe = AdbDeviceProbe()
+        else:
+            resolved_device_probe = AdbDeviceProbe(adb_path=str(adb_binary))
+    resolved_device_capture_gateway = device_capture_gateway
+    if resolved_device_capture_gateway is None:
+        toolchain: LocalAndroidToolchain | None = None
+        try:
+            toolchain = resolve_local_android_toolchain()
+        except LocalDeviceCaptureError as error:
+            _LOGGER.warning("Local Android capture unavailable code=%s", error.code)
+        if toolchain is not None:
+            resolved_device_capture_gateway = build_local_device_capture_gateway(
+                toolchain=toolchain,
+            )
     resolved_memory_analysis_gateway = memory_analysis_gateway
     if resolved_memory_analysis_gateway is None:
         try:
