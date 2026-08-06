@@ -126,6 +126,33 @@ configure_smartperfetto_environment() {
   chmod 600 "$environment_file"
 }
 
+write_initial_ai_environment() {
+  local source_file="$ENGINE_ROOT/SmartPerfetto/backend/.env"
+  local target_file="$CONFIG_ROOT/perfpilot-ai.env"
+  local temporary_file="$CONFIG_ROOT/.perfpilot-ai.env.new"
+  local model_line
+  local token_line
+
+  if [[ -f "$target_file" ]]; then
+    return 0
+  fi
+  model_line="$(grep -m 1 '^CLAUDE_MODEL=' "$source_file" || true)"
+  token_line="$(grep -m 1 '^ANTHROPIC_AUTH_TOKEN=' "$source_file" || true)"
+  if [[ -z "$model_line" || -z "$token_line" ]]; then
+    printf '%s\n' '未发现可复用的 AI 配置，PerfPilot 三轮 AI 暂不启用。'
+    return 0
+  fi
+  umask 077
+  {
+    printf 'PERFPILOT_LOCAL_AI_BASE_URL=https://api.deepseek.com/v1/\n'
+    printf 'PERFPILOT_LOCAL_AI_MODEL=%s\n' "${model_line#*=}"
+    printf 'PERFPILOT_LOCAL_AI_TOKEN=%s\n' "${token_line#*=}"
+    printf 'PERFPILOT_LOCAL_AI_PROVIDER_NAME=deepseek\n'
+  } > "$temporary_file"
+  chmod 600 "$temporary_file"
+  mv "$temporary_file" "$target_file"
+}
+
 write_initial_environment() {
   local environment_file="$CONFIG_ROOT/perfpilot.env"
   local proxy_secret
@@ -164,6 +191,7 @@ sync_engine \
   https://github.com/Gracker/Android-App-Memory-Analysis.git \
   "$ANDROID_MEMORY_COMMIT"
 configure_smartperfetto_environment
+write_initial_ai_environment
 
 printf '%s\n' '正在安装 PerfPilot Python 依赖……'
 if [[ ! -x "$PROJECT_DIR/.venv/bin/python" ]]; then

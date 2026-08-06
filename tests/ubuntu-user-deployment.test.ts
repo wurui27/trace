@@ -22,6 +22,9 @@ describe("Ubuntu user deployment", () => {
     expect(script).toContain('--editable "$PROJECT_DIR/agents/device-agent"');
     expect(script).toContain("for key in PORT SMARTPERFETTO_BACKEND_PORT");
     expect(script).toContain("printf '%s=3001\\n'");
+    expect(script).toContain("PERFPILOT_LOCAL_AI_BASE_URL=https://api.deepseek.com/v1/");
+    expect(script).toContain("PERFPILOT_LOCAL_AI_MODEL");
+    expect(script).toContain("PERFPILOT_LOCAL_AI_TOKEN");
     expect(script).not.toMatch(/\bsudo\b/);
     expect(script).not.toMatch(/rm\s+-rf[^\n]*data/);
   });
