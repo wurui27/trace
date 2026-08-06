@@ -1140,6 +1140,7 @@ async def test_internal_composition_requires_sink_and_builds_no_public_route() -
         smartperfetto_base_url="http://127.0.0.1:3001",
         smartperfetto_credential_reference="development-secret-ref",
     )
+    android = FakeAndroidMemoryAdapter()
     try:
         service = build_smartperfetto_execution_service(
             settings=settings,
@@ -1149,9 +1150,12 @@ async def test_internal_composition_requires_sink_and_builds_no_public_route() -
             artifact_client=artifact_client,
             engine_lock=_lock(),
             result_sink=FakeSink(),
+            additional_adapters=(android,),
             now=lambda: NOW,
         )
         assert isinstance(service, EngineExecutionService)
+        assert service._registry.require("android_memory") is android
+        assert service._registry.require("smartperfetto").descriptor.engine_id == "smartperfetto"
         with pytest.raises(ValueError, match="result sink"):
             build_smartperfetto_execution_service(
                 settings=settings,

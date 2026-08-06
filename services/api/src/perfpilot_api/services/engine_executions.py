@@ -1305,6 +1305,7 @@ def build_smartperfetto_execution_service(
     artifact_client: httpx.AsyncClient,
     engine_lock: EngineLock,
     result_sink: EngineResultSink,
+    additional_adapters: Iterable[EngineAdapter] = (),
     now: Callable[[], datetime] | None = None,
 ) -> EngineExecutionService:
     if result_sink is None:
@@ -1340,7 +1341,7 @@ def build_smartperfetto_execution_service(
     return build_engine_execution_service(
         control_session_factory=control_session_factory,
         workspace_service=workspace_service,
-        adapters=(adapter,),
+        adapters=(adapter, *additional_adapters),
         engine_lock=engine_lock,
         result_sink=result_sink,
         now=now or (lambda: datetime.now(UTC)),

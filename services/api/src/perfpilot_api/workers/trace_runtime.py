@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import inspect
 import os
+import stat
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -19,11 +20,30 @@ from perfpilot_api.db.control.session import (
     create_control_engine,
     create_control_session_factory,
 )
+from perfpilot_api.engines.android_memory import AndroidMemoryAdapter
+from perfpilot_api.engines.android_memory_stager import AndroidMemoryStager
+from perfpilot_api.engines.android_memory_worker import OciAndroidMemoryWorker
 from perfpilot_api.engines.lock import load_engine_lock
 from perfpilot_api.runtime.artifacts import build_artifact_runtime
 from perfpilot_api.runtime.secrets import read_owner_only_file
+from perfpilot_api.services.device_kernel_executions import (
+    DeviceKernelExecutionService,
+    SQLAlchemyDeviceKernelContextRepository,
+)
 from perfpilot_api.services.engine_executions import (
     build_smartperfetto_execution_service,
+)
+from perfpilot_api.services.internal_artifacts import (
+    S3InternalArtifactSink,
+    SQLAlchemyInternalArtifactRepository,
+)
+from perfpilot_api.services.memory_analyses import (
+    MemoryCaptureService,
+    SQLAlchemyMemoryCaptureRepository,
+)
+from perfpilot_api.services.memory_executions import (
+    MemoryExecutionService,
+    SQLAlchemyMemoryExecutionRepository,
 )
 from perfpilot_api.services.trace_executions import (
     SQLAlchemyTraceExecutionRepository,
@@ -174,6 +194,20 @@ def _required_path(name: str) -> Path:
     return path
 
 
+def _prepare_private_directory(path: Path) -> Path:
+    if not _is_unambiguous_absolute_path(path):
+        raise TraceWorkerRuntimeError("Android Memory runtime is unavailable")
+    try:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+        metadata = path.lstat()
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+            raise OSError
+        path.chmod(0o700)
+    except Exception:
+        raise TraceWorkerRuntimeError("Android Memory runtime is unavailable") from None
+    return path
+
+
 async def build_production_trace_worker() -> TraceWorkerRuntime:
     """Build only the production, pinned and externally authenticated runtime."""
 
@@ -182,6 +216,13 @@ async def build_production_trace_worker() -> TraceWorkerRuntime:
         raise RuntimeError("trace worker requires a production environment")
     if not settings.smartperfetto_enabled:
         raise RuntimeError("SmartPerfetto must be enabled for the trace worker")
+    if not settings.android_memory_enabled:
+        raise RuntimeError("Android Memory must be enabled for the trace worker")
+    if (
+        settings.android_memory_backend != "oci"
+        or settings.android_memory_image_reference is None
+    ):
+        raise RuntimeError("Android Memory OCI runtime is required for the trace worker")
 
     worker_id = _required_environment("PERFPILOT_TRACE_WORKER_ID")
     credential_path = _required_path("PERFPILOT_SMARTPERFETTO_CREDENTIAL_FILE")
@@ -197,6 +238,14 @@ async def build_production_trace_worker() -> TraceWorkerRuntime:
             schema_path=schema_path,
             require_image_digests=True,
         )
+        image_reference = settings.android_memory_image_reference
+        if (
+            image_reference.rpartition("@")[2]
+            != engine_lock.android_memory.image_digest
+        ):
+            raise TraceWorkerRuntimeError("Android Memory runtime is unavailable")
+        memory_root = _prepare_private_directory(settings.android_memory_run_root)
+        memory_staging_root = _prepare_private_directory(memory_root / "staging")
         credential_resolver = MountedSmartPerfettoCredentialResolver(
             expected_reference=settings.smartperfetto_credential_reference,
             path=credential_path,
@@ -234,6 +283,29 @@ async def build_production_trace_worker() -> TraceWorkerRuntime:
         )
         callbacks.append(artifact_client.aclose)
 
+        memory_worker = OciAndroidMemoryWorker(
+            container_runtime=settings.android_memory_container_runtime,
+            image_reference=image_reference,
+            run_root=memory_root / "worker",
+            max_output_bytes=settings.android_memory_max_output_bytes,
+            pids_limit=settings.android_memory_pids_limit,
+            memory_bytes=settings.android_memory_memory_bytes,
+            cpu_limit=settings.android_memory_cpu_limit,
+            tmpfs_bytes=settings.android_memory_tmpfs_bytes,
+        )
+        callbacks.append(memory_worker.shutdown)
+        memory_adapter = AndroidMemoryAdapter(
+            stager=AndroidMemoryStager(
+                client=artifact_client,
+                workspace_root=memory_staging_root,
+                max_files=settings.android_memory_max_files,
+                max_file_bytes=settings.android_memory_max_file_bytes,
+                max_total_bytes=settings.android_memory_max_total_bytes,
+            ),
+            worker=memory_worker,
+            max_timeout_seconds=settings.android_memory_timeout_seconds,
+        )
+
         engine_service = build_smartperfetto_execution_service(
             settings=settings,
             control_session_factory=control_sessions,
@@ -242,8 +314,9 @@ async def build_production_trace_worker() -> TraceWorkerRuntime:
             artifact_client=artifact_client,
             engine_lock=engine_lock,
             result_sink=artifact_runtime.engine_result_sink,
+            additional_adapters=(memory_adapter,),
         )
-        execution_service = TraceExecutionService(
+        trace_service = TraceExecutionService(
             repository=SQLAlchemyTraceExecutionRepository(
                 control_session_factory=control_sessions,
                 tenant_router=artifact_runtime.tenant_router,
@@ -251,6 +324,38 @@ async def build_production_trace_worker() -> TraceWorkerRuntime:
             upload_service=artifact_runtime.upload_service,
             engine_service=engine_service,
             schedule_synthesis=settings.ai_enabled,
+        )
+        if artifact_runtime.bucket_resolver is None or artifact_runtime.s3_client is None:
+            raise TraceWorkerRuntimeError("Android Memory runtime is unavailable")
+        capture_service = MemoryCaptureService(
+            repository=SQLAlchemyMemoryCaptureRepository(
+                tenant_router=artifact_runtime.tenant_router,
+            ),
+            manifest_sink=S3InternalArtifactSink(
+                repository=SQLAlchemyInternalArtifactRepository(
+                    tenant_router=artifact_runtime.tenant_router,
+                ),
+                bucket_resolver=artifact_runtime.bucket_resolver,
+                client=artifact_runtime.s3_client,
+            ),
+        )
+        memory_service = MemoryExecutionService(
+            repository=SQLAlchemyMemoryExecutionRepository(
+                tenant_router=artifact_runtime.tenant_router,
+                bucket_resolver=artifact_runtime.bucket_resolver,
+                client=artifact_runtime.s3_client,
+            ),
+            upload_service=artifact_runtime.upload_service,
+            engine_service=engine_service,
+            timeout_seconds=settings.android_memory_timeout_seconds,
+        )
+        execution_service = DeviceKernelExecutionService(
+            repository=SQLAlchemyDeviceKernelContextRepository(
+                tenant_router=artifact_runtime.tenant_router,
+            ),
+            trace_service=trace_service,
+            capture_service=capture_service,
+            memory_service=memory_service,
         )
         queue = SQLAlchemyTraceWorkQueueRepository(
             session_factory=control_sessions,

@@ -104,17 +104,19 @@ async def test_runtime_cleanup_attempts_every_component_and_redacts_errors() -> 
 
 
 @pytest.mark.parametrize(
-    ("app_env", "enabled", "message"),
+    ("app_env", "smartperfetto_enabled", "android_memory_enabled", "message"),
     [
-        ("test", True, "production environment"),
-        ("production", False, "SmartPerfetto must be enabled"),
+        ("test", True, True, "production environment"),
+        ("production", False, True, "SmartPerfetto must be enabled"),
+        ("production", True, False, "Android Memory must be enabled"),
     ],
 )
 @pytest.mark.asyncio
 async def test_builder_rejects_nonproduction_or_disabled_smartperfetto(
     monkeypatch: pytest.MonkeyPatch,
     app_env: str,
-    enabled: bool,
+    smartperfetto_enabled: bool,
+    android_memory_enabled: bool,
     message: str,
 ) -> None:
     monkeypatch.setattr(
@@ -122,7 +124,8 @@ async def test_builder_rejects_nonproduction_or_disabled_smartperfetto(
         "get_settings",
         lambda: SimpleNamespace(
             app_env=app_env,
-            smartperfetto_enabled=enabled,
+            smartperfetto_enabled=smartperfetto_enabled,
+            android_memory_enabled=android_memory_enabled,
         ),
     )
 
@@ -153,6 +156,20 @@ async def test_builder_composes_pinned_runtime_and_closes_separate_clients(
     settings = SimpleNamespace(
         app_env="production",
         smartperfetto_enabled=True,
+        android_memory_enabled=True,
+        android_memory_backend="oci",
+        android_memory_image_reference="registry.invalid/memory@sha256:" + "d" * 64,
+        android_memory_run_root=tmp_path / "android-memory",
+        android_memory_container_runtime=Path("/usr/bin/docker"),
+        android_memory_max_output_bytes=32 * 1024 * 1024,
+        android_memory_pids_limit=128,
+        android_memory_memory_bytes=8 * 1024**3,
+        android_memory_cpu_limit=4.0,
+        android_memory_tmpfs_bytes=1024**3,
+        android_memory_max_files=2048,
+        android_memory_max_file_bytes=5 * 1024**3,
+        android_memory_max_total_bytes=8 * 1024**3,
+        android_memory_timeout_seconds=900,
         ai_enabled=True,
         control_database_url=SecretStr(
             "postgresql+psycopg://control.example/db?sslmode=verify-full"
@@ -174,6 +191,8 @@ async def test_builder_composes_pinned_runtime_and_closes_separate_clients(
         upload_service = object()
         engine_result_sink = object()
         tenant_router = object()
+        bucket_resolver = object()
+        s3_client = object()
 
         async def close(self) -> None:
             events.append("artifact-runtime")
@@ -187,9 +206,20 @@ async def test_builder_composes_pinned_runtime_and_closes_separate_clients(
         async def aclose(self) -> None:
             events.append(self.name)
 
+    class FakeMemoryWorker:
+        isolation = "oci"
+
+        def __init__(self, *, image_reference: str, **_: object) -> None:
+            self.image_reference = image_reference
+
+        async def shutdown(self) -> None:
+            events.append("android-memory-worker")
+
     fake_engine = FakeControlEngine()
     fake_artifacts = FakeArtifactRuntime()
-    fake_lock = object()
+    fake_lock = SimpleNamespace(
+        android_memory=SimpleNamespace(image_digest="sha256:" + "d" * 64)
+    )
     fake_sessions = object()
     fake_engine_service = object()
 
@@ -215,6 +245,7 @@ async def test_builder_composes_pinned_runtime_and_closes_separate_clients(
     )
     monkeypatch.setattr(trace_runtime, "build_artifact_runtime", build_artifacts)
     monkeypatch.setattr(trace_runtime.httpx, "AsyncClient", FakeHttpClient)
+    monkeypatch.setattr(trace_runtime, "OciAndroidMemoryWorker", FakeMemoryWorker)
     monkeypatch.setattr(
         trace_runtime,
         "build_smartperfetto_execution_service",
@@ -250,13 +281,18 @@ async def test_builder_composes_pinned_runtime_and_closes_separate_clients(
     assert engine_calls[0]["engine_lock"] is fake_lock
     assert engine_calls[0]["result_sink"] is fake_artifacts.engine_result_sink
     assert engine_calls[0]["engine_client"] is not engine_calls[0]["artifact_client"]
-    assert runtime.worker._service._schedule_synthesis is True  # type: ignore[attr-defined]
+    additional_adapters = engine_calls[0]["additional_adapters"]
+    assert len(additional_adapters) == 1
+    assert additional_adapters[0].descriptor.engine_id == "android_memory"
+    assert runtime.worker._service._trace_service._schedule_synthesis is True  # type: ignore[attr-defined]
+    assert runtime.worker._service._memory_service._timeout_seconds == 900  # type: ignore[attr-defined]
     credential_resolver = engine_calls[0]["credential_resolver"]
     resolved = await credential_resolver(settings.smartperfetto_credential_reference)
     assert resolved.get_secret_value() == marker
 
     await runtime.close()
     assert events == [
+        "android-memory-worker",
         "http-client-2",
         "http-client-1",
         "artifact-runtime",
@@ -282,6 +318,10 @@ async def test_builder_rolls_back_partial_runtime_and_redacts_build_errors(
     settings = SimpleNamespace(
         app_env="production",
         smartperfetto_enabled=True,
+        android_memory_enabled=True,
+        android_memory_backend="oci",
+        android_memory_image_reference="registry.invalid/memory@sha256:" + "d" * 64,
+        android_memory_run_root=tmp_path / "android-memory",
         control_database_url=SecretStr(
             "postgresql+psycopg://control.example/db?sslmode=verify-full"
         ),
@@ -299,7 +339,13 @@ async def test_builder_rolls_back_partial_runtime_and_redacts_build_errors(
 
     fake_engine = FakeControlEngine()
     monkeypatch.setattr(trace_runtime, "get_settings", lambda: settings)
-    monkeypatch.setattr(trace_runtime, "load_engine_lock", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        trace_runtime,
+        "load_engine_lock",
+        lambda *args, **kwargs: SimpleNamespace(
+            android_memory=SimpleNamespace(image_digest="sha256:" + "d" * 64)
+        ),
+    )
     monkeypatch.setattr(trace_runtime, "create_control_engine", lambda _: fake_engine)
     monkeypatch.setattr(
         trace_runtime,
