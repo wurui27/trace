@@ -35,11 +35,16 @@ and `aapt2` from `ANDROID_SDK_ROOT` / `ANDROID_HOME`, the standard Android SDK
 directory on macOS, Windows, or Linux, and then `PATH`. Use absolute
 `PERFPILOT_LOCAL_ADB` and `PERFPILOT_LOCAL_AAPT2` overrides for a custom SDK.
 The local runtime installs the APK, captures startup and scroll Perfetto traces,
-and collects the Android memory evidence archive in the background.
+and collects the Android memory evidence archive in the background. It loads the
+Android Memory engine from `~/Android-App-Memory-Analysis` by default; set
+`PERFPILOT_LOCAL_ANDROID_MEMORY_ROOT` when that checkout lives elsewhere. The
+current checkout commit is pinned for each server process, so pulling an engine
+update only requires restarting the local server.
 
 The optional runtime overrides are `PERFPILOT_LOCAL_SMARTPERFETTO_URL`,
 `PERFPILOT_LOCAL_DATA_DIR`, `PERFPILOT_LOCAL_API_ORIGIN`,
-`PERFPILOT_LOCAL_ADB`, and `PERFPILOT_LOCAL_AAPT2`.
+`PERFPILOT_LOCAL_ADB`, `PERFPILOT_LOCAL_AAPT2`, and
+`PERFPILOT_LOCAL_ANDROID_MEMORY_ROOT`.
 
 ## Local checks
 

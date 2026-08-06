@@ -23,12 +23,15 @@ def test_store_round_trips_analysis_state_and_documents(tmp_path: Path) -> None:
         "state": "analyzing",
     }
     report = {"schema_version": "1.1", "analysis_id": str(ANALYSIS_ID)}
+    memory = {"schema_version": "1.2", "context_type": "android-memory-ai-context"}
 
     store.save_state(ANALYSIS_ID, state)
     store.save_document(ANALYSIS_ID, "report.json", report)
+    store.save_document(ANALYSIS_ID, "android-memory-result.json", memory)
 
     assert store.load_states() == {ANALYSIS_ID: state}
     assert store.load_document(ANALYSIS_ID, "report.json") == report
+    assert store.load_document(ANALYSIS_ID, "android-memory-result.json") == memory
 
 
 def test_store_rejects_symlinked_analysis_directory(tmp_path: Path) -> None:

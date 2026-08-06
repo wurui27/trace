@@ -57,8 +57,17 @@ from perfpilot_api.local_device_capture import (
     LocalDeviceCaptureGateway,
     build_local_device_capture_gateway,
 )
+from perfpilot_api.local_memory_analysis import (
+    LocalMemoryAnalysisError,
+    LocalMemoryAnalysisGateway,
+    build_local_memory_analysis_gateway,
+)
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
-from perfpilot_api.reports.memory_join import join_unavailable_android_memory
+from perfpilot_api.reports.memory_join import (
+    AndroidMemoryNormalizationError,
+    join_android_memory_result,
+    join_unavailable_android_memory,
+)
 from perfpilot_api.reports.normalizer import (
     NormalizedTraceReport,
     SmartPerfettoNormalizationError,
@@ -877,11 +886,54 @@ def _merge_local_smartperfetto_reports(
     )
 
 
+def _canonical_local_memory_result(
+    analysis: _LocalAnalysis,
+    result: EngineResult,
+    *,
+    engine_commit_sha: str,
+) -> LoadedCanonicalResult:
+    execution_id = uuid4()
+    artifact_id = result_artifact_id(execution_id)
+    apk = analysis.inputs["apk"].descriptor
+    canonical = canonicalize_engine_result(
+        EngineResultWrite(
+            team_id=LOCAL_TEAM_ID,
+            analysis_id=analysis.analysis_id,
+            execution_id=execution_id,
+            expected_execution_version=1,
+            tenant_resource_version=1,
+            artifact_id=artifact_id,
+            engine_id="android_memory",
+            adapter_version="1.0.0",
+            engine_commit_sha=engine_commit_sha,
+            engine_image_digest=(
+                "sha256:" + hashlib.sha256(engine_commit_sha.encode()).hexdigest()
+            ),
+            attempt_number=1,
+            input_manifest_hash=hashlib.sha256(apk.sha256_b64.encode()).hexdigest(),
+            config_hash=hashlib.sha256(b"auto\0local-device-memory").hexdigest(),
+            result=result,
+        )
+    )
+    return LoadedCanonicalResult(
+        team_id=LOCAL_TEAM_ID,
+        analysis_id=analysis.analysis_id,
+        execution_id=execution_id,
+        artifact_id=artifact_id,
+        tenant_resource_version=1,
+        sha256_b64=canonical.checksum_sha256_b64,
+        document=canonical.document,
+        canonical_bytes=canonical.canonical_bytes,
+    )
+
+
 def _prepare_local_report(
     analysis: _LocalAnalysis,
     result: EngineResult,
     *,
     scroll_result: EngineResult | None = None,
+    memory_result: EngineResult | None = None,
+    memory_engine_commit_sha: str | None = None,
 ) -> _PreparedLocalReport:
     primary = _normalize_local_smartperfetto_result(
         analysis,
@@ -899,10 +951,26 @@ def _prepare_local_report(
             normalized = _merge_local_smartperfetto_reports(normalized, scroll.report)
         else:
             normalized = _merge_local_smartperfetto_reports(normalized, normalized)
-        normalized = join_unavailable_android_memory(
-            normalized,
-            reason="result_unavailable",
-        )
+        if memory_result is not None and memory_engine_commit_sha is not None:
+            try:
+                normalized = join_android_memory_result(
+                    normalized,
+                    _canonical_local_memory_result(
+                        analysis,
+                        memory_result,
+                        engine_commit_sha=memory_engine_commit_sha,
+                    ),
+                )
+            except AndroidMemoryNormalizationError:
+                normalized = join_unavailable_android_memory(
+                    normalized,
+                    reason="result_invalid",
+                )
+        else:
+            normalized = join_unavailable_android_memory(
+                normalized,
+                reason="result_unavailable",
+            )
     normalized_provenance = normalized.document.get("provenance")
     if not isinstance(normalized_provenance, Mapping) or not isinstance(
         normalized_provenance.get("normalizer_version"), str
@@ -1040,6 +1108,7 @@ class _LocalRuntime:
         synthesizer: LocalMultiRoundSynthesizer | None,
         device_probe: LocalDeviceProbe,
         device_capture_gateway: LocalDeviceCaptureGateway | None,
+        memory_analysis_gateway: LocalMemoryAnalysisGateway | None,
         data_root: Path,
         public_origin: str,
         poll_interval_seconds: float,
@@ -1050,6 +1119,7 @@ class _LocalRuntime:
         self.synthesizer = synthesizer
         self.device_probe = device_probe
         self.device_capture_gateway = device_capture_gateway
+        self.memory_analysis_gateway = memory_analysis_gateway
         self.data_root = data_root.resolve()
         self.store = LocalAnalysisStore(self.data_root)
         self.public_origin = _public_origin(public_origin)
@@ -1319,6 +1389,8 @@ class _LocalRuntime:
         await self.gateway.aclose()
         if self.synthesizer is not None:
             await self.synthesizer.aclose()
+        if self.memory_analysis_gateway is not None:
+            await self.memory_analysis_gateway.aclose()
 
     async def create(self, request: _CreateAnalysisRequest) -> _LocalAnalysis:
         if isinstance(request, _CreateDeviceAnalysisRequest):
@@ -1676,7 +1748,11 @@ class _LocalRuntime:
             await self._execute_run(analysis, run)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            _LOGGER.exception(
+                "Local analysis execution failed type=%s",
+                type(error).__name__,
+            )
             await self._fail_analysis(analysis)
 
     async def _execute_device(self, analysis: _LocalAnalysis) -> None:
@@ -1701,6 +1777,28 @@ class _LocalRuntime:
             workspace=workspace,
         )
         metadata = capture.metadata
+        memory_task: asyncio.Task[EngineResult | None] | None = None
+        if self.memory_analysis_gateway is not None:
+
+            async def analyze_memory() -> EngineResult | None:
+                try:
+                    return await self.memory_analysis_gateway.analyze(
+                        analysis_id=analysis.analysis_id,
+                        evidence_path=capture.memory_evidence,
+                        package_name=metadata.package_name,
+                        android_release=detected.device.android_version or None,
+                        api_level=detected.device.api_level,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    _LOGGER.warning(
+                        "Local Android memory analysis unavailable type=%s",
+                        type(error).__name__,
+                    )
+                    return None
+
+            memory_task = asyncio.create_task(analyze_memory())
         async with self.lock:
             if analysis.cancel_requested_at is not None:
                 raise asyncio.CancelledError
@@ -1724,26 +1822,45 @@ class _LocalRuntime:
             analysis.version += 1
         await self._persist(analysis)
 
-        startup_run = await self.gateway.submit(
-            trace_path=capture.startup_trace,
-            profile="startup",
-            question=None,
-        )
-        await self._register_source_run(analysis, startup_run)
-        startup_result = await self._wait_engine_result(analysis, startup_run)
+        try:
+            startup_run = await self.gateway.submit(
+                trace_path=capture.startup_trace,
+                profile="startup",
+                question=None,
+            )
+            await self._register_source_run(analysis, startup_run)
+            startup_result = await self._wait_engine_result(analysis, startup_run)
 
-        scroll_run = await self.gateway.submit(
-            trace_path=capture.scroll_trace,
-            profile="scroll",
-            question=None,
-        )
-        await self._register_source_run(analysis, scroll_run)
-        scroll_result = await self._wait_engine_result(analysis, scroll_run)
+            scroll_run = await self.gateway.submit(
+                trace_path=capture.scroll_trace,
+                profile="scroll",
+                question=None,
+            )
+            await self._register_source_run(analysis, scroll_run)
+            scroll_result = await self._wait_engine_result(analysis, scroll_run)
+            memory_result = await memory_task if memory_task is not None else None
+        finally:
+            if memory_task is not None and not memory_task.done():
+                memory_task.cancel()
+                await asyncio.gather(memory_task, return_exceptions=True)
         await self._mark_smartperfetto_completed(analysis)
+        if memory_result is not None:
+            await asyncio.to_thread(
+                self.store.save_document,
+                analysis.analysis_id,
+                "android-memory-result.json",
+                memory_result.payload,
+            )
         prepared = _prepare_local_report(
             analysis,
             startup_result,
             scroll_result=scroll_result,
+            memory_result=memory_result,
+            memory_engine_commit_sha=(
+                self.memory_analysis_gateway.engine_commit_sha
+                if self.memory_analysis_gateway is not None
+                else None
+            ),
         )
         await self._publish_prepared(analysis, prepared)
 
@@ -1799,7 +1916,11 @@ class _LocalRuntime:
             await self._publish_prepared(analysis, prepared)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as error:
+            _LOGGER.exception(
+                "Local report execution failed type=%s",
+                type(error).__name__,
+            )
             await self._fail_analysis(analysis)
 
     async def _publish_prepared(
@@ -2106,6 +2227,7 @@ def create_local_app(
     synthesizer: LocalMultiRoundSynthesizer | None = None,
     device_probe: LocalDeviceProbe | None = None,
     device_capture_gateway: LocalDeviceCaptureGateway | None = None,
+    memory_analysis_gateway: LocalMemoryAnalysisGateway | None = None,
     data_root: Path | None = None,
     public_origin: str | None = None,
     poll_interval_seconds: float = 2.0,
@@ -2115,19 +2237,30 @@ def create_local_app(
     )
     resolved_synthesizer = synthesizer or build_local_multiround_synthesizer()
     resolved_device_probe = device_probe or AdbDeviceProbe()
+    resolved_data_root = data_root or Path(
+        os.getenv("PERFPILOT_LOCAL_DATA_DIR", ".perfpilot/local-runtime")
+    )
     resolved_device_capture_gateway = device_capture_gateway
     if resolved_device_capture_gateway is None:
         try:
             resolved_device_capture_gateway = build_local_device_capture_gateway()
         except LocalDeviceCaptureError as error:
             _LOGGER.warning("Local Android toolchain unavailable code=%s", error.code)
+    resolved_memory_analysis_gateway = memory_analysis_gateway
+    if resolved_memory_analysis_gateway is None:
+        try:
+            resolved_memory_analysis_gateway = build_local_memory_analysis_gateway(
+                data_root=resolved_data_root,
+            )
+        except LocalMemoryAnalysisError as error:
+            _LOGGER.warning("Local Android Memory unavailable code=%s", error.code)
     runtime = _LocalRuntime(
         gateway=resolved_gateway,
         synthesizer=resolved_synthesizer,
         device_probe=resolved_device_probe,
         device_capture_gateway=resolved_device_capture_gateway,
-        data_root=data_root
-        or Path(os.getenv("PERFPILOT_LOCAL_DATA_DIR", ".perfpilot/local-runtime")),
+        memory_analysis_gateway=resolved_memory_analysis_gateway,
+        data_root=resolved_data_root,
         public_origin=public_origin
         or os.getenv("PERFPILOT_LOCAL_API_ORIGIN", "http://localhost:8000"),
         poll_interval_seconds=poll_interval_seconds,

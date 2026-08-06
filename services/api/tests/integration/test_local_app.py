@@ -120,6 +120,22 @@ class _FakeLocalDeviceCaptureGateway:
         )
 
 
+class _FakeLocalMemoryAnalysisGateway:
+    engine_commit_sha = "d5514972ced78c3faa7fc17589c1ea9231645056"
+
+    def __init__(self, result: EngineResult) -> None:
+        self.result = result
+        self.calls: list[dict[str, object]] = []
+        self.close_calls = 0
+
+    async def analyze(self, **kwargs: object) -> EngineResult:
+        self.calls.append(kwargs)
+        return self.result
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+
+
 class _ProjectionRoundProvider:
     provider_name = "test-provider"
     model = "test-model"
@@ -293,6 +309,68 @@ def _live_smartperfetto_result() -> EngineResult:
                 },
                 "identityResolutions": [],
             },
+        },
+    )
+
+
+def _android_memory_result() -> EngineResult:
+    return EngineResult(
+        contract="android-memory-ai-context-1.2",
+        state="completed",
+        payload={
+            "context_type": "android-memory-ai-context",
+            "schema_version": "1.2",
+            "generator": {"name": "android-memory-ai", "version": "1.2.0"},
+            "request": {
+                "intent": "quick-triage",
+                "evaluated_intents": ["quick-triage"],
+            },
+            "evidence": {
+                "coverage": {
+                    "level": "strong",
+                    "available": ["meminfo"],
+                    "missing_required": [],
+                    "missing_supporting": [],
+                    "missing_any_of": [],
+                    "inadequate": [],
+                },
+                "accounting_ledger": {
+                    "schema_version": "1.0",
+                    "status": "available",
+                    "rows": [
+                        {
+                            "name": "TOTAL",
+                            "meminfo": {
+                                "pss_total_kb": 123456,
+                                "private_dirty_kb": 45678,
+                                "private_clean_kb": 987,
+                                "swap_pss_kb": 321,
+                                "rss_total_kb": 150000,
+                            },
+                        },
+                        {
+                            "name": "Native Heap",
+                            "meminfo": {
+                                "pss_total_kb": 32000,
+                                "private_dirty_kb": 30000,
+                                "private_clean_kb": 0,
+                                "swap_pss_kb": 12,
+                                "rss_total_kb": 34000,
+                            },
+                        },
+                    ],
+                },
+            },
+            "analysis_contract": {
+                "support_level": "strong",
+                "primary_intent_support_level": "strong",
+                "privacy": {
+                    "raw_contents_embedded": False,
+                    "local_paths_included": False,
+                },
+            },
+            "next_evidence": [],
+            "limitations": [],
         },
     )
 
@@ -578,6 +656,7 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
         )
     )
     capture_gateway = _FakeLocalDeviceCaptureGateway()
+    memory_gateway = _FakeLocalMemoryAnalysisGateway(_android_memory_result())
     smartperfetto = _FakeSmartPerfettoGateway(_live_smartperfetto_result())
     apk = b"installable-local-device-apk"
     checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
@@ -586,6 +665,7 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
         synthesizer=_test_synthesizer(),
         device_probe=device_probe,
         device_capture_gateway=capture_gateway,
+        memory_analysis_gateway=memory_gateway,
         data_root=tmp_path,
         public_origin="http://localhost:8000",
         poll_interval_seconds=0.001,
@@ -669,6 +749,15 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
         (b"captured-startup-trace", "startup", None),
         (b"captured-scroll-trace", "scroll", None),
     ]
+    assert len(memory_gateway.calls) == 1
+    assert memory_gateway.calls[0]["analysis_id"] == UUID(analysis_id)
+    assert memory_gateway.calls[0]["package_name"] == "com.example.perfpilot"
+    assert memory_gateway.calls[0]["android_release"] == "13"
+    assert memory_gateway.calls[0]["api_level"] == 33
+    evidence_path = memory_gateway.calls[0]["evidence_path"]
+    assert isinstance(evidence_path, Path)
+    assert evidence_path.name == "memory-evidence.tar"
+    assert memory_gateway.close_calls == 1
     assert report_response.status_code == 200
     report = validate_contract("analysis-report", report_response.json())
     assert report["analysis_mode"] == "device"
@@ -678,8 +767,15 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
         "memory_cycle",
     ]
     memory = report["scenario_reports"][2]
-    assert memory["result_state"] == "failed"
-    assert memory["failure"]["code"] == "insufficient_data"
+    assert memory["result_state"] == "completed"
+    assert memory["failure"] is None
+    assert memory["bundle"]["metrics"]
+    metric_values = {
+        metric["name"]: metric["numeric_value"]
+        for metric in memory["bundle"]["metrics"]
+    }
+    assert metric_values["memory.meminfo.total.pss_kb"] == 123456
+    assert metric_values["memory.meminfo.native_heap.private_dirty_kb"] == 30000
     assert serial not in json.dumps(report)
 
 
