@@ -96,9 +96,11 @@ sync_engine() {
       printf '内核目录存在未提交修改：%s\n' "$destination" >&2
       exit 1
     fi
-    git -C "$destination" fetch --quiet origin "$commit"
   else
     git clone --quiet "$url" "$destination"
+  fi
+  if ! git -C "$destination" cat-file -e "$commit^{commit}" 2>/dev/null; then
+    git -C "$destination" fetch --quiet origin "$commit"
   fi
   git -C "$destination" checkout --quiet --detach "$commit"
   if [[ "$(git -C "$destination" rev-parse HEAD)" != "$commit" ]]; then
