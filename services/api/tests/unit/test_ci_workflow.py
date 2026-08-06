@@ -10,6 +10,7 @@ import yaml
 
 REPOSITORY_ROOT = Path(__file__).resolve().parents[4]
 WORKFLOW_PATH = REPOSITORY_ROOT / ".github" / "workflows" / "ci.yml"
+PACKAGE_WORKFLOW_PATH = WORKFLOW_PATH.with_name("device-agent-packages.yml")
 
 CHECKOUT_ACTION = "actions/checkout@11d5960a326750d5838078e36cf38b85af677262"
 SETUP_PYTHON_ACTION = "actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065"
@@ -91,7 +92,7 @@ def _assert_checkout_policy(workflow: dict[str, object]) -> None:
 
 
 def _assert_workflow_paths(workflow_paths: list[Path]) -> None:
-    assert workflow_paths == [WORKFLOW_PATH]
+    assert workflow_paths == [WORKFLOW_PATH, PACKAGE_WORKFLOW_PATH]
 
 
 @pytest.fixture(scope="module")
@@ -145,7 +146,7 @@ def test_actual_workflow_satisfies_checkout_policy(workflow: dict[str, object]) 
     _assert_checkout_policy(workflow)
 
 
-def test_workflow_directory_contains_only_ci_workflow() -> None:
+def test_workflow_directory_contains_only_approved_workflows() -> None:
     workflow_paths = sorted(
         path
         for path in WORKFLOW_PATH.parent.iterdir()
@@ -263,8 +264,12 @@ def test_checkout_policy_rejects_platform_override(
         _assert_checkout_policy(weakened)
 
 
-def test_policy_rejects_a_second_workflow_file() -> None:
-    workflow_paths = [WORKFLOW_PATH, WORKFLOW_PATH.with_name("release.yml")]
+def test_policy_rejects_an_unapproved_workflow_file() -> None:
+    workflow_paths = [
+        WORKFLOW_PATH,
+        PACKAGE_WORKFLOW_PATH,
+        WORKFLOW_PATH.with_name("release.yml"),
+    ]
 
     with pytest.raises(AssertionError):
         _assert_workflow_paths(workflow_paths)
@@ -328,7 +333,11 @@ def test_python_quality_runs_locked_ruff_checks(workflow: dict[str, object]) -> 
     assert _action_step(quality, SETUP_UV_ACTION)["with"] == {"version": "0.11.32"}
     assert _run_steps(quality) == [
         "uv sync --locked --all-packages",
-        "uv run --locked --package perfpilot-api ruff check services/api/src services/api/tests",
+        (
+            "uv run --locked --package perfpilot-api ruff check "
+            "services/api/src services/api/tests "
+            "agents/device-agent/src agents/device-agent/tests"
+        ),
     ]
 
 
@@ -397,6 +406,10 @@ def test_python_tests_checkout_upstream_and_require_all_services(
         (
             "uv run --locked --package perfpilot-api pytest -p no:cacheprovider "
             "services/api/tests -q"
+        ),
+        (
+            "uv run --locked --package perfpilot-device-agent pytest -p no:cacheprovider "
+            "agents/device-agent/tests -q"
         ),
     ]
 
