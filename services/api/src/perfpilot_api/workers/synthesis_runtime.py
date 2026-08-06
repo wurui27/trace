@@ -42,6 +42,7 @@ from perfpilot_api.reports.writer import AnalysisReportWriter
 from perfpilot_api.workers.synthesis_orchestrator import (
     SQLAlchemyAutomaticSynthesisRequestFactory,
     SQLAlchemySynthesisAnalysisContextRepository,
+    SQLAlchemySynthesisMemorySourceRepository,
     SQLAlchemySynthesisParentProjector,
     SQLAlchemySynthesisWorkQueue,
     SynthesisCoordinator,
@@ -296,6 +297,9 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
             ),
             analysis_contexts=SQLAlchemySynthesisAnalysisContextRepository(
                 tenant_router=artifacts.tenant_router
+            ),
+            memory_sources=SQLAlchemySynthesisMemorySourceRepository(
+                session_factory=control_sessions
             ),
             parent_projector=SQLAlchemySynthesisParentProjector(
                 control_session_factory=control_sessions,

@@ -44,6 +44,7 @@ from perfpilot_api.services.synthesis_executions import (
 )
 from perfpilot_api.workers.synthesis_orchestrator import (
     SQLAlchemySynthesisAnalysisContextRepository,
+    SQLAlchemySynthesisMemorySourceRepository,
     SQLAlchemySynthesisParentProjector,
     SQLAlchemySynthesisWorkQueue,
     SynthesisCoordinator,
@@ -745,6 +746,64 @@ async def test_device_coordinator_waits_for_android_memory_terminal_state(
     assert record is not None
     assert record.analysis_id == DEVICE_ANALYSIS_ID
     assert record.source_execution_id == source_id
+
+
+@pytest.mark.asyncio
+async def test_memory_source_repository_returns_latest_fenced_execution(
+    database: ExecutionDatabase,
+) -> None:
+    _source_id, _event_id, first_memory_id = await _seed_device_source_event(
+        database,
+        memory_execution_state="completed",
+    )
+    repository = SQLAlchemySynthesisMemorySourceRepository(
+        session_factory=database.sessions
+    )
+
+    first = await repository.load(
+        team_id=TEAM_ID,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        tenant_resource_version=7,
+    )
+
+    assert first.scenario_state == "analyzing"
+    assert first.execution is not None
+    assert first.execution.id == first_memory_id
+    assert first.execution.state == "completed"
+
+    latest_id = uuid4()
+    async with database.sessions.begin() as session:
+        session.add(
+            EngineExecution(
+                id=latest_id,
+                team_id=TEAM_ID,
+                analysis_id=DEVICE_ANALYSIS_ID,
+                engine_id="android_memory",
+                attempt_number=2,
+                tenant_resource_version=7,
+                adapter_version="1.0.0",
+                engine_commit_sha="3" * 40,
+                engine_image_digest="sha256:" + "4" * 64,
+                input_manifest_hash="5" * 64,
+                config_hash="6" * 64,
+                state="failed",
+                stable_error_code="memory_engine_failed",
+                started_at=NOW,
+                completed_at=NOW,
+                version=4,
+            )
+        )
+
+    latest = await repository.load(
+        team_id=TEAM_ID,
+        analysis_id=DEVICE_ANALYSIS_ID,
+        tenant_resource_version=7,
+    )
+
+    assert latest.execution is not None
+    assert latest.execution.id == latest_id
+    assert latest.execution.attempt_number == 2
+    assert latest.execution.state == "failed"
 
 
 @pytest.mark.parametrize(

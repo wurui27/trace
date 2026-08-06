@@ -66,6 +66,7 @@ from perfpilot_api.services.uploads import (
 from perfpilot_api.workers.synthesis_orchestrator import (
     SQLAlchemyAutomaticSynthesisRequestFactory,
     SQLAlchemySynthesisAnalysisContextRepository,
+    SQLAlchemySynthesisMemorySourceRepository,
     SQLAlchemySynthesisParentProjector,
     SQLAlchemySynthesisWorkQueue,
     SynthesisCoordinator,
@@ -627,6 +628,9 @@ async def test_trace_result_reaches_private_ai_and_public_report(
         ),
         analysis_contexts=SQLAlchemySynthesisAnalysisContextRepository(
             tenant_router=databases.tenant_router  # type: ignore[arg-type]
+        ),
+        memory_sources=SQLAlchemySynthesisMemorySourceRepository(
+            session_factory=databases.control_sessions
         ),
         parent_projector=SQLAlchemySynthesisParentProjector(
             control_session_factory=databases.control_sessions,

@@ -342,6 +342,7 @@ async def test_production_builder_wires_automatic_synthesis_coordinator(
         "SQLAlchemySynthesisExecutionRepository",
         "AnalysisReportWriter",
         "SQLAlchemySynthesisAnalysisContextRepository",
+        "SQLAlchemySynthesisMemorySourceRepository",
         "SQLAlchemySynthesisParentProjector",
         "SQLAlchemySynthesisWorkQueue",
     ):
@@ -371,3 +372,4 @@ async def test_production_builder_wires_automatic_synthesis_coordinator(
     assert captured["worker"]["coordinator"] == "automatic-coordinator"  # type: ignore[index]
     assert captured["coordinator"]["session_factory"] is sessions  # type: ignore[index]
     assert captured["pipeline"]["max_projection_bytes"] == 2048  # type: ignore[index]
+    assert captured["pipeline"]["memory_sources"].session_factory is sessions  # type: ignore[index,union-attr]

@@ -30,8 +30,13 @@ from perfpilot_api.services.synthesis_executions import (
     SynthesisExecutionRecord,
     SynthesisSourceRecord,
 )
+from perfpilot_api.services.canonical_result_reader import (
+    CanonicalResultIntegrityError,
+    CanonicalResultUnavailableError,
+)
 from perfpilot_api.workers.synthesis_orchestrator import (
     SynthesisAnalysisContext,
+    SynthesisMemorySourceContext,
     SynthesisPipeline,
     SynthesisWorkClaim,
 )
@@ -244,7 +249,16 @@ class FakeRepository:
 
 
 class FakeCanonicalReader:
+    def __init__(self, *, memory_result: object | None = None) -> None:
+        self.memory_result = memory_result
+        self.calls: list[object] = []
+
     async def read(self, _source: object):
+        self.calls.append(_source)
+        if getattr(_source, "engine_id", None) == "android_memory":
+            if isinstance(self.memory_result, Exception):
+                raise self.memory_result
+            return self.memory_result
         return SimpleNamespace(
             artifact_id=CANONICAL_ID,
             sha256_b64=CHECKSUM,
@@ -308,6 +322,16 @@ class FakeContexts:
         )  # type: ignore[return-value]
 
 
+class FakeMemorySources:
+    def __init__(self, context: SynthesisMemorySourceContext) -> None:
+        self.context = context
+        self.calls: list[dict[str, object]] = []
+
+    async def load(self, **kwargs: object) -> SynthesisMemorySourceContext:
+        self.calls.append(kwargs)
+        return self.context
+
+
 class FakeProjector:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -340,17 +364,32 @@ def _pipeline(
     projection_builder=None,
     max_projection_bytes: int = 256 * 1024,
     analysis_mode: str = "trace_upload",
+    memory_context: SynthesisMemorySourceContext | None = None,
+    canonical_reader: FakeCanonicalReader | None = None,
+    memory_result_joiner=None,
+    memory_unavailable_joiner=None,
 ) -> SynthesisPipeline:
     kwargs = {}
     if projection_builder is not None:
         kwargs["projection_builder"] = projection_builder
+    if memory_result_joiner is not None:
+        kwargs["memory_result_joiner"] = memory_result_joiner
+    if memory_unavailable_joiner is not None:
+        kwargs["memory_unavailable_joiner"] = memory_unavailable_joiner
     return SynthesisPipeline(
         repository=repository,  # type: ignore[arg-type]
-        canonical_reader=FakeCanonicalReader(),
+        canonical_reader=canonical_reader or FakeCanonicalReader(),
         artifact_store=artifacts,
         provider=provider,
         report_writer=writer,  # type: ignore[arg-type]
         analysis_contexts=FakeContexts(analysis_mode),
+        memory_sources=FakeMemorySources(
+            memory_context
+            or SynthesisMemorySourceContext(
+                scenario_state="failed",
+                execution=None,
+            )
+        ),
         parent_projector=projector,
         clock=lambda: NOW,
         checkpoint=checkpoint,
@@ -377,6 +416,128 @@ async def test_device_pipeline_passes_authoritative_mode_to_final_report() -> No
 
     assert result.state == "succeeded"
     assert writer.requests[-1].core_document["analysis_mode"] == "device"
+    assert {
+        item["scenario_type"]
+        for item in writer.requests[-1].core_document["scenario_reports"]
+    } == {"startup", "memory_cycle"}
+
+
+@pytest.mark.asyncio
+async def test_device_pipeline_reads_and_joins_terminal_android_memory_result() -> None:
+    memory_execution = SynthesisSourceRecord(
+        id=UUID("86000000-0000-4000-8000-000000000001"),
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        engine_id="android_memory",
+        attempt_number=2,
+        tenant_resource_version=7,
+        adapter_version="1.0.0",
+        engine_commit_sha="2" * 40,
+        engine_image_digest="sha256:" + "3" * 64,
+        state="completed",
+        raw_result_artifact_id=UUID("87000000-0000-4000-8000-000000000001"),
+        normalized_report_version_id=None,
+        version=3,
+    )
+    memory_result = object()
+    reader = FakeCanonicalReader(memory_result=memory_result)
+    joined: list[object] = []
+
+    def joiner(core: NormalizedTraceReport, loaded: object) -> NormalizedTraceReport:
+        from perfpilot_api.reports.memory_join import join_unavailable_android_memory
+
+        joined.append(loaded)
+        return join_unavailable_android_memory(core, reason="result_unavailable")
+
+    pipeline = _pipeline(
+        FakeRepository(),
+        FakeProvider(),
+        FakeArtifactStore(),
+        FakeWriter(),
+        FakeProjector(),
+        analysis_mode="device",
+        memory_context=SynthesisMemorySourceContext(
+            scenario_state="completed",
+            execution=memory_execution,
+        ),
+        canonical_reader=reader,
+        memory_result_joiner=joiner,
+    )
+
+    assert (await pipeline.advance(_claim())).state == "running"
+    assert joined == [memory_result]
+    assert [getattr(item, "engine_id", None) for item in reader.calls] == [
+        "smartperfetto",
+        "android_memory",
+    ]
+
+
+def _memory_execution() -> SynthesisSourceRecord:
+    return SynthesisSourceRecord(
+        id=UUID("86000000-0000-4000-8000-000000000001"),
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        engine_id="android_memory",
+        attempt_number=2,
+        tenant_resource_version=7,
+        adapter_version="1.0.0",
+        engine_commit_sha="2" * 40,
+        engine_image_digest="sha256:" + "3" * 64,
+        state="completed",
+        raw_result_artifact_id=UUID("87000000-0000-4000-8000-000000000001"),
+        normalized_report_version_id=None,
+        version=3,
+    )
+
+
+@pytest.mark.asyncio
+async def test_invalid_memory_result_degrades_without_failing_smartperfetto_report() -> None:
+    writer = FakeWriter()
+    pipeline = _pipeline(
+        FakeRepository(),
+        FakeProvider(),
+        FakeArtifactStore(),
+        writer,
+        FakeProjector(),
+        analysis_mode="device",
+        memory_context=SynthesisMemorySourceContext(
+            scenario_state="completed",
+            execution=_memory_execution(),
+        ),
+        canonical_reader=FakeCanonicalReader(
+            memory_result=CanonicalResultIntegrityError()
+        ),
+    )
+
+    assert (await _finish(pipeline)).state == "succeeded"
+    assert any(
+        item["code"] == "android_memory.result_invalid"
+        for item in writer.requests[-1].core_document["limitations"]
+    )
+
+
+@pytest.mark.asyncio
+async def test_temporarily_unavailable_memory_result_retries_before_projection() -> None:
+    pipeline = _pipeline(
+        FakeRepository(),
+        FakeProvider(),
+        FakeArtifactStore(),
+        FakeWriter(),
+        FakeProjector(),
+        analysis_mode="device",
+        memory_context=SynthesisMemorySourceContext(
+            scenario_state="completed",
+            execution=_memory_execution(),
+        ),
+        canonical_reader=FakeCanonicalReader(
+            memory_result=CanonicalResultUnavailableError()
+        ),
+    )
+
+    result = await pipeline.advance(_claim())
+
+    assert result.state == "pending"
+    assert result.retry_after_seconds == 5
 
 
 async def _finish(pipeline: SynthesisPipeline, *, limit: int = 10):

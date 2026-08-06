@@ -40,6 +40,12 @@ from perfpilot_api.domain.transitions import (
     transition,
 )
 from perfpilot_api.reports.contracts import validate_contract
+from perfpilot_api.reports.memory_join import (
+    AndroidMemoryNormalizationError,
+    MemoryUnavailableReason,
+    join_android_memory_result,
+    join_unavailable_android_memory,
+)
 from perfpilot_api.reports.normalizer import (
     NormalizedTraceReport,
     SmartPerfettoNormalizationError,
@@ -78,6 +84,7 @@ from perfpilot_api.services.synthesis_executions import (
     SynthesisLeaseLostError,
     SynthesisMutationFence,
     SynthesisRequest,
+    SynthesisSourceRecord,
 )
 
 
@@ -551,6 +558,101 @@ class SQLAlchemySynthesisAnalysisContextRepository:
             )
 
 
+@dataclass(frozen=True, slots=True)
+class SynthesisMemorySourceContext:
+    scenario_state: Literal[
+        "queued",
+        "scheduled",
+        "running",
+        "analyzing",
+        "completed",
+        "failed",
+        "canceled",
+    ]
+    execution: SynthesisSourceRecord | None
+
+
+class SQLAlchemySynthesisMemorySourceRepository:
+    """Resolve the latest Android Memory execution from control authority."""
+
+    def __init__(self, *, session_factory: async_sessionmaker[AsyncSession]) -> None:
+        self._sessions = session_factory
+
+    async def load(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        tenant_resource_version: int,
+    ) -> SynthesisMemorySourceContext:
+        async with self._sessions() as session:
+            job = await session.scalar(
+                select(GlobalJob).where(
+                    GlobalJob.id == analysis_id,
+                    GlobalJob.team_id == team_id,
+                    GlobalJob.analysis_mode == "device",
+                )
+            )
+            scenario = await session.scalar(
+                select(ScenarioJob).where(
+                    ScenarioJob.analysis_id == analysis_id,
+                    ScenarioJob.scenario_type == "memory_cycle",
+                )
+            )
+            execution = await session.scalar(
+                select(EngineExecution)
+                .where(
+                    EngineExecution.team_id == team_id,
+                    EngineExecution.analysis_id == analysis_id,
+                    EngineExecution.engine_id == "android_memory",
+                )
+                .order_by(EngineExecution.attempt_number.desc())
+                .limit(1)
+            )
+            if (
+                job is None
+                or scenario is None
+                or scenario.state
+                not in {
+                    "queued",
+                    "scheduled",
+                    "running",
+                    "analyzing",
+                    "completed",
+                    "failed",
+                    "canceled",
+                }
+                or type(tenant_resource_version) is not int
+                or tenant_resource_version < 1
+                or execution is not None
+                and execution.tenant_resource_version != tenant_resource_version
+            ):
+                raise SynthesisArtifactConflictError
+            record = (
+                None
+                if execution is None
+                else SynthesisSourceRecord(
+                    id=execution.id,
+                    team_id=execution.team_id,
+                    analysis_id=execution.analysis_id,
+                    engine_id=execution.engine_id,
+                    attempt_number=execution.attempt_number,
+                    tenant_resource_version=execution.tenant_resource_version,
+                    adapter_version=execution.adapter_version,
+                    engine_commit_sha=execution.engine_commit_sha,
+                    engine_image_digest=execution.engine_image_digest,
+                    state=execution.state,
+                    raw_result_artifact_id=execution.raw_result_artifact_id,
+                    normalized_report_version_id=execution.normalized_report_version_id,
+                    version=execution.version,
+                )
+            )
+            return SynthesisMemorySourceContext(
+                scenario_state=scenario.state,  # type: ignore[arg-type]
+                execution=record,
+            )
+
+
 class SQLAlchemySynthesisParentProjector:
     """Project a published report to tenant and control parents with remediation fencing."""
 
@@ -857,6 +959,10 @@ class _AnalysisContexts(Protocol):
     async def load(self, **kwargs: object) -> SynthesisAnalysisContext: ...
 
 
+class _MemorySources(Protocol):
+    async def load(self, **kwargs: object) -> SynthesisMemorySourceContext: ...
+
+
 class _ParentProjector(Protocol):
     async def project(self, **kwargs: object) -> str: ...
 
@@ -876,10 +982,17 @@ class SynthesisPipeline:
         provider: _Provider,
         report_writer: AnalysisReportWriter,
         analysis_contexts: _AnalysisContexts,
+        memory_sources: _MemorySources,
         parent_projector: _ParentProjector,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         checkpoint: Checkpoint | None = None,
         normalizer: Callable[..., NormalizedTraceReport] = normalize_smartperfetto_result,
+        memory_result_joiner: Callable[
+            [NormalizedTraceReport, object], NormalizedTraceReport
+        ] = join_android_memory_result,
+        memory_unavailable_joiner: Callable[..., NormalizedTraceReport] = (
+            join_unavailable_android_memory
+        ),
         projection_builder: Callable[..., AIProjection] = build_ai_projection,
         max_projection_bytes: int = 256 * 1024,
     ) -> None:
@@ -894,10 +1007,13 @@ class SynthesisPipeline:
         self._provider = provider
         self._report_writer = report_writer
         self._analysis_contexts = analysis_contexts
+        self._memory_sources = memory_sources
         self._parent_projector = parent_projector
         self._clock = clock
         self._checkpoint_callback = checkpoint
         self._normalizer = normalizer
+        self._memory_result_joiner = memory_result_joiner
+        self._memory_unavailable_joiner = memory_unavailable_joiner
         self._projection_builder = projection_builder
         self._max_projection_bytes = max_projection_bytes
 
@@ -925,7 +1041,51 @@ class SynthesisPipeline:
     ) -> tuple[object, NormalizedTraceReport]:
         loaded = await self._canonical_reader.read(source)
         await self._checkpoint("canonical_read")
-        return loaded, self._normalizer(loaded, analysis_mode=analysis_mode)
+        core = self._normalizer(loaded, analysis_mode=analysis_mode)
+        if analysis_mode == "device":
+            core = await self._join_device_memory(source=source, core=core)
+        return loaded, core
+
+    async def _join_device_memory(
+        self,
+        *,
+        source: object,
+        core: NormalizedTraceReport,
+    ) -> NormalizedTraceReport:
+        memory = await self._memory_sources.load(
+            team_id=getattr(source, "team_id", None),
+            analysis_id=getattr(source, "analysis_id", None),
+            tenant_resource_version=getattr(source, "tenant_resource_version", None),
+        )
+        execution = memory.execution
+        if execution is None:
+            if memory.scenario_state in _MEMORY_SCENARIO_ACTIVE_STATES:
+                raise CanonicalResultUnavailableError
+            reason: MemoryUnavailableReason = (
+                "execution_canceled"
+                if memory.scenario_state == "canceled"
+                else "execution_failed"
+                if memory.scenario_state == "failed"
+                else "result_unavailable"
+            )
+            return self._memory_unavailable_joiner(core, reason=reason)
+        if execution.state in {"completed", "insufficient_data"}:
+            try:
+                loaded = await self._canonical_reader.read(execution)
+                await self._checkpoint("memory_canonical_read")
+                return self._memory_result_joiner(core, loaded)
+            except CanonicalResultUnavailableError:
+                raise
+            except (CanonicalResultIntegrityError, AndroidMemoryNormalizationError):
+                return self._memory_unavailable_joiner(core, reason="result_invalid")
+        if execution.state in {"failed", "canceled"}:
+            reason = (
+                "execution_canceled"
+                if execution.state == "canceled"
+                else "execution_failed"
+            )
+            return self._memory_unavailable_joiner(core, reason=reason)
+        raise CanonicalResultUnavailableError
 
     async def _projection(
         self,
@@ -977,6 +1137,7 @@ class SynthesisPipeline:
             return SynthesisStepResult("pending", 5)
         except (
             CanonicalResultIntegrityError,
+            AndroidMemoryNormalizationError,
             SmartPerfettoNormalizationError,
             SynthesisArtifactConflictError,
             ReportIntegrityError,
@@ -1391,9 +1552,11 @@ class SynthesisOrchestrationWorker:
 __all__ = [
     "SQLAlchemyAutomaticSynthesisRequestFactory",
     "SQLAlchemySynthesisAnalysisContextRepository",
+    "SQLAlchemySynthesisMemorySourceRepository",
     "SQLAlchemySynthesisParentProjector",
     "SQLAlchemySynthesisWorkQueue",
     "SynthesisAnalysisContext",
+    "SynthesisMemorySourceContext",
     "SynthesisClaimLostError",
     "SynthesisCoordinator",
     "SynthesisOrchestrationWorker",
