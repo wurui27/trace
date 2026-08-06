@@ -10,11 +10,12 @@ import hmac
 import os
 import re
 import stat
+import tarfile
 import tempfile
 import threading
 from collections.abc import Iterable
 from dataclasses import dataclass, field
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import TracebackType
 from typing import BinaryIO, Final
 
@@ -37,6 +38,7 @@ _ACTIVE_OWNERS: Final[dict[tuple[int, int, str], object]] = {}
 
 _ROLE_LAYOUT: Final[dict[str, tuple[str, str]]] = {
     "auto": ("memory_evidence", "unclassified/{id}.bin"),
+    "handoff_archive": ("memory_evidence", "archives/handoff-{id}.tar"),
     "meminfo": ("memory_evidence", "meminfo/meminfo-{id}.txt"),
     "smaps": ("memory_evidence", "smaps/smaps-{id}.txt"),
     "showmap": ("memory_evidence", "showmap/showmap-{id}.txt"),
@@ -588,7 +590,7 @@ class AndroidMemoryStager:
         evidence_by_id: dict[object, EngineInput],
     ) -> tuple[
         MemoryCaptureManifest,
-        tuple[tuple[str, EngineInput, str], ...],
+        tuple[tuple[str, str, EngineInput, str], ...],
         int,
     ]:
         destination: BinaryIO | None = None
@@ -608,7 +610,7 @@ class AndroidMemoryStager:
         size = 0
         payload = b""
         manifest: MemoryCaptureManifest | None = None
-        ordered_evidence: tuple[tuple[str, EngineInput, str], ...] | None = None
+        ordered_evidence: tuple[tuple[str, str, EngineInput, str], ...] | None = None
         download_failure: _CapturedFailure | None = None
         try:
             size = await self._download(
@@ -674,19 +676,23 @@ class AndroidMemoryStager:
     def _match_manifest(
         manifest: MemoryCaptureManifest,
         evidence_by_id: dict[object, EngineInput],
-    ) -> tuple[tuple[str, EngineInput, str], ...]:
+    ) -> tuple[tuple[str, str, EngineInput, str], ...]:
         referenced_ids = {reference.artifact_id for reference in manifest.artifacts}
         if referenced_ids != set(evidence_by_id):
             raise _error("manifest_invalid")
 
-        matched: list[tuple[str, EngineInput, str]] = []
+        matched: list[tuple[str, str, EngineInput, str]] = []
         for reference in manifest.artifacts:
             source = evidence_by_id[reference.artifact_id]
             expected_kind, path_template = _ROLE_LAYOUT[reference.role]
-            if source.kind != expected_kind:
+            if source.kind != expected_kind or (
+                reference.role == "handoff_archive"
+                and source.mime != "application/x-tar"
+            ):
                 raise _error("manifest_invalid")
             matched.append(
                 (
+                    reference.role,
                     path_template,
                     source,
                     path_template.format(id=reference.artifact_id),
@@ -697,13 +703,13 @@ class AndroidMemoryStager:
     async def _materialize_evidence(
         self,
         owned: _OwnedWorkspace,
-        ordered_evidence: tuple[tuple[str, EngineInput, str], ...],
+        ordered_evidence: tuple[tuple[str, str, EngineInput, str], ...],
         *,
         initial_total: int,
     ) -> None:
         total = initial_total
         owned_directories: set[str] = set()
-        for _, source, relative_path_text in ordered_evidence:
+        for role, _, source, relative_path_text in ordered_evidence:
             relative_path = Path(relative_path_text)
             directory_name = relative_path.parts[0]
             filename = relative_path.parts[1]
@@ -758,6 +764,195 @@ class AndroidMemoryStager:
             close_failure = _close_destination(destination)
             _raise_captured(primary, close_failure)
             total += size
+            if role == "handoff_archive":
+                expanded = self._extract_handoff_archive(
+                    owned,
+                    source=source,
+                    archive_relative_path=relative_path,
+                    remaining_total=self._max_total_bytes - total,
+                    existing_file_count=len(ordered_evidence),
+                )
+                total += expanded
+
+    def _extract_handoff_archive(
+        self,
+        owned: _OwnedWorkspace,
+        *,
+        source: EngineInput,
+        archive_relative_path: Path,
+        remaining_total: int,
+        existing_file_count: int,
+    ) -> int:
+        """Expand one Agent tar without trusting member paths or tar link semantics."""
+
+        input_fd: int | None = None
+        archive_dir_fd: int | None = None
+        archive_fd: int | None = None
+        archive_file: BinaryIO | None = None
+        root_fd: int | None = None
+        try:
+            input_fd = self._open_owned_input(owned)
+            archive_dir_fd = os.open(
+                archive_relative_path.parts[0],
+                _DIRECTORY_FLAGS,
+                dir_fd=input_fd,
+            )
+            archive_fd = os.open(
+                archive_relative_path.parts[1],
+                os.O_RDONLY | os.O_NOFOLLOW,
+                dir_fd=archive_dir_fd,
+            )
+            archive_stat = os.fstat(archive_fd)
+            if not stat.S_ISREG(archive_stat.st_mode):
+                raise _error("manifest_invalid")
+            archive_file = os.fdopen(archive_fd, "rb")
+            archive_fd = None
+
+            with tarfile.open(fileobj=archive_file, mode="r:") as archive:
+                members: list[tarfile.TarInfo] = []
+                while True:
+                    member = archive.next()
+                    if member is None:
+                        break
+                    members.append(member)
+                    if existing_file_count + len(members) > self._max_files:
+                        raise _error("input_limit_exceeded")
+                validated = self._validated_handoff_members(
+                    members,
+                    remaining_total=remaining_total,
+                    existing_file_count=existing_file_count,
+                )
+                root_fd = self._create_handoff_root(
+                    input_fd,
+                    artifact_id=str(source.artifact_id),
+                )
+                extracted = 0
+                for member, parts in validated:
+                    parent_fd = self._ensure_relative_directories(root_fd, parts[:-1])
+                    try:
+                        file_fd = os.open(
+                            parts[-1],
+                            _FILE_FLAGS,
+                            0o600,
+                            dir_fd=parent_fd,
+                        )
+                        with os.fdopen(file_fd, "wb") as destination:
+                            extracted_member = archive.extractfile(member)
+                            if extracted_member is None:
+                                raise _error("manifest_invalid")
+                            written = 0
+                            with extracted_member:
+                                while True:
+                                    chunk = extracted_member.read(64 * 1024)
+                                    if not chunk:
+                                        break
+                                    written += len(chunk)
+                                    if written > member.size:
+                                        raise _error("manifest_invalid")
+                                    destination.write(chunk)
+                            if written != member.size:
+                                raise _error("manifest_invalid")
+                            destination.flush()
+                            extracted += written
+                    finally:
+                        _close_fd(parent_fd)
+                return extracted
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except AndroidMemoryStagingError:
+            raise
+        except (tarfile.TarError, OSError, ValueError, EOFError):
+            raise _error("manifest_invalid") from None
+        finally:
+            _close_fd(root_fd)
+            if archive_file is not None:
+                try:
+                    archive_file.close()
+                except Exception:
+                    pass
+            _close_fd(archive_fd)
+            _close_fd(archive_dir_fd)
+            _close_fd(input_fd)
+
+    def _validated_handoff_members(
+        self,
+        members: list[tarfile.TarInfo],
+        *,
+        remaining_total: int,
+        existing_file_count: int,
+    ) -> tuple[tuple[tarfile.TarInfo, tuple[str, ...]], ...]:
+        files: list[tuple[tarfile.TarInfo, tuple[str, ...]]] = []
+        observed: set[tuple[str, ...]] = set()
+        regular_paths: set[tuple[str, ...]] = set()
+        expanded_total = 0
+        for member in members:
+            path = PurePosixPath(member.name)
+            parts = path.parts
+            if (
+                path.is_absolute()
+                or not parts
+                or len(parts) > 16
+                or len(member.name.encode("utf-8")) > 1024
+                or any(
+                    part in {"", ".", ".."}
+                    or len(part.encode("utf-8")) > 255
+                    or "\x00" in part
+                    for part in parts
+                )
+                or parts in observed
+                or any(parts[:index] in regular_paths for index in range(1, len(parts)))
+            ):
+                raise _error("manifest_invalid")
+            observed.add(parts)
+            if member.isdir():
+                if parts in regular_paths:
+                    raise _error("manifest_invalid")
+                continue
+            if not member.isfile() or member.size < 0:
+                raise _error("manifest_invalid")
+            if member.size > self._max_file_bytes:
+                raise _error("input_limit_exceeded")
+            expanded_total += member.size
+            if expanded_total > remaining_total:
+                raise _error("input_limit_exceeded")
+            regular_paths.add(parts)
+            files.append((member, parts))
+        if not files:
+            raise _error("manifest_invalid")
+        if existing_file_count + len(files) > self._max_files:
+            raise _error("input_limit_exceeded")
+        return tuple(files)
+
+    @staticmethod
+    def _create_handoff_root(input_fd: int, *, artifact_id: str) -> int:
+        handoff_fd: int | None = None
+        try:
+            try:
+                os.mkdir("handoff", mode=0o700, dir_fd=input_fd)
+            except FileExistsError:
+                pass
+            handoff_fd = os.open("handoff", _DIRECTORY_FLAGS, dir_fd=input_fd)
+            os.mkdir(artifact_id, mode=0o700, dir_fd=handoff_fd)
+            return os.open(artifact_id, _DIRECTORY_FLAGS, dir_fd=handoff_fd)
+        finally:
+            _close_fd(handoff_fd)
+
+    @staticmethod
+    def _ensure_relative_directories(root_fd: int, parts: tuple[str, ...]) -> int:
+        current_fd = os.dup(root_fd)
+        try:
+            for part in parts:
+                try:
+                    os.mkdir(part, mode=0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                child_fd = os.open(part, _DIRECTORY_FLAGS, dir_fd=current_fd)
+                os.close(current_fd)
+                current_fd = child_fd
+            return current_fd
+        except Exception:
+            _close_fd(current_fd)
+            raise
 
     @staticmethod
     def _open_owned_input(owned: _OwnedWorkspace) -> int:

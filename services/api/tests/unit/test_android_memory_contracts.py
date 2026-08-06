@@ -82,6 +82,40 @@ def test_capture_manifest_rejects_duplicate_singleton_roles() -> None:
         MemoryCaptureManifest.model_validate(payload)
 
 
+def test_capture_manifest_accepts_one_agent_handoff_archive() -> None:
+    payload = valid_manifest_payload()
+    payload["source"] = "adb_agent"
+    payload["artifacts"] = [
+        {
+            "artifact_id": "e4000000-0000-4000-8000-000000000001",
+            "role": "handoff_archive",
+        }
+    ]
+
+    manifest = MemoryCaptureManifest.model_validate(payload)
+
+    assert manifest.source == "adb_agent"
+    assert manifest.artifacts[0].role == "handoff_archive"
+
+
+def test_capture_manifest_rejects_multiple_agent_handoff_archives() -> None:
+    payload = valid_manifest_payload()
+    payload["source"] = "adb_agent"
+    payload["artifacts"] = [
+        {
+            "artifact_id": "e4000000-0000-4000-8000-000000000001",
+            "role": "handoff_archive",
+        },
+        {
+            "artifact_id": "e4000000-0000-4000-8000-000000000002",
+            "role": "handoff_archive",
+        },
+    ]
+
+    with pytest.raises(ValidationError, match="singleton artifact roles"):
+        MemoryCaptureManifest.model_validate(payload)
+
+
 @pytest.mark.parametrize("role", ["auto", "android_log", "qa_screenshot", "previous_ai_context"])
 def test_capture_manifest_allows_repeated_non_singleton_roles(role: str) -> None:
     payload = valid_manifest_payload()

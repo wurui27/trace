@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import io
 import os
 import shutil
+import tarfile
 from collections.abc import AsyncIterator, Callable, Iterable
 from dataclasses import FrozenInstanceError
 from pathlib import Path
@@ -121,6 +123,37 @@ def _meminfo_input(
         mime="text/plain",
         size_bytes=size_bytes,
         sha256_b64=sha256_b64,
+    )
+
+
+def _tar_bytes(
+    files: dict[str, bytes],
+    *,
+    symbolic_link: tuple[str, str] | None = None,
+) -> bytes:
+    output = io.BytesIO()
+    with tarfile.open(fileobj=output, mode="w") as archive:
+        for name, payload in files.items():
+            member = tarfile.TarInfo(name)
+            member.size = len(payload)
+            member.mode = 0o600
+            archive.addfile(member, io.BytesIO(payload))
+        if symbolic_link is not None:
+            name, target = symbolic_link
+            member = tarfile.TarInfo(name)
+            member.type = tarfile.SYMTYPE
+            member.linkname = target
+            archive.addfile(member)
+    return output.getvalue()
+
+
+def _handoff_input(payload: bytes) -> EngineInput:
+    return _input(
+        MEMINFO_ID,
+        kind="memory_evidence",
+        payload=payload,
+        path="agent-memory-evidence.tar",
+        mime="application/x-tar",
     )
 
 
@@ -250,6 +283,127 @@ async def test_stager_downloads_manifest_first_and_materializes_only_references(
         assert client.is_closed is False
     finally:
         await client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_stager_preserves_and_safely_expands_agent_handoff_archive(
+    tmp_path: Path,
+) -> None:
+    archive_payload = _tar_bytes(
+        {
+            "meminfo/meminfo-000.txt": MEMINFO_BYTES,
+            "metadata.json": b'{"schema_version":"1.0"}',
+            "summary.json": b'{"delta_pss_kb":20}',
+        }
+    )
+    manifest_payload = _manifest_bytes(((MEMINFO_ID, "handoff_archive"),))
+    client = _client(
+        _responses(
+            {
+                "/private/manifest.json": manifest_payload,
+                "/private/agent-memory-evidence.tar": archive_payload,
+            }
+        )
+    )
+
+    try:
+        staged = await _stager(client, tmp_path).stage(
+            run_id="agent-handoff-success",
+            inputs=(_manifest_input(manifest_payload), _handoff_input(archive_payload)),
+        )
+        files = sorted(
+            path.relative_to(staged.input_dir).as_posix()
+            for path in staged.input_dir.rglob("*")
+            if path.is_file()
+        )
+
+        assert files == [
+            f"archives/handoff-{MEMINFO_ID}.tar",
+            f"handoff/{MEMINFO_ID}/meminfo/meminfo-000.txt",
+            f"handoff/{MEMINFO_ID}/metadata.json",
+            f"handoff/{MEMINFO_ID}/summary.json",
+        ]
+        assert (
+            staged.input_dir / f"handoff/{MEMINFO_ID}/meminfo/meminfo-000.txt"
+        ).read_bytes() == MEMINFO_BYTES
+        assert (
+            staged.input_dir / f"archives/handoff-{MEMINFO_ID}.tar"
+        ).read_bytes() == archive_payload
+        await staged.cleanup()
+    finally:
+        await client.aclose()
+
+
+@pytest.mark.parametrize(
+    "archive_payload",
+    [
+        _tar_bytes({"../private-marker.txt": b"outside"}),
+        _tar_bytes(
+            {"meminfo/meminfo-000.txt": MEMINFO_BYTES},
+            symbolic_link=("meminfo/latest.txt", "meminfo-000.txt"),
+        ),
+        _tar_bytes({"/absolute/private-marker.txt": b"outside"}),
+    ],
+)
+@pytest.mark.asyncio
+async def test_stager_rejects_unsafe_agent_handoff_members(
+    tmp_path: Path,
+    archive_payload: bytes,
+) -> None:
+    manifest_payload = _manifest_bytes(((MEMINFO_ID, "handoff_archive"),))
+    client = _client(
+        _responses(
+            {
+                "/private/manifest.json": manifest_payload,
+                "/private/agent-memory-evidence.tar": archive_payload,
+            }
+        )
+    )
+
+    try:
+        await _stage_error(
+            _stager(client, tmp_path),
+            (_manifest_input(manifest_payload), _handoff_input(archive_payload)),
+            stable_code="manifest_invalid",
+            run_id="unsafe-agent-handoff",
+        )
+    finally:
+        await client.aclose()
+
+    assert not (tmp_path / "unsafe-agent-handoff").exists()
+
+
+@pytest.mark.asyncio
+async def test_stager_counts_expanded_handoff_members_against_file_limit(
+    tmp_path: Path,
+) -> None:
+    archive_payload = _tar_bytes(
+        {
+            "meminfo/meminfo-000.txt": MEMINFO_BYTES,
+            "metadata.json": b'{"schema_version":"1.0"}',
+        }
+    )
+    manifest_payload = _manifest_bytes(((MEMINFO_ID, "handoff_archive"),))
+    client = _client(
+        _responses(
+            {
+                "/private/manifest.json": manifest_payload,
+                "/private/agent-memory-evidence.tar": archive_payload,
+            }
+        )
+    )
+
+    try:
+        await _stage_error(
+            _stager(client, tmp_path, max_files=2),
+            (_manifest_input(manifest_payload), _handoff_input(archive_payload)),
+            stable_code="input_limit_exceeded",
+            run_id="oversized-agent-handoff",
+        )
+    finally:
+        await client.aclose()
+
+    assert not (tmp_path / "oversized-agent-handoff").exists()
 
 
 @pytest.mark.parametrize("target", ["manifest", "evidence"])

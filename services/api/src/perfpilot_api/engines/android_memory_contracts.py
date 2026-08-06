@@ -38,6 +38,7 @@ _AndroidRelease = Annotated[
 ]
 ArtifactRole = Literal[
     "auto",
+    "handoff_archive",
     "meminfo",
     "smaps",
     "showmap",
@@ -60,6 +61,7 @@ ArtifactRole = Literal[
     "qa_screenshot",
 ]
 _SingletonArtifactRole = Literal[
+    "handoff_archive",
     "meminfo",
     "smaps",
     "showmap",
@@ -77,6 +79,7 @@ _SingletonArtifactRole = Literal[
 ]
 _SINGLETON_ARTIFACT_ROLES: frozenset[_SingletonArtifactRole] = frozenset(
     {
+        "handoff_archive",
         "meminfo",
         "smaps",
         "showmap",
