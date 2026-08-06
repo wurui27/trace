@@ -14,6 +14,7 @@ from perfpilot_api.engines.android_memory_contracts import (
     MemoryCaptureManifest,
     MemorySubject,
 )
+from perfpilot_api.engines.contracts import EngineStepOutcome
 from perfpilot_api.services.engine_executions import EngineExecutionRecord
 from perfpilot_api.services.internal_artifacts import manifest_artifact_id
 from perfpilot_api.services.memory_executions import (
@@ -109,7 +110,7 @@ def _capture(
     )
 
 
-def _execution() -> EngineExecutionRecord:
+def _execution(*, state: str = "pending") -> EngineExecutionRecord:
     return EngineExecutionRecord(
         id=EXECUTION_ID,
         analysis_id=ANALYSIS_ID,
@@ -125,11 +126,11 @@ def _execution() -> EngineExecutionRecord:
         external_workspace_id=None,
         external_session_id=None,
         external_run_id=None,
-        state="pending",
+        state=state,  # type: ignore[arg-type]
         last_event_cursor=None,
         stable_error_code=None,
-        started_at=None,
-        completed_at=None,
+        started_at=NOW if state != "pending" else None,
+        completed_at=NOW if state in {"completed", "insufficient_data", "failed", "canceled"} else None,
         raw_result_artifact_id=None,
         normalized_report_version_id=None,
         version=1,
@@ -210,10 +211,24 @@ class FakeUploads:
 class FakeExecutions:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
+        self.submit_calls: list[dict[str, object]] = []
+        self.step_calls: list[dict[str, object]] = []
+        self.record = _execution()
+        self.step_state = "completed"
 
     async def create_attempt(self, **kwargs: object) -> EngineExecutionRecord:
         self.calls.append(kwargs)
-        return _execution()
+        return self.record
+
+    async def submit_attempt(self, **kwargs: object) -> EngineExecutionRecord:
+        self.submit_calls.append(kwargs)
+        self.record = _execution(state="running")
+        return self.record
+
+    async def step(self, **kwargs: object) -> EngineStepOutcome:
+        self.step_calls.append(kwargs)
+        self.record = _execution(state=self.step_state)
+        return EngineStepOutcome(EXECUTION_ID, self.step_state, None)  # type: ignore[arg-type]
 
 
 def _service(
@@ -310,6 +325,58 @@ async def test_prepare_accepts_device_agent_capture_for_android_memory() -> None
         "memory_evidence",
     )
     assert executions.calls[0]["engine_id"] == "android_memory"
+
+
+@pytest.mark.asyncio
+async def test_advance_submits_pending_memory_attempt_then_steps_running_attempt() -> None:
+    capture = _capture(
+        analysis_mode="device",
+        source="adb_agent",
+        role="handoff_archive",
+    )
+    repository = FakeRepository(capture)
+    uploads = FakeUploads(source="adb_agent", role="handoff_archive")
+    executions = FakeExecutions()
+    service = _service(repository, uploads, executions)
+
+    submitted = await service.advance(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        capture_id=CAPTURE_ID,
+    )
+    completed = await service.advance(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        capture_id=CAPTURE_ID,
+    )
+
+    assert submitted == EngineStepOutcome(EXECUTION_ID, "running", None)
+    assert completed == EngineStepOutcome(EXECUTION_ID, "completed", None)
+    assert len(executions.submit_calls) == 1
+    assert executions.submit_calls[0]["profile"] == "auto"
+    assert executions.submit_calls[0]["question"] == capture.question
+    assert executions.submit_calls[0]["timeout_seconds"] == 900
+    assert len(executions.step_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_advance_returns_existing_terminal_memory_attempt_without_resubmitting() -> None:
+    executions = FakeExecutions()
+    executions.record = _execution(state="insufficient_data")
+
+    outcome = await _service(
+        FakeRepository(_capture()),
+        FakeUploads(),
+        executions,
+    ).advance(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        capture_id=CAPTURE_ID,
+    )
+
+    assert outcome == EngineStepOutcome(EXECUTION_ID, "insufficient_data", None)
+    assert executions.submit_calls == []
+    assert executions.step_calls == []
 
 
 @pytest.mark.parametrize(

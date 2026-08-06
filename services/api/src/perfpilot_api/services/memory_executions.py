@@ -21,7 +21,7 @@ from sqlalchemy import select
 from perfpilot_api.db.tenant.models import Analysis, Artifact
 from perfpilot_api.db.tenant.router import TenantRouter
 from perfpilot_api.engines.android_memory_contracts import MemoryCaptureManifest
-from perfpilot_api.engines.contracts import EngineInput
+from perfpilot_api.engines.contracts import AnalysisProfile, EngineInput, EngineStepOutcome
 from perfpilot_api.services.engine_executions import EngineExecutionRecord
 from perfpilot_api.services.internal_artifacts import manifest_artifact_id
 from perfpilot_api.services.uploads import (
@@ -125,6 +125,26 @@ class MemoryAttemptService(Protocol):
         input_manifest_hash: str,
         config_hash: str,
     ) -> EngineExecutionRecord: ...
+
+    async def submit_attempt(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        execution_id: UUID,
+        inputs: tuple[EngineInput, ...],
+        profile: AnalysisProfile,
+        question: str | None,
+        timeout_seconds: int,
+    ) -> EngineExecutionRecord | EngineStepOutcome: ...
+
+    async def step(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        execution_id: UUID,
+    ) -> EngineStepOutcome: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -751,6 +771,42 @@ class MemoryExecutionService:
             inputs=inputs,
             question=capture.question,
         )
+
+    async def advance(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        capture_id: UUID,
+    ) -> EngineStepOutcome:
+        prepared = await self.prepare(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            capture_id=capture_id,
+        )
+        execution = prepared.execution
+        if execution.state == "pending":
+            result = await self._engine_service.submit_attempt(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                execution_id=execution.id,
+                inputs=prepared.inputs,
+                profile="auto",
+                question=prepared.question,
+                timeout_seconds=self._timeout_seconds,
+            )
+            return (
+                result
+                if isinstance(result, EngineStepOutcome)
+                else EngineStepOutcome(result.id, result.state, None)
+            )
+        if execution.state in ("running", "awaiting_user"):
+            return await self._engine_service.step(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                execution_id=execution.id,
+            )
+        return EngineStepOutcome(execution.id, execution.state, None)
 
 
 __all__ = [

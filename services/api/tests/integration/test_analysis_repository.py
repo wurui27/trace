@@ -76,6 +76,9 @@ from perfpilot_api.services.analyses import (
     scenario_job_id,
     trace_analysis_ready_event_id,
 )
+from perfpilot_api.services.device_kernel_executions import (
+    SQLAlchemyDeviceKernelContextRepository,
+)
 from perfpilot_api.security.agent_signatures import encode_ed25519_public_key
 from perfpilot_api.security.task_snapshots import (
     TaskSnapshotSigner,
@@ -102,6 +105,7 @@ from perfpilot_api.reports.writer import (
 from perfpilot_api.services.synthesis_executions import (
     SQLAlchemySynthesisExecutionRepository,
 )
+from perfpilot_api.services.memory_analyses import SQLAlchemyMemoryCaptureRepository
 from perfpilot_api.services.trace_executions import SQLAlchemyTraceExecutionRepository
 from perfpilot_api.services.uploads import (
     SQLAlchemyUploadRepository,
@@ -3003,6 +3007,19 @@ async def test_agent_completion_releases_device_and_queues_trace_analysis_exactl
     assert len(trace_inputs.input_artifacts) == 1
     assert trace_inputs.input_artifacts[0].artifact_kind == "trace"
     assert trace_inputs.input_artifacts[0].source_artifact_kind == "startup_trace"
+    kernel_context = await SQLAlchemyDeviceKernelContextRepository(
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    ).load_context(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+    assert kernel_context.analysis_mode == "device"
+    assert kernel_context.memory_scenario_state == "analyzing"
+    memory_context = await SQLAlchemyMemoryCaptureRepository(
+        tenant_router=analysis_databases.tenant_router,  # type: ignore[arg-type]
+    ).load_device_context(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+    assert memory_context.analysis_mode == "device"
+    assert memory_context.memory_scenario_state == "analyzing"
+    assert tuple(item.artifact_id for item in memory_context.artifacts) == (
+        artifact_specs[2][0],
+    )
     queue = SQLAlchemyTraceWorkQueueRepository(
         session_factory=analysis_databases.control_sessions,
         lease_seconds=30,
