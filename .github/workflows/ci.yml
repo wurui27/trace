@@ -111,9 +111,9 @@ jobs:
       - name: Sync dependencies
         run: uv sync --locked --all-packages
       - name: Run Python tests
-        run: >-
-          uv run --locked --package perfpilot-api pytest -p no:cacheprovider
-          services/api/tests agents/device-agent/tests -q
+        run: |
+          uv run --locked --package perfpilot-api pytest -p no:cacheprovider services/api/tests -q
+          uv run --locked --package perfpilot-device-agent pytest -p no:cacheprovider agents/device-agent/tests -q
 
   web:
     runs-on: ubuntu-latest
