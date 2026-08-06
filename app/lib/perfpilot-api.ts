@@ -75,7 +75,7 @@ export interface AnalysisStage {
 
 export interface AnalysisAiRound {
   readonly round: 1 | 2 | 3;
-  readonly role: "extract" | "review" | "finalize";
+  readonly role: "report" | "extract" | "review" | "finalize";
   readonly state: "pending" | "running" | "completed" | "failed";
   readonly attempts: number;
 }
@@ -755,22 +755,24 @@ function validStages(value: unknown): value is AnalysisStage[] {
   );
 }
 
-const AI_ROUND_ROLES: readonly AnalysisAiRound["role"][] = [
-  "extract",
-  "review",
-  "finalize",
+const AI_ROUND_LAYOUTS: readonly (readonly AnalysisAiRound["role"][])[] = [
+  ["report"],
+  ["extract", "review", "finalize"],
 ];
 
 function validAiRounds(value: unknown): value is AnalysisAiRound[] {
+  if (!Array.isArray(value)) return false;
+  const layout = AI_ROUND_LAYOUTS.find(
+    (candidate) => candidate.length === value.length,
+  );
   return (
-    Array.isArray(value) &&
-    value.length === 3 &&
+    layout !== undefined &&
     value.every(
       (item, index) =>
         object(item) &&
         exactKeys(item, ["round", "role", "state", "attempts"]) &&
         item.round === index + 1 &&
-        item.role === AI_ROUND_ROLES[index] &&
+        item.role === layout[index] &&
         ["pending", "running", "completed", "failed"].includes(String(item.state)) &&
         Number.isSafeInteger(item.attempts) &&
         Number(item.attempts) >= 0,

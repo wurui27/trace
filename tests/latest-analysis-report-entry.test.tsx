@@ -37,9 +37,7 @@ const analysis: AnalysisListItem = {
   ],
   failure: null,
   ai_rounds: [
-    { round: 1, role: "extract", state: "completed", attempts: 1 },
-    { round: 2, role: "review", state: "completed", attempts: 1 },
-    { round: 3, role: "finalize", state: "completed", attempts: 1 },
+    { round: 1, role: "report", state: "completed", attempts: 1 },
   ],
   source_analysis: {
     engine: "smartperfetto",
@@ -143,13 +141,35 @@ describe("LatestAnalysisReportEntry", () => {
     expect(screen.getByText("首帧前为什么慢？")).toBeInTheDocument();
     expect(screen.getByText("完整报告")).toBeInTheDocument();
     expect(screen.getByText("SmartPerfetto 53 轮")).toBeInTheDocument();
-    expect(screen.getByText("PerfPilot AI 3/3")).toBeInTheDocument();
+    expect(screen.getByText("PerfPilot AI 单轮完成")).toBeInTheDocument();
     expect(screen.getByText("报告 v2")).toBeInTheDocument();
     expect(onSnapshot).toHaveBeenCalledWith({
       teamId: analysis.team_id,
       analysis,
       report,
     });
+  });
+
+  it("keeps the not-requested AI label truthful", async () => {
+    const loader: LatestReportLoader = vi.fn().mockResolvedValue({
+      teamId: analysis.team_id,
+      analysis: { ...analysis, ai_rounds: undefined },
+      report: {
+        ...report,
+        synthesis: {
+          state: "not_requested",
+          output: null,
+          synthesis_artifact_id: null,
+          failure_code: null,
+          provenance: null,
+        },
+      },
+    });
+
+    render(<LatestAnalysisReportEntry loader={loader} />);
+
+    expect(await screen.findByText("当前报告未包含 AI")).toBeInTheDocument();
+    expect(screen.queryByText("PerfPilot AI 单轮完成")).not.toBeInTheDocument();
   });
 
   it("prompts a new analysis when no history exists", async () => {

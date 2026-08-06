@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ArrowUpRight, CircleStop, LoaderCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 
+import { runningAiProcessLabel } from "../lib/analysis-ai-status";
 import type {
   AnalysisResponse,
   AnalysisStage,
@@ -81,10 +82,7 @@ export function activeAnalysisStageLabel(analysis: AnalysisResponse): string {
   if (smartPerfetto?.state === "running") return "SmartPerfetto 正在解析 Trace";
   const aiStage = analysis.stages.find((stage) => stage.stage === "perfpilot_ai");
   if (aiStage?.state === "running") {
-    const runningRound = analysis.ai_rounds?.find((round) => round.state === "running");
-    return runningRound
-      ? `PerfPilot AI 第 ${runningRound.round}/3 轮`
-      : "PerfPilot AI 正在生成建议";
+    return runningAiProcessLabel(analysis.ai_rounds);
   }
   const report = analysis.stages.find((stage) => stage.stage === "report");
   if (report?.state === "running" || aiStage?.state === "completed") {

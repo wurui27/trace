@@ -177,7 +177,26 @@ describe("ActiveAnalysisTaskCard", () => {
     expect(screen.getByText("内存循环采集")).toBeInTheDocument();
   });
 
-  it("derives AI and cancel stages only from authoritative analysis fields", () => {
+  it("shows a truthful single-pass final-report label", () => {
+    const ai: AnalysisResponse = {
+      ...activeAnalysis(),
+      stages: [
+        { stage: "input_validation", state: "completed", failure: null },
+        { stage: "smartperfetto", state: "completed", failure: null },
+        { stage: "perfpilot_ai", state: "running", failure: null },
+        { stage: "report", state: "pending", failure: null },
+      ],
+      ai_rounds: [
+        { round: 1, role: "report", state: "running", attempts: 1 },
+      ],
+    };
+
+    expect(activeAnalysisStageLabel(ai)).toBe(
+      "PerfPilot AI 正在生成最终报告",
+    );
+  });
+
+  it("preserves the legacy running round and cancel labels", () => {
     const ai: AnalysisResponse = {
       ...activeAnalysis(),
       stages: [

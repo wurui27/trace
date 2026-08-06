@@ -7,6 +7,7 @@ import Link from "next/link";
 import { AnalysisReportView } from "./analysis-report";
 import {
   createPerfPilotClient,
+  createRandomUuid,
   PerfPilotApiError,
   type AnalysisReport,
   type AnalysisResponse,
@@ -251,7 +252,7 @@ export function AnalysisProgress({
   analysisId,
   loader = defaultLoader,
   rerunner = defaultRerunner,
-  randomUUID = () => crypto.randomUUID(),
+  randomUUID = createRandomUuid,
 }: AnalysisProgressProps) {
   const [snapshot, setSnapshot] = useState<AnalysisSnapshot | null>(null);
   const [attempt, setAttempt] = useState(0);

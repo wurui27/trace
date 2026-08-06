@@ -4,6 +4,8 @@ import { ArrowLeft, CheckCircle2 } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
+import { completedAiProcessCopy } from "../lib/analysis-ai-status";
+import { createRandomUuid } from "../lib/perfpilot-api";
 import {
   createAnalysisLoader,
   createSynthesisRerunner,
@@ -33,7 +35,7 @@ export function FullAnalysisReport({
   analysisId,
   loader = defaultLoader,
   rerunner = defaultRerunner,
-  randomUUID = () => crypto.randomUUID(),
+  randomUUID = createRandomUuid,
 }: FullAnalysisReportProps) {
   const [attempt, setAttempt] = useState(0);
   const [snapshot, setSnapshot] = useState<ReportSnapshot | null>(null);
@@ -110,9 +112,7 @@ export function FullAnalysisReport({
   }
 
   const sourceRounds = analysis.source_analysis?.rounds;
-  const completedAiRounds =
-    analysis.ai_rounds?.filter((round) => round.state === "completed").length ??
-    (report.synthesis.state === "completed" ? 3 : 0);
+  const aiProcess = completedAiProcessCopy(analysis.ai_rounds);
   const verification = analysis.source_analysis?.verification ?? "unknown";
   const memoryScenario = report.scenario_reports.find(
     (scenario) => scenario.scenario_type === "memory_cycle",
@@ -197,14 +197,14 @@ export function FullAnalysisReport({
               <dt>AI 复核</dt>
               <dd>
                 {report.synthesis.state === "completed"
-                  ? `${completedAiRounds} 轮 PerfPilot AI 已完成`
+                  ? aiProcess.title
                   : report.synthesis.state === "not_requested"
                     ? "当前报告未包含 AI"
                     : "PerfPilot AI 未完成"}
               </dd>
               <span>
                 {report.synthesis.state === "completed"
-                  ? "提取、复核、定稿"
+                  ? aiProcess.detail
                   : report.synthesis.state === "not_requested"
                     ? hasMemoryScenario
                       ? "双内核基础报告"

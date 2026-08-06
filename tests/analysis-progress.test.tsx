@@ -17,7 +17,10 @@ import type {
   PerfPilotClient,
 } from "../app/lib/perfpilot-api";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 function analysis(
   state: AnalysisState,
@@ -258,5 +261,45 @@ describe("AnalysisProgress", () => {
       expect.any(AbortSignal),
     );
     expect(loadCount).toBe(2);
+  });
+
+  it("uses the LAN-compatible UUID factory by default for an AI-only rerun", async () => {
+    const user = userEvent.setup();
+    const nativeRandomUuid = vi
+      .spyOn(globalThis.crypto, "randomUUID")
+      .mockReturnValue("00000000-0000-4000-8000-000000000000");
+    const loader = vi.fn(async (_analysisId: string, _signal, onSnapshot) => {
+      onSnapshot({
+        teamId: "team-1",
+        analysis: analysis("partially_completed"),
+        report: failedReport(),
+        reportLoadFailed: false,
+      });
+    });
+    const rerunner = vi
+      .fn<
+        (
+          teamId: string,
+          analysisId: string,
+          idempotencyKey: string,
+          signal: AbortSignal,
+        ) => Promise<void>
+      >()
+      .mockResolvedValue(undefined);
+
+    render(
+      <AnalysisProgress
+        analysisId="analysis-live-1"
+        loader={loader}
+        rerunner={rerunner}
+      />,
+    );
+    await user.click(await screen.findByRole("button", { name: "重新生成 AI 建议" }));
+
+    expect(rerunner).toHaveBeenCalledOnce();
+    expect(rerunner.mock.calls[0]?.[2]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(nativeRandomUuid).not.toHaveBeenCalled();
   });
 });

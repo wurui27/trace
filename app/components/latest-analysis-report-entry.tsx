@@ -4,6 +4,7 @@ import Link from "next/link";
 import { ArrowUpRight, FileCheck2 } from "lucide-react";
 import { memo, useEffect, useState } from "react";
 
+import { aiCompletionBadge } from "../lib/analysis-ai-status";
 import {
   createPerfPilotClient,
   type AnalysisListItem,
@@ -150,8 +151,6 @@ export const LatestAnalysisReportEntry = memo(function LatestAnalysisReportEntry
       : report.synthesis.state === "not_requested"
         ? "三类真机性能证据已经归档，可打开报告查看完整内核结论。"
         : "报告已保留可验证证据，AI 总结暂未完成。";
-  const completedAiRounds =
-    analysis.ai_rounds?.filter((round) => round.state === "completed").length;
   const smartPerfettoLabel =
     analysis.source_analysis?.rounds === null || analysis.source_analysis?.rounds === undefined
       ? "SmartPerfetto 已完成"
@@ -161,9 +160,7 @@ export const LatestAnalysisReportEntry = memo(function LatestAnalysisReportEntry
       ? "当前报告未包含 AI"
       : report.synthesis.state === "failed"
       ? "PerfPilot AI 未完成"
-      : completedAiRounds === undefined
-        ? "PerfPilot AI 已完成"
-        : `PerfPilot AI ${completedAiRounds}/3`;
+      : aiCompletionBadge(analysis.ai_rounds);
   const reportState = report.state === "completed" ? "完整报告" : "部分结论";
 
   return (

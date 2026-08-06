@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { FullAnalysisReport } from "../app/components/full-analysis-report";
@@ -9,7 +10,10 @@ import type {
   AnalysisResponse,
 } from "../app/lib/perfpilot-api";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.restoreAllMocks();
+});
 
 const analysis: AnalysisResponse = {
   schema_version: "1.0",
@@ -30,9 +34,7 @@ const analysis: AnalysisResponse = {
   ],
   failure: null,
   ai_rounds: [
-    { round: 1, role: "extract", state: "completed", attempts: 1 },
-    { round: 2, role: "review", state: "completed", attempts: 1 },
-    { round: 3, role: "finalize", state: "completed", attempts: 1 },
+    { round: 1, role: "report", state: "completed", attempts: 1 },
   ],
   source_analysis: {
     engine: "smartperfetto",
@@ -112,12 +114,37 @@ describe("FullAnalysisReport", () => {
 
     expect(await screen.findByRole("heading", { name: "最终性能报告" })).toBeVisible();
     expect(screen.getByText("53 轮 SmartPerfetto 分析")).toBeVisible();
-    expect(screen.getByText("3 轮 PerfPilot AI 已完成")).toBeVisible();
+    expect(screen.getByText("单轮 PerfPilot AI 深度分析已完成")).toBeVisible();
+    expect(screen.getByText("证据核验、归因、建议与复测计划")).toBeVisible();
     expect(screen.getByRole("heading", { name: "优化建议" })).toBeVisible();
     expect(screen.getByRole("link", { name: "返回分析进度" })).toHaveAttribute(
       "href",
       "/analyses/analysis-live-1",
     );
+  });
+
+  it("preserves the completed legacy three-round process copy", async () => {
+    const legacyAnalysis: AnalysisResponse = {
+      ...analysis,
+      ai_rounds: [
+        { round: 1, role: "extract", state: "completed", attempts: 1 },
+        { round: 2, role: "review", state: "completed", attempts: 1 },
+        { round: 3, role: "finalize", state: "completed", attempts: 1 },
+      ],
+    };
+    const loader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({
+        teamId: "team-1",
+        analysis: legacyAnalysis,
+        report,
+        reportLoadFailed: false,
+      });
+    });
+
+    render(<FullAnalysisReport analysisId="analysis-live-1" loader={loader} />);
+
+    expect(await screen.findByText("3 轮 PerfPilot AI 已完成")).toBeVisible();
+    expect(screen.getByText("提取、复核、定稿")).toBeVisible();
   });
 
   it("does not describe a failed AI stage as completed", async () => {
@@ -167,6 +194,74 @@ describe("FullAnalysisReport", () => {
 
     expect(await screen.findByText("PerfPilot AI 未完成")).toBeVisible();
     expect(screen.queryByText("0 轮 PerfPilot AI 已完成")).not.toBeInTheDocument();
+  });
+
+  it("uses the LAN-compatible UUID factory for the default AI retry key", async () => {
+    const user = userEvent.setup();
+    const nativeRandomUuid = vi
+      .spyOn(globalThis.crypto, "randomUUID")
+      .mockReturnValue("00000000-0000-4000-8000-000000000000");
+    const partialAnalysis: AnalysisResponse = {
+      ...analysis,
+      state: "partially_completed",
+      stages: analysis.stages.map((stage) =>
+        stage.stage === "perfpilot_ai"
+          ? {
+              ...stage,
+              state: "failed",
+              failure: {
+                code: "synthesis_unavailable",
+                message: "AI 建议生成失败",
+                retryable: true,
+              },
+            }
+          : stage,
+      ),
+    };
+    const partialReport: AnalysisReport = {
+      ...report,
+      state: "partially_completed",
+      synthesis: {
+        state: "failed",
+        output: null,
+        synthesis_artifact_id: null,
+        failure_code: "synthesis_unavailable",
+        provenance: null,
+      },
+    };
+    const loader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({
+        teamId: "team-1",
+        analysis: partialAnalysis,
+        report: partialReport,
+        reportLoadFailed: false,
+      });
+    });
+    const rerunner = vi
+      .fn<
+        (
+          teamId: string,
+          analysisId: string,
+          idempotencyKey: string,
+          signal: AbortSignal,
+        ) => Promise<void>
+      >()
+      .mockResolvedValue(undefined);
+
+    render(
+      <FullAnalysisReport
+        analysisId="analysis-live-1"
+        loader={loader}
+        rerunner={rerunner}
+      />,
+    );
+    await user.click(await screen.findByRole("button", { name: "重新生成 AI 建议" }));
+
+    expect(rerunner).toHaveBeenCalledOnce();
+    expect(rerunner.mock.calls[0]?.[2]).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    expect(nativeRandomUuid).not.toHaveBeenCalled();
   });
 
   it("describes the joined kernels for a device report", async () => {

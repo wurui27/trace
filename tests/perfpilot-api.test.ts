@@ -680,30 +680,11 @@ describe("PerfPilot browser API", () => {
 
   it("reads the exact four server stages and rejects a reordered stage list", async () => {
     const valid = analysis("completed");
-    const local = {
-      ...valid,
-      ai_rounds: [
-        { round: 1, role: "extract", state: "completed", attempts: 1 },
-        { round: 2, role: "review", state: "completed", attempts: 1 },
-        { round: 3, role: "finalize", state: "completed", attempts: 1 },
-      ],
-      source_analysis: {
-        engine: "smartperfetto",
-        rounds: 53,
-        verification: "passed",
-        session_id: "agent-session-1",
-        run_id: "run-session-1",
-      },
-    };
     const fetcher = vi
       .fn<typeof fetch>()
       .mockResolvedValueOnce(Response.json(valid))
       .mockResolvedValueOnce(
         Response.json({ ...valid, stages: [...valid.stages].reverse() }),
-      )
-      .mockResolvedValueOnce(Response.json(local))
-      .mockResolvedValueOnce(
-        Response.json({ ...local, ai_rounds: [...local.ai_rounds].reverse() }),
       );
     const client = createPerfPilotClient({ fetcher });
 
@@ -718,6 +699,44 @@ describe("PerfPilot browser API", () => {
     await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
       code: "invalid_api_response",
     });
+  });
+
+  it("accepts the exact single-pass and legacy AI round layouts", async () => {
+    const valid = analysis("completed");
+    const sourceAnalysis = {
+      engine: "smartperfetto",
+      rounds: 53,
+      verification: "passed",
+      session_id: "agent-session-1",
+      run_id: "run-session-1",
+    };
+    const single = {
+      ...valid,
+      ai_rounds: [
+        { round: 1, role: "report", state: "completed", attempts: 1 },
+      ],
+      source_analysis: sourceAnalysis,
+    };
+    const legacy = {
+      ...valid,
+      ai_rounds: [
+        { round: 1, role: "extract", state: "completed", attempts: 1 },
+        { round: 2, role: "review", state: "completed", attempts: 1 },
+        { round: 3, role: "finalize", state: "completed", attempts: 1 },
+      ],
+      source_analysis: sourceAnalysis,
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(single))
+      .mockResolvedValueOnce(Response.json(legacy));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      ai_rounds: [
+        { round: 1, role: "report", state: "completed", attempts: 1 },
+      ],
+    });
     await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
       ai_rounds: [
         { round: 1, role: "extract", state: "completed" },
@@ -726,6 +745,79 @@ describe("PerfPilot browser API", () => {
       ],
       source_analysis: { engine: "smartperfetto", rounds: 53 },
     });
+  });
+
+  it("rejects a one-item extract layout and a reversed legacy layout", async () => {
+    const valid = analysis("completed");
+    const sourceAnalysis = {
+      engine: "smartperfetto",
+      rounds: 53,
+      verification: "passed",
+      session_id: "agent-session-1",
+      run_id: "run-session-1",
+    };
+    const legacyRounds = [
+      { round: 1, role: "extract", state: "completed", attempts: 1 },
+      { round: 2, role: "review", state: "completed", attempts: 1 },
+      { round: 3, role: "finalize", state: "completed", attempts: 1 },
+    ];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({
+          ...valid,
+          ai_rounds: [legacyRounds[0]],
+          source_analysis: sourceAnalysis,
+        }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          ...valid,
+          ai_rounds: [...legacyRounds].reverse(),
+          source_analysis: sourceAnalysis,
+        }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
+  it.each([
+    ["extra keys", { round: 1, role: "report", state: "completed", attempts: 1, extra: true }],
+    ["nonsequential rounds", { round: 2, role: "report", state: "completed", attempts: 1 }],
+    ["unknown states", { round: 1, role: "report", state: "done", attempts: 1 }],
+    ["negative attempts", { round: 1, role: "report", state: "completed", attempts: -1 }],
+    ["fractional attempts", { round: 1, role: "report", state: "completed", attempts: 1.5 }],
+    [
+      "unsafe attempts",
+      {
+        round: 1,
+        role: "report",
+        state: "completed",
+        attempts: Number.MAX_SAFE_INTEGER + 1,
+      },
+    ],
+  ])("rejects AI rounds with %s", async (_case, aiRound) => {
+    const response = {
+      ...analysis("completed"),
+      ai_rounds: [aiRound],
+      source_analysis: {
+        engine: "smartperfetto",
+        rounds: 53,
+        verification: "passed",
+        session_id: "agent-session-1",
+        run_id: "run-session-1",
+      },
+    };
+    const client = createPerfPilotClient({
+      fetcher: vi.fn<typeof fetch>().mockResolvedValue(Response.json(response)),
+    });
+
     await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
       code: "invalid_api_response",
     });
