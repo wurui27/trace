@@ -89,7 +89,7 @@ export function FullAnalysisReport({
         {backLink}
         <div className="final-report-skeleton" aria-hidden="true" />
         <h1>正在读取最终报告</h1>
-        <p>正在校验 SmartPerfetto 证据与 PerfPilot AI 结论。</p>
+        <p>正在校验内核证据与 PerfPilot AI 结论。</p>
       </main>
     );
   }
@@ -103,7 +103,7 @@ export function FullAnalysisReport({
         <p>
           {reportLoadFailed
             ? "分析记录仍然可用，请稍后重新加载报告。"
-            : "SmartPerfetto 或 PerfPilot AI 仍在处理，请返回进度页查看。"}
+            : "内核分析或 PerfPilot AI 仍在处理，请返回进度页查看。"}
         </p>
       </main>
     );
@@ -114,6 +114,15 @@ export function FullAnalysisReport({
     analysis.ai_rounds?.filter((round) => round.state === "completed").length ??
     (report.synthesis.state === "completed" ? 3 : 0);
   const verification = analysis.source_analysis?.verification ?? "unknown";
+  const memoryScenario = report.scenario_reports.find(
+    (scenario) => scenario.scenario_type === "memory_cycle",
+  );
+  const hasMemoryScenario = memoryScenario !== undefined;
+  const memoryComplete = memoryScenario?.result_state === "completed";
+  const smartPerfettoSummary =
+    sourceRounds === null || sourceRounds === undefined
+      ? "SmartPerfetto 已完成"
+      : `SmartPerfetto ${sourceRounds} 轮`;
 
   const retrySynthesis = async (): Promise<void> => {
     if (retrying) return;
@@ -155,7 +164,9 @@ export function FullAnalysisReport({
               </span>
             </div>
             <p>
-              SmartPerfetto 提供可验证的 Trace 证据，PerfPilot AI 负责复核、归纳并生成最终优化方案。
+              {hasMemoryScenario
+                ? "SmartPerfetto 提供 Trace 证据，Android Memory 提供内存采集事实，PerfPilot AI 负责复核、归纳并生成最终优化方案。"
+                : "SmartPerfetto 提供可验证的 Trace 证据，PerfPilot AI 负责复核、归纳并生成最终优化方案。"}
             </p>
             <code>{analysis.analysis_id}</code>
           </div>
@@ -164,13 +175,19 @@ export function FullAnalysisReport({
             <div>
               <dt>内核分析</dt>
               <dd>
-                {sourceRounds === null || sourceRounds === undefined
-                  ? "SmartPerfetto 分析已完成"
-                  : `${sourceRounds} 轮 SmartPerfetto 分析`}
+                {hasMemoryScenario
+                  ? `${smartPerfettoSummary}，Android Memory ${memoryComplete ? "已汇聚" : "不完整"}`
+                  : sourceRounds === null || sourceRounds === undefined
+                    ? "SmartPerfetto 分析已完成"
+                    : `${sourceRounds} 轮 SmartPerfetto 分析`}
               </dd>
               <span>
-                {verification === "passed"
-                  ? "证据校验通过"
+                {verification === "passed" && hasMemoryScenario
+                  ? memoryComplete
+                    ? "Trace 证据已校验，内存证据已归一化"
+                    : "Trace 证据已校验，内存证据不完整"
+                  : verification === "passed"
+                    ? "证据校验通过"
                   : verification === "failed"
                     ? "证据校验未通过"
                     : "证据校验状态未知"}
@@ -189,8 +206,12 @@ export function FullAnalysisReport({
                 {report.synthesis.state === "completed"
                   ? "提取、复核、定稿"
                   : report.synthesis.state === "not_requested"
-                    ? "SmartPerfetto 三场景报告"
-                    : "SmartPerfetto 基础报告仍可查看"}
+                    ? hasMemoryScenario
+                      ? "双内核基础报告"
+                      : "SmartPerfetto 基础报告"
+                    : hasMemoryScenario
+                      ? "双内核基础报告仍可查看"
+                      : "SmartPerfetto 基础报告仍可查看"}
               </span>
             </div>
             <div>
@@ -198,7 +219,7 @@ export function FullAnalysisReport({
               <dd>v{report.report_version}</dd>
               <span>
                 {analysis.analysis_mode === "device"
-                  ? "真机三场景"
+                  ? `${report.scenario_reports.length} 个真机场景`
                   : analysis.analysis_profile === "auto"
                     ? "自动识别场景"
                     : analysis.analysis_profile}

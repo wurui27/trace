@@ -32,7 +32,51 @@ const confidenceLabels = {
   low: "低可信",
   none: "无可信度",
 } as const;
+const memorySupportLabels: Readonly<Record<string, string>> = {
+  strong: "证据充分",
+  supported: "证据可用",
+  limited: "证据有限",
+  insufficient: "证据不足",
+};
+const memoryLedgerLabels: Readonly<Record<string, string>> = {
+  available: "账本可用",
+  ambiguous: "账本口径有歧义",
+  invalid: "账本无效",
+  unavailable: "账本不可用",
+  not_provided: "未提供账本",
+};
+const memoryRowLabels: Readonly<Record<string, string>> = {
+  total: "总",
+  native_heap: "Native Heap",
+  dalvik_heap: "Dalvik Heap",
+  graphics: "Graphics",
+  code: "Code",
+  stack: "Stack",
+};
+const memoryFieldLabels: Readonly<Record<string, string>> = {
+  pss_kb: "PSS",
+  private_dirty_kb: "Private Dirty",
+  private_clean_kb: "Private Clean",
+  swap_pss_kb: "SwapPss",
+  rss_kb: "RSS",
+};
+const memoryRowPriorities: Readonly<Record<string, number>> = {
+  total: 0,
+  native_heap: 1,
+  dalvik_heap: 2,
+  graphics: 3,
+  code: 4,
+  stack: 5,
+};
+const memoryFieldPriorities: Readonly<Record<string, number>> = {
+  pss_kb: 0,
+  private_dirty_kb: 1,
+  private_clean_kb: 2,
+  swap_pss_kb: 3,
+  rss_kb: 4,
+};
 const primaryMetricLimit = 8;
+const memoryMetricLimit = 8;
 
 function plainReportText(value: string): string {
   return value
@@ -68,6 +112,36 @@ function evidenceCopy(evidence: ReportEvidence): string {
   return [evidence.source, evidence.query_id, interval].filter(Boolean).join(" · ");
 }
 
+function evidenceString(evidence: ReportEvidence | null, field: string): string | null {
+  const value = evidence?.fields[field];
+  return typeof value === "string" ? value : null;
+}
+
+function evidenceNumber(evidence: ReportEvidence | null, field: string): number | null {
+  const value = evidence?.fields[field];
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function memoryMetricLabel(metric: ReportMetric): string {
+  const match = /^memory\.meminfo\.([a-z_]+)\.(pss_kb|private_dirty_kb|private_clean_kb|swap_pss_kb|rss_kb)$/.exec(
+    metric.name,
+  );
+  if (match === null) return plainReportText(metric.definition);
+  const row = memoryRowLabels[match[1]];
+  const field = memoryFieldLabels[match[2]];
+  return row && field ? `${row} ${field}` : plainReportText(metric.definition);
+}
+
+function memoryMetricRank(metric: ReportMetric): number {
+  const match = /^memory\.meminfo\.([a-z_]+)\.(pss_kb|private_dirty_kb|private_clean_kb|swap_pss_kb|rss_kb)$/.exec(
+    metric.name,
+  );
+  if (match === null) return Number.MAX_SAFE_INTEGER;
+  const row = memoryRowPriorities[match[1]] ?? 99;
+  const field = memoryFieldPriorities[match[2]] ?? 9;
+  return row * 10 + field;
+}
+
 export function AnalysisReportView({
   report,
   onRetrySynthesis,
@@ -76,7 +150,11 @@ export function AnalysisReportView({
   const bundles = report.scenario_reports.flatMap((scenario) =>
     scenario.bundle === null ? [] : [{ scenario: scenario.scenario_type, bundle: scenario.bundle }],
   );
-  const metrics = bundles.flatMap(({ scenario, bundle }) =>
+  const memoryScenario = report.scenario_reports.find(
+    (scenario) => scenario.scenario_type === "memory_cycle",
+  );
+  const hasMemoryScenario = memoryScenario !== undefined;
+  const metrics = bundles.filter(({ scenario }) => scenario !== "memory_cycle").flatMap(({ scenario, bundle }) =>
     bundle.metrics.map((metric) => ({ scenario, metric })),
   );
   const availableMetrics = metrics.flatMap(({ scenario, metric }) => {
@@ -85,6 +163,32 @@ export function AnalysisReportView({
   });
   const primaryMetrics = availableMetrics.slice(0, primaryMetricLimit);
   const additionalMetrics = availableMetrics.slice(primaryMetricLimit);
+  const memoryMetrics = (memoryScenario?.bundle?.metrics ?? []).flatMap((metric) => {
+    const value = metricValue(metric);
+    return value === null ? [] : [{ metric, value }];
+  }).sort(
+    (left, right) =>
+      memoryMetricRank(left.metric) - memoryMetricRank(right.metric) ||
+      left.metric.name.localeCompare(right.metric.name),
+  );
+  const primaryMemoryMetrics = memoryMetrics.slice(0, memoryMetricLimit);
+  const additionalMemoryMetrics = memoryMetrics.slice(memoryMetricLimit);
+  const memoryEvidence =
+    memoryScenario?.bundle?.evidence.find(
+      (evidence) => evidence.source === "android_memory.context",
+    ) ?? memoryScenario?.bundle?.evidence[0] ?? null;
+  const memorySupport = evidenceString(memoryEvidence, "support_level");
+  const primaryMemorySupport = evidenceString(memoryEvidence, "primary_intent_support_level");
+  const memoryLedger = evidenceString(memoryEvidence, "accounting_ledger_status");
+  const memoryCoverageCount = evidenceNumber(memoryEvidence, "coverage_available_count");
+  const memoryStateLabel =
+    memoryScenario?.result_state === "completed"
+      ? "采集完成"
+      : memoryScenario?.result_state === "canceled"
+        ? "分析已取消"
+        : memoryScenario?.bundle === null
+          ? "分析未完成"
+          : "证据不完整";
   const coreFindings = bundles.flatMap(({ bundle }) => bundle.findings);
   const findingsById = new Map(coreFindings.map((finding) => [finding.finding_id, finding]));
   const evidenceById = new Map(
@@ -144,8 +248,12 @@ export function AnalysisReportView({
             </strong>
             <p>
               {report.synthesis.state === "not_requested"
-                ? "当前报告包含 SmartPerfetto 的指标、问题和证据。"
-                : "SmartPerfetto 的指标、问题和证据仍可查看。你可以只重新生成 AI 建议。"}
+                ? hasMemoryScenario
+                  ? "当前报告包含 SmartPerfetto 与 Android Memory 的指标和证据。"
+                  : "当前报告包含 SmartPerfetto 的指标、问题和证据。"
+                : hasMemoryScenario
+                  ? "SmartPerfetto 与 Android Memory 的指标和证据仍可查看。你可以只重新生成 AI 建议。"
+                  : "SmartPerfetto 的指标、问题和证据仍可查看。你可以只重新生成 AI 建议。"}
             </p>
           </div>
           {report.synthesis.state === "failed" ? (
@@ -164,10 +272,99 @@ export function AnalysisReportView({
         </section>
       ) : null}
 
+      {memoryScenario ? (
+        <section
+          className="analysis-report-section analysis-memory-section"
+          aria-labelledby="report-memory-title"
+        >
+          <div className="analysis-report-heading">
+            <div>
+              <p className="section-label">ANDROID MEMORY EVIDENCE</p>
+              <h2 id="report-memory-title">Android 内存分析</h2>
+            </div>
+            <span
+              className={`analysis-memory-state is-${memoryScenario.result_state === "completed" ? "complete" : "partial"}`}
+            >
+              {memoryStateLabel}
+            </span>
+          </div>
+
+          <p className="analysis-memory-description">
+            Android Memory 提供本次采集的 meminfo 账本与证据覆盖状态。
+          </p>
+
+          <dl className="analysis-memory-facts" aria-label="Android 内存证据状态">
+            <div>
+              <dt>证据强度</dt>
+              <dd>{memorySupportLabels[memorySupport ?? ""] ?? "未报告"}</dd>
+            </div>
+            <div>
+              <dt>主要意图支持</dt>
+              <dd>{memorySupportLabels[primaryMemorySupport ?? ""] ?? "未报告"}</dd>
+            </div>
+            <div>
+              <dt>内存账本</dt>
+              <dd>{memoryLedgerLabels[memoryLedger ?? "not_provided"] ?? "状态未知"}</dd>
+            </div>
+            <div>
+              <dt>证据覆盖</dt>
+              <dd>{memoryCoverageCount === null ? "未报告" : `${memoryCoverageCount} 类可用`}</dd>
+            </div>
+          </dl>
+
+          {primaryMemoryMetrics.length > 0 ? (
+            <>
+              <dl className="analysis-report-metrics analysis-memory-metrics" aria-label="Android 内存指标">
+                {primaryMemoryMetrics.map(({ metric, value }) => (
+                  <div key={metric.metric_id}>
+                    <dt>{memoryMetricLabel(metric)}</dt>
+                    <dd>{value}</dd>
+                  </div>
+                ))}
+              </dl>
+              {additionalMemoryMetrics.length > 0 ? (
+                <details className="analysis-report-metric-details">
+                  <summary>另有 {additionalMemoryMetrics.length} 项内存指标</summary>
+                  <dl className="analysis-report-metrics" aria-label="其余 Android 内存指标">
+                    {additionalMemoryMetrics.map(({ metric, value }) => (
+                      <div key={metric.metric_id}>
+                        <dt>{memoryMetricLabel(metric)}</dt>
+                        <dd>{value}</dd>
+                      </div>
+                    ))}
+                  </dl>
+                </details>
+              ) : null}
+            </>
+          ) : (
+            <p className="analysis-memory-unavailable">
+              {memoryScenario.result_state === "canceled"
+                ? "内存分析已取消，本次没有可展示的内存指标。"
+                : memoryScenario.result_state === "failed"
+                  ? "Android Memory 未获得完整采集结果，已保留可验证的证据状态。"
+                  : "Android Memory 已完成，但当前证据中没有可展示的 meminfo 账本指标。"}
+            </p>
+          )}
+
+          <p className="analysis-memory-boundary">
+            这里只展示采集事实；单次内存值不会自动判定为泄漏。
+          </p>
+
+          {memoryEvidence && Object.keys(memoryEvidence.fields).length > 0 ? (
+            <details className="analysis-memory-evidence-details">
+              <summary>查看 Android Memory 证据字段</summary>
+              <pre>{JSON.stringify(memoryEvidence.fields, null, 2)}</pre>
+            </details>
+          ) : null}
+        </section>
+      ) : null}
+
       <section className="analysis-report-section" aria-labelledby="report-findings-title">
         <div className="analysis-report-heading">
           <div>
-            <p className="section-label">SMARTPERFETTO EVIDENCE</p>
+            <p className="section-label">
+              {hasMemoryScenario ? "DUAL-KERNEL EVIDENCE" : "SMARTPERFETTO EVIDENCE"}
+            </p>
             <h2 id="report-findings-title">重点问题</h2>
           </div>
           <span>{visibleFindings.length} 项</span>

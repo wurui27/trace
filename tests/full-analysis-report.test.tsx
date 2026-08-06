@@ -168,4 +168,49 @@ describe("FullAnalysisReport", () => {
     expect(await screen.findByText("PerfPilot AI 未完成")).toBeVisible();
     expect(screen.queryByText("0 轮 PerfPilot AI 已完成")).not.toBeInTheDocument();
   });
+
+  it("describes the joined kernels for a device report", async () => {
+    const deviceAnalysis: AnalysisResponse = {
+      ...analysis,
+      analysis_mode: "device",
+    };
+    const deviceReport: AnalysisReport = {
+      ...report,
+      analysis_mode: "device",
+      scenario_reports: [
+        ...report.scenario_reports,
+        {
+          scenario_job_id: "scenario-memory-1",
+          scenario_type: "memory_cycle",
+          result_state: "completed",
+          device_group_id: null,
+          device_group_reason: "not_applicable",
+          bundle: {
+            metrics: [],
+            findings: [],
+            evidence: [],
+          },
+          failure: null,
+        },
+      ],
+    };
+    const loader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({
+        teamId: "team-1",
+        analysis: deviceAnalysis,
+        report: deviceReport,
+        reportLoadFailed: false,
+      });
+    });
+
+    render(<FullAnalysisReport analysisId="analysis-live-1" loader={loader} />);
+
+    expect(
+      await screen.findByText(
+        "SmartPerfetto 提供 Trace 证据，Android Memory 提供内存采集事实，PerfPilot AI 负责复核、归纳并生成最终优化方案。",
+      ),
+    ).toBeVisible();
+    expect(screen.getByText("SmartPerfetto 53 轮，Android Memory 已汇聚")).toBeVisible();
+    expect(screen.getByText("2 个真机场景")).toBeVisible();
+  });
 });
