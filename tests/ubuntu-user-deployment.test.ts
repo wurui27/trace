@@ -28,7 +28,7 @@ describe("Ubuntu user deployment", () => {
 
   it.each([
     ["perfpilot-smartperfetto.service", "PORT=3001"],
-    ["perfpilot-api.service", "--host 10.166.0.125 --port 8000"],
+    ["perfpilot-api.service", "--host 0.0.0.0 --port 8000"],
     ["perfpilot-web.service", "--port 3000"],
   ])("keeps %s supervised and bound to its declared port", async (unit, marker) => {
     const service = await source(`infra/ubuntu-user/systemd/${unit}`);
