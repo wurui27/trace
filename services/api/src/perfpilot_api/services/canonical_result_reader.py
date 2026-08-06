@@ -167,7 +167,8 @@ class CanonicalResultReader:
             not all(isinstance(value, UUID) for value in fields[:4])
             or type(resource_version) is not int
             or resource_version < 1
-            or getattr(execution, "engine_id", None) != "smartperfetto"
+            or getattr(execution, "engine_id", None)
+            not in {"smartperfetto", "android_memory"}
             or getattr(execution, "state", None) not in {"completed", "insufficient_data"}
         ):
             raise CanonicalResultIntegrityError

@@ -43,6 +43,10 @@ class Execution:
     attempt_number = 1
 
 
+class AndroidMemoryExecution(Execution):
+    engine_id = "android_memory"
+
+
 def _canonical() -> object:
     return canonicalize_engine_result(
         EngineResultWrite(
@@ -159,6 +163,20 @@ def _reader(record: EngineResultArtifactRecord | None = None) -> tuple[Canonical
         ),
         client,
     )
+
+
+def test_reader_accepts_android_memory_as_a_supported_canonical_engine() -> None:
+    values = CanonicalResultReader._execution_values(AndroidMemoryExecution())
+
+    assert values == (TEAM_ID, ANALYSIS_ID, EXECUTION_ID, ARTIFACT_ID, 7)
+
+
+def test_reader_rejects_unknown_canonical_engines() -> None:
+    class UnknownExecution(Execution):
+        engine_id = "unknown_engine"
+
+    with pytest.raises(CanonicalResultIntegrityError, match="^canonical result integrity failure$"):
+        CanonicalResultReader._execution_values(UnknownExecution())
 
 
 @pytest.mark.asyncio
