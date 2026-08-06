@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import copy
 import hashlib
 import json
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -285,6 +288,49 @@ class _InvalidReportProvider:
 
     async def aclose(self) -> None:
         return None
+
+
+class _RerunBarrierReportProvider(_ProjectionReportProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.rerun_calls = 0
+        self.first_rerun_started = threading.Event()
+        self.second_rerun_started = threading.Event()
+        self.release_reruns = threading.Event()
+
+    async def complete(self, *, projection) -> SynthesisCandidate:
+        self.calls += 1
+        if self.calls > 1:
+            self.rerun_calls += 1
+            if self.rerun_calls == 1:
+                self.first_rerun_started.set()
+            else:
+                self.second_rerun_started.set()
+            while not self.release_reruns.is_set():
+                await asyncio.sleep(0.001)
+        return await super().complete(projection=projection)
+
+
+class _AggregateTokenUsageReportProvider(_ProjectionReportProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, *, projection) -> SynthesisCandidate:
+        self.calls += 1
+        if self.calls == 1:
+            return SynthesisCandidate(
+                candidate_json=b"{}",
+                prompt_tokens=3,
+                completion_tokens=5,
+                latency_ms=7,
+            )
+        valid = await super().complete(projection=projection)
+        return SynthesisCandidate(
+            candidate_json=valid.candidate_json,
+            prompt_tokens=11,
+            completion_tokens=13,
+            latency_ms=17,
+        )
 
 
 def _smartperfetto_result() -> EngineResult:
@@ -1308,6 +1354,73 @@ def test_local_app_persists_bounded_single_pass_failure(tmp_path: Path) -> None:
     assert report["synthesis"]["state"] == "failed"
     assert report["synthesis"]["failure_code"] == "ai_output_invalid"
     assert report["scenario_reports"][0]["bundle"] is not None
+    expected_failed_rounds = [
+        {"round": 1, "role": "report", "state": "failed", "attempts": 2}
+    ]
+    persisted = LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)]
+    assert persisted["ai_rounds"] == expected_failed_rounds
+
+    restarted_app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+    with TestClient(restarted_app) as client:
+        restored = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}")
+
+    assert restored.status_code == 200
+    assert restored.json()["ai_rounds"] == expected_failed_rounds
+
+
+def test_local_app_publishes_aggregate_token_usage_after_a_valid_retry(
+    tmp_path: Path,
+) -> None:
+    provider = _AggregateTokenUsageReportProvider()
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+        )
+        terminal = None
+        for _ in range(200):
+            terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if terminal["report_available"]:
+                break
+            time.sleep(0.01)
+        assert terminal is not None
+        assert terminal["ai_rounds"] == [
+            {"round": 1, "role": "report", "state": "completed", "attempts": 2}
+        ]
+        published = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert provider.calls == 2
+    assert published.status_code == 200
+    report = validate_contract("analysis-report", published.json())
+    provenance = report["synthesis"]["provenance"]
+    assert provenance["prompt_tokens"] == 14
+    assert provenance["completion_tokens"] == 18
+    assert provenance["total_tokens"] == 32
 
 
 def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> None:
@@ -1498,6 +1611,177 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         assert (legacy_directory / "round-3.json").read_bytes() == legacy_round_3_bytes
 
     assert restored_gateway.submissions == []
+
+
+def test_local_app_serializes_simultaneous_ai_rerun_reservations(
+    tmp_path: Path,
+) -> None:
+    provider = _RerunBarrierReportProvider()
+    gateway = _FakeSmartPerfettoGateway(_live_smartperfetto_result())
+    app = create_local_app(
+        gateway=gateway,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    checksum = base64.b64encode(hashlib.sha256(b"recovered-trace").digest()).decode(
+        "ascii"
+    )
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        recovered = client.post(
+            f"/v1/teams/{team_id}/local-recoveries",
+            headers=headers,
+            json={
+                "schema_version": "1.0",
+                "session_id": "session-local-1",
+                "run_id": "run-local-1",
+                "analysis_profile": "auto",
+                "question": "给出最终优化方案",
+                "trace_size": len(b"recovered-trace"),
+                "trace_sha256_b64": checksum,
+            },
+        )
+        assert recovered.status_code == 201
+        analysis_id = recovered.json()["analysis_id"]
+        initial = recovered.json()
+        for _ in range(100):
+            initial = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if initial["report_available"] and initial["state"] in {
+                "completed",
+                "partially_completed",
+            }:
+                break
+            time.sleep(0.01)
+        runtime = app.state.local_runtime
+        parsed_analysis_id = UUID(analysis_id)
+        for _ in range(100):
+            initial_task = runtime.analyses[parsed_analysis_id].task
+            if initial_task is not None and initial_task.done():
+                break
+            time.sleep(0.01)
+        assert initial["ai_rounds"] == [
+            {"round": 1, "role": "report", "state": "completed", "attempts": 1}
+        ]
+        assert provider.calls == 1
+        initial_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+        assert initial_report.status_code == 200
+        assert initial_report.json()["report_version"] == 1
+
+        original_persist = runtime._persist
+        first_reservation_entered = threading.Event()
+        second_reservation_entered = threading.Event()
+        release_reservations = threading.Event()
+        reservation_persists = 0
+
+        async def persist_with_reservation_barrier(analysis) -> None:
+            nonlocal reservation_persists
+            is_reservation = (
+                analysis.analysis_id == parsed_analysis_id
+                and analysis.generation >= 2
+                and len(analysis.ai_rounds) == 1
+                and analysis.ai_rounds[0].state == "pending"
+                and analysis.stages["report"] == "pending"
+            )
+            if is_reservation:
+                reservation_persists += 1
+                if reservation_persists == 1:
+                    first_reservation_entered.set()
+                else:
+                    second_reservation_entered.set()
+                while not release_reservations.is_set():
+                    await asyncio.sleep(0.001)
+            await original_persist(analysis)
+
+        runtime._persist = persist_with_reservation_barrier
+        rerun_path = f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs"
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            first_future = executor.submit(
+                client.post,
+                rerun_path,
+                headers=headers,
+            )
+            first_entered = first_reservation_entered.wait(timeout=2)
+            if not first_entered:
+                release_reservations.set()
+                first_future.result(timeout=5)
+            assert first_entered
+            assert not provider.first_rerun_started.is_set()
+            second_future = executor.submit(
+                client.post,
+                rerun_path,
+                headers=headers,
+            )
+            deadline = time.monotonic() + 2
+            while (
+                not second_future.done()
+                and not second_reservation_entered.is_set()
+                and time.monotonic() < deadline
+            ):
+                time.sleep(0.001)
+            second_observed = (
+                second_future.done() or second_reservation_entered.is_set()
+            )
+            release_reservations.set()
+            first_rerun = first_future.result(timeout=5)
+            second_rerun = second_future.result(timeout=5)
+        assert second_observed
+
+        responses = (first_rerun, second_rerun)
+        try:
+            assert sorted(response.status_code for response in responses) == [201, 409]
+            accepted = next(response for response in responses if response.status_code == 201)
+            rejected = next(response for response in responses if response.status_code == 409)
+            assert accepted.json()["generation"] == 2
+            assert rejected.json() == {"detail": "analysis is already running"}
+            assert provider.first_rerun_started.wait(timeout=2)
+            assert provider.rerun_calls == 1
+            assert not provider.second_rerun_started.is_set()
+        finally:
+            provider.release_reruns.set()
+
+        terminal = initial
+        for _ in range(100):
+            terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if (
+                terminal["stages"][2]["state"] == "completed"
+                and terminal["stages"][3]["state"] == "completed"
+                and terminal["ai_rounds"]
+                == [
+                    {
+                        "round": 1,
+                        "role": "report",
+                        "state": "completed",
+                        "attempts": 1,
+                    }
+                ]
+            ):
+                break
+            time.sleep(0.01)
+        final_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert terminal["ai_rounds"] == [
+        {"round": 1, "role": "report", "state": "completed", "attempts": 1}
+    ]
+    assert provider.calls == 2
+    assert provider.rerun_calls == 1
+    assert final_report.status_code == 200
+    assert final_report.json()["report_version"] == 2
+    persisted = LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)]
+    assert persisted["generation"] == 2
+    assert persisted["ai_rounds"] == terminal["ai_rounds"]
+    assert gateway.submissions == []
 
 
 def test_local_recovery_imports_a_completed_smartperfetto_session_once(

@@ -147,6 +147,10 @@ class LocalEngineRun:
     run_id: str
 
 
+class _StaleLocalGeneration(RuntimeError):
+    pass
+
+
 class LocalAnalysisGateway(Protocol):
     async def submit(
         self,
@@ -1066,6 +1070,7 @@ def _compose_local_report(
     analysis: _LocalAnalysis,
     prepared: _PreparedLocalReport,
     *,
+    generation: int,
     synthesis: AISynthesisOutput | None,
     synthesis_failure_code: str | None,
     rounds: tuple[LocalReportUsage, ...],
@@ -1096,7 +1101,7 @@ def _compose_local_report(
             analysis_id=analysis.analysis_id,
             synthesis_execution_id=synthesis_execution_id,
             tenant_resource_version=1,
-            generation=analysis.generation,
+            generation=generation,
             generated_at=generated_at,
             core_document=prepared.core_document,
             synthesis_document=synthesis_document,
@@ -1527,24 +1532,55 @@ class _LocalRuntime:
             self.analyses[analysis_id] = analysis
         await self._persist(analysis)
         async with self.lock:
-            task = asyncio.create_task(self._execute_run(analysis, run))
+            task = asyncio.create_task(
+                self._execute_run(
+                    analysis,
+                    run,
+                    generation=analysis.generation,
+                )
+            )
             analysis.task = task
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
         return analysis
 
     async def rerun_synthesis(self, analysis: _LocalAnalysis) -> int:
-        if analysis.source_run is None:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                "SmartPerfetto source analysis is unavailable",
+        start_gate = asyncio.Event()
+
+        async def execute_reserved(
+            run: LocalEngineRun,
+            generation: int,
+        ) -> None:
+            await start_gate.wait()
+            await self._execute_run(
+                analysis,
+                run,
+                generation=generation,
             )
+
         async with self.lock:
+            if analysis.source_run is None:
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "SmartPerfetto source analysis is unavailable",
+                )
             if analysis.task is not None and not analysis.task.done():
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     "analysis is already running",
                 )
+            source_run = analysis.source_run
+            previous_generation = analysis.generation
+            previous_state = analysis.state
+            previous_failure = (
+                dict(analysis.failure) if analysis.failure is not None else None
+            )
+            previous_stages = dict(analysis.stages)
+            previous_ai_rounds = [
+                _LocalAIRound(item.number, item.role, item.state, item.attempts)
+                for item in analysis.ai_rounds
+            ]
+            previous_version = analysis.version
             analysis.generation += 1
             analysis.state = "analyzing"
             analysis.failure = None
@@ -1554,12 +1590,32 @@ class _LocalRuntime:
             analysis.ai_rounds = _default_ai_rounds()
             analysis.version += 1
             generation = analysis.generation
-        await self._persist(analysis)
-        async with self.lock:
-            task = asyncio.create_task(self._execute_run(analysis, analysis.source_run))
+            reserved_version = analysis.version
+            task = asyncio.create_task(execute_reserved(source_run, generation))
             analysis.task = task
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
+        try:
+            await self._persist(analysis)
+        except BaseException:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            async with self.lock:
+                if analysis.task is task:
+                    analysis.task = None
+                    if (
+                        analysis.generation == generation
+                        and analysis.version == reserved_version
+                    ):
+                        analysis.generation = previous_generation
+                        analysis.state = previous_state
+                        analysis.failure = previous_failure
+                        analysis.stages = previous_stages
+                        analysis.ai_rounds = previous_ai_rounds
+                        analysis.version = previous_version
+            self.tasks.discard(task)
+            raise
+        start_gate.set()
         return generation
 
     async def analysis(self, analysis_id: UUID) -> _LocalAnalysis:
@@ -1754,9 +1810,10 @@ class _LocalRuntime:
         return upload
 
     async def _execute(self, analysis: _LocalAnalysis) -> None:
+        generation = analysis.generation
         try:
             if analysis.analysis_mode == "device":
-                await self._execute_device(analysis)
+                await self._execute_device(analysis, generation=generation)
                 return
             trace = analysis.inputs["trace"]
             if trace.upload_id is None:
@@ -1768,17 +1825,24 @@ class _LocalRuntime:
                 question=analysis.question,
             )
             await self._register_source_run(analysis, run)
-            await self._execute_run(analysis, run)
+            await self._execute_run(analysis, run, generation=generation)
         except asyncio.CancelledError:
             raise
+        except _StaleLocalGeneration:
+            return
         except Exception as error:
             _LOGGER.exception(
                 "Local analysis execution failed type=%s",
                 type(error).__name__,
             )
-            await self._fail_analysis(analysis)
+            await self._fail_analysis(analysis, generation=generation)
 
-    async def _execute_device(self, analysis: _LocalAnalysis) -> None:
+    async def _execute_device(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        generation: int,
+    ) -> None:
         if self.device_capture_gateway is None or analysis.device_id is None:
             raise RuntimeError("local device capture is unavailable")
         detected = await self.device_probe.inspect()
@@ -1866,7 +1930,7 @@ class _LocalRuntime:
             if memory_task is not None and not memory_task.done():
                 memory_task.cancel()
                 await asyncio.gather(memory_task, return_exceptions=True)
-        await self._mark_smartperfetto_completed(analysis)
+        await self._mark_smartperfetto_completed(analysis, generation=generation)
         if memory_result is not None:
             await asyncio.to_thread(
                 self.store.save_document,
@@ -1885,7 +1949,11 @@ class _LocalRuntime:
                 else None
             ),
         )
-        await self._publish_prepared(analysis, prepared)
+        await self._publish_prepared(
+            analysis,
+            prepared,
+            generation=generation,
+        )
 
     async def _register_source_run(
         self,
@@ -1918,10 +1986,17 @@ class _LocalRuntime:
                 raise RuntimeError("SmartPerfetto analysis did not complete")
             await asyncio.sleep(self.poll_interval_seconds)
 
-    async def _mark_smartperfetto_completed(self, analysis: _LocalAnalysis) -> None:
+    async def _mark_smartperfetto_completed(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        generation: int,
+    ) -> None:
         async with self.lock:
             if analysis.cancel_requested_at is not None:
                 raise asyncio.CancelledError
+            if analysis.generation != generation:
+                raise _StaleLocalGeneration
             analysis.stages["smartperfetto"] = "completed"
             analysis.stages["perfpilot_ai"] = "running"
             analysis.version += 1
@@ -1931,29 +2006,45 @@ class _LocalRuntime:
         self,
         analysis: _LocalAnalysis,
         run: LocalEngineRun,
+        *,
+        generation: int,
     ) -> None:
         try:
             result = await self._wait_engine_result(analysis, run)
-            await self._mark_smartperfetto_completed(analysis)
+            await self._mark_smartperfetto_completed(
+                analysis,
+                generation=generation,
+            )
             prepared = _prepare_local_report(analysis, result)
-            await self._publish_prepared(analysis, prepared)
+            await self._publish_prepared(
+                analysis,
+                prepared,
+                generation=generation,
+            )
         except asyncio.CancelledError:
             raise
+        except _StaleLocalGeneration:
+            return
         except Exception as error:
             _LOGGER.exception(
                 "Local report execution failed type=%s",
                 type(error).__name__,
             )
-            await self._fail_analysis(analysis)
+            await self._fail_analysis(analysis, generation=generation)
 
     async def _publish_prepared(
         self,
         analysis: _LocalAnalysis,
         prepared: _PreparedLocalReport,
+        *,
+        generation: int,
     ) -> None:
-        analysis.source_rounds, analysis.source_verification = _source_metadata(
-            prepared.source_report
-        )
+        async with self.lock:
+            if analysis.generation != generation:
+                raise _StaleLocalGeneration
+            analysis.source_rounds, analysis.source_verification = _source_metadata(
+                prepared.source_report
+            )
         await asyncio.to_thread(
             self.store.save_document,
             analysis.analysis_id,
@@ -1986,6 +2077,8 @@ class _LocalRuntime:
                 output: AISynthesisOutput | None,
             ) -> None:
                 async with self.lock:
+                    if analysis.generation != generation:
+                        raise _StaleLocalGeneration
                     if not 1 <= number <= len(analysis.ai_rounds):
                         raise LocalSynthesisError(
                             "ai_state_invalid",
@@ -2016,6 +2109,8 @@ class _LocalRuntime:
             synthesis = synthesis_result.output
             rounds = synthesis_result.rounds
             async with self.lock:
+                if analysis.generation != generation:
+                    raise _StaleLocalGeneration
                 analysis.stages["perfpilot_ai"] = "completed"
                 analysis.failure = None
                 analysis.version += 1
@@ -2028,6 +2123,8 @@ class _LocalRuntime:
                 error.round_number,
             )
             async with self.lock:
+                if analysis.generation != generation:
+                    raise _StaleLocalGeneration
                 analysis.stages["perfpilot_ai"] = "failed"
                 analysis.failure = {
                     "code": error.stable_code,
@@ -2035,9 +2132,13 @@ class _LocalRuntime:
                     "retryable": error.retryable,
                 }
                 analysis.version += 1
+        async with self.lock:
+            if analysis.generation != generation:
+                raise _StaleLocalGeneration
         report = _compose_local_report(
             analysis,
             prepared,
+            generation=generation,
             synthesis=synthesis,
             synthesis_failure_code=synthesis_failure_code,
             rounds=rounds,
@@ -2052,6 +2153,8 @@ class _LocalRuntime:
         async with self.lock:
             if analysis.cancel_requested_at is not None:
                 raise asyncio.CancelledError
+            if analysis.generation != generation:
+                raise _StaleLocalGeneration
             analysis.report = report
             analysis.state = str(report["state"])
             analysis.completed_at = datetime.now(UTC)
@@ -2059,13 +2162,20 @@ class _LocalRuntime:
             analysis.version += 1
         await self._persist(analysis)
 
-    async def _fail_analysis(self, analysis: _LocalAnalysis) -> None:
+    async def _fail_analysis(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        generation: int,
+    ) -> None:
         failure = {
             "code": "local_analysis_failed",
             "message": "本地 SmartPerfetto 分析未能完成",
             "retryable": True,
         }
         async with self.lock:
+            if analysis.generation != generation:
+                return
             if analysis.cancel_requested_at is not None or analysis.state == "canceled":
                 return
             analysis.state = "failed"
