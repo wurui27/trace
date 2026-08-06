@@ -106,6 +106,113 @@ class RegistrationResponse(BaseModel):
         return self
 
 
+class ExecutionSlot(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    state: Literal["idle", "busy"]
+    execution_id: UUID | None
+
+    @model_validator(mode="after")
+    def validate_state(self) -> Self:
+        if (self.state == "idle") != (self.execution_id is None):
+            raise ValueError("execution slot is invalid")
+        return self
+
+
+class HeartbeatDevice(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    client_ref: UUID
+    serial: str = Field(
+        min_length=1,
+        max_length=255,
+        pattern=r"^[!-~]+$",
+        repr=False,
+    )
+    manufacturer: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[^\x00-\x1f\x7f]*$",
+    )
+    model: str | None = Field(
+        default=None,
+        max_length=128,
+        pattern=r"^[^\x00-\x1f\x7f]*$",
+    )
+    android_release: str | None = Field(
+        default=None,
+        max_length=64,
+        pattern=r"^[^\x00-\x1f\x7f]*$",
+    )
+    api_level: int | None = Field(default=None, strict=True, ge=1, le=1_000)
+    connection_type: Literal["usb", "wifi", "unknown"]
+    adb_state: Literal["device", "unauthorized", "offline", "booting"]
+    battery_percent: int | None = Field(default=None, strict=True, ge=0, le=100)
+    temperature_c: float | None = Field(default=None, ge=-100, le=200)
+    storage_available_bytes: int | None = Field(default=None, strict=True, ge=0)
+    property_error_code: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=96,
+        pattern=r"^[a-z][a-z0-9_]*$",
+    )
+
+
+class HeartbeatRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    agent_version: str
+    platform: AgentPlatform
+    hostname: str = Field(min_length=1, max_length=200, pattern=r"^[^\x00-\x1f\x7f]+$")
+    observed_at: datetime
+    clock_skew_ms: int = Field(strict=True, ge=-300_000, le=300_000)
+    disk_available_bytes: int = Field(strict=True, ge=0, le=2**63 - 1)
+    execution_slot: ExecutionSlot
+    devices: tuple[HeartbeatDevice, ...] = Field(max_length=32)
+
+    @field_validator("agent_version")
+    @classmethod
+    def validate_agent_version(cls, value: str) -> str:
+        if len(value) > 64 or _AGENT_VERSION.fullmatch(value) is None:
+            raise ValueError("Agent version is invalid")
+        return value
+
+    @field_validator("observed_at")
+    @classmethod
+    def validate_observed_at(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class HeartbeatDeviceReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    client_ref: UUID
+    device_id: UUID
+    device_digest: str = Field(pattern=r"^[0-9a-f]{64}$")
+
+
+class HeartbeatResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    accepted_at: datetime
+    next_heartbeat_seconds: Literal[10]
+    devices: tuple[HeartbeatDeviceReceipt, ...] = Field(max_length=32)
+
+    @field_validator("accepted_at", mode="before")
+    @classmethod
+    def require_string_timestamp(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("heartbeat timestamp must be an ISO 8601 string")
+        return value
+
+    @field_validator("accepted_at")
+    @classmethod
+    def validate_accepted_at(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
 class ControlClient:
     def __init__(
         self,
@@ -154,10 +261,41 @@ class ControlClient:
         except (httpx.HTTPError, ValidationError, ValueError, TypeError, UnicodeError):
             raise ControlClientError from None
 
+    async def heartbeat(
+        self,
+        request: HeartbeatRequest | Mapping[str, object],
+        *,
+        access_token: str,
+    ) -> HeartbeatResponse:
+        try:
+            if re.fullmatch(r"ppat_[A-Za-z0-9_-]{43}", access_token) is None:
+                raise ControlClientError
+            normalized = HeartbeatRequest.model_validate(request)
+            response = await self._client.post(
+                f"{self._config.server_url}/v1/agent/heartbeat",
+                json=normalized.model_dump(mode="json"),
+                headers={"authorization": f"Bearer {access_token}"},
+            )
+            if response.status_code != 200:
+                raise ControlClientError
+            payload = response.content
+            if not payload or len(payload) > _MAXIMUM_RESPONSE_BYTES:
+                raise ControlClientError
+            return HeartbeatResponse.model_validate_json(payload)
+        except ControlClientError:
+            raise
+        except (httpx.HTTPError, ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
 
 __all__ = [
     "ControlClient",
     "ControlClientError",
+    "ExecutionSlot",
+    "HeartbeatDevice",
+    "HeartbeatDeviceReceipt",
+    "HeartbeatRequest",
+    "HeartbeatResponse",
     "RegistrationRequest",
     "RegistrationResponse",
     "TaskSigningKeyResponse",

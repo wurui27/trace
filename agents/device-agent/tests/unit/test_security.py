@@ -2,15 +2,21 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from uuid import UUID
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from conftest import AGENT_ID, DEVICE_DIGEST, NOW, OTHER_AGENT_ID, TASK_KID
 from perfpilot_agent.security import TaskRejected, TaskVerifier
+
+AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
+OTHER_AGENT_ID = UUID("71000000-0000-4000-8000-000000000002")
+NOW = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
+DEVICE_DIGEST = "a" * 64
+TASK_KID = "task-key-2026-08"
 
 
 def public_key_b64(key: Ed25519PrivateKey) -> str:

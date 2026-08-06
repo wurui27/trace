@@ -3,12 +3,12 @@ from __future__ import annotations
 import base64
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from uuid import UUID
 
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from conftest import AGENT_ID, TASK_KID
 from perfpilot_agent.credentials import (
     AgentCredentials,
     CredentialStore,
@@ -17,6 +17,9 @@ from perfpilot_agent.credentials import (
     TaskSigningKey,
 )
 from perfpilot_agent.platform.linux import LinuxFileCredentialBackend
+
+AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
+TASK_KID = "task-key-2026-08"
 
 
 def encoded_private_key(key: Ed25519PrivateKey) -> str:

@@ -1,0 +1,4 @@
+List of devices attached
+R3CN30SECRET           device product:demo model:Pixel_7 device:panther usb:1-2 transport_id:1
+192.168.50.8:5555      unauthorized transport_id:2
+emulator-5554          offline transport_id:3

@@ -2,13 +2,13 @@ from __future__ import annotations
 
 import base64
 from datetime import UTC, datetime, timedelta
+from uuid import UUID
 
 import httpx
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from conftest import AGENT_ID, TASK_KID
 from perfpilot_agent.config import AgentConfig
 from perfpilot_agent.control_client import (
     ControlClient,
@@ -19,6 +19,9 @@ from perfpilot_agent.control_client import (
 from perfpilot_agent.credentials import CredentialStore, InMemoryCredentialBackend
 from perfpilot_agent.platform.base import PlatformMetadata
 from perfpilot_agent.registration import RegistrationAlreadyExists, RegistrationService
+
+AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
+TASK_KID = "task-key-2026-08"
 
 
 def public_key_b64(key: Ed25519PrivateKey) -> str:
