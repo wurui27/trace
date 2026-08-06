@@ -367,6 +367,75 @@ def test_local_app_reports_the_device_currently_connected_over_adb(tmp_path: Pat
     assert device_probe.calls == 1
 
 
+def test_local_app_exposes_connected_adb_device_through_team_directory(
+    tmp_path: Path,
+) -> None:
+    serial = "0123456789ABCDEF"
+    device_probe = _FakeDeviceProbe(
+        _FakeDeviceStatus(
+            state="connected",
+            device=_FakeDevice(
+                serial=serial,
+                manufacturer="UNISOC",
+                model="uis7870_2h10_car_c200_6",
+                android_version="13",
+                api_level=33,
+            ),
+        )
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        device_probe=device_probe,
+        data_root=tmp_path,
+    )
+
+    with TestClient(app) as client:
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        first = client.get(f"/v1/teams/{team_id}/devices")
+        second = client.get(f"/v1/teams/{team_id}/devices")
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    device = first.json()["devices"][0]
+    assert device == {
+        "device_id": second.json()["devices"][0]["device_id"],
+        "agent_id": "71000000-0000-4000-8000-000000000001",
+        "agent_name": "本机 ADB",
+        "serial_suffix": "CDEF",
+        "manufacturer": "UNISOC",
+        "model": "uis7870_2h10_car_c200_6",
+        "android_release": "13",
+        "api_level": 33,
+        "connection_type": "usb",
+        "adb_state": "device",
+        "state": "ready",
+        "last_seen_at": device["last_seen_at"],
+    }
+    assert serial not in json.dumps(first.json())
+    assert datetime.fromisoformat(device["last_seen_at"]).tzinfo is not None
+    assert device_probe.calls == 2
+
+
+def test_local_team_device_directory_is_empty_without_one_ready_device(
+    tmp_path: Path,
+) -> None:
+    device_probe = _FakeDeviceProbe(
+        _FakeDeviceStatus(state="disconnected", device=None)
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        device_probe=device_probe,
+        data_root=tmp_path,
+    )
+
+    with TestClient(app) as client:
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        response = client.get(f"/v1/teams/{team_id}/devices")
+
+    assert response.status_code == 200
+    assert response.json() == {"schema_version": "1.0", "devices": []}
+
+
 def test_local_app_lists_one_active_analysis_and_rejects_a_second(
     tmp_path: Path,
 ) -> None:

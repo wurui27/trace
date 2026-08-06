@@ -50,7 +50,7 @@ from perfpilot_api.engines.smartperfetto_contracts import (
     SmartPerfettoTraceUploadResponse,
 )
 from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
-from perfpilot_api.local_device import AdbDeviceProbe, LocalDeviceProbe
+from perfpilot_api.local_device import AdbDeviceProbe, LocalDevice, LocalDeviceProbe
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import (
@@ -73,6 +73,7 @@ from perfpilot_api.services.canonical_result_reader import LoadedCanonicalResult
 
 LOCAL_TEAM_ID = UUID("81000000-0000-4000-8000-000000000001")
 LOCAL_USER_ID = UUID("80000000-0000-4000-8000-000000000001")
+LOCAL_AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
 _SMARTPERFETTO_COMMIT = "1508f99788bfcf18cc861e4bf4f8b472e84240c3"
 _ENGINE_IMAGE_DIGEST = "sha256:" + hashlib.sha256(_SMARTPERFETTO_COMMIT.encode()).hexdigest()
 _MAX_UPLOAD_BYTES = 5 * 1024**3
@@ -103,6 +104,7 @@ _TERMINAL_ANALYSIS_STATES = {
     "deleted",
 }
 _LOCAL_RECOVERY_NAMESPACE = UUID("e2ac7e9c-50e3-5d78-bd3f-53a56e2b2978")
+_LOCAL_DEVICE_NAMESPACE = UUID("06905aa0-0e0a-55c7-b63a-87e7a93775ca")
 _EARLIEST_LOCAL_ANALYSIS_TIME = datetime.min.replace(tzinfo=UTC)
 _LOGGER = logging.getLogger(__name__)
 
@@ -493,6 +495,24 @@ def _public_origin(value: str) -> str:
     ):
         raise ValueError("local public origin must be loopback HTTP")
     return value.rstrip("/")
+
+
+def _team_device(connected: LocalDevice) -> dict[str, object]:
+    serial_suffix = connected.serial[-4:]
+    return {
+        "device_id": str(uuid5(_LOCAL_DEVICE_NAMESPACE, connected.serial)),
+        "agent_id": str(LOCAL_AGENT_ID),
+        "agent_name": "本机 ADB",
+        "serial_suffix": serial_suffix,
+        "manufacturer": connected.manufacturer or None,
+        "model": connected.model or None,
+        "android_release": connected.android_version or None,
+        "api_level": connected.api_level,
+        "connection_type": "wifi" if ":" in connected.serial else "usb",
+        "adb_state": "device",
+        "state": "ready",
+        "last_seen_at": datetime.now(UTC).isoformat(),
+    }
 
 
 def _synthesis_from_core(
@@ -1703,6 +1723,17 @@ def create_local_app(
                 "api_level": connected.api_level,
             },
         }
+
+    @app.get("/v1/teams/{team_id}/devices")
+    async def team_devices(team_id: UUID) -> dict[str, object]:
+        check_team(team_id)
+        detected = await resolved_device_probe.inspect()
+        devices = (
+            [_team_device(detected.device)]
+            if detected.state == "connected" and detected.device is not None
+            else []
+        )
+        return {"schema_version": "1.0", "devices": devices}
 
     @app.post("/v1/teams/{team_id}/analyses", status_code=status.HTTP_201_CREATED)
     async def create_analysis(
