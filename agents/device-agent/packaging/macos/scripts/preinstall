@@ -1,0 +1,5 @@
+#!/bin/bash
+set -euo pipefail
+
+/bin/launchctl bootout system/com.perfpilot.agent >/dev/null 2>&1 || true
+exit 0

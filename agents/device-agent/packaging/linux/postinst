@@ -1,0 +1,12 @@
+#!/bin/sh
+set -eu
+
+install -d -o root -g root -m 0700 \
+  /var/lib/perfpilot-agent \
+  /var/lib/perfpilot-agent/workspace \
+  /var/lib/perfpilot-agent/.android
+chmod 0644 /etc/perfpilot-agent/config.json /etc/perfpilot-agent/perfpilot-ca.crt
+systemctl daemon-reload
+systemctl enable perfpilot-agent.service
+systemctl restart perfpilot-agent.service >/dev/null 2>&1 || true
+exit 0

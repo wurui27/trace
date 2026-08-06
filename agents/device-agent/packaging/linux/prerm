@@ -1,0 +1,9 @@
+#!/bin/sh
+set -eu
+
+if [ "${1:-}" = "remove" ]; then
+  systemctl disable --now perfpilot-agent.service >/dev/null 2>&1 || true
+elif [ "${1:-}" = "upgrade" ]; then
+  systemctl stop perfpilot-agent.service >/dev/null 2>&1 || true
+fi
+exit 0

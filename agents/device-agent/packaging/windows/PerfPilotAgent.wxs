@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+    Name="PerfPilot Android Device Agent"
+    Manufacturer="PerfPilot"
+    Version="$(var.ProductVersion)"
+    UpgradeCode="{9B95492F-AAC7-43B5-A775-86E94391D9E2}"
+    Language="1033"
+    Scope="perMachine"
+    InstallerVersion="500">
+    <MajorUpgrade
+      AllowSameVersionUpgrades="yes"
+      DowngradeErrorMessage="A newer PerfPilot Agent is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="PerfPilot Agent">
+        <Component Id="AgentExecutable" Guid="*">
+          <File Id="AgentExecutableFile" Source="$(var.PayloadDir)\bin\perfpilot-agent.exe" KeyPath="yes" />
+        </Component>
+        <Component Id="ServiceExecutable" Guid="*">
+          <File Id="ServiceExecutableFile" Source="$(var.PayloadDir)\bin\perfpilot-agent-service.exe" KeyPath="yes" />
+          <ServiceInstall
+            Id="PerfPilotServiceInstall"
+            Name="PerfPilotAgent"
+            DisplayName="PerfPilot Android Device Agent"
+            Description="Connects local Android devices to the PerfPilot control plane."
+            Type="ownProcess"
+            Start="auto"
+            ErrorControl="normal"
+            Account="LocalSystem">
+            <ServiceConfig DelayedAutoStart="yes" OnInstall="yes" OnReinstall="yes" />
+          </ServiceInstall>
+          <ServiceControl
+            Id="PerfPilotServiceControl"
+            Name="PerfPilotAgent"
+            Stop="both"
+            Remove="uninstall"
+            Wait="yes" />
+        </Component>
+        <Component Id="WindowsUninstaller" Guid="*">
+          <File Id="WindowsUninstallerFile" Source="$(var.PayloadDir)\bin\uninstall.ps1" KeyPath="yes" />
+        </Component>
+        <Directory Id="PlatformToolsFolder" Name="platform-tools">
+          <Component Id="AdbExecutable" Guid="*">
+            <File Id="AdbExecutableFile" Source="$(var.PayloadDir)\platform-tools\adb.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="AdbWinApi" Guid="*">
+            <File Id="AdbWinApiFile" Source="$(var.PayloadDir)\platform-tools\AdbWinApi.dll" KeyPath="yes" />
+          </Component>
+          <Component Id="AdbWinUsbApi" Guid="*">
+            <File Id="AdbWinUsbApiFile" Source="$(var.PayloadDir)\platform-tools\AdbWinUsbApi.dll" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="CommonAppDataFolder">
+      <Directory Id="ProgramDataPerfPilot" Name="PerfPilot">
+        <Directory Id="ProgramDataAgent" Name="Agent">
+          <Component Id="BootstrapConfiguration" Guid="*">
+            <File Id="BootstrapConfigurationFile" Source="$(var.PayloadDir)\config\config.json" KeyPath="yes" />
+          </Component>
+          <Component Id="BootstrapCa" Guid="*">
+            <File Id="BootstrapCaFile" Source="$(var.PayloadDir)\config\perfpilot-ca.crt" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="MainFeature" Title="PerfPilot Agent" Level="1">
+      <ComponentRef Id="AgentExecutable" />
+      <ComponentRef Id="ServiceExecutable" />
+      <ComponentRef Id="WindowsUninstaller" />
+      <ComponentRef Id="AdbExecutable" />
+      <ComponentRef Id="AdbWinApi" />
+      <ComponentRef Id="AdbWinUsbApi" />
+      <ComponentRef Id="BootstrapConfiguration" />
+      <ComponentRef Id="BootstrapCa" />
+    </Feature>
+  </Package>
+</Wix>

@@ -1,0 +1,259 @@
+name: Device Agent native packages
+
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - "agents/device-agent/**"
+      - "contracts/v1/agents/**"
+      - ".github/workflows/device-agent-packages.yml"
+  push:
+    branches:
+      - main
+    paths:
+      - "agents/device-agent/**"
+      - "contracts/v1/agents/**"
+      - ".github/workflows/device-agent-packages.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: device-agent-packages-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  PACKAGE_VERSION: 0.1.0
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  macos-package:
+    runs-on: macos-15
+    steps:
+      - name: Checkout platform
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41
+        with:
+          version: "0.11.32"
+      - name: Sync Agent build dependencies
+        run: uv sync --locked --package perfpilot-device-agent --extra build
+      - name: Create non-secret bootstrap fixture
+        run: >-
+          uv run --locked --package perfpilot-device-agent python
+          agents/device-agent/packaging/common/create_ci_fixture.py
+          --platform macos --output "$PWD/build/bootstrap"
+      - name: Build macOS package
+        run: |
+          ADB_DIR="$(dirname "$(command -v adb)")"
+          bash agents/device-agent/packaging/macos/build.sh \
+            --config "$PWD/build/bootstrap/config.json" \
+            --ca "$PWD/build/bootstrap/perfpilot-ca.crt" \
+            --adb-dir "$ADB_DIR" \
+            --output "$PWD/build/device-agent-macos.pkg" \
+            --version "$PACKAGE_VERSION" \
+            --python "$PWD/.venv/bin/python"
+      - name: Install and run doctor
+        run: |
+          sudo installer -pkg "$PWD/build/device-agent-macos.pkg" -target /
+          sudo launchctl print system/com.perfpilot.agent >/dev/null
+          sudo launchctl bootout system/com.perfpilot.agent || true
+          sudo "/Library/PerfPilot Agent/perfpilot-agent" doctor --json
+      - name: upgrade-smoke
+        run: |
+          sudo installer -pkg "$PWD/build/device-agent-macos.pkg" -target /
+          sudo launchctl print system/com.perfpilot.agent >/dev/null
+      - name: uninstall-smoke
+        run: |
+          sudo "/Library/PerfPilot Agent/uninstall.sh" --remove-data
+          test ! -e "/Library/PerfPilot Agent"
+          test ! -e "/Library/Application Support/PerfPilot Agent"
+      - name: Hash macOS package
+        run: >-
+          shasum -a 256 build/device-agent-macos.pkg
+          > build/device-agent-macos.pkg.sha256
+      - name: Upload macOS package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: device-agent-macos
+          path: |
+            build/device-agent-macos.pkg
+            build/device-agent-macos.pkg.sha256
+          if-no-files-found: error
+
+  windows-package:
+    runs-on: windows-2025
+    steps:
+      - name: Checkout platform
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41
+        with:
+          version: "0.11.32"
+      - name: Sync Agent build dependencies
+        run: uv sync --locked --package perfpilot-device-agent --extra build --extra windows
+      - name: Install pinned WiX
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix --version 6.0.2
+          "$env:USERPROFILE\.dotnet\tools" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Create non-secret bootstrap fixture
+        shell: pwsh
+        run: |
+          uv run --locked --package perfpilot-device-agent python `
+            agents/device-agent/packaging/common/create_ci_fixture.py `
+            --platform windows --output "$PWD\build\bootstrap"
+      - name: Build Windows package
+        shell: pwsh
+        run: |
+          $AdbDir = Join-Path $env:ANDROID_HOME "platform-tools"
+          & agents/device-agent/packaging/windows/build.ps1 `
+            -Config "$PWD\build\bootstrap\config.json" `
+            -Ca "$PWD\build\bootstrap\perfpilot-ca.crt" `
+            -AdbDir $AdbDir `
+            -Output "$PWD\build\device-agent-windows.msi" `
+            -Version $env:PACKAGE_VERSION `
+            -Python "$PWD\.venv\Scripts\python.exe"
+      - name: Install and run doctor
+        shell: pwsh
+        run: |
+          $Process = Start-Process msiexec.exe -ArgumentList "/i `"$PWD\build\device-agent-windows.msi`" /qn /norestart" -Wait -PassThru
+          if ($Process.ExitCode -ne 0) { throw "MSI installation failed." }
+          Get-Service -Name PerfPilotAgent | Out-Null
+          Stop-Service -Name PerfPilotAgent -Force -ErrorAction SilentlyContinue
+          & "$env:ProgramFiles\PerfPilot Agent\perfpilot-agent.exe" doctor --json
+          if ($LASTEXITCODE -ne 0) { throw "Agent doctor failed." }
+      - name: upgrade-smoke
+        shell: pwsh
+        run: |
+          $Arguments = "/i `"$PWD\build\device-agent-windows.msi`" REINSTALL=ALL REINSTALLMODE=vomus /qn /norestart"
+          $Process = Start-Process msiexec.exe -ArgumentList $Arguments -Wait -PassThru
+          if ($Process.ExitCode -ne 0) { throw "MSI upgrade failed." }
+          Get-Service -Name PerfPilotAgent | Out-Null
+      - name: uninstall-smoke
+        shell: pwsh
+        run: |
+          $State = Join-Path $env:ProgramData "PerfPilot\Agent"
+          New-Item -ItemType Directory -Force -Path (Join-Path $State "workspace") | Out-Null
+          Set-Content -LiteralPath (Join-Path $State "credentials.dat") -Value "ci-placeholder"
+          $Process = Start-Process msiexec.exe -ArgumentList "/x `"$PWD\build\device-agent-windows.msi`" /qn /norestart" -Wait -PassThru
+          if ($Process.ExitCode -ne 0) { throw "MSI uninstall failed." }
+          & agents/device-agent/packaging/windows/uninstall.ps1 -RemoveData
+          if (Test-Path -LiteralPath $State) { throw "Agent state was not removed." }
+      - name: Hash Windows package
+        shell: pwsh
+        run: |
+          $Hash = (Get-FileHash -Algorithm SHA256 "$PWD\build\device-agent-windows.msi").Hash.ToLowerInvariant()
+          "$Hash  device-agent-windows.msi" | Set-Content -Encoding ascii "$PWD\build\device-agent-windows.msi.sha256"
+      - name: Upload Windows package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: device-agent-windows
+          path: |
+            build/device-agent-windows.msi
+            build/device-agent-windows.msi.sha256
+          if-no-files-found: error
+
+  linux-package:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout platform
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@e797f83bcb11b83ae66e0230d6156d7c80228e7c
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@85856786d1ce8acfbcc2f13a5f3fbd6b938f9f41
+        with:
+          version: "0.11.32"
+      - name: Sync Agent build dependencies
+        run: uv sync --locked --package perfpilot-device-agent --extra build
+      - name: Create non-secret bootstrap fixture
+        run: >-
+          uv run --locked --package perfpilot-device-agent python
+          agents/device-agent/packaging/common/create_ci_fixture.py
+          --platform linux --output "$PWD/build/bootstrap"
+      - name: Build Linux package
+        run: |
+          ADB_DIR="$(dirname "$(command -v adb)")"
+          bash agents/device-agent/packaging/linux/build.sh \
+            --config "$PWD/build/bootstrap/config.json" \
+            --ca "$PWD/build/bootstrap/perfpilot-ca.crt" \
+            --adb-dir "$ADB_DIR" \
+            --output "$PWD/build/device-agent-linux.deb" \
+            --version "$PACKAGE_VERSION" \
+            --python "$PWD/.venv/bin/python"
+      - name: Install and run doctor
+        run: |
+          sudo dpkg -i "$PWD/build/device-agent-linux.deb"
+          sudo systemctl is-enabled perfpilot-agent.service
+          sudo systemctl stop perfpilot-agent.service || true
+          sudo /opt/perfpilot-agent/perfpilot-agent doctor --json
+      - name: upgrade-smoke
+        run: |
+          sudo dpkg -i "$PWD/build/device-agent-linux.deb"
+          sudo systemctl is-enabled perfpilot-agent.service
+      - name: uninstall-smoke
+        run: |
+          sudo install -d -m 0700 /var/lib/perfpilot-agent/workspace
+          printf 'ci-placeholder' | sudo tee /var/lib/perfpilot-agent/credentials.json >/dev/null
+          sudo chmod 0600 /var/lib/perfpilot-agent/credentials.json
+          sudo dpkg -r perfpilot-device-agent
+          sudo dpkg -P perfpilot-device-agent
+          test ! -e /var/lib/perfpilot-agent
+      - name: Hash Linux package
+        run: >-
+          sha256sum build/device-agent-linux.deb
+          > build/device-agent-linux.deb.sha256
+      - name: Upload Linux package
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: device-agent-linux
+          path: |
+            build/device-agent-linux.deb
+            build/device-agent-linux.deb.sha256
+          if-no-files-found: error
+
+  checksum-manifest:
+    runs-on: ubuntu-24.04
+    needs:
+      - macos-package
+      - windows-package
+      - linux-package
+    steps:
+      - name: Download native packages
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+        with:
+          pattern: device-agent-*
+          path: packages
+          merge-multiple: true
+      - name: Build SHA256SUMS
+        run: |
+          cd packages
+          sha256sum device-agent-macos.pkg device-agent-windows.msi device-agent-linux.deb > SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Upload packages and SHA256SUMS
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: device-agent-native-packages
+          path: |
+            packages/device-agent-macos.pkg
+            packages/device-agent-windows.msi
+            packages/device-agent-linux.deb
+            packages/SHA256SUMS
+          if-no-files-found: error

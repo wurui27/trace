@@ -1,0 +1,8 @@
+Package: perfpilot-device-agent
+Version: @VERSION@
+Section: utils
+Priority: optional
+Architecture: @ARCHITECTURE@
+Maintainer: PerfPilot Operations <ops@perfpilot.invalid>
+Description: PerfPilot Android Device Agent
+ Connects locally attached Android devices to a trusted PerfPilot control plane.

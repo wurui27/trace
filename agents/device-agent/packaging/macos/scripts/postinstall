@@ -1,0 +1,22 @@
+#!/bin/bash
+set -euo pipefail
+
+STATE_DIR="/Library/Application Support/PerfPilot Agent"
+LOG_DIR="/Library/Logs/PerfPilot Agent"
+PLIST="/Library/LaunchDaemons/com.perfpilot.agent.plist"
+CA_FILE="$STATE_DIR/perfpilot-ca.crt"
+
+/usr/bin/install -d -o root -g wheel -m 0755 "$STATE_DIR" "$LOG_DIR"
+/usr/bin/install -d -o root -g wheel -m 0700 "$STATE_DIR/workspace" "$STATE_DIR/.android"
+/usr/sbin/chown -R root:wheel "/Library/PerfPilot Agent" "$STATE_DIR" "$LOG_DIR" "$PLIST"
+/bin/chmod 0644 "$STATE_DIR/config.json" "$CA_FILE" "$PLIST"
+/usr/bin/security add-trusted-cert \
+  -d \
+  -r trustRoot \
+  -k /Library/Keychains/System.keychain \
+  "$CA_FILE"
+/bin/launchctl bootout system/com.perfpilot.agent >/dev/null 2>&1 || true
+/bin/launchctl bootstrap system "$PLIST"
+/bin/launchctl enable system/com.perfpilot.agent
+/bin/launchctl kickstart -k system/com.perfpilot.agent >/dev/null 2>&1 || true
+exit 0
