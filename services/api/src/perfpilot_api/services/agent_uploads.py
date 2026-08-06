@@ -87,6 +87,28 @@ class AgentUploadDescriptor:
 
 
 @dataclass(frozen=True, slots=True)
+class StoredAgentInput:
+    artifact_id: UUID
+    analysis_id: UUID
+    mime: str
+    size: int
+    sha256_b64: str = field(repr=False)
+    object_key: str = field(repr=False)
+    version_id: str = field(repr=False)
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class AgentInputSlot:
+    artifact_id: UUID
+    mime: str
+    size: int
+    sha256_b64: str = field(repr=False)
+    url: str = field(repr=False)
+    expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
 class StoredAgentUpload:
     artifact_id: UUID
     analysis_id: UUID
@@ -156,6 +178,14 @@ class AgentExecutionAuthorizer(Protocol):
 
 
 class AgentUploadRepository(Protocol):
+    async def load_input(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        artifact_id: UUID,
+    ) -> StoredAgentInput: ...
+
     async def reserve_upload(
         self,
         *,
@@ -245,8 +275,22 @@ class AgentUploadRepository(Protocol):
 
 
 class InMemoryAgentUploadRepository:
-    def __init__(self) -> None:
+    def __init__(self, *, inputs: Sequence[StoredAgentInput] = ()) -> None:
         self._uploads: dict[UUID, StoredAgentUpload] = {}
+        self._inputs = {item.artifact_id: item for item in inputs}
+
+    async def load_input(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        artifact_id: UUID,
+    ) -> StoredAgentInput:
+        del tenant
+        stored = self._inputs.get(artifact_id)
+        if stored is None or stored.analysis_id != access.analysis_id:
+            raise AgentUploadNotFound("input artifact was not found")
+        return stored
 
     async def reserve_upload(
         self,
@@ -622,6 +666,37 @@ class SQLAlchemyAgentUploadRepository:
             rows = await self._load_rows(session, access=access, upload_id=upload_id)
             return self._stored(*rows)
 
+    async def load_input(
+        self,
+        *,
+        tenant: TenantBucket,
+        access: AgentExecutionAccess,
+        artifact_id: UUID,
+    ) -> StoredAgentInput:
+        async with self._session(tenant) as session:
+            artifact = await session.scalar(
+                select(Artifact).where(
+                    Artifact.id == artifact_id,
+                    Artifact.analysis_id == access.analysis_id,
+                    Artifact.artifact_kind == "apk",
+                    Artifact.state == "finalized",
+                    Artifact.version_id.is_not(None),
+                    Artifact.deleted_at.is_(None),
+                )
+            )
+        if artifact is None or artifact.analysis_id is None or artifact.version_id is None:
+            raise AgentUploadNotFound("input artifact was not found")
+        return StoredAgentInput(
+            artifact_id=artifact.id,
+            analysis_id=artifact.analysis_id,
+            mime=artifact.mime_type,
+            size=artifact.size_bytes,
+            sha256_b64=artifact.sha256_b64,
+            object_key=artifact.object_key,
+            version_id=artifact.version_id,
+            expires_at=artifact.expires_at,
+        )
+
     async def prepare_completion(
         self,
         *,
@@ -909,6 +984,52 @@ class AgentUploadService:
         self._execution_authorizer = execution_authorizer
         self._clock = clock
         self._uuid_source = uuid_source
+
+    async def authorize_input(
+        self,
+        *,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        artifact_id: UUID,
+    ) -> AgentInputSlot:
+        now = _aware(self._clock())
+        access = await self._authorize(
+            agent_id=agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            now=now,
+        )
+        if artifact_id not in access.input_artifact_ids:
+            raise AgentUploadNotFound("input artifact was not found")
+        tenant = await _available(self._bucket_resolver.active_for_team(access.team_id))
+        stored = await _available(
+            self._repository.load_input(
+                tenant=tenant,
+                access=access,
+                artifact_id=artifact_id,
+            )
+        )
+        if stored.expires_at <= now:
+            raise AgentUploadExpired("input artifact has expired")
+        authorization = await _available(
+            self._artifact_store.authorize_get(
+                location=ObjectLocation(
+                    bucket=tenant.bucket,
+                    key=stored.object_key,
+                    version_id=stored.version_id,
+                ),
+                expires_in_seconds=300,
+            )
+        )
+        return AgentInputSlot(
+            artifact_id=stored.artifact_id,
+            mime=stored.mime,
+            size=stored.size,
+            sha256_b64=stored.sha256_b64,
+            url=authorization.url,
+            expires_at=now + timedelta(seconds=authorization.expires_in_seconds),
+        )
 
     async def create_upload(
         self,
@@ -1361,6 +1482,7 @@ def _aware(value: datetime) -> datetime:
 
 
 __all__ = [
+    "AgentInputSlot",
     "AgentUploadError",
     "AgentUploadExpired",
     "AgentUploadInvalidRequest",
@@ -1374,4 +1496,5 @@ __all__ = [
     "InMemoryAgentUploadRepository",
     "SQLAlchemyAgentUploadRepository",
     "StoredAgentUpload",
+    "StoredAgentInput",
 ]

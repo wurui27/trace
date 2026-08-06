@@ -12,11 +12,13 @@ from perfpilot_api.services.agent_uploads import (
     AgentUploadNotFound,
     AgentUploadService,
     InMemoryAgentUploadRepository,
+    StoredAgentInput,
 )
 from perfpilot_api.services.agent_tasks import AgentExecutionAccess
 from perfpilot_api.services.uploads import TenantBucket
 from perfpilot_api.storage.base import (
     CompletedMultipart,
+    GetAuthorization,
     MultipartCreation,
     MultipartPart,
     MultipartPartAuthorization,
@@ -31,6 +33,7 @@ AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
 OTHER_AGENT_ID = UUID("71000000-0000-4000-8000-000000000002")
 EXECUTION_ID = UUID("73000000-0000-4000-8000-000000000001")
 ARTIFACT_ID = UUID("76000000-0000-4000-8000-000000000001")
+INPUT_ID = UUID("50000000-0000-4000-8000-000000000001")
 UPLOAD_ID = UUID("77000000-0000-4000-8000-000000000001")
 CHECKSUM = base64.b64encode(b"a" * 32).decode("ascii")
 
@@ -57,6 +60,7 @@ class FixedExecutionAuthorizer:
                 "memory_evidence",
                 "agent_log",
             ),
+            input_artifact_ids=(INPUT_ID,),
         )
 
 
@@ -71,6 +75,7 @@ class RecordingMultipartStore:
         self.complete_calls = 0
         self.abort_calls = 0
         self.part_calls: list[int] = []
+        self.get_calls: list[ObjectLocation] = []
         self.metadata = StoredObjectMetadata(
             location=ObjectLocation(
                 bucket="private-team-bucket",
@@ -80,6 +85,15 @@ class RecordingMultipartStore:
             checksum_sha256_b64=CHECKSUM,
             content_type="application/x-perfetto-trace",
             size_bytes=512 * 1024 * 1024,
+        )
+
+    async def authorize_get(self, **kwargs: object) -> GetAuthorization:
+        location = kwargs["location"]
+        self.get_calls.append(location)
+        return GetAuthorization(
+            location=location,
+            url="https://objects.example/private-signed-input?signature=secret",
+            expires_in_seconds=int(kwargs["expires_in_seconds"]),
         )
 
     async def create_multipart(self, **kwargs: object) -> MultipartCreation:
@@ -110,7 +124,20 @@ class RecordingMultipartStore:
 
 
 def _service() -> tuple[AgentUploadService, RecordingMultipartStore]:
-    repository = InMemoryAgentUploadRepository()
+    repository = InMemoryAgentUploadRepository(
+        inputs=(
+            StoredAgentInput(
+                artifact_id=INPUT_ID,
+                analysis_id=ANALYSIS_ID,
+                mime="application/vnd.android.package-archive",
+                size=4,
+                sha256_b64=CHECKSUM,
+                object_key="raw/private/input.apk",
+                version_id="input-version",
+                expires_at=NOW + timedelta(days=1),
+            ),
+        )
+    )
     store = RecordingMultipartStore()
     return (
         AgentUploadService(
@@ -135,6 +162,30 @@ async def _create(service: AgentUploadService):
         size=512 * 1024 * 1024,
         sha256_b64=CHECKSUM,
     )
+
+
+@pytest.mark.asyncio
+async def test_input_authorization_is_bound_to_the_signed_artifact_and_five_minutes() -> None:
+    service, store = _service()
+
+    authorized = await service.authorize_input(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        artifact_id=INPUT_ID,
+    )
+
+    assert authorized.artifact_id == INPUT_ID
+    assert authorized.expires_at == NOW + timedelta(minutes=5)
+    assert store.get_calls[0].version_id == "input-version"
+    assert "signature=secret" not in repr(authorized)
+    with pytest.raises(AgentUploadNotFound):
+        await service.authorize_input(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=1,
+            artifact_id=ARTIFACT_ID,
+        )
 
 
 @pytest.mark.asyncio

@@ -36,6 +36,8 @@ class RunningTask(Protocol):
 
     async def stop(self, reason: StopReason) -> None: ...
 
+    async def finalize(self) -> None: ...
+
 
 class TaskRunner(Protocol):
     async def start(self, task: TaskSnapshot, *, serial: str) -> RunningTask: ...
@@ -183,6 +185,7 @@ class TaskExecutor:
                         lease_version=task.lease_version,
                         manifest=outcome.manifest,
                     )
+                    await running.finalize()
                     return
 
                 if self._monotonic() >= next_renewal:

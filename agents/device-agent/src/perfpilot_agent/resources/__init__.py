@@ -1,0 +1,1 @@
+"""Packaged Device Agent resources."""

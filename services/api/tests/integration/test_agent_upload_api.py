@@ -9,7 +9,11 @@ from fastapi.testclient import TestClient
 
 from perfpilot_api.config import Settings
 from perfpilot_api.main import create_app
-from perfpilot_api.services.agent_uploads import AgentUploadPartSlot, AgentUploadSlot
+from perfpilot_api.services.agent_uploads import (
+    AgentInputSlot,
+    AgentUploadPartSlot,
+    AgentUploadSlot,
+)
 
 NOW = datetime(2026, 8, 5, 9, 0, tzinfo=UTC)
 AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
@@ -44,6 +48,17 @@ class FakeUploadService:
             state="pending",
             expires_at=NOW,
             finalized_at=None,
+        )
+
+    async def authorize_input(self, **kwargs: object) -> AgentInputSlot:
+        self.calls.append(("input", kwargs))
+        return AgentInputSlot(
+            artifact_id=ARTIFACT_ID,
+            mime="application/vnd.android.package-archive",
+            size=4,
+            sha256_b64=CHECKSUM,
+            url="https://objects.example/signed-input?signature=secret",
+            expires_at=NOW,
         )
 
     async def authorize_part(self, **kwargs: object) -> AgentUploadPartSlot:
@@ -151,6 +166,38 @@ def test_agent_creates_part_and_completes_a_closed_multipart_upload() -> None:
     assert service.calls[2][0] == "complete"
     assert service.calls[2][1]["agent_id"] == AGENT_ID
     assert service.calls[2][1]["parts"][0].etag == '"etag-1"'
+
+
+def test_agent_authorizes_only_the_fenced_task_input() -> None:
+    service = FakeUploadService()
+    with _client(service) as client:
+        response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/inputs/{ARTIFACT_ID}",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+            json={"schema_version": "1.0", "lease_version": 1},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": "1.0",
+        "artifact_id": str(ARTIFACT_ID),
+        "mime": "application/vnd.android.package-archive",
+        "size": 4,
+        "sha256_b64": CHECKSUM,
+        "download_url": "https://objects.example/signed-input?signature=secret",
+        "expires_at": NOW.isoformat(),
+    }
+    assert service.calls == [
+        (
+            "input",
+            {
+                "agent_id": AGENT_ID,
+                "execution_id": EXECUTION_ID,
+                "lease_version": 1,
+                "artifact_id": ARTIFACT_ID,
+            },
+        )
+    ]
 
 
 def test_agent_upload_contract_rejects_extra_fields() -> None:

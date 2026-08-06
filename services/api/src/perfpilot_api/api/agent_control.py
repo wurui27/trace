@@ -705,6 +705,38 @@ async def create_agent_upload(
     return _agent_upload_payload(upload)
 
 
+@router.post("/tasks/{execution_id}/inputs/{artifact_id}")
+async def authorize_agent_input(
+    execution_id: UUID,
+    artifact_id: UUID,
+    payload: RenewAgentTaskRequest,
+    request: Request,
+    response: Response,
+    agent_service: Annotated[AgentService, Depends(get_agent_service)],
+    upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
+) -> dict[str, object]:
+    principal = await _authenticate_access(request, agent_service)
+    try:
+        input_slot = await upload_service.authorize_input(
+            agent_id=principal.agent_id,
+            execution_id=execution_id,
+            lease_version=payload.lease_version,
+            artifact_id=artifact_id,
+        )
+    except AgentUploadError as error:
+        _raise_agent_upload_error(error)
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "artifact_id": str(input_slot.artifact_id),
+        "mime": input_slot.mime,
+        "size": input_slot.size,
+        "sha256_b64": input_slot.sha256_b64,
+        "download_url": input_slot.url,
+        "expires_at": _utc(input_slot.expires_at),
+    }
+
+
 @router.post("/tasks/{execution_id}/uploads/{upload_id}/parts")
 async def authorize_agent_upload_part(
     execution_id: UUID,

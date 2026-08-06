@@ -5,10 +5,11 @@ import base64
 import binascii
 import re
 import secrets
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Annotated, Literal, Self
 from uuid import UUID
+from urllib.parse import urlsplit
 
 import httpx
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
@@ -36,6 +37,8 @@ _AGENT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 _ACCESS_TOKEN = re.compile(r"^ppat_[A-Za-z0-9_-]{43}$")
 _NONCE = re.compile(r"^[A-Za-z0-9_-]{22,128}$")
 _STABLE_CODE = re.compile(r"^[a-z][a-z0-9_]{0,95}$")
+_MIME_TYPE = re.compile(r"^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$")
+_HEADER_NAME = re.compile(r"^[!#$%&'*+.^_`|~0-9A-Za-z-]{1,128}$")
 _RETRYABLE_STATUSES = frozenset({408, 425, 429})
 _MAXIMUM_ATTEMPTS = 4
 
@@ -78,6 +81,23 @@ def _aware(value: datetime) -> datetime:
 def _require_string_timestamp(value: object) -> object:
     if not isinstance(value, str):
         raise ValueError("timestamp must be an ISO 8601 string")
+    return value
+
+
+def _validate_https_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        _ = parsed.port
+    except ValueError:
+        raise ValueError("signed URL is invalid") from None
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.fragment
+    ):
+        raise ValueError("signed URL is invalid")
     return value
 
 
@@ -376,6 +396,118 @@ class CompletionAcknowledgementResponse(BaseModel):
     @classmethod
     def validate_timestamp(cls, value: datetime) -> datetime:
         return _aware(value)
+
+
+class InputAuthorizationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    artifact_id: UUID
+    mime: str
+    size: int = Field(strict=True, ge=1, le=5 * 1024 * 1024 * 1024)
+    sha256_b64: str = Field(pattern=r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$", repr=False)
+    download_url: str = Field(min_length=9, max_length=8_192, repr=False)
+    expires_at: datetime
+
+    @field_validator("mime")
+    @classmethod
+    def validate_mime(cls, value: str) -> str:
+        if _MIME_TYPE.fullmatch(value) is None:
+            raise ValueError("input MIME type is invalid")
+        return value
+
+    @field_validator("download_url")
+    @classmethod
+    def validate_download_url(cls, value: str) -> str:
+        return _validate_https_url(value)
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class UploadSlotResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    artifact_id: UUID
+    upload_id: UUID
+    artifact_kind: Literal[
+        "startup_trace",
+        "scroll_trace",
+        "memory_evidence",
+        "agent_log",
+    ]
+    mime: str
+    size: int = Field(strict=True, ge=1, le=512 * 1024 * 1024)
+    sha256_b64: str = Field(pattern=r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$", repr=False)
+    part_size_bytes: int = Field(strict=True, ge=1, le=512 * 1024 * 1024)
+    part_count: int = Field(strict=True, ge=1, le=10_000)
+    state: Literal["pending", "finalized", "aborted", "expired"]
+    expires_at: datetime
+    finalized_at: datetime | None
+
+    @field_validator("mime")
+    @classmethod
+    def validate_mime(cls, value: str) -> str:
+        if _MIME_TYPE.fullmatch(value) is None:
+            raise ValueError("upload MIME type is invalid")
+        return value
+
+    @field_validator("expires_at", "finalized_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime | None) -> datetime | None:
+        return None if value is None else _aware(value)
+
+    @model_validator(mode="after")
+    def validate_state(self) -> Self:
+        if (self.state == "finalized") != (self.finalized_at is not None):
+            raise ValueError("upload finalization state is invalid")
+        expected_parts = (self.size + self.part_size_bytes - 1) // self.part_size_bytes
+        if expected_parts != self.part_count:
+            raise ValueError("upload part count is invalid")
+        return self
+
+
+class UploadPartAuthorizationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    upload_id: UUID
+    part_number: int = Field(strict=True, ge=1, le=10_000)
+    put_url: str = Field(min_length=9, max_length=8_192, repr=False)
+    required_headers: dict[str, str] = Field(max_length=32, repr=False)
+    expires_at: datetime
+
+    @field_validator("put_url")
+    @classmethod
+    def validate_put_url(cls, value: str) -> str:
+        return _validate_https_url(value)
+
+    @field_validator("required_headers")
+    @classmethod
+    def validate_required_headers(cls, value: dict[str, str]) -> dict[str, str]:
+        if any(
+            _HEADER_NAME.fullmatch(name) is None
+            or len(item) > 4_096
+            or any(ord(character) < 32 or ord(character) == 127 for character in item)
+            for name, item in value.items()
+        ):
+            raise ValueError("upload headers are invalid")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_timestamp(cls, value: datetime) -> datetime:
+        return _aware(value)
+
+
+class UploadPartReceipt(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    part_number: int = Field(strict=True, ge=1, le=10_000)
+    etag: str = Field(min_length=1, max_length=1_024, pattern=r"^[^\x00-\x1f\x7f]+$", repr=False)
 
 
 class UnregistrationResponse(BaseModel):
@@ -746,6 +878,138 @@ class ControlClient:
         except (ValidationError, ValueError, TypeError, UnicodeError):
             raise ControlClientError from None
 
+    async def authorize_input(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        artifact_id: UUID,
+        access_token: str | None = None,
+    ) -> InputAuthorizationResponse:
+        try:
+            payload = await self._authorized_request(
+                "POST",
+                f"/v1/agent/tasks/{execution_id}/inputs/{artifact_id}",
+                expected_status=200,
+                json={"schema_version": "1.0", "lease_version": lease_version},
+                access_token=access_token,
+                lease_fenced=True,
+            )
+            response = InputAuthorizationResponse.model_validate_json(payload)
+            if response.artifact_id != artifact_id:
+                raise ControlClientError
+            return response
+        except (ControlClientError, LeaseLost):
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def create_upload(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        artifact_kind: str,
+        mime: str,
+        size: int,
+        sha256_b64: str,
+        access_token: str | None = None,
+    ) -> UploadSlotResponse:
+        try:
+            payload = await self._authorized_request(
+                "POST",
+                f"/v1/agent/tasks/{execution_id}/uploads",
+                expected_status=201,
+                json={
+                    "schema_version": "1.0",
+                    "lease_version": lease_version,
+                    "artifact_kind": artifact_kind,
+                    "mime": mime,
+                    "size": size,
+                    "sha256_b64": sha256_b64,
+                },
+                access_token=access_token,
+                lease_fenced=True,
+            )
+            response = UploadSlotResponse.model_validate_json(payload)
+            if (
+                response.artifact_kind != artifact_kind
+                or response.mime != mime
+                or response.size != size
+                or response.sha256_b64 != sha256_b64
+            ):
+                raise ControlClientError
+            return response
+        except (ControlClientError, LeaseLost):
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def authorize_upload_part(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        upload_id: UUID,
+        part_number: int,
+        access_token: str | None = None,
+    ) -> UploadPartAuthorizationResponse:
+        try:
+            payload = await self._authorized_request(
+                "POST",
+                f"/v1/agent/tasks/{execution_id}/uploads/{upload_id}/parts",
+                expected_status=200,
+                json={
+                    "schema_version": "1.0",
+                    "lease_version": lease_version,
+                    "part_number": part_number,
+                },
+                access_token=access_token,
+                lease_fenced=True,
+            )
+            response = UploadPartAuthorizationResponse.model_validate_json(payload)
+            if response.upload_id != upload_id or response.part_number != part_number:
+                raise ControlClientError
+            return response
+        except (ControlClientError, LeaseLost):
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
+    async def complete_upload(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        upload_id: UUID,
+        parts: Sequence[UploadPartReceipt | Mapping[str, object]],
+        access_token: str | None = None,
+    ) -> UploadSlotResponse:
+        try:
+            canonical = tuple(UploadPartReceipt.model_validate(part) for part in parts)
+            if any(part.part_number != index for index, part in enumerate(canonical, start=1)):
+                raise ControlClientError
+            payload = await self._authorized_request(
+                "POST",
+                f"/v1/agent/tasks/{execution_id}/uploads/{upload_id}/complete",
+                expected_status=200,
+                json={
+                    "schema_version": "1.0",
+                    "lease_version": lease_version,
+                    "parts": [part.model_dump(mode="json") for part in canonical],
+                },
+                access_token=access_token,
+                lease_fenced=True,
+            )
+            response = UploadSlotResponse.model_validate_json(payload)
+            if response.upload_id != upload_id or response.state != "finalized":
+                raise ControlClientError
+            return response
+        except (ControlClientError, LeaseLost):
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
     async def renew_task(
         self,
         *,
@@ -845,6 +1109,7 @@ __all__ = [
     "HeartbeatDeviceReceipt",
     "HeartbeatRequest",
     "HeartbeatResponse",
+    "InputAuthorizationResponse",
     "LeaseLost",
     "RefreshRequest",
     "RegistrationRequest",
@@ -857,4 +1122,7 @@ __all__ = [
     "TaskSigningKeyResponse",
     "TaskWaitResponse",
     "UnregistrationResponse",
+    "UploadPartAuthorizationResponse",
+    "UploadPartReceipt",
+    "UploadSlotResponse",
 ]

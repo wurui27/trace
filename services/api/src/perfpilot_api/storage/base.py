@@ -100,6 +100,13 @@ class ArtifactStore(Protocol):
 
 
 class MultipartArtifactStore(Protocol):
+    async def authorize_get(
+        self,
+        *,
+        location: ObjectLocation,
+        expires_in_seconds: int = 300,
+    ) -> GetAuthorization: ...
+
     async def create_multipart(
         self,
         *,

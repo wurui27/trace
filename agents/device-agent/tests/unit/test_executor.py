@@ -20,6 +20,7 @@ class FakeRunningTask:
     def __init__(self) -> None:
         self._finished = asyncio.Event()
         self.stop_reasons: list[str] = []
+        self.finalized = False
 
     async def wait(self) -> ExecutionOutcome:
         await self._finished.wait()
@@ -28,6 +29,9 @@ class FakeRunningTask:
     async def stop(self, reason: str) -> None:
         self.stop_reasons.append(reason)
         self._finished.set()
+
+    async def finalize(self) -> None:
+        self.finalized = True
 
 
 class FakeTaskRunner:
@@ -132,4 +136,5 @@ async def test_success_is_fenced_by_a_final_renewal(task_claims) -> None:
     await asyncio.wait_for(run, timeout=1)
 
     assert len(control.complete_calls) == 1
+    assert runner.running.finalized is True
     assert state.execution_id is None

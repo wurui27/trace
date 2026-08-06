@@ -165,6 +165,7 @@ class AgentExecutionAccess:
     lease_expires_at: datetime
     allowed_uploads: tuple[str, ...] = _ALLOWED_UPLOADS
     scenario_types: tuple[TaskScenarioType, ...] = ()
+    input_artifact_ids: tuple[UUID, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -426,6 +427,7 @@ def validate_agent_execution_manifest(
         diagnostic_code=diagnostic_code,
         document_hash=hashlib.sha256(canonical).hexdigest(),
     )
+
 
 class AgentTaskRepository(Protocol):
     async def schedule(
@@ -694,11 +696,7 @@ class InMemoryAgentTaskRepository:
     ) -> LeaseRenewal | AgentTaskCancellation:
         _require_aware(now)
         lease = self._leases.get(execution_id)
-        if (
-            lease is None
-            or lease.definition.agent_id != agent_id
-            or lease.expires_at <= now
-        ):
+        if lease is None or lease.definition.agent_id != agent_id or lease.expires_at <= now:
             raise AgentTaskNotFound
         if lease.lease_version != lease_version:
             raise StaleLeaseVersion
@@ -801,6 +799,7 @@ class InMemoryAgentTaskRepository:
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
             scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
+            input_artifact_ids=tuple(item.artifact_id for item in lease.definition.input_artifacts),
         )
 
     async def acknowledge_cancellation(
@@ -862,6 +861,7 @@ class InMemoryAgentTaskRepository:
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
             scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
+            input_artifact_ids=tuple(item.artifact_id for item in lease.definition.input_artifacts),
         )
 
     async def authorize_completion(
@@ -891,6 +891,7 @@ class InMemoryAgentTaskRepository:
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
             scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
+            input_artifact_ids=tuple(item.artifact_id for item in lease.definition.input_artifacts),
         )
 
     async def complete_execution(
@@ -1493,19 +1494,16 @@ class SQLAlchemyAgentTaskRepository:
             async with session.begin():
                 row = (
                     await session.execute(
-                    select(AgentLease, GlobalJob)
-                    .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
-                    .where(AgentLease.execution_id == execution_id)
-                    .with_for_update()
+                        select(AgentLease, GlobalJob)
+                        .join(GlobalJob, GlobalJob.id == AgentLease.global_job_id)
+                        .where(AgentLease.execution_id == execution_id)
+                        .with_for_update()
                     )
                 ).one_or_none()
                 if row is None:
                     raise AgentTaskNotFound
                 lease, job = row
-                if (
-                    lease.agent_id != agent_id
-                    or lease.expires_at <= now
-                ):
+                if lease.agent_id != agent_id or lease.expires_at <= now:
                     raise AgentTaskNotFound
                 if lease.version != lease_version:
                     raise StaleLeaseVersion
@@ -1580,9 +1578,7 @@ class SQLAlchemyAgentTaskRepository:
                         update(ScenarioJob)
                         .where(
                             ScenarioJob.analysis_id == analysis_id,
-                            ScenarioJob.state.in_(
-                                ("queued", "scheduled", "running", "analyzing")
-                            ),
+                            ScenarioJob.state.in_(("queued", "scheduled", "running", "analyzing")),
                         )
                         .values(
                             state="canceled",
@@ -1726,6 +1722,7 @@ class SQLAlchemyAgentTaskRepository:
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
             scenario_types=_control_scenario_types(scenario_rows),
+            input_artifact_ids=(() if job.input_artifact_id is None else (job.input_artifact_id,)),
         )
 
     async def acknowledge_cancellation(
@@ -1879,6 +1876,7 @@ class SQLAlchemyAgentTaskRepository:
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
             scenario_types=_control_scenario_types(scenario_rows),
+            input_artifact_ids=(() if job.input_artifact_id is None else (job.input_artifact_id,)),
         )
 
     async def authorize_completion(
@@ -1940,6 +1938,7 @@ class SQLAlchemyAgentTaskRepository:
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
             scenario_types=_control_scenario_types(scenario_rows),
+            input_artifact_ids=(() if job.input_artifact_id is None else (job.input_artifact_id,)),
         )
 
     async def complete_execution(
