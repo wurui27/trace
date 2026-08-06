@@ -26,7 +26,8 @@ from perfpilot_api.ai.synthesis import (
     SynthesisValidationError,
     validate_synthesis_output,
 )
-from perfpilot_api.reports.contracts import canonical_json_bytes
+from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
+from perfpilot_api.reports.privacy import reject_private_json
 from perfpilot_api.reports.projection import AIProjection
 
 
@@ -61,6 +62,7 @@ class LocalReportProvider(Protocol):
 
 
 _PROMPT_RESOURCE = "perfpilot-local-report-v2.txt"
+_MAX_PROJECTION_BYTES = 256 * 1024
 
 
 def _checksum(payload: bytes) -> str:
@@ -83,10 +85,34 @@ def _local_prompt() -> SynthesisPrompt:
     )
 
 
+def _validated_local_projection(projection: AIProjection) -> AIProjection:
+    try:
+        payload = projection.canonical_bytes
+        if type(payload) is not bytes or not 1 <= len(payload) <= _MAX_PROJECTION_BYTES:
+            raise ValueError
+        if (
+            type(projection.sha256_b64) is not str
+            or projection.sha256_b64 != _checksum(payload)
+        ):
+            raise ValueError
+        document = projection.document
+        reject_private_json(document)
+        validated = validate_contract("analysis-projection", document)
+        canonical_payload = canonical_json_bytes(validated)
+        if canonical_payload != payload:
+            raise ValueError
+    except Exception:
+        raise ValueError("local AI report input is invalid") from None
+    return AIProjection(
+        canonical_bytes=canonical_payload,
+        sha256_b64=_checksum(canonical_payload),
+    )
+
+
 def build_local_report_projection(projection: AIProjection) -> AIProjection:
     if not isinstance(projection, AIProjection):
         raise ValueError("local AI report input is invalid")
-    projection_document = projection.document
+    projection_document = _validated_local_projection(projection).document
     numeric_spellings: set[str] = set()
     for scenario in projection_document["scenarios"]:  # type: ignore[index]
         for metric in scenario["metrics"]:
@@ -132,16 +158,6 @@ class LocalOpenAICompatibleReportProvider:
         self.provider_name = provider_name.strip()
         self.model = model
         self.prompt_sha256_b64 = prompt.sha256_b64
-        self._client = httpx.AsyncClient(
-            follow_redirects=False,
-            timeout=httpx.Timeout(
-                timeout=120.0,
-                connect=10.0,
-                read=120.0,
-                write=30.0,
-                pool=10.0,
-            ),
-        )
         self._provider = OpenAICompatibleSynthesisProvider(
             base_url=base_url,
             model=model,
@@ -151,7 +167,13 @@ class LocalOpenAICompatibleReportProvider:
             response_format="json_object",
             max_completion_tokens=8192,
             thinking_mode=thinking_mode,
-            client=self._client,
+            timeout=httpx.Timeout(
+                timeout=120.0,
+                connect=10.0,
+                read=120.0,
+                write=30.0,
+                pool=10.0,
+            ),
         )
 
     async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
@@ -159,7 +181,7 @@ class LocalOpenAICompatibleReportProvider:
         return await self._provider.synthesize(provider_projection)
 
     async def aclose(self) -> None:
-        await self._client.aclose()
+        await self._provider.aclose()
 
 
 def build_local_report_synthesizer(
@@ -244,16 +266,23 @@ class LocalReportSynthesizer:
     ) -> LocalSynthesisResult:
         if not isinstance(projection, AIProjection):
             raise TypeError("projection must be an AIProjection")
+        projection = _validated_local_projection(projection)
         if on_report is not None:
             await on_report(1, "report", "running", 0, None)
         attempts = 0
         failure_code = "ai_output_invalid"
         retryable = True
         detail_code = "unspecified"
+        prompt_tokens = 0
+        completion_tokens = 0
+        latency_ms = 0
         while attempts < 2:
             attempts += 1
             try:
                 candidate = await self._provider.complete(projection=projection)
+                prompt_tokens += candidate.prompt_tokens
+                completion_tokens += candidate.completion_tokens
+                latency_ms += candidate.latency_ms
                 output = validate_synthesis_output(
                     projection=projection,
                     candidate=candidate.candidate_json,
@@ -262,9 +291,9 @@ class LocalReportSynthesizer:
                     number=1,
                     role="report",
                     attempts=attempts,
-                    prompt_tokens=candidate.prompt_tokens,
-                    completion_tokens=candidate.completion_tokens,
-                    latency_ms=candidate.latency_ms,
+                    prompt_tokens=prompt_tokens,
+                    completion_tokens=completion_tokens,
+                    latency_ms=latency_ms,
                 )
                 if on_report is not None:
                     await on_report(1, "report", "completed", attempts, output)

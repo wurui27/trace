@@ -27,6 +27,11 @@ from perfpilot_api.reports.projection import AIProjection, build_ai_projection
 ROOT = Path(__file__).resolve().parents[4]
 
 
+class _AlwaysEqualChecksum:
+    def __eq__(self, _other: object) -> bool:
+        return True
+
+
 def _load(name: str) -> dict[str, object]:
     return json.loads(
         (ROOT / "contracts" / "v1" / "examples" / name).read_text(
@@ -42,6 +47,44 @@ def _projection() -> AIProjection:
         sha256_b64=base64.b64encode(hashlib.sha256(core_bytes).digest()).decode(),
     )
     return build_ai_projection(core, analysis_profile="auto", question=None)
+
+
+def _unchecked_projection(case: str) -> AIProjection:
+    projection = _projection()
+    if case == "checksum":
+        return AIProjection(
+            canonical_bytes=projection.canonical_bytes,
+            sha256_b64="not-the-projection-checksum",
+        )
+    if case == "checksum_type":
+        return AIProjection(
+            canonical_bytes=projection.canonical_bytes,
+            sha256_b64=_AlwaysEqualChecksum(),  # type: ignore[arg-type]
+        )
+    if case == "noncanonical":
+        payload = projection.canonical_bytes + b"\n"
+        return AIProjection(
+            canonical_bytes=payload,
+            sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode(),
+        )
+    if case == "oversized":
+        payload = b" " * (256 * 1024 + 1)
+        return AIProjection(
+            canonical_bytes=payload,
+            sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode(),
+        )
+    document = projection.document
+    if case == "private":
+        document["question"] = "https://objects.invalid/private/customer.trace"
+    elif case == "contract":
+        document["unexpected"] = "not allowed by the projection contract"
+    else:
+        raise AssertionError("unknown unchecked projection case")
+    payload = canonical_json_bytes(document)
+    return AIProjection(
+        canonical_bytes=payload,
+        sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode(),
+    )
 
 
 class FakeReportProvider:
@@ -80,6 +123,23 @@ class FailingReportProvider(FakeReportProvider):
         raise self.errors.pop(0)
 
 
+class ScriptedReportProvider(FakeReportProvider):
+    def __init__(
+        self,
+        events: list[SynthesisCandidate | AIProviderError],
+    ) -> None:
+        super().__init__([])
+        self.events = events
+
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+        assert projection.document["analysis_profile"] == "auto"
+        self.calls += 1
+        event = self.events.pop(0)
+        if isinstance(event, AIProviderError):
+            raise event
+        return event
+
+
 @pytest.mark.asyncio
 async def test_report_synthesizer_uses_one_provider_request() -> None:
     candidate = canonical_json_bytes(_load("synthesis-output.valid.json"))
@@ -114,6 +174,95 @@ async def test_report_synthesizer_retries_invalid_output_once() -> None:
 
     assert provider.calls == 2
     assert result.rounds[0].attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_accumulates_usage_from_invalid_candidate() -> None:
+    provider = ScriptedReportProvider(
+        [
+            SynthesisCandidate(b"{}", 3, 5, 7),
+            SynthesisCandidate(
+                canonical_json_bytes(_load("synthesis-output.valid.json")),
+                11,
+                13,
+                17,
+            ),
+        ]
+    )
+
+    result = await LocalReportSynthesizer(provider=provider).synthesize(_projection())
+
+    assert result.rounds == (
+        LocalReportUsage(1, "report", 2, 14, 18, 24),
+    )
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_retries_retryable_provider_error() -> None:
+    provider = ScriptedReportProvider(
+        [
+            AIProviderError(
+                "ai_timeout",
+                retryable=True,
+                detail_code="transport_timeout",
+            ),
+            SynthesisCandidate(
+                canonical_json_bytes(_load("synthesis-output.valid.json")),
+                10,
+                20,
+                30,
+            ),
+        ]
+    )
+    observed: list[tuple[str, int]] = []
+
+    async def observe(_number, _role, state, attempts, _output) -> None:
+        observed.append((state, attempts))
+
+    result = await LocalReportSynthesizer(provider=provider).synthesize(
+        _projection(),
+        on_report=observe,
+    )
+
+    assert provider.calls == 2
+    assert result.rounds == (
+        LocalReportUsage(1, "report", 2, 10, 20, 30),
+    )
+    assert observed[-1] == ("completed", 2)
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_retains_final_retryable_provider_error() -> None:
+    provider = ScriptedReportProvider(
+        [
+            AIProviderError(
+                "ai_timeout",
+                retryable=True,
+                detail_code="transport_timeout",
+            ),
+            AIProviderError(
+                "ai_provider_unavailable",
+                retryable=True,
+                detail_code="transport_request_error",
+            ),
+        ]
+    )
+    observed: list[tuple[str, int]] = []
+
+    async def observe(_number, _role, state, attempts, _output) -> None:
+        observed.append((state, attempts))
+
+    with pytest.raises(LocalSynthesisError) as captured:
+        await LocalReportSynthesizer(provider=provider).synthesize(
+            _projection(),
+            on_report=observe,
+        )
+
+    assert provider.calls == 2
+    assert captured.value.stable_code == "ai_provider_unavailable"
+    assert captured.value.retryable is True
+    assert captured.value.detail_code == "transport_request_error"
+    assert observed[-1] == ("failed", 2)
 
 
 @pytest.mark.asyncio
@@ -216,10 +365,14 @@ def test_local_provider_factory_exposes_non_secret_report_metadata() -> None:
     )
 
     assert synthesizer is not None
-    assert synthesizer.provider_name == "local-deepseek"
-    assert synthesizer.model == "model-a"
-    assert synthesizer.prompt_version == "perfpilot-local-report-v2"
-    assert "not-a-real-token" not in repr(synthesizer)
+    try:
+        assert synthesizer.provider_name == "local-deepseek"
+        assert synthesizer.model == "model-a"
+        assert synthesizer.prompt_version == "perfpilot-local-report-v2"
+        assert "not-a-real-token" not in repr(synthesizer)
+        assert "not-a-real-token" not in repr(synthesizer._provider)
+    finally:
+        asyncio.run(synthesizer.aclose())
 
 
 def test_local_provider_factory_forwards_explicit_thinking_mode(monkeypatch) -> None:
@@ -252,6 +405,18 @@ def test_local_provider_factory_forwards_explicit_thinking_mode(monkeypatch) -> 
     assert captured["thinking_mode"] == "disabled"
 
 
+def test_local_provider_factory_rejects_invalid_thinking_mode() -> None:
+    with pytest.raises(ValueError, match="^local AI thinking mode is invalid$"):
+        build_local_report_synthesizer(
+            {
+                "PERFPILOT_LOCAL_AI_BASE_URL": "https://api.example.com/v1/",
+                "PERFPILOT_LOCAL_AI_MODEL": "model-a",
+                "PERFPILOT_LOCAL_AI_TOKEN": "not-a-real-token",
+                "PERFPILOT_LOCAL_AI_THINKING": "sometimes",
+            }
+        )
+
+
 def test_json_object_report_envelope_supplies_the_output_schema() -> None:
     report_projection = build_local_report_projection(_projection())
 
@@ -269,18 +434,66 @@ def test_json_object_report_envelope_supplies_the_output_schema() -> None:
     assert document["allowed_numeric_spellings"] == ["700", "812.4"]
 
 
-def test_openai_compatible_report_provider_uses_bounded_json_configuration(
+@pytest.mark.parametrize(
+    "case",
+    [
+        "private",
+        "contract",
+        "checksum",
+        "checksum_type",
+        "noncanonical",
+        "oversized",
+    ],
+)
+def test_report_projection_rejects_untrusted_projection(case: str) -> None:
+    with pytest.raises(ValueError, match="^local AI report input is invalid$"):
+        build_local_report_projection(_unchecked_projection(case))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "case",
+    [
+        "private",
+        "contract",
+        "checksum",
+        "checksum_type",
+        "noncanonical",
+        "oversized",
+    ],
+)
+async def test_report_synthesizer_rejects_untrusted_projection_before_provider_call(
+    case: str,
+) -> None:
+    provider = FakeReportProvider([])
+
+    with pytest.raises(ValueError, match="^local AI report input is invalid$"):
+        await LocalReportSynthesizer(provider=provider).synthesize(
+            _unchecked_projection(case)
+        )
+
+    assert provider.calls == 0
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_report_provider_uses_bounded_json_configuration(
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
+    instances: list[CapturingSynthesisProvider] = []
 
     class CapturingSynthesisProvider:
         def __init__(self, **kwargs) -> None:
             captured.update(kwargs)
+            self.closed = False
+            instances.append(self)
 
         async def synthesize(self, projection: AIProjection) -> SynthesisCandidate:
             captured["projection"] = projection
             return SynthesisCandidate(b"{}", 1, 2, 3)
+
+        async def aclose(self) -> None:
+            self.closed = True
 
     monkeypatch.setattr(
         local_report,
@@ -295,10 +508,11 @@ def test_openai_compatible_report_provider_uses_bounded_json_configuration(
         thinking_mode="disabled",
     )
 
-    candidate = asyncio.run(provider.complete(projection=_projection()))
-    asyncio.run(provider.aclose())
+    candidate = await provider.complete(projection=_projection())
+    await provider.aclose()
 
-    timeout = captured["client"].timeout
+    timeout = captured["timeout"]
+    assert "client" not in captured
     assert captured["response_format"] == "json_object"
     assert captured["max_completion_tokens"] == 8192
     assert captured["max_response_bytes"] == 128 * 1024
@@ -309,3 +523,47 @@ def test_openai_compatible_report_provider_uses_bounded_json_configuration(
     assert timeout.pool == 10.0
     assert captured["projection"].document["round_role"] == "report"
     assert candidate.prompt_tokens == 1
+    assert instances[0].closed is True
+
+
+@pytest.mark.asyncio
+async def test_openai_compatible_report_provider_owns_and_closes_client() -> None:
+    provider = LocalOpenAICompatibleReportProvider(
+        base_url=SecretStr("https://api.example.com/v1/"),
+        model="model-a",
+        token=SecretStr("not-a-real-token"),
+        provider_name="provider-a",
+    )
+    inner_provider = provider._provider
+    client = inner_provider.client
+
+    try:
+        assert inner_provider._owns_client is True
+        assert client.is_closed is False
+    finally:
+        await provider.aclose()
+
+    assert client.is_closed is True
+
+
+def test_invalid_provider_url_does_not_allocate_client(monkeypatch) -> None:
+    allocations = 0
+
+    class TrackingClient:
+        follow_redirects = False
+
+        def __init__(self, **_kwargs) -> None:
+            nonlocal allocations
+            allocations += 1
+
+    monkeypatch.setattr(local_report.httpx, "AsyncClient", TrackingClient)
+
+    with pytest.raises(ValueError, match="^AI provider URL is invalid$"):
+        LocalOpenAICompatibleReportProvider(
+            base_url=SecretStr("https://api.example.com/not-v1/"),
+            model="model-a",
+            token=SecretStr("not-a-real-token"),
+            provider_name="provider-a",
+        )
+
+    assert allocations == 0
