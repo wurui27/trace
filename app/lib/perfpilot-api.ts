@@ -1071,7 +1071,7 @@ function analysisReportResponse(value: unknown): AnalysisReport {
     } as unknown as AnalysisReport;
   }
   if (
-    value.analysis_mode !== "trace_upload" ||
+    !["trace_upload", "device"].includes(String(value.analysis_mode)) ||
     !object(value.synthesis) ||
     !exactKeys(value.synthesis, [
       "state",

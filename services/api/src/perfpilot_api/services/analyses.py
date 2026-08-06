@@ -836,7 +836,10 @@ def _load_trace_report_from_versions(
     *,
     analysis_id: UUID,
     versions: list[ReportVersion],
+    analysis_mode: Literal["trace_upload", "device"] = "trace_upload",
 ) -> dict[str, object] | None:
+    if analysis_mode not in {"trace_upload", "device"}:
+        raise AnalysisUnavailableError("analysis report identity is invalid")
     for version in sorted(
         versions,
         key=lambda item: item.report_version,
@@ -874,7 +877,7 @@ def _load_trace_report_from_versions(
         if (
             candidate.get("schema_version") != "1.1"
             or candidate.get("analysis_id") != str(analysis_id)
-            or candidate.get("analysis_mode") != "trace_upload"
+            or candidate.get("analysis_mode") != analysis_mode
             or candidate.get("report_version") != version.report_version
             or expected_row_state is None
             or version.state != expected_row_state
@@ -1691,7 +1694,7 @@ class SynthesisRunService:
             )
             if job is None:
                 raise AnalysisNotFoundError("analysis was not found")
-            if job.analysis_mode != "trace_upload":
+            if job.analysis_mode not in {"trace_upload", "device"}:
                 raise AnalysisInvalidRequestError("analysis does not support AI reruns")
             if AnalysisState(job.state) not in ANALYSIS_TERMINAL_STATES:
                 raise AnalysisIdempotencyConflictError("analysis is not terminal")
@@ -1774,7 +1777,7 @@ class SynthesisRunService:
             )
             if (
                 analysis is None
-                or analysis.analysis_mode != "trace_upload"
+                or analysis.analysis_mode != job.analysis_mode
                 or analysis.tombstoned_at is not None
                 or artifact is None
                 or artifact.analysis_id != analysis_id
@@ -1788,6 +1791,7 @@ class SynthesisRunService:
             report = _load_trace_report_from_versions(
                 analysis_id=analysis_id,
                 versions=report_rows,
+                analysis_mode=job.analysis_mode,  # type: ignore[arg-type]
             )
             latest_content = next(
                 (row for row in report_rows if row.report is not None),
@@ -3003,6 +3007,28 @@ class SQLAlchemyAnalysisRepository:
             else None
         )
         terminal = AnalysisState(job.state) in ANALYSIS_TERMINAL_STATES
+        device_report = _load_trace_report_from_versions(
+            analysis_id=analysis_id,
+            versions=trace_report_versions,
+            analysis_mode="device",
+        )
+        latest_device_report = next(
+            (row for row in trace_report_versions if row.report is not None),
+            None,
+        )
+        device_report_available = (
+            device_report is not None
+            and latest_device_report is not None
+            and latest_smartperfetto is not None
+            and latest_smartperfetto.normalized_report_version_id
+            == latest_device_report.id
+        )
+        if (
+            latest_synthesis is not None
+            and latest_synthesis.report_version_id is not None
+            and not device_report_available
+        ):
+            raise AnalysisUnavailableError("device analysis report is unavailable")
         return AnalysisView(
             analysis_id=job.id,
             team_id=job.team_id,
@@ -3016,7 +3042,8 @@ class SQLAlchemyAnalysisRepository:
             scenarios=tuple(ordered_children),
             sample_verdict_counts=aggregate,
             active_lease=active_lease,
-            report_available=terminal
+            report_available=device_report_available
+            or terminal
             and _report_is_available(
                 children,
                 tenant_scenarios,
@@ -4047,7 +4074,7 @@ class SQLAlchemyAnalysisRepository:
                 raise AnalysisNotFoundError("analysis was not found")
             if analysis.analysis_mode != job.analysis_mode:
                 raise AnalysisUnavailableError("analysis report identity is invalid")
-            if job.analysis_mode == "trace_upload":
+            if job.analysis_mode in {"trace_upload", "device"}:
                 trace_versions = list(
                     (
                         await session.scalars(
@@ -4063,10 +4090,12 @@ class SQLAlchemyAnalysisRepository:
                 report = _load_trace_report_from_versions(
                     analysis_id=analysis_id,
                     versions=trace_versions,
+                    analysis_mode=job.analysis_mode,  # type: ignore[arg-type]
                 )
-                if report is None:
+                if report is not None:
+                    return report
+                if job.analysis_mode == "trace_upload":
                     raise ReportNotAvailableError("analysis report is not available")
-                return report
             scenarios = list(
                 (
                     await session.scalars(

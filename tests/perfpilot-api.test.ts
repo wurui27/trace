@@ -787,6 +787,22 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("accepts a device AnalysisReport 1.1 with PerfPilot AI synthesis", async () => {
+    const deviceReport = reportPayload();
+    deviceReport.analysis_mode = "device";
+    deviceReport.state = "partially_completed";
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(Response.json(deviceReport));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      schema_version: "1.1",
+      analysis_mode: "device",
+      state: "partially_completed",
+      synthesis: { state: "completed" },
+      scenario_reports: [{ scenario_type: "startup" }],
+    });
+  });
+
   it("rejects unknown or transport-private report fields", async () => {
     const unknown = { ...reportPayload(), unexpected: true };
     const privateReport = structuredClone(reportPayload());
