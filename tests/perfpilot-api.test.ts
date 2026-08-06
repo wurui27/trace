@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
 import {
+  createRandomUuid,
   createPerfPilotClient,
   validUploadUrl,
   enqueueDeviceAnalysis,
@@ -113,6 +114,17 @@ function reportPayload(): Record<string, unknown> {
 }
 
 describe("PerfPilot browser API", () => {
+  it("generates an idempotency UUID when private-LAN HTTP hides crypto.randomUUID", () => {
+    const source = {
+      getRandomValues(target: Uint8Array): Uint8Array {
+        target.set(Array.from({ length: 16 }, (_, index) => index));
+        return target;
+      },
+    };
+
+    expect(createRandomUuid(source)).toBe("00010203-0405-4607-8809-0a0b0c0d0e0f");
+  });
+
   it("accepts a private-LAN upload URL only when it matches the web host", () => {
     const uploadUrl =
       "http://10.166.0.125:8000/local/v1/uploads/upload-1?token=opaque-token";
