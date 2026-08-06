@@ -457,8 +457,6 @@ def _default_ai_rounds() -> list[_LocalAIRound]:
 
 
 def _restore_ai_rounds(value: object) -> list[_LocalAIRound]:
-    if value is None:
-        return _default_ai_rounds()
     if not isinstance(value, list):
         raise ValueError("invalid persisted local analysis")
     expected_roles: tuple[LocalAIRole, ...]
@@ -1287,7 +1285,11 @@ class _LocalRuntime:
                 session_id=str(raw_source["session_id"]),
                 run_id=str(raw_source["run_id"]),
             )
-        ai_rounds = _restore_ai_rounds(document.get("ai_rounds"))
+        ai_rounds = (
+            _restore_ai_rounds(document["ai_rounds"])
+            if "ai_rounds" in document
+            else _default_ai_rounds()
+        )
         stages = document.get("stages")
         if not isinstance(stages, Mapping):
             raise ValueError("invalid persisted local analysis")

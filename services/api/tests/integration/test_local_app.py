@@ -513,6 +513,62 @@ def _upload_and_finalize_trace(
     ).status_code == 200
 
 
+def _persist_created_trace_analysis(
+    tmp_path: Path,
+) -> tuple[str, UUID, dict[str, object]]:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, _ = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+        )
+    parsed_analysis_id = UUID(analysis_id)
+    state = LocalAnalysisStore(tmp_path).load_states()[parsed_analysis_id]
+    return team_id, parsed_analysis_id, state
+
+
+def test_local_app_defaults_missing_persisted_ai_rounds_after_restart(
+    tmp_path: Path,
+) -> None:
+    team_id, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    state.pop("ai_rounds")
+    LocalAnalysisStore(tmp_path).save_state(analysis_id, state)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+
+    with TestClient(app) as client:
+        restored = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}")
+
+    assert restored.status_code == 200
+    assert restored.json()["ai_rounds"] == [
+        {"round": 1, "role": "report", "state": "pending", "attempts": 0}
+    ]
+
+
+def test_local_app_rejects_present_null_persisted_ai_rounds_after_restart(
+    tmp_path: Path,
+) -> None:
+    _, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    state["ai_rounds"] = None
+    LocalAnalysisStore(tmp_path).save_state(analysis_id, state)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="^invalid persisted local analysis$"):
+        with TestClient(app):
+            pass
+
+
 def test_local_app_reports_the_device_currently_connected_over_adb(tmp_path: Path) -> None:
     device_probe = _FakeDeviceProbe(
         _FakeDeviceStatus(
@@ -1328,15 +1384,24 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     legacy_id = UUID("92000000-0000-4000-8000-000000000004")
     legacy_state = copy.deepcopy(original_state)
     legacy_state["analysis_id"] = str(legacy_id)
-    legacy_state["ai_rounds"] = [
+    expected_legacy_rounds = [
         {"round": 1, "role": "extract", "state": "completed", "attempts": 1},
         {"round": 2, "role": "review", "state": "completed", "attempts": 1},
         {"round": 3, "role": "finalize", "state": "completed", "attempts": 1},
     ]
+    legacy_state["ai_rounds"] = expected_legacy_rounds
     legacy_report = copy.deepcopy(expected_report)
     legacy_report["analysis_id"] = str(legacy_id)
+    assert legacy_report["report_version"] == 1
     store.save_state(legacy_id, legacy_state)
     store.save_document(legacy_id, "report.json", legacy_report)
+    legacy_round_2 = {"sentinel": "legacy-round-2"}
+    legacy_round_3 = {"sentinel": "legacy-round-3"}
+    store.save_document(legacy_id, "round-2.json", legacy_round_2)
+    store.save_document(legacy_id, "round-3.json", legacy_round_3)
+    legacy_directory = tmp_path / "analyses" / str(legacy_id)
+    legacy_round_2_bytes = (legacy_directory / "round-2.json").read_bytes()
+    legacy_round_3_bytes = (legacy_directory / "round-3.json").read_bytes()
 
     newer_id = UUID("92000000-0000-4000-8000-000000000002")
     newer_state = copy.deepcopy(original_state)
@@ -1354,12 +1419,13 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     pending_state["report_available"] = False
     store.save_state(pending_id, pending_state)
 
-    legacy_state = copy.deepcopy(original_state)
-    legacy_state.pop("created_at")
-    store.save_state(original_id, legacy_state)
+    migrated_state = copy.deepcopy(original_state)
+    migrated_state.pop("created_at")
+    store.save_state(original_id, migrated_state)
 
+    restored_gateway = _FakeSmartPerfettoGateway(_smartperfetto_result())
     second_app = create_local_app(
-        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        gateway=restored_gateway,
         synthesizer=_test_synthesizer(),
         data_root=tmp_path,
         public_origin="http://localhost:8000",
@@ -1389,11 +1455,49 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         assert all(item["report_available"] for item in latest.json()["analyses"])
         legacy = client.get(f"/v1/teams/{team_id}/analyses/{legacy_id}")
         assert legacy.status_code == 200
-        assert [item["role"] for item in legacy.json()["ai_rounds"]] == [
-            "extract",
-            "review",
-            "finalize",
+        assert legacy.json()["ai_rounds"] == expected_legacy_rounds
+        assert store.load_document(legacy_id, "round-2.json") == legacy_round_2
+        assert store.load_document(legacy_id, "round-3.json") == legacy_round_3
+        assert (legacy_directory / "round-2.json").read_bytes() == legacy_round_2_bytes
+        assert (legacy_directory / "round-3.json").read_bytes() == legacy_round_3_bytes
+
+        legacy_version = legacy.json()["version"]
+        second_headers = {
+            "x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]
+        }
+        rerun = client.post(
+            f"/v1/teams/{team_id}/analyses/{legacy_id}/synthesis-runs",
+            headers=second_headers,
+        )
+        assert rerun.status_code == 201
+        assert rerun.json()["generation"] == 2
+        legacy_terminal = legacy.json()
+        for _ in range(100):
+            legacy_terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{legacy_id}"
+            ).json()
+            if (
+                legacy_terminal["version"] > legacy_version
+                and legacy_terminal["stages"][2]["state"] == "completed"
+                and legacy_terminal["stages"][3]["state"] == "completed"
+            ):
+                break
+            time.sleep(0.01)
+        assert legacy_terminal["ai_rounds"] == [
+            {"round": 1, "role": "report", "state": "completed", "attempts": 1}
         ]
+        rerun_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{legacy_id}/report"
+        )
+        assert rerun_report.status_code == 200
+        assert rerun_report.json()["report_version"] == 2
+        assert store.load_document(legacy_id, "round-1.json") is not None
+        assert store.load_document(legacy_id, "round-2.json") == legacy_round_2
+        assert store.load_document(legacy_id, "round-3.json") == legacy_round_3
+        assert (legacy_directory / "round-2.json").read_bytes() == legacy_round_2_bytes
+        assert (legacy_directory / "round-3.json").read_bytes() == legacy_round_3_bytes
+
+    assert restored_gateway.submissions == []
 
 
 def test_local_recovery_imports_a_completed_smartperfetto_session_once(
