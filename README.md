@@ -29,9 +29,17 @@ rounds, evidence-backed findings, recommendations, retest steps, and known
 limitations. Runtime state and every AI round are stored below
 `.perfpilot/local-runtime`; provider tokens are never persisted there.
 
+For a local device analysis, connect exactly one authorized Android device and
+select it in the web page before uploading the APK. PerfPilot discovers `adb`
+and `aapt2` from `ANDROID_SDK_ROOT` / `ANDROID_HOME`, the standard Android SDK
+directory on macOS, Windows, or Linux, and then `PATH`. Use absolute
+`PERFPILOT_LOCAL_ADB` and `PERFPILOT_LOCAL_AAPT2` overrides for a custom SDK.
+The local runtime installs the APK, captures startup and scroll Perfetto traces,
+and collects the Android memory evidence archive in the background.
+
 The optional runtime overrides are `PERFPILOT_LOCAL_SMARTPERFETTO_URL`,
-`PERFPILOT_LOCAL_DATA_DIR`, `PERFPILOT_LOCAL_API_ORIGIN`, and
-`PERFPILOT_LOCAL_ADB`.
+`PERFPILOT_LOCAL_DATA_DIR`, `PERFPILOT_LOCAL_API_ORIGIN`,
+`PERFPILOT_LOCAL_ADB`, and `PERFPILOT_LOCAL_AAPT2`.
 
 ## Local checks
 

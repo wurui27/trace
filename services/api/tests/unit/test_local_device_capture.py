@@ -10,6 +10,8 @@ from perfpilot_api.local_device_capture import (
     Aapt2LocalApkInspector,
     AdbLocalDeviceCaptureGateway,
     LocalApkMetadata,
+    LocalDeviceCaptureError,
+    resolve_local_android_toolchain,
 )
 
 
@@ -49,6 +51,80 @@ class _FakeCaptureDevice:
 
     async def cleanup(self) -> None:
         self.cleanup_calls += 1
+
+
+def _executable(path: Path) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("test", encoding="utf-8")
+    path.chmod(0o700)
+    return path
+
+
+def test_toolchain_prefers_explicit_local_overrides(tmp_path: Path) -> None:
+    adb = _executable(tmp_path / "custom" / "adb")
+    aapt2 = _executable(tmp_path / "custom" / "aapt2")
+
+    resolved = resolve_local_android_toolchain(
+        environ={
+            "PERFPILOT_LOCAL_ADB": str(adb),
+            "PERFPILOT_LOCAL_AAPT2": str(aapt2),
+        },
+        which=lambda _name: None,
+        home=tmp_path / "home",
+        platform_name="darwin",
+    )
+
+    assert resolved.adb_binary == adb
+    assert resolved.aapt2_binary == aapt2
+
+
+def test_toolchain_discovers_latest_build_tools_from_android_sdk(
+    tmp_path: Path,
+) -> None:
+    sdk = tmp_path / "Android" / "Sdk"
+    adb = _executable(sdk / "platform-tools" / "adb")
+    _executable(sdk / "build-tools" / "9.0.0" / "aapt2")
+    latest = _executable(sdk / "build-tools" / "35.0.1" / "aapt2")
+
+    resolved = resolve_local_android_toolchain(
+        environ={"ANDROID_SDK_ROOT": str(sdk)},
+        which=lambda _name: None,
+        home=tmp_path / "home",
+        platform_name="linux",
+    )
+
+    assert resolved.adb_binary == adb
+    assert resolved.aapt2_binary == latest
+
+
+def test_toolchain_supports_windows_sdk_executables(tmp_path: Path) -> None:
+    sdk = tmp_path / "Android" / "Sdk"
+    adb = _executable(sdk / "platform-tools" / "adb.exe")
+    aapt2 = _executable(sdk / "build-tools" / "36.0.0" / "aapt2.exe")
+
+    resolved = resolve_local_android_toolchain(
+        environ={"ANDROID_HOME": str(sdk)},
+        which=lambda _name: None,
+        home=tmp_path / "home",
+        platform_name="win32",
+    )
+
+    assert resolved.adb_binary == adb
+    assert resolved.aapt2_binary == aapt2
+
+
+def test_toolchain_reports_a_stable_error_when_android_tools_are_missing(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(LocalDeviceCaptureError) as raised:
+        resolve_local_android_toolchain(
+            environ={},
+            which=lambda _name: None,
+            home=tmp_path / "empty-home",
+            platform_name="linux",
+        )
+
+    assert raised.value.code == "android_toolchain_unavailable"
 
 
 @pytest.mark.asyncio

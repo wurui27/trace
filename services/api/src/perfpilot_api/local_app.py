@@ -52,7 +52,11 @@ from perfpilot_api.engines.smartperfetto_contracts import (
 from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
 from perfpilot_api.local_device import AdbDeviceProbe, LocalDevice, LocalDeviceProbe
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
-from perfpilot_api.local_device_capture import LocalDeviceCaptureGateway
+from perfpilot_api.local_device_capture import (
+    LocalDeviceCaptureError,
+    LocalDeviceCaptureGateway,
+    build_local_device_capture_gateway,
+)
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.memory_join import join_unavailable_android_memory
 from perfpilot_api.reports.normalizer import (
@@ -2111,11 +2115,17 @@ def create_local_app(
     )
     resolved_synthesizer = synthesizer or build_local_multiround_synthesizer()
     resolved_device_probe = device_probe or AdbDeviceProbe()
+    resolved_device_capture_gateway = device_capture_gateway
+    if resolved_device_capture_gateway is None:
+        try:
+            resolved_device_capture_gateway = build_local_device_capture_gateway()
+        except LocalDeviceCaptureError as error:
+            _LOGGER.warning("Local Android toolchain unavailable code=%s", error.code)
     runtime = _LocalRuntime(
         gateway=resolved_gateway,
         synthesizer=resolved_synthesizer,
         device_probe=resolved_device_probe,
-        device_capture_gateway=device_capture_gateway,
+        device_capture_gateway=resolved_device_capture_gateway,
         data_root=data_root
         or Path(os.getenv("PERFPILOT_LOCAL_DATA_DIR", ".perfpilot/local-runtime")),
         public_origin=public_origin

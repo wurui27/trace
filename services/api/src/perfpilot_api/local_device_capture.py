@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
-from collections.abc import Awaitable, Callable
+import shutil
+import sys
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -32,6 +35,12 @@ class LocalDeviceCaptureError(RuntimeError):
     def __init__(self, code: str = "local_device_capture_failed") -> None:
         super().__init__("Local Android device capture failed")
         self.code = code
+
+
+@dataclass(frozen=True, slots=True)
+class LocalAndroidToolchain:
+    adb_binary: Path
+    aapt2_binary: Path
 
 
 @dataclass(frozen=True, slots=True)
@@ -66,6 +75,130 @@ class LocalDeviceCaptureGateway(Protocol):
 
 class LocalApkInspector(Protocol):
     async def inspect(self, apk_path: Path) -> LocalApkMetadata: ...
+
+
+def _executable(path: Path) -> Path | None:
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except OSError:
+        return None
+    if not resolved.is_file() or not os.access(resolved, os.X_OK):
+        return None
+    return resolved
+
+
+def _sdk_roots(
+    *,
+    environ: Mapping[str, str],
+    home: Path,
+    platform_name: str,
+) -> tuple[Path, ...]:
+    candidates: list[Path] = []
+    for name in ("ANDROID_SDK_ROOT", "ANDROID_HOME"):
+        value = environ.get(name)
+        if value:
+            candidates.append(Path(value))
+    if platform_name == "darwin":
+        candidates.append(home / "Library" / "Android" / "sdk")
+    elif platform_name == "win32":
+        local_app_data = environ.get("LOCALAPPDATA")
+        if local_app_data:
+            candidates.append(Path(local_app_data) / "Android" / "Sdk")
+        candidates.append(home / "AppData" / "Local" / "Android" / "Sdk")
+    else:
+        candidates.append(home / "Android" / "Sdk")
+    unique: list[Path] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        key = str(candidate.expanduser().absolute())
+        if key not in seen:
+            seen.add(key)
+            unique.append(candidate)
+    return tuple(unique)
+
+
+def _build_tools_key(path: Path) -> tuple[tuple[int, ...], int, str]:
+    numbers = tuple(int(value) for value in re.findall(r"\d+", path.name))[:4]
+    padded = numbers + (0,) * (4 - len(numbers))
+    stable = int(re.fullmatch(r"\d+(?:\.\d+)*", path.name) is not None)
+    return padded, stable, path.name
+
+
+def _sdk_aapt2(root: Path, executable_name: str) -> Path | None:
+    build_tools = root / "build-tools"
+    try:
+        versions = sorted(
+            (item for item in build_tools.iterdir() if item.is_dir()),
+            key=_build_tools_key,
+            reverse=True,
+        )
+    except OSError:
+        return None
+    for version in versions:
+        resolved = _executable(version / executable_name)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def resolve_local_android_toolchain(
+    *,
+    environ: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    home: Path | None = None,
+    platform_name: str = sys.platform,
+) -> LocalAndroidToolchain:
+    values = os.environ if environ is None else environ
+    home_directory = Path.home() if home is None else Path(home)
+    windows = platform_name == "win32"
+    adb_name = "adb.exe" if windows else "adb"
+    aapt2_name = "aapt2.exe" if windows else "aapt2"
+    roots = _sdk_roots(
+        environ=values,
+        home=home_directory,
+        platform_name=platform_name,
+    )
+
+    explicit_adb = values.get("PERFPILOT_LOCAL_ADB")
+    explicit_aapt2 = values.get("PERFPILOT_LOCAL_AAPT2")
+    if explicit_adb is not None:
+        adb = _executable(Path(explicit_adb))
+        if adb is None:
+            raise LocalDeviceCaptureError("android_toolchain_unavailable")
+    else:
+        adb = next(
+            (
+                candidate
+                for root in roots
+                if (candidate := _executable(root / "platform-tools" / adb_name))
+                is not None
+            ),
+            None,
+        )
+        if adb is None:
+            located = which(adb_name)
+            adb = _executable(Path(located)) if located else None
+
+    if explicit_aapt2 is not None:
+        aapt2 = _executable(Path(explicit_aapt2))
+        if aapt2 is None:
+            raise LocalDeviceCaptureError("android_toolchain_unavailable")
+    else:
+        aapt2 = next(
+            (
+                candidate
+                for root in roots
+                if (candidate := _sdk_aapt2(root, aapt2_name)) is not None
+            ),
+            None,
+        )
+        if aapt2 is None:
+            located = which(aapt2_name)
+            aapt2 = _executable(Path(located)) if located else None
+
+    if adb is None or aapt2 is None:
+        raise LocalDeviceCaptureError("android_toolchain_unavailable")
+    return LocalAndroidToolchain(adb_binary=adb, aapt2_binary=aapt2)
 
 
 def _sdk_value(pattern: re.Pattern[str], output: str) -> int | None:
@@ -268,12 +401,24 @@ class AdbLocalDeviceCaptureGateway:
         )
 
 
+def build_local_device_capture_gateway() -> AdbLocalDeviceCaptureGateway:
+    tools = resolve_local_android_toolchain()
+    return AdbLocalDeviceCaptureGateway(
+        adb_binary=tools.adb_binary,
+        inspector=Aapt2LocalApkInspector(binary=tools.aapt2_binary),
+        sleep=asyncio.sleep,
+    )
+
+
 __all__ = [
     "Aapt2LocalApkInspector",
     "AdbLocalDeviceCaptureGateway",
+    "LocalAndroidToolchain",
     "LocalApkInspector",
     "LocalApkMetadata",
     "LocalDeviceCapture",
     "LocalDeviceCaptureGateway",
     "LocalDeviceCaptureError",
+    "build_local_device_capture_gateway",
+    "resolve_local_android_toolchain",
 ]
