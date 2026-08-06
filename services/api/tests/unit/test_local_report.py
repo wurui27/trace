@@ -1,0 +1,311 @@
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+from pathlib import Path
+
+import pytest
+from pydantic import SecretStr
+
+import perfpilot_api.ai.local_report as local_report
+from perfpilot_api.ai.local_report import (
+    LocalOpenAICompatibleReportProvider,
+    LocalReportSynthesizer,
+    LocalReportUsage,
+    LocalSynthesisError,
+    build_local_report_projection,
+    build_local_report_synthesizer,
+)
+from perfpilot_api.ai.openai_compatible import AIProviderError, SynthesisCandidate
+from perfpilot_api.reports.contracts import canonical_json_bytes
+from perfpilot_api.reports.normalizer import NormalizedTraceReport
+from perfpilot_api.reports.projection import AIProjection, build_ai_projection
+
+
+ROOT = Path(__file__).resolve().parents[4]
+
+
+def _load(name: str) -> dict[str, object]:
+    return json.loads(
+        (ROOT / "contracts" / "v1" / "examples" / name).read_text(
+            encoding="utf-8"
+        )
+    )
+
+
+def _projection() -> AIProjection:
+    core_bytes = canonical_json_bytes(_load("normalized-trace-report.valid.json"))
+    core = NormalizedTraceReport(
+        canonical_bytes=core_bytes,
+        sha256_b64=base64.b64encode(hashlib.sha256(core_bytes).digest()).decode(),
+    )
+    return build_ai_projection(core, analysis_profile="auto", question=None)
+
+
+class FakeReportProvider:
+    provider_name = "test-provider"
+    model = "test-model"
+    prompt_version = "perfpilot-local-report-v2"
+    prompt_sha256_b64 = base64.b64encode(hashlib.sha256(b"prompt").digest()).decode()
+
+    def __init__(self, candidates: list[bytes]) -> None:
+        self.candidates = candidates
+        self.calls = 0
+        self.closed = False
+
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+        assert projection.document["analysis_profile"] == "auto"
+        self.calls += 1
+        return SynthesisCandidate(
+            candidate_json=self.candidates.pop(0),
+            prompt_tokens=10,
+            completion_tokens=20,
+            latency_ms=30,
+        )
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+class FailingReportProvider(FakeReportProvider):
+    def __init__(self, errors: list[BaseException]) -> None:
+        super().__init__([])
+        self.errors = errors
+
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+        assert projection.document["analysis_profile"] == "auto"
+        self.calls += 1
+        raise self.errors.pop(0)
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_uses_one_provider_request() -> None:
+    candidate = canonical_json_bytes(_load("synthesis-output.valid.json"))
+    provider = FakeReportProvider([candidate])
+    observed: list[tuple[int, str, str, int]] = []
+
+    async def observe(number, role, state, attempts, _output) -> None:
+        observed.append((number, role, state, attempts))
+
+    result = await LocalReportSynthesizer(provider=provider).synthesize(
+        _projection(),
+        on_report=observe,
+    )
+
+    assert provider.calls == 1
+    assert observed == [
+        (1, "report", "running", 0),
+        (1, "report", "completed", 1),
+    ]
+    assert result.output.document == _load("synthesis-output.valid.json")
+    assert result.rounds == (
+        LocalReportUsage(1, "report", 1, 10, 20, 30),
+    )
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_retries_invalid_output_once() -> None:
+    candidate = canonical_json_bytes(_load("synthesis-output.valid.json"))
+    provider = FakeReportProvider([b"{}", candidate])
+
+    result = await LocalReportSynthesizer(provider=provider).synthesize(_projection())
+
+    assert provider.calls == 2
+    assert result.rounds[0].attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_stops_after_second_invalid_output() -> None:
+    provider = FakeReportProvider([b"{}", b"{}"])
+    observed: list[tuple[str, int]] = []
+
+    async def observe(_number, _role, state, attempts, _output) -> None:
+        observed.append((state, attempts))
+
+    with pytest.raises(LocalSynthesisError, match="ai_output_invalid") as captured:
+        await LocalReportSynthesizer(provider=provider).synthesize(
+            _projection(),
+            on_report=observe,
+        )
+
+    assert provider.calls == 2
+    assert captured.value.stable_code == "ai_output_invalid"
+    assert captured.value.round_number == 1
+    assert captured.value.retryable is True
+    assert captured.value.detail_code == "semantic_validation"
+    assert observed[-1] == ("failed", 2)
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_stops_after_nonretryable_provider_error() -> None:
+    provider = FailingReportProvider(
+        [
+            AIProviderError(
+                "ai_authentication_failed",
+                retryable=False,
+                detail_code="http_authentication",
+            )
+        ]
+    )
+
+    with pytest.raises(LocalSynthesisError) as captured:
+        await LocalReportSynthesizer(provider=provider).synthesize(_projection())
+
+    assert provider.calls == 1
+    assert captured.value.stable_code == "ai_authentication_failed"
+    assert captured.value.retryable is False
+    assert captured.value.detail_code == "http_authentication"
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_propagates_cancellation() -> None:
+    provider = FailingReportProvider([asyncio.CancelledError()])
+
+    with pytest.raises(asyncio.CancelledError):
+        await LocalReportSynthesizer(provider=provider).synthesize(_projection())
+
+    assert provider.calls == 1
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_closes_the_provider() -> None:
+    provider = FakeReportProvider([])
+    synthesizer = LocalReportSynthesizer(provider=provider)
+
+    await synthesizer.aclose()
+
+    assert provider.closed is True
+
+
+def test_report_synthesizer_requires_an_ai_projection() -> None:
+    provider = FakeReportProvider([])
+
+    with pytest.raises(TypeError, match="projection must be an AIProjection"):
+        asyncio.run(
+            LocalReportSynthesizer(provider=provider).synthesize(  # type: ignore[arg-type]
+                object()
+            )
+        )
+
+    assert provider.calls == 0
+
+
+def test_local_provider_factory_requires_complete_configuration() -> None:
+    assert build_local_report_synthesizer({}) is None
+    assert (
+        build_local_report_synthesizer(
+            {
+                "PERFPILOT_LOCAL_AI_BASE_URL": "https://api.example.com/v1/",
+                "PERFPILOT_LOCAL_AI_MODEL": "model-a",
+            }
+        )
+        is None
+    )
+
+
+def test_local_provider_factory_exposes_non_secret_report_metadata() -> None:
+    synthesizer = build_local_report_synthesizer(
+        {
+            "PERFPILOT_LOCAL_AI_BASE_URL": "https://api.example.com/v1/",
+            "PERFPILOT_LOCAL_AI_MODEL": "model-a",
+            "PERFPILOT_LOCAL_AI_TOKEN": "not-a-real-token",
+            "PERFPILOT_LOCAL_AI_PROVIDER_NAME": "local-deepseek",
+        }
+    )
+
+    assert synthesizer is not None
+    assert synthesizer.provider_name == "local-deepseek"
+    assert synthesizer.model == "model-a"
+    assert synthesizer.prompt_version == "perfpilot-local-report-v2"
+    assert "not-a-real-token" not in repr(synthesizer)
+
+
+def test_local_provider_factory_forwards_explicit_thinking_mode(monkeypatch) -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingProvider:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def aclose(self) -> None:
+            return None
+
+    monkeypatch.setattr(
+        local_report,
+        "LocalOpenAICompatibleReportProvider",
+        CapturingProvider,
+    )
+
+    synthesizer = build_local_report_synthesizer(
+        {
+            "PERFPILOT_LOCAL_AI_BASE_URL": "https://api.example.com/v1/",
+            "PERFPILOT_LOCAL_AI_MODEL": "model-a",
+            "PERFPILOT_LOCAL_AI_TOKEN": "not-a-real-token",
+            "PERFPILOT_LOCAL_AI_PROVIDER_NAME": "provider-a",
+            "PERFPILOT_LOCAL_AI_THINKING": "disabled",
+        }
+    )
+
+    assert synthesizer is not None
+    assert captured["thinking_mode"] == "disabled"
+
+
+def test_json_object_report_envelope_supplies_the_output_schema() -> None:
+    report_projection = build_local_report_projection(_projection())
+
+    document = report_projection.document
+    assert set(document) == {
+        "allowed_numeric_spellings",
+        "authoritative_projection",
+        "output_schema",
+        "round_role",
+    }
+    assert document["round_role"] == "report"
+    assert document["output_schema"]["$id"] == (
+        "https://perfpilot.internal/contracts/v1/ai/synthesis-output.schema.json"
+    )
+    assert document["allowed_numeric_spellings"] == ["700", "812.4"]
+
+
+def test_openai_compatible_report_provider_uses_bounded_json_configuration(
+    monkeypatch,
+) -> None:
+    captured: dict[str, object] = {}
+
+    class CapturingSynthesisProvider:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+
+        async def synthesize(self, projection: AIProjection) -> SynthesisCandidate:
+            captured["projection"] = projection
+            return SynthesisCandidate(b"{}", 1, 2, 3)
+
+    monkeypatch.setattr(
+        local_report,
+        "OpenAICompatibleSynthesisProvider",
+        CapturingSynthesisProvider,
+    )
+    provider = LocalOpenAICompatibleReportProvider(
+        base_url=SecretStr("https://api.example.com/v1/"),
+        model="model-a",
+        token=SecretStr("not-a-real-token"),
+        provider_name="provider-a",
+        thinking_mode="disabled",
+    )
+
+    candidate = asyncio.run(provider.complete(projection=_projection()))
+    asyncio.run(provider.aclose())
+
+    timeout = captured["client"].timeout
+    assert captured["response_format"] == "json_object"
+    assert captured["max_completion_tokens"] == 8192
+    assert captured["max_response_bytes"] == 128 * 1024
+    assert captured["thinking_mode"] == "disabled"
+    assert timeout.connect == 10.0
+    assert timeout.read == 120.0
+    assert timeout.write == 30.0
+    assert timeout.pool == 10.0
+    assert captured["projection"].document["round_role"] == "report"
+    assert candidate.prompt_tokens == 1
