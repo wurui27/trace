@@ -62,6 +62,7 @@
     },
     "sourceContext": {
       "type": "object",
+      "$comment": "match_summary is exact: none carries no fragments, weak carries one or more weak fragments only, and strong carries one or more strong fragments only.",
       "additionalProperties": false,
       "required": ["trust", "snapshot_hash", "match_summary", "fragments"],
       "properties": {
@@ -69,7 +70,35 @@
         "snapshot_hash": {"$ref": "#/$defs/hex64"},
         "match_summary": {"enum": ["strong", "weak", "none"]},
         "fragments": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceFragment"}}
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"match_summary": {"const": "none"}}, "required": ["match_summary"]},
+          "then": {"properties": {"fragments": {"maxItems": 0}}}
+        },
+        {
+          "if": {"properties": {"match_summary": {"const": "weak"}}, "required": ["match_summary"]},
+          "then": {
+            "properties": {
+              "fragments": {
+                "minItems": 1,
+                "items": {"properties": {"match_grade": {"const": "weak"}}, "required": ["match_grade"]}
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"match_summary": {"const": "strong"}}, "required": ["match_summary"]},
+          "then": {
+            "properties": {
+              "fragments": {
+                "minItems": 1,
+                "items": {"properties": {"match_grade": {"const": "strong"}}, "required": ["match_grade"]}
+              }
+            }
+          }
+        }
+      ]
     }
   }
 }

@@ -138,7 +138,7 @@ def _enforce_report_source_coherence(
         raise jsonschema.ValidationError("weak match summary requires weak source refs")
     if match_summary == "none" and (source_refs or public_fixes):
         raise jsonschema.ValidationError("none match summary carries no source refs or fixes")
-    if match_summary == "strong" and (source_refs or public_fixes) and not any(
+    if match_summary == "strong" and not any(
         source_ref.get("match_grade") == "strong"
         for source_ref in ref_by_id.values()
     ):
@@ -159,6 +159,13 @@ def _enforce_report_source_coherence(
     )
     if not isinstance(synthesis_fixes, list):
         return
+    fix_ids = [
+        synthesis_fix.get("fix_id")
+        for synthesis_fix in synthesis_fixes
+        if isinstance(synthesis_fix, dict)
+    ]
+    if len(fix_ids) != len(set(fix_ids)):
+        raise jsonschema.ValidationError("source fix IDs must be unique")
     if len(public_fixes) != len(synthesis_fixes):
         raise jsonschema.ValidationError(
             "report source fixes must exactly enrich synthesis source fixes"
@@ -184,9 +191,25 @@ def _enforce_report_source_coherence(
                 raise jsonschema.ValidationError("source fix snapshot hash is incoherent")
             if source_ref.get("relative_path") != synthesis_fix.get("relative_path"):
                 raise jsonschema.ValidationError("source fix path does not match source ref")
+            if source_ref.get("symbol") != synthesis_fix.get("symbol"):
+                raise jsonschema.ValidationError("source fix symbol does not match source ref")
+            if synthesis_fix.get("finding_id") not in source_ref.get("finding_ids", []):
+                raise jsonschema.ValidationError(
+                    "source fix finding is not linked by source ref"
+                )
+            if not set(synthesis_fix.get("evidence_ids", [])).issubset(
+                source_ref.get("evidence_ids", [])
+            ):
+                raise jsonschema.ValidationError(
+                    "source fix evidence is not linked by source ref"
+                )
             if synthesis_fix.get("rule_id") not in source_ref.get("rule_ids", []):
                 raise jsonschema.ValidationError("source fix rule is not allowed by source ref")
-            if source_ref.get("match_grade") != "strong":
+            if not (
+                synthesis_fix.get("match_grade")
+                == source_ref.get("match_grade")
+                == "strong"
+            ):
                 raise jsonschema.ValidationError("source fix requires a strong source ref")
 
         verification = public_fix.get("verification")
@@ -250,6 +273,16 @@ def _enforce_unified_diff_headers(items: object) -> None:
         if section_headers != [0]:
             raise jsonschema.ValidationError(
                 "source fix must contain exactly one diff section"
+            )
+        old_file_headers = [
+            index for index, line in enumerate(lines) if line.startswith("--- ")
+        ]
+        new_file_headers = [
+            index for index, line in enumerate(lines) if line.startswith("+++ ")
+        ]
+        if old_file_headers != [1] or new_file_headers != [2]:
+            raise jsonschema.ValidationError(
+                "source fix must contain exactly one leading file header pair"
             )
         matches = (
             re.fullmatch(r"diff --git a/([^\r\n]+) b/([^\r\n]+)", lines[0]),
@@ -380,14 +413,16 @@ def _assert_only_report_v12_state(
     expected_state: str,
 ) -> None:
     schema_name = "reports/analysis-report.schema.json"
-    for candidate_state in ("completed", "partially_completed"):
+    accepted_states = []
+    for candidate_state in ("completed", "partially_completed", "failed", "canceled"):
         candidate = deepcopy(report)
         candidate["state"] = candidate_state
-        if candidate_state == expected_state:
+        try:
             _validate_ai_contract(schema_name, candidate)
-        else:
-            with pytest.raises(jsonschema.ValidationError):
-                _validate_ai_contract(schema_name, candidate)
+        except jsonschema.ValidationError:
+            continue
+        accepted_states.append(candidate_state)
+    assert accepted_states == [expected_state]
 
 
 def _report_with_two_source_fixes() -> dict[str, object]:
@@ -473,6 +508,12 @@ def _unsafe_complete_diff(kind: str, path: str) -> tuple[str, str]:
             "diff --git a/.git/hooks/post-commit b/.git/hooks/post-commit\n"
             "--- a/.git/hooks/post-commit\n"
             "+++ b/.git/hooks/post-commit\n"
+            "@@ -1,1 +1,1 @@\n-old\n+new\n"
+        )
+    if kind == "traditional-second-file":
+        return declared_path, diff + (
+            "--- a/src/Other.kt\n"
+            "+++ b/src/Other.kt\n"
             "@@ -1,1 +1,1 @@\n-old\n+new\n"
         )
 
@@ -585,6 +626,62 @@ def test_projection_v2_source_context_is_untrusted_relative_and_bounded() -> Non
     for document in invalid_documents:
         with pytest.raises(jsonschema.ValidationError):
             validator.validate(document)
+
+
+@pytest.mark.parametrize(
+    ("match_summary", "fragment_grades"),
+    [
+        ("none", ["strong"]),
+        ("none", ["none"]),
+        ("weak", []),
+        ("weak", ["strong"]),
+        ("weak", ["weak", "none"]),
+        ("strong", []),
+        ("strong", ["weak"]),
+        ("strong", ["strong", "weak"]),
+    ],
+)
+def test_projection_v2_match_summary_agrees_with_fragment_grades(
+    match_summary: str,
+    fragment_grades: list[str],
+) -> None:
+    projection = _example("analysis-projection-v2.valid.json")
+    source_context = projection["source_context"]
+    fragment = source_context["fragments"][0]
+    source_context["match_summary"] = match_summary
+    source_context["fragments"] = [
+        {
+            **deepcopy(fragment),
+            "source_ref_id": f"97000000-0000-4000-8000-{index:012d}",
+            "match_grade": grade,
+        }
+        for index, grade in enumerate(fragment_grades, start=1)
+    ]
+    with pytest.raises(jsonschema.ValidationError):
+        _validate_ai_contract("ai/analysis-projection.schema.json", projection)
+
+
+@pytest.mark.parametrize(
+    ("match_summary", "fragment_grades"),
+    [("none", []), ("weak", ["weak"]), ("strong", ["strong", "strong"])],
+)
+def test_projection_v2_accepts_coherent_fragment_grades(
+    match_summary: str,
+    fragment_grades: list[str],
+) -> None:
+    projection = _example("analysis-projection-v2.valid.json")
+    source_context = projection["source_context"]
+    fragment = source_context["fragments"][0]
+    source_context["match_summary"] = match_summary
+    source_context["fragments"] = [
+        {
+            **deepcopy(fragment),
+            "source_ref_id": f"97000000-0000-4000-8000-{index:012d}",
+            "match_grade": grade,
+        }
+        for index, grade in enumerate(fragment_grades, start=1)
+    ]
+    _validate_ai_contract("ai/analysis-projection.schema.json", projection)
 
 
 def test_projection_v2_enforces_aggregate_fragment_utf8_bytes() -> None:
@@ -931,6 +1028,9 @@ def test_report_v12_state_mapping_is_deterministic_for_source_and_core_outcomes(
     pending = deepcopy(verified)
     _set_first_verification_state(pending, "pending")
 
+    verification_not_requested = deepcopy(verified)
+    _set_first_verification_state(verification_not_requested, "not_requested")
+
     verification_failed = deepcopy(verified)
     _set_first_verification_state(verification_failed, "validation_failed")
     verification_failed["source_code"]["fixes"][0]["verification"].update(  # type: ignore[index]
@@ -942,19 +1042,57 @@ def test_report_v12_state_mapping_is_deterministic_for_source_and_core_outcomes(
     )
 
     core_failed = _example("analysis-report-v1.2.valid.json")
+    core_canceled = deepcopy(core_failed)
+    core_canceled["scenario_reports"][0]["result_state"] = "canceled"  # type: ignore[index]
+
+    verification_canceled = deepcopy(verified)
+    _set_first_verification_state(verification_canceled, "canceled")
 
     cases = {
         "verified": (verified, "completed"),
+        "verification-not-requested": (verification_not_requested, "completed"),
         "strong-without-fixes": (strong_without_fixes, "completed"),
         "weak": (weak, "completed"),
         "no-source": (no_source, "completed"),
         "unavailable": (unavailable, "partially_completed"),
         "verification-pending": (pending, "partially_completed"),
         "verification-failed": (verification_failed, "partially_completed"),
+        "verification-canceled": (verification_canceled, "partially_completed"),
         "core-failed": (core_failed, "partially_completed"),
+        "core-canceled": (core_canceled, "partially_completed"),
     }
     for report, expected_state in cases.values():
         _assert_only_report_v12_state(report, expected_state)
+
+
+@pytest.mark.parametrize(
+    "verification_state",
+    [
+        "not_requested",
+        "pending",
+        "validating",
+        "verified",
+        "apply_failed",
+        "validation_failed",
+        "source_changed",
+        "not_configured",
+        "timeout",
+        "canceled",
+        "unavailable",
+    ],
+)
+def test_report_v12_every_verification_state_maps_to_exactly_one_report_state(
+    verification_state: str,
+) -> None:
+    report = _completed_report_v12()
+    if verification_state != "verified":
+        _set_first_verification_state(report, verification_state)
+    expected_state = (
+        "completed"
+        if verification_state in {"not_requested", "verified"}
+        else "partially_completed"
+    )
+    _assert_only_report_v12_state(report, expected_state)
 
 
 @pytest.mark.parametrize("source_case", ["not-requested", "weak", "none"])
@@ -1056,6 +1194,36 @@ def test_report_v12_match_summary_agrees_with_source_ref_grades(
         _validate_ai_contract("reports/analysis-report.schema.json", report)
 
 
+def test_report_v12_strong_match_requires_a_strong_source_ref() -> None:
+    report = _completed_report_v12()
+    report["source_code"]["source_refs"] = []  # type: ignore[index]
+    report["source_code"]["fixes"] = []  # type: ignore[index]
+    report["synthesis"]["output"]["source_fixes"] = []  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        _validate_ai_contract("reports/analysis-report.schema.json", report)
+
+
+@pytest.mark.parametrize("identifier_kind", ["source-ref", "fix"])
+def test_report_v12_source_ref_and_fix_ids_are_unique(identifier_kind: str) -> None:
+    if identifier_kind == "source-ref":
+        report = _completed_report_v12()
+        duplicate_ref = deepcopy(report["source_code"]["source_refs"][0])  # type: ignore[index]
+        duplicate_ref["end_line"] += 1
+        duplicate_ref["content_sha256"] = "e" * 64
+        report["source_code"]["source_refs"].append(duplicate_ref)  # type: ignore[index]
+    else:
+        report = _report_with_two_source_fixes()
+        synthesis_fixes = report["synthesis"]["output"]["source_fixes"]  # type: ignore[index]
+        public_fixes = report["source_code"]["fixes"]  # type: ignore[index]
+        duplicate_id = synthesis_fixes[0]["fix_id"]
+        for fix in (synthesis_fixes[1], public_fixes[1]):
+            fix["fix_id"] = duplicate_id
+            fix["diagnosis"] = "A distinct diagnosis with a duplicated fix identity."
+
+    with pytest.raises(jsonschema.ValidationError):
+        _validate_ai_contract("reports/analysis-report.schema.json", report)
+
+
 @pytest.mark.parametrize(
     "mutation",
     [
@@ -1063,7 +1231,11 @@ def test_report_v12_match_summary_agrees_with_source_ref_grades(
         "dangling-source-ref",
         "mismatched-profile",
         "mismatched-path",
+        "mismatched-symbol",
+        "unreferenced-finding",
+        "unreferenced-evidence",
         "mismatched-rule",
+        "weak-referenced-ref",
         "reordered-public-fixes",
         "missing-public-fix",
         "extra-public-fix",
@@ -1095,9 +1267,25 @@ def test_report_v12_source_fixes_are_exact_ordered_enrichments(
         for fix in (synthesis_fixes[0], public_fixes[0]):
             fix["relative_path"] = other_path
             fix["diff"] = other_diff
+    elif mutation == "mismatched-symbol":
+        for fix in (synthesis_fixes[0], public_fixes[0]):
+            fix["symbol"] = "demo.OtherActivity.onCreate"
+    elif mutation == "unreferenced-finding":
+        for fix in (synthesis_fixes[0], public_fixes[0]):
+            fix["finding_id"] = "85000000-0000-4000-8000-000000000009"
+    elif mutation == "unreferenced-evidence":
+        for fix in (synthesis_fixes[0], public_fixes[0]):
+            fix["evidence_ids"] = ["86000000-0000-4000-8000-000000000009"]
     elif mutation == "mismatched-rule":
         for fix in (synthesis_fixes[0], public_fixes[0]):
             fix["rule_id"] = "startup.unlisted_rule"
+    elif mutation == "weak-referenced-ref":
+        weak_ref = deepcopy(report["source_code"]["source_refs"][0])  # type: ignore[index]
+        weak_ref["source_ref_id"] = "97000000-0000-4000-8000-000000000002"
+        weak_ref["match_grade"] = "weak"
+        report["source_code"]["source_refs"].append(weak_ref)  # type: ignore[index]
+        for fix in (synthesis_fixes[0], public_fixes[0]):
+            fix["source_ref_ids"].append(weak_ref["source_ref_id"])
     elif mutation == "reordered-public-fixes":
         report["source_code"]["fixes"] = list(reversed(public_fixes))  # type: ignore[index]
     elif mutation == "missing-public-fix":
@@ -1241,6 +1429,7 @@ def test_source_fix_requires_safe_matching_unified_diff_headers(
     [
         "second-file",
         "second-git-hook",
+        "traditional-second-file",
         "git-path",
         "casefold-git-path",
         "binary",

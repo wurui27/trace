@@ -190,6 +190,7 @@
         "required": ["synthesis", "source_code"],
         "properties": {
           "analysis_mode": {"enum": ["trace_upload", "device"]},
+          "state": {"enum": ["completed", "partially_completed"]},
           "synthesis": {"$ref": "#/$defs/synthesisV2"},
           "source_code": {"$ref": "#/$defs/sourceCode"},
           "scenario_reports": {
@@ -216,7 +217,7 @@
           "synthesis": {"properties": {"state": {"const": "completed"}}},
           "scenario_reports": {"items": {"properties": {"result_state": {"const": "completed"}}}},
           "source_code": {
-            "$comment": "Report 1.2 state mapping is deterministic: no-source and available zero-fix outcomes are completed; executable fixes are completed only after every fix is verified.",
+            "$comment": "Report 1.2 state mapping is deterministic: no-source and available zero-fix outcomes are completed; executable fixes are completed when verification is either verified or explicitly not_requested.",
             "oneOf": [
               {
                 "properties": {"requested": {"const": false}},
@@ -240,7 +241,7 @@
                     "items": {
                       "properties": {
                         "verification": {
-                          "properties": {"state": {"const": "verified"}},
+                          "properties": {"state": {"enum": ["verified", "not_requested"]}},
                           "required": ["state"]
                         }
                       },
@@ -1544,7 +1545,7 @@
         "relative_path": {"$ref": "#/$defs/sourceFixPath"},
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
-        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate synthesis-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file whose four header paths equal relative_path, rejects .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk old-lines to source."},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate synthesis-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file and one leading ---/+++ pair whose four header paths equal relative_path, rejects later file headers, .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk ranges or old-lines to source."},
         "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000}
       }
@@ -1718,7 +1719,7 @@
         "relative_path": {"$ref": "#/$defs/sourceFixPath"},
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
-        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate public-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file whose four header paths equal relative_path, rejects .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk old-lines to source."},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate public-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file and one leading ---/+++ pair whose four header paths equal relative_path, rejects later file headers, .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk ranges or old-lines to source."},
         "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000},
         "verification": {"$ref": "#/$defs/patchVerification"}
@@ -1726,7 +1727,7 @@
     },
     "sourceCode": {
       "type": "object",
-      "$comment": "Semantic validation requires every source_refs snapshot_hash to equal snapshot.snapshot_hash; each synthesis source fix to reference existing strong refs with the same snapshot, path, and allowed rule; source_code.fixes to be an exact ordered enrichment of synthesis source_fixes across all AI-owned fields; and every verification profile to equal both fix and report validation profiles. JSON Schema cannot compare these sibling values.",
+      "$comment": "Semantic validation requires source_ref_id and fix_id values to be unique; every source_refs snapshot_hash to equal snapshot.snapshot_hash; each synthesis source fix to reference existing strong refs with the same snapshot, path, symbol, linked finding/evidence, and allowed rule; source_code.fixes to be an exact ordered enrichment of synthesis source_fixes across all AI-owned fields; and every verification profile to equal both fix and report validation profiles. JSON Schema cannot compare these sibling values.",
       "additionalProperties": false,
       "required": ["requested", "provider_kind", "agent_id", "workspace_id", "snapshot_policy", "validation_profile_id", "snapshot", "context_state", "match_summary", "source_refs", "exclusions", "fixes", "limitations"],
       "properties": {
@@ -1789,11 +1790,7 @@
         {
           "if": {
             "properties": {"match_summary": {"const": "strong"}},
-            "required": ["match_summary"],
-            "anyOf": [
-              {"properties": {"source_refs": {"minItems": 1}}, "required": ["source_refs"]},
-              {"properties": {"fixes": {"minItems": 1}}, "required": ["fixes"]}
-            ]
+            "required": ["match_summary"]
           },
           "then": {
             "properties": {
