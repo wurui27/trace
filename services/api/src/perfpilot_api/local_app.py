@@ -464,6 +464,30 @@ class _LocalAIRound:
     attempts: int = 0
 
 
+def _restore_evidence_manifest(value: object) -> dict[str, str]:
+    checksum_keys = {
+        "normalized_core_sha256_b64",
+        "smartperfetto_report_sha256_b64",
+        "projection_sha256_b64",
+    }
+    try:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"schema_version", *checksum_keys}
+            or value.get("schema_version") != "1.0"
+        ):
+            raise ValueError
+        manifest = {"schema_version": "1.0"}
+        for key in checksum_keys:
+            checksum = value[key]
+            if not isinstance(checksum, str):
+                raise ValueError
+            manifest[key] = _validated_checksum(checksum)
+        return manifest
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("invalid persisted local analysis") from None
+
+
 def _default_ai_rounds() -> list[_LocalAIRound]:
     return [_LocalAIRound(1, "report")]
 
@@ -528,6 +552,7 @@ class _LocalAnalysis:
     source_rounds: int | None = None
     source_verification: Literal["passed", "failed", "unknown"] = "unknown"
     evidence_format_version: Literal["normalized-core-v1"] | None = None
+    evidence_manifest: dict[str, str] | None = None
     ai_rounds: list[_LocalAIRound] = field(default_factory=_default_ai_rounds)
     stages: dict[str, str] = field(
         default_factory=lambda: {
@@ -572,6 +597,26 @@ def _parse_utc_datetime(value: object) -> datetime | None:
 
 def _sha256_b64(value: bytes) -> str:
     return base64.b64encode(hashlib.sha256(value).digest()).decode("ascii")
+
+
+def _evidence_manifest(
+    *,
+    core: Mapping[str, object],
+    source: Mapping[str, object],
+    projection: Mapping[str, object],
+) -> dict[str, str]:
+    return {
+        "schema_version": "1.0",
+        "normalized_core_sha256_b64": _sha256_b64(
+            canonical_json_bytes(dict(core))
+        ),
+        "smartperfetto_report_sha256_b64": _sha256_b64(
+            canonical_json_bytes(dict(source))
+        ),
+        "projection_sha256_b64": _sha256_b64(
+            canonical_json_bytes(dict(projection))
+        ),
+    }
 
 
 def _blocked_ai_projection(
@@ -1213,12 +1258,83 @@ def _remap_projection_artifact(
     return validate_contract("analysis-projection", migrated)
 
 
+def _validate_legacy_report_facts(
+    analysis: _LocalAnalysis,
+    prepared: _PreparedLocalReport,
+    report_value: object,
+) -> None:
+    try:
+        report = validate_contract("analysis-report", report_value)
+        if (
+            report["analysis_id"] != str(analysis.analysis_id)
+            or report["analysis_mode"] != analysis.analysis_mode
+        ):
+            raise ValueError
+        report_scenarios = report["scenario_reports"]
+        core_scenarios = prepared.core_document["scenario_reports"]
+        if len(report_scenarios) != len(core_scenarios):
+            raise ValueError
+        selected = {
+            (item["scenario_job_id"], item["scenario_type"]): item
+            for item in report_scenarios
+        }
+        if len(selected) != len(report_scenarios):
+            raise ValueError
+        rebuilt_artifact_id = str(prepared.canonical_artifact_id)
+        for core_scenario in core_scenarios:
+            key = (
+                core_scenario["scenario_id"],
+                core_scenario["scenario_type"],
+            )
+            report_scenario = selected[key]
+            bundle = report_scenario["bundle"]
+            input_artifacts = bundle["provenance"]["input_artifacts"]
+            if (
+                len(input_artifacts) != 1
+                or input_artifacts[0].get("artifact_kind") != "engine_result"
+            ):
+                raise ValueError
+            old_artifact_id = input_artifacts[0]["artifact_id"]
+            mapped_evidence = [
+                {
+                    **item,
+                    "artifact_id": (
+                        old_artifact_id
+                        if item.get("artifact_id") == rebuilt_artifact_id
+                        else item.get("artifact_id")
+                    ),
+                }
+                for item in core_scenario["evidence"]
+            ]
+            if (
+                report_scenario["result_state"]
+                != (
+                    "completed"
+                    if core_scenario["core_state"] == "complete"
+                    else "failed"
+                )
+                or bundle["scenario_job_id"] != core_scenario["scenario_id"]
+                or bundle["scenario_type"] != core_scenario["scenario_type"]
+                or bundle["bundle_state"] != core_scenario["core_state"]
+                or bundle["metrics"] != core_scenario["metrics"]
+                or bundle["findings"] != core_scenario["findings"]
+                or bundle["evidence"] != mapped_evidence
+                or bundle["trace_health"] != core_scenario["trace_health"]
+                or bundle["trace_capabilities"]
+                != core_scenario["trace_capabilities"]
+            ):
+                raise ValueError
+    except Exception:
+        raise _PersistedLocalEvidenceError("ai_source_evidence_invalid") from None
+
+
 def _prepared_from_persisted_documents(
     analysis: _LocalAnalysis,
     *,
     source_value: object,
     core_value: object | None,
     projection_value: object,
+    report_value: object | None,
 ) -> _PreparedLocalReport:
     source_report = _validated_persisted_source_report(source_value)
     try:
@@ -1259,6 +1375,15 @@ def _prepared_from_persisted_documents(
                 if canonical_json_bytes(migrated_projection) == (
                     rebuilt.projection.canonical_bytes
                 ):
+                    if report_value is None:
+                        raise _PersistedLocalEvidenceError(
+                            "ai_source_evidence_unavailable"
+                        )
+                    _validate_legacy_report_facts(
+                        analysis,
+                        rebuilt,
+                        report_value,
+                    )
                     return rebuilt
             raise ValueError
         core_document = validate_contract("normalized-trace-report", core_value)
@@ -1417,8 +1542,13 @@ class _LocalRuntime:
             ],
             "report_available": analysis.report is not None,
         }
+        if (analysis.evidence_format_version is None) != (
+            analysis.evidence_manifest is None
+        ):
+            raise RuntimeError("invalid local evidence state")
         if analysis.evidence_format_version is not None:
             document["evidence_format_version"] = analysis.evidence_format_version
+            document["evidence_manifest"] = dict(analysis.evidence_manifest or {})
         return document
 
     async def _persist(self, analysis: _LocalAnalysis) -> None:
@@ -1488,12 +1618,18 @@ class _LocalRuntime:
         completed_at = _parse_utc_datetime(raw_completed_at)
         if raw_completed_at is not None and completed_at is None:
             raise ValueError("invalid persisted local analysis")
-        evidence_format_version = document.get("evidence_format_version")
-        if (
-            "evidence_format_version" in document
-            and evidence_format_version != _LOCAL_EVIDENCE_FORMAT_VERSION
-        ):
+        has_evidence_format = "evidence_format_version" in document
+        has_evidence_manifest = "evidence_manifest" in document
+        if has_evidence_format != has_evidence_manifest:
             raise ValueError("invalid persisted local analysis")
+        evidence_format_version = document.get("evidence_format_version")
+        evidence_manifest = None
+        if has_evidence_format:
+            if evidence_format_version != _LOCAL_EVIDENCE_FORMAT_VERSION:
+                raise ValueError("invalid persisted local analysis")
+            evidence_manifest = _restore_evidence_manifest(
+                document["evidence_manifest"]
+            )
         analysis = _LocalAnalysis(
             analysis_id=analysis_id,
             profile=str(document["profile"]),
@@ -1541,6 +1677,7 @@ class _LocalRuntime:
                 str(document.get("source_verification", "unknown"))  # type: ignore[arg-type]
             ),
             evidence_format_version=evidence_format_version,  # type: ignore[arg-type]
+            evidence_manifest=evidence_manifest,
             ai_rounds=ai_rounds,
             stages={key: str(value) for key, value in stages.items()},
         )
@@ -1831,19 +1968,40 @@ class _LocalRuntime:
                 raise _PersistedLocalEvidenceError(
                     "ai_source_evidence_unavailable"
                 )
-            if (
-                core_value is None
-                and analysis.evidence_format_version
-                == _LOCAL_EVIDENCE_FORMAT_VERSION
-            ):
-                raise _PersistedLocalEvidenceError(
-                    "ai_source_evidence_unavailable"
+            report_value: object | None = None
+            if analysis.evidence_manifest is not None:
+                if core_value is None:
+                    raise _PersistedLocalEvidenceError(
+                        "ai_source_evidence_unavailable"
+                    )
+                try:
+                    manifest = _evidence_manifest(
+                        core=core_value,
+                        source=source_value,
+                        projection=projection_value,
+                    )
+                except Exception:
+                    manifest = None
+                if analysis.evidence_manifest != manifest:
+                    raise _PersistedLocalEvidenceError(
+                        "ai_source_evidence_invalid"
+                    )
+            else:
+                core_value = None
+                report_value = self.store.load_document(
+                    analysis.analysis_id,
+                    "report.json",
                 )
+                if report_value is None:
+                    raise _PersistedLocalEvidenceError(
+                        "ai_source_evidence_unavailable"
+                    )
             return _prepared_from_persisted_documents(
                 analysis,
                 source_value=source_value,
                 core_value=core_value,
                 projection_value=projection_value,
+                report_value=report_value,
             )
         except _PersistedLocalEvidenceError:
             raise
@@ -2314,6 +2472,7 @@ class _LocalRuntime:
         *,
         generation: int,
     ) -> None:
+        projection_document = prepared.projection.document
         async with self.lock:
             if analysis.generation != generation:
                 raise _StaleLocalGeneration
@@ -2326,16 +2485,6 @@ class _LocalRuntime:
             "normalized-core.json",
             prepared.core_document,
         )
-        marker_changed = False
-        async with self.lock:
-            if analysis.generation != generation:
-                raise _StaleLocalGeneration
-            if analysis.evidence_format_version is None:
-                analysis.evidence_format_version = _LOCAL_EVIDENCE_FORMAT_VERSION
-                analysis.version += 1
-                marker_changed = True
-        if marker_changed:
-            await self._persist(analysis)
         await asyncio.to_thread(
             self.store.save_document,
             analysis.analysis_id,
@@ -2346,8 +2495,27 @@ class _LocalRuntime:
             self.store.save_document,
             analysis.analysis_id,
             "projection.json",
-            prepared.projection.document,
+            projection_document,
         )
+        manifest = _evidence_manifest(
+            core=prepared.core_document,
+            source=prepared.source_report,
+            projection=projection_document,
+        )
+        manifest_changed = False
+        async with self.lock:
+            if analysis.generation != generation:
+                raise _StaleLocalGeneration
+            if (
+                analysis.evidence_format_version != _LOCAL_EVIDENCE_FORMAT_VERSION
+                or analysis.evidence_manifest != manifest
+            ):
+                analysis.evidence_format_version = _LOCAL_EVIDENCE_FORMAT_VERSION
+                analysis.evidence_manifest = manifest
+                analysis.version += 1
+                manifest_changed = True
+        if manifest_changed:
+            await self._persist(analysis)
         synthesis: AISynthesisOutput | None = None
         rounds: tuple[LocalReportUsage, ...] = ()
         synthesis_failure_code: str | None = None
@@ -2474,7 +2642,11 @@ class _LocalRuntime:
             analysis.failure = {
                 "code": failure_code,
                 "message": "PerfPilot AI 最终报告无法从已保存的分析证据生成",
-                "retryable": True,
+                "retryable": failure_code
+                not in {
+                    "ai_source_evidence_invalid",
+                    "ai_source_evidence_unavailable",
+                },
             }
             analysis.stages["smartperfetto"] = "completed"
             analysis.stages["perfpilot_ai"] = "failed"

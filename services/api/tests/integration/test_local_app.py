@@ -22,6 +22,8 @@ from perfpilot_api.ai.openai_compatible import SynthesisCandidate
 from perfpilot_api.engines.contracts import EngineResult
 from perfpilot_api.local_app import (
     LocalEngineRun,
+    _evidence_manifest,
+    _prepare_local_report,
     _public_origin,
     _restore_ai_rounds,
     create_local_app,
@@ -29,6 +31,8 @@ from perfpilot_api.local_app import (
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
 from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapture
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
+from perfpilot_api.reports.normalizer import NormalizedTraceReport
+from perfpilot_api.reports.projection import build_ai_projection
 
 
 class _FakeSmartPerfettoGateway:
@@ -680,6 +684,38 @@ def test_local_app_rejects_present_null_evidence_format_after_restart(
             pass
 
 
+@pytest.mark.parametrize("mutation", ["marker_only", "manifest_only", "malformed"])
+def test_local_app_requires_a_strict_evidence_marker_manifest_pair_after_restart(
+    tmp_path: Path,
+    mutation: str,
+) -> None:
+    _, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    checksum = base64.b64encode(hashlib.sha256(b"manifest").digest()).decode(
+        "ascii"
+    )
+    manifest = {
+        "schema_version": "1.0",
+        "normalized_core_sha256_b64": checksum,
+        "smartperfetto_report_sha256_b64": checksum,
+        "projection_sha256_b64": checksum,
+    }
+    if mutation != "manifest_only":
+        state["evidence_format_version"] = "normalized-core-v1"
+    if mutation != "marker_only":
+        state["evidence_manifest"] = manifest
+    if mutation == "malformed":
+        manifest["unexpected"] = True
+    LocalAnalysisStore(tmp_path).save_state(analysis_id, state)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="^invalid persisted local analysis$"):
+        with TestClient(app):
+            pass
+
+
 def test_local_app_reports_the_device_currently_connected_over_adb(tmp_path: Path) -> None:
     device_probe = _FakeDeviceProbe(
         _FakeDeviceStatus(
@@ -1061,6 +1097,7 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
     parsed_analysis_id = UUID(analysis_id)
     legacy_state = store.load_states()[parsed_analysis_id]
     legacy_state.pop("evidence_format_version", None)
+    legacy_state.pop("evidence_manifest", None)
     store.save_state(parsed_analysis_id, legacy_state)
     analysis_directory = tmp_path / "analyses" / analysis_id
     (analysis_directory / "normalized-core.json").unlink()
@@ -1649,6 +1686,8 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     legacy_id = UUID("92000000-0000-4000-8000-000000000004")
     legacy_state = copy.deepcopy(original_state)
     legacy_state["analysis_id"] = str(legacy_id)
+    legacy_state.pop("evidence_format_version", None)
+    legacy_state.pop("evidence_manifest", None)
     expected_legacy_rounds = [
         {"round": 1, "role": "extract", "state": "completed", "attempts": 1},
         {"round": 2, "role": "review", "state": "completed", "attempts": 1},
@@ -1678,6 +1717,13 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         "smartperfetto-report.json",
         legacy_source_report,
     )
+    legacy_state["evidence_format_version"] = "normalized-core-v1"
+    legacy_state["evidence_manifest"] = _evidence_manifest(
+        core=legacy_core,
+        source=legacy_source_report,
+        projection=legacy_projection,
+    )
+    store.save_state(legacy_id, legacy_state)
     legacy_round_2 = {"sentinel": "legacy-round-2"}
     legacy_round_3 = {"sentinel": "legacy-round-3"}
     store.save_document(legacy_id, "round-2.json", legacy_round_2)
@@ -1822,6 +1868,7 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
     legacy_store = LocalAnalysisStore(tmp_path)
     legacy_state = legacy_store.load_states()[UUID(analysis_id)]
     legacy_state.pop("evidence_format_version", None)
+    legacy_state.pop("evidence_manifest", None)
     legacy_store.save_state(UUID(analysis_id), legacy_state)
     assert {
         "projection.json",
@@ -1877,12 +1924,96 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
         "evidence_format_version"
     ] == "normalized-core-v1"
 
+    store = LocalAnalysisStore(tmp_path)
+    parsed_analysis_id = UUID(analysis_id)
+    legacy_state = store.load_states()[parsed_analysis_id]
+    legacy_state.pop("evidence_format_version", None)
+    legacy_state.pop("evidence_manifest", None)
+    store.save_state(parsed_analysis_id, legacy_state)
+    (legacy_directory / "normalized-core.json").unlink()
+    tampered_source = store.load_document(
+        parsed_analysis_id,
+        "smartperfetto-report.json",
+    )
+    assert tampered_source is not None
+    startup_envelope = tampered_source["dataEnvelopes"][0]
+    startup_envelope["evidence"][0]["fields"]["duration_ms"] = 123.4
+    startup_envelope["columns"][0]["value"] = 123.4
+    analysis = second_app.state.local_runtime.analyses[parsed_analysis_id]
+    tampered = _prepare_local_report(
+        analysis,
+        EngineResult(
+            contract="workspace-agent-v1",
+            state="completed",
+            payload={
+                "reportId": tampered_source["reportId"],
+                "report": tampered_source,
+            },
+        ),
+    )
+    store.save_document(
+        parsed_analysis_id,
+        "smartperfetto-report.json",
+        tampered.source_report,
+    )
+    store.save_document(
+        parsed_analysis_id,
+        "projection.json",
+        tampered.projection.document,
+    )
+    old_report_bytes = (legacy_directory / "report.json").read_bytes()
+    old_report = rerun_report.json()
+    tamper_provider = _InvalidReportProvider()
+    tamper_gateway = _UnavailableAfterRestartSmartPerfettoGateway()
+    third_app = create_local_app(
+        gateway=tamper_gateway,
+        synthesizer=LocalReportSynthesizer(provider=tamper_provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(third_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        rerun = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",
+            headers=headers,
+        )
+        assert rerun.status_code == 201
+        assert rerun.json()["generation"] == 3
+        for _ in range(100):
+            tampered_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if tampered_state["state"] in {
+                "completed",
+                "partially_completed",
+                "failed",
+            }:
+                break
+            time.sleep(0.01)
+        preserved = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert tampered_state["failure"] == {
+        "code": "ai_source_evidence_invalid",
+        "message": "PerfPilot AI 最终报告无法从已保存的分析证据生成",
+        "retryable": False,
+    }
+    assert preserved.json() == old_report
+    assert (legacy_directory / "report.json").read_bytes() == old_report_bytes
+    assert tamper_provider.calls == 0
+    assert tamper_gateway.submissions == []
+    assert tamper_gateway.status_calls == 0
+    assert tamper_gateway.fetch_calls == 0
+
 
 @pytest.mark.parametrize(
     ("core_mutation", "expected_failure_code"),
     [
         ("missing", "ai_source_evidence_unavailable"),
         ("corrupt", "ai_source_evidence_invalid"),
+        ("consistent_tamper", "ai_source_evidence_invalid"),
     ],
 )
 def test_local_app_rejects_invalid_versioned_core_and_keeps_the_old_report(
@@ -1927,15 +2058,42 @@ def test_local_app_rejects_invalid_versioned_core_and_keeps_the_old_report(
     parsed_analysis_id = UUID(analysis_id)
     state = store.load_states()[parsed_analysis_id]
     assert state["evidence_format_version"] == "normalized-core-v1"
+    original_core = store.load_document(parsed_analysis_id, "normalized-core.json")
+    assert original_core is not None
     analysis_directory = tmp_path / "analyses" / analysis_id
     old_report_bytes = (analysis_directory / "report.json").read_bytes()
     if core_mutation == "missing":
         (analysis_directory / "normalized-core.json").unlink()
-    else:
+    elif core_mutation == "corrupt":
         store.save_document(
             parsed_analysis_id,
             "normalized-core.json",
             {"schema_version": "invalid"},
+        )
+    else:
+        scenario = original_core["scenario_reports"][0]
+        metric = scenario["metrics"][0]
+        metric["numeric_value"] = float(metric["numeric_value"]) + 1.0
+        core_bytes = canonical_json_bytes(original_core)
+        tampered_projection = build_ai_projection(
+            NormalizedTraceReport(
+                canonical_bytes=core_bytes,
+                sha256_b64=base64.b64encode(
+                    hashlib.sha256(core_bytes).digest()
+                ).decode("ascii"),
+            ),
+            analysis_profile=state["profile"],
+            question=state["question"],
+        )
+        store.save_document(
+            parsed_analysis_id,
+            "normalized-core.json",
+            original_core,
+        )
+        store.save_document(
+            parsed_analysis_id,
+            "projection.json",
+            tampered_projection.document,
         )
     provider = _InvalidReportProvider()
     restarted_gateway = _UnavailableAfterRestartSmartPerfettoGateway()
@@ -1968,7 +2126,7 @@ def test_local_app_rejects_invalid_versioned_core_and_keeps_the_old_report(
     assert failed_state["failure"] == {
         "code": expected_failure_code,
         "message": "PerfPilot AI 最终报告无法从已保存的分析证据生成",
-        "retryable": True,
+        "retryable": False,
     }
     assert failed_state["ai_rounds"] == [
         {"round": 1, "role": "report", "state": "failed", "attempts": 0}
@@ -1986,6 +2144,106 @@ def test_local_app_rejects_invalid_versioned_core_and_keeps_the_old_report(
     assert restarted_gateway.submissions == []
     assert restarted_gateway.status_calls == 0
     assert restarted_gateway.fetch_calls == 0
+
+
+@pytest.mark.parametrize(
+    "failed_document",
+    ["smartperfetto-report.json", "projection.json"],
+)
+def test_local_app_does_not_publish_a_manifest_for_partial_evidence_writes(
+    tmp_path: Path,
+    failed_document: str,
+) -> None:
+    first_app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(first_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        recovered = client.post(
+            f"/v1/teams/{team_id}/local-recoveries",
+            headers=headers,
+            json=_recovery_request(),
+        )
+        assert recovered.status_code == 201
+        analysis_id = recovered.json()["analysis_id"]
+        for _ in range(100):
+            initial_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if initial_state["report_available"]:
+                break
+            time.sleep(0.01)
+        old_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        ).json()
+
+    store = LocalAnalysisStore(tmp_path)
+    parsed_analysis_id = UUID(analysis_id)
+    legacy_state = store.load_states()[parsed_analysis_id]
+    legacy_state.pop("evidence_format_version", None)
+    legacy_state.pop("evidence_manifest", None)
+    store.save_state(parsed_analysis_id, legacy_state)
+    analysis_directory = tmp_path / "analyses" / analysis_id
+    (analysis_directory / "normalized-core.json").unlink()
+    old_report_bytes = (analysis_directory / "report.json").read_bytes()
+    provider = _InvalidReportProvider()
+    gateway = _UnavailableAfterRestartSmartPerfettoGateway()
+    second_app = create_local_app(
+        gateway=gateway,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(second_app) as client:
+        runtime = second_app.state.local_runtime
+        original_save_document = runtime.store.save_document
+
+        def fail_selected_document(
+            stored_analysis_id: UUID,
+            name: str,
+            value: dict[str, object],
+        ) -> None:
+            if name == failed_document:
+                raise RuntimeError("evidence document write failed")
+            original_save_document(stored_analysis_id, name, value)
+
+        runtime.store.save_document = fail_selected_document
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        rerun = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",
+            headers=headers,
+        )
+        assert rerun.status_code == 201
+        for _ in range(100):
+            failed_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if failed_state["state"] in {
+                "completed",
+                "partially_completed",
+                "failed",
+            }:
+                break
+            time.sleep(0.01)
+        preserved_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    persisted = store.load_states()[parsed_analysis_id]
+    assert "evidence_format_version" not in persisted
+    assert "evidence_manifest" not in persisted
+    assert preserved_report.json() == old_report
+    assert (analysis_directory / "report.json").read_bytes() == old_report_bytes
+    assert provider.calls == 0
+    assert gateway.submissions == []
+    assert gateway.status_calls == 0
+    assert gateway.fetch_calls == 0
 
 
 def test_local_app_installs_recovery_task_before_persisting_initial_state(
