@@ -174,9 +174,30 @@ describe("Dashboard analysis coordinator", () => {
     ).toBeGreaterThanOrEqual(1);
     expect(screen.getByText("481.8 ms")).toBeInTheDocument();
     expect(screen.getByText("215.5 ms")).toBeInTheDocument();
-    expect(screen.getByText("AI 建议 未完成")).toBeInTheDocument();
+    expect(screen.getByText("AI 最终报告 未完成")).toBeInTheDocument();
+    expect(screen.queryByText("AI 建议 未完成")).not.toBeInTheDocument();
     expect(screen.getByText("PerfPilot AI 未完成")).toBeInTheDocument();
     expect(screen.queryByText("暂无分析结论")).not.toBeInTheDocument();
+  });
+
+  it("uses final-report language in the empty credibility slot", async () => {
+    const client = clientWithActive({
+      activeAnalyses: vi.fn().mockResolvedValue({
+        schema_version: "1.0",
+        analyses: [],
+      }),
+    });
+
+    render(
+      <TestDashboard
+        client={client}
+        pollDelay={() => new Promise<void>(() => undefined)}
+        latestReportLoader={vi.fn().mockResolvedValue(null)}
+      />,
+    );
+
+    expect(await screen.findByText("AI 最终报告 —")).toBeInTheDocument();
+    expect(screen.queryByText("AI 建议 —")).not.toBeInTheDocument();
   });
 
   it("restores the active task and refreshes reports when polling reaches completion", async () => {

@@ -276,11 +276,24 @@ describe("AnalysisReportView", () => {
     );
 
     const status = screen.getByRole("status");
-    expect(status).toHaveTextContent("内核分析已完成，AI 最终报告暂未生成");
-    expect(status.querySelector("p")).toHaveTextContent(/你可以只重新生成 AI 报告。$/);
+    expect(status.querySelector("strong")).toHaveTextContent(
+      /^内核分析已完成，AI 最终报告暂未生成$/,
+    );
+    expect(status.querySelector("p")).toHaveTextContent(
+      /^SmartPerfetto 的指标、问题和证据仍可查看。你可以只重新生成 AI 报告。$/,
+    );
+    expect(status).not.toHaveTextContent(["AI", "建议暂未生成"].join(" "));
+    expect(status.querySelector("p")).not.toHaveTextContent(
+      ["SmartPerfetto 的指标、问题和证据仍可查看。你可以只重新生成 AI", "建议。"].join(
+        " ",
+      ),
+    );
     expect(screen.getByText("真实问题 1")).toBeInTheDocument();
     expect(document.getElementById(`evidence-${EVIDENCE_IDS[0]}`)).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "优化建议" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: ["重新生成 AI", "建议"].join(" ") }),
+    ).not.toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "重新生成 AI 报告" }));
     expect(retry).toHaveBeenCalledTimes(1);
   });

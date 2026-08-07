@@ -459,7 +459,7 @@ export function Dashboard({
               </li>
               <li>失败阶段 {reportProjection.credibility.failedStages} 个</li>
               <li>
-                AI 建议 {reportProjection.credibility.aiState === "completed"
+                AI 最终报告 {reportProjection.credibility.aiState === "completed"
                   ? "已完成"
                   : reportProjection.credibility.aiState === "not_requested"
                     ? "当前报告未包含"
@@ -471,7 +471,7 @@ export function Dashboard({
               <li>有效采集 —</li>
               <li>可用指标 —</li>
               <li>可验证证据 —</li>
-              <li>AI 建议 —</li>
+              <li>AI 最终报告 —</li>
             </>
           )}
         </ul>
