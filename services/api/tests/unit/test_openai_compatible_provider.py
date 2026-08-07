@@ -95,9 +95,12 @@ async def test_invalid_output_retry_sends_safe_instructions_without_prior_candid
 
     requests: list[httpx.Request] = []
 
+    rejected_candidate = "REJECTED_REPORT_SENTINEL_DO_NOT_REPEAT"
+    responses = [_response(rejected_candidate), _response()]
+
     def handler(request: httpx.Request) -> httpx.Response:
         requests.append(request)
-        return _response()
+        return responses.pop(0)
 
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(handler), follow_redirects=False
@@ -110,11 +113,13 @@ async def test_invalid_output_retry_sends_safe_instructions_without_prior_candid
             max_response_bytes=128 * 1024,
             client=client,
         )
+        first_candidate = await provider.synthesize(_projection())
         await provider.synthesize(_projection(), retry_code="ai_output_invalid")
 
-    body = json.loads(requests[0].content)
-    retry_message = body["messages"][-1]
-    assert retry_message == {
+    assert first_candidate.candidate_json == rejected_candidate.encode("utf-8")
+    assert len(requests) == 2
+    body = json.loads(requests[1].content)
+    retry_message = {
         "role": "user",
         "content": (
             "The previous output failed validation. Generate a complete new JSON "
@@ -123,8 +128,9 @@ async def test_invalid_output_retry_sends_safe_instructions_without_prior_candid
             "digits; measurements belong only in report metric sections."
         ),
     }
+    assert body["messages"][2:] == [retry_message]
     assert re.search(r"[0-9]", retry_message["content"]) is None
-    assert "candidate" not in json.dumps(body).casefold()
+    assert rejected_candidate not in requests[1].content.decode("utf-8")
 
 
 @pytest.mark.asyncio

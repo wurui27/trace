@@ -96,18 +96,11 @@ class FakeReportProvider:
     def __init__(self, candidates: list[bytes]) -> None:
         self.candidates = candidates
         self.calls = 0
-        self.retry_codes: list[str | None] = []
         self.closed = False
 
-    async def complete(
-        self,
-        *,
-        projection: AIProjection,
-        retry_code: str | None = None,
-    ) -> SynthesisCandidate:
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
         assert projection.document["analysis_profile"] == "auto"
         self.calls += 1
-        self.retry_codes.append(retry_code)
         return SynthesisCandidate(
             candidate_json=self.candidates.pop(0),
             prompt_tokens=10,
@@ -124,15 +117,9 @@ class FailingReportProvider(FakeReportProvider):
         super().__init__([])
         self.errors = errors
 
-    async def complete(
-        self,
-        *,
-        projection: AIProjection,
-        retry_code: str | None = None,
-    ) -> SynthesisCandidate:
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
         assert projection.document["analysis_profile"] == "auto"
         self.calls += 1
-        self.retry_codes.append(retry_code)
         raise self.errors.pop(0)
 
 
@@ -143,12 +130,24 @@ class ScriptedReportProvider(FakeReportProvider):
     ) -> None:
         super().__init__([])
         self.events = events
+        self.retry_codes: list[str | None] = []
 
-    async def complete(
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+        return await self._complete(projection=projection, retry_code=None)
+
+    async def complete_retry(
         self,
         *,
         projection: AIProjection,
-        retry_code: str | None = None,
+        retry_code: str,
+    ) -> SynthesisCandidate:
+        return await self._complete(projection=projection, retry_code=retry_code)
+
+    async def _complete(
+        self,
+        *,
+        projection: AIProjection,
+        retry_code: str | None,
     ) -> SynthesisCandidate:
         assert projection.document["analysis_profile"] == "auto"
         self.calls += 1
@@ -164,20 +163,31 @@ class RetryAwareReportProvider(FakeReportProvider):
         super().__init__([])
         self.invalid = invalid
         self.valid = valid
+        self.retry_codes: list[str | None] = []
 
-    async def complete(
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+        assert projection.document["analysis_profile"] == "auto"
+        self.calls += 1
+        self.retry_codes.append(None)
+        return SynthesisCandidate(
+            candidate_json=self.invalid,
+            prompt_tokens=10,
+            completion_tokens=20,
+            latency_ms=30,
+        )
+
+    async def complete_retry(
         self,
         *,
         projection: AIProjection,
-        retry_code: str | None = None,
+        retry_code: str,
     ) -> SynthesisCandidate:
         assert projection.document["analysis_profile"] == "auto"
+        assert retry_code == "ai_output_invalid"
         self.calls += 1
         self.retry_codes.append(retry_code)
         return SynthesisCandidate(
-            candidate_json=(
-                self.valid if retry_code == "ai_output_invalid" else self.invalid
-            ),
+            candidate_json=self.valid,
             prompt_tokens=10,
             completion_tokens=20,
             latency_ms=30,
@@ -199,7 +209,6 @@ async def test_report_synthesizer_uses_one_provider_request() -> None:
     )
 
     assert provider.calls == 1
-    assert provider.retry_codes == [None]
     assert observed == [
         (1, "report", "running", 0),
         (1, "report", "completed", 1),
@@ -230,6 +239,20 @@ async def test_report_synthesizer_retries_invalid_output_once() -> None:
     assert result.rounds[0].number == 1
     assert result.rounds[0].role == "report"
     assert result.rounds[0].attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_retries_an_invalid_legacy_provider_without_kwargs(
+) -> None:
+    valid = canonical_json_bytes(_load("synthesis-output.valid.json"))
+    provider = FakeReportProvider([b"{}", valid])
+
+    result = await LocalReportSynthesizer(provider=provider).synthesize(_projection())
+
+    assert provider.calls == 2
+    assert result.rounds == (
+        LocalReportUsage(1, "report", 2, 20, 40, 60),
+    )
 
 
 @pytest.mark.asyncio
@@ -537,6 +560,7 @@ async def test_openai_compatible_report_provider_uses_bounded_json_configuration
     monkeypatch,
 ) -> None:
     captured: dict[str, object] = {}
+    synthesize_kwargs: list[dict[str, object]] = []
     instances: list[CapturingSynthesisProvider] = []
 
     class CapturingSynthesisProvider:
@@ -545,14 +569,9 @@ async def test_openai_compatible_report_provider_uses_bounded_json_configuration
             self.closed = False
             instances.append(self)
 
-        async def synthesize(
-            self,
-            projection: AIProjection,
-            *,
-            retry_code: str | None = None,
-        ) -> SynthesisCandidate:
+        async def synthesize(self, projection: AIProjection, **kwargs) -> SynthesisCandidate:
             captured["projection"] = projection
-            captured["retry_code"] = retry_code
+            synthesize_kwargs.append(kwargs)
             return SynthesisCandidate(b"{}", 1, 2, 3)
 
         async def aclose(self) -> None:
@@ -571,7 +590,8 @@ async def test_openai_compatible_report_provider_uses_bounded_json_configuration
         thinking_mode="disabled",
     )
 
-    candidate = await provider.complete(
+    candidate = await provider.complete(projection=_projection())
+    retry_candidate = await provider.complete_retry(
         projection=_projection(),
         retry_code="ai_output_invalid",
     )
@@ -588,8 +608,12 @@ async def test_openai_compatible_report_provider_uses_bounded_json_configuration
     assert timeout.write == 30.0
     assert timeout.pool == 10.0
     assert captured["projection"].document["round_role"] == "report"
-    assert captured["retry_code"] == "ai_output_invalid"
+    assert synthesize_kwargs == [
+        {},
+        {"retry_code": "ai_output_invalid"},
+    ]
     assert candidate.prompt_tokens == 1
+    assert retry_candidate.prompt_tokens == 1
     assert instances[0].closed is True
 
 

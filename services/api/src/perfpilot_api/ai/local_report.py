@@ -9,7 +9,7 @@ import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from importlib.resources import files
-from typing import Literal, Mapping, Protocol, cast
+from typing import Literal, Mapping, Protocol, cast, runtime_checkable
 
 import httpx
 from pydantic import SecretStr
@@ -57,14 +57,19 @@ class LocalSynthesisError(RuntimeError):
 
 
 class LocalReportProvider(Protocol):
-    async def complete(
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate: ...
+
+    async def aclose(self) -> None: ...
+
+
+@runtime_checkable
+class RetryAwareLocalReportProvider(Protocol):
+    async def complete_retry(
         self,
         *,
         projection: AIProjection,
-        retry_code: OutputRetryCode | None = None,
+        retry_code: OutputRetryCode,
     ) -> SynthesisCandidate: ...
-
-    async def aclose(self) -> None: ...
 
 
 _PROMPT_RESOURCE = "perfpilot-local-report-v2.txt"
@@ -182,11 +187,15 @@ class LocalOpenAICompatibleReportProvider:
             ),
         )
 
-    async def complete(
+    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+        provider_projection = build_local_report_projection(projection)
+        return await self._provider.synthesize(provider_projection)
+
+    async def complete_retry(
         self,
         *,
         projection: AIProjection,
-        retry_code: OutputRetryCode | None = None,
+        retry_code: OutputRetryCode,
     ) -> SynthesisCandidate:
         provider_projection = build_local_report_projection(projection)
         return await self._provider.synthesize(
@@ -294,10 +303,16 @@ class LocalReportSynthesizer:
         while attempts < 2:
             attempts += 1
             try:
-                candidate = await self._provider.complete(
-                    projection=projection,
-                    retry_code=retry_code,
-                )
+                if retry_code is not None and isinstance(
+                    self._provider,
+                    RetryAwareLocalReportProvider,
+                ):
+                    candidate = await self._provider.complete_retry(
+                        projection=projection,
+                        retry_code=retry_code,
+                    )
+                else:
+                    candidate = await self._provider.complete(projection=projection)
                 prompt_tokens += candidate.prompt_tokens
                 completion_tokens += candidate.completion_tokens
                 latency_ms += candidate.latency_ms
@@ -351,6 +366,7 @@ __all__ = [
     "ReportObserver",
     "ReportRole",
     "ReportState",
+    "RetryAwareLocalReportProvider",
     "build_local_report_projection",
     "build_local_report_synthesizer",
 ]
