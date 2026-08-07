@@ -157,13 +157,13 @@
           "exit_code": 0,
           "duration_ms": 1200,
           "profile_id": "94000000-0000-4000-8000-000000000001",
-          "patch_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "patch_sha256": "2df9a8532c8e0497546c1b97cf2ef4b3b5e6d2a11254f702e88205befdeadf32",
           "log_summary": "Validation passed.",
           "patch_artifact": {
             "artifact_id": "98000000-0000-4000-8000-000000000001",
             "version_id": "source-patch-version-1",
-            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
-            "size": 241,
+            "sha256_b64": "LfmoUyyOBJdUbBuXzy70s7Xm0qESVPcC6IIFvv3q3zI=",
+            "size": 254,
             "mime": "text/x-diff"
           }
         }

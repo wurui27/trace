@@ -216,31 +216,41 @@
           "synthesis": {"properties": {"state": {"const": "completed"}}},
           "scenario_reports": {"items": {"properties": {"result_state": {"const": "completed"}}}},
           "source_code": {
-            "properties": {
-              "context_state": {"enum": ["not_requested", "available", "unavailable"]},
-              "fixes": {
-                "items": {
-                  "properties": {
-                    "verification": {
+            "$comment": "Report 1.2 state mapping is deterministic: no-source and available zero-fix outcomes are completed; executable fixes are completed only after every fix is verified.",
+            "oneOf": [
+              {
+                "properties": {"requested": {"const": false}},
+                "required": ["requested"]
+              },
+              {
+                "properties": {
+                  "requested": {"const": true},
+                  "context_state": {"const": "available"},
+                  "fixes": {"maxItems": 0}
+                },
+                "required": ["requested", "context_state", "fixes"]
+              },
+              {
+                "properties": {
+                  "requested": {"const": true},
+                  "context_state": {"const": "available"},
+                  "match_summary": {"const": "strong"},
+                  "fixes": {
+                    "minItems": 1,
+                    "items": {
                       "properties": {
-                        "state": {
-                          "enum": [
-                            "verified",
-                            "apply_failed",
-                            "validation_failed",
-                            "source_changed",
-                            "not_configured",
-                            "timeout",
-                            "canceled",
-                            "unavailable"
-                          ]
+                        "verification": {
+                          "properties": {"state": {"const": "verified"}},
+                          "required": ["state"]
                         }
-                      }
+                      },
+                      "required": ["verification"]
                     }
                   }
-                }
+                },
+                "required": ["requested", "context_state", "match_summary", "fixes"]
               }
-            }
+            ]
           }
         }
       }
@@ -255,7 +265,6 @@
           {"properties": {"synthesis": {"properties": {"state": {"const": "failed"}}, "required": ["state"]}}},
           {"properties": {"scenario_reports": {"contains": {"properties": {"result_state": {"enum": ["failed", "canceled"]}}, "required": ["result_state"]}, "minContains": 1}}},
           {"properties": {"source_code": {"properties": {"requested": {"const": true}, "context_state": {"enum": ["waiting_for_agent", "extracting", "unavailable"]}}, "required": ["requested", "context_state"]}}},
-          {"properties": {"source_code": {"properties": {"requested": {"const": true}, "match_summary": {"enum": ["weak", "none"]}}, "required": ["requested", "match_summary"]}}},
           {
             "properties": {
               "source_code": {
@@ -267,7 +276,6 @@
                           "properties": {
                             "state": {
                               "enum": [
-                                "not_requested",
                                 "pending",
                                 "validating",
                                 "apply_failed",
@@ -1536,7 +1544,7 @@
         "relative_path": {"$ref": "#/$defs/sourceFixPath"},
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
-        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate synthesis-fix budget. Semantic validation requires all four header paths to equal relative_path and remain safe repository-relative paths."},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate synthesis-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file whose four header paths equal relative_path, rejects .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk old-lines to source."},
         "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000}
       }
@@ -1658,6 +1666,7 @@
     },
     "patchArtifact": {
       "type": "object",
+      "$comment": "For a verified source fix, semantic validation binds size to the UTF-8 diff byte length and sha256_b64 to the SHA-256 digest of those exact bytes; mime remains exactly text/x-diff.",
       "additionalProperties": false,
       "required": ["artifact_id", "version_id", "sha256_b64", "size", "mime"],
       "properties": {
@@ -1670,6 +1679,7 @@
     },
     "patchVerification": {
       "type": "object",
+      "$comment": "For a verified source fix, semantic validation binds patch_sha256 and the nested artifact digest metadata to the exact canonical diff bytes and binds profile_id to both fix and report validation_profile_id.",
       "additionalProperties": false,
       "required": ["state", "exit_code", "duration_ms", "profile_id", "patch_sha256", "log_summary", "patch_artifact"],
       "properties": {
@@ -1708,7 +1718,7 @@
         "relative_path": {"$ref": "#/$defs/sourceFixPath"},
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
-        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate public-fix budget. Semantic validation requires all four header paths to equal relative_path and remain safe repository-relative paths."},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate public-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file whose four header paths equal relative_path, rejects .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk old-lines to source."},
         "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000},
         "verification": {"$ref": "#/$defs/patchVerification"}
@@ -1716,7 +1726,7 @@
     },
     "sourceCode": {
       "type": "object",
-      "$comment": "Semantic validation requires every source_refs snapshot_hash to equal snapshot.snapshot_hash; JSON Schema cannot compare sibling values.",
+      "$comment": "Semantic validation requires every source_refs snapshot_hash to equal snapshot.snapshot_hash; each synthesis source fix to reference existing strong refs with the same snapshot, path, and allowed rule; source_code.fixes to be an exact ordered enrichment of synthesis source_fixes across all AI-owned fields; and every verification profile to equal both fix and report validation profiles. JSON Schema cannot compare these sibling values.",
       "additionalProperties": false,
       "required": ["requested", "provider_kind", "agent_id", "workspace_id", "snapshot_policy", "validation_profile_id", "snapshot", "context_state", "match_summary", "source_refs", "exclusions", "fixes", "limitations"],
       "properties": {
@@ -1764,8 +1774,35 @@
           }
         },
         {
-          "if": {"properties": {"match_summary": {"enum": ["weak", "none"]}}, "required": ["match_summary"]},
-          "then": {"properties": {"fixes": {"maxItems": 0}}}
+          "if": {"properties": {"match_summary": {"const": "weak"}}, "required": ["match_summary"]},
+          "then": {
+            "properties": {
+              "source_refs": {"items": {"properties": {"match_grade": {"const": "weak"}}, "required": ["match_grade"]}},
+              "fixes": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"match_summary": {"const": "none"}}, "required": ["match_summary"]},
+          "then": {"properties": {"source_refs": {"maxItems": 0}, "fixes": {"maxItems": 0}}}
+        },
+        {
+          "if": {
+            "properties": {"match_summary": {"const": "strong"}},
+            "required": ["match_summary"],
+            "anyOf": [
+              {"properties": {"source_refs": {"minItems": 1}}, "required": ["source_refs"]},
+              {"properties": {"fixes": {"minItems": 1}}, "required": ["fixes"]}
+            ]
+          },
+          "then": {
+            "properties": {
+              "source_refs": {
+                "contains": {"properties": {"match_grade": {"const": "strong"}}, "required": ["match_grade"]},
+                "minContains": 1
+              }
+            }
+          }
         },
         {
           "if": {"properties": {"context_state": {"const": "unavailable"}}, "required": ["context_state"]},
