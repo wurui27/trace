@@ -139,7 +139,7 @@ write_initial_ai_environment() {
   model_line="$(grep -m 1 '^CLAUDE_MODEL=' "$source_file" || true)"
   token_line="$(grep -m 1 '^ANTHROPIC_AUTH_TOKEN=' "$source_file" || true)"
   if [[ -z "$model_line" || -z "$token_line" ]]; then
-    printf '%s\n' '未发现可复用的 AI 配置，PerfPilot 三轮 AI 暂不启用。'
+    printf '%s\n' '未发现可复用的 AI 配置，PerfPilot 单轮 AI 报告暂不启用。'
     return 0
   fi
   umask 077

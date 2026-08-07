@@ -106,7 +106,10 @@ test("server-renders the live analysis route without demo findings", async () =>
   assert.doesNotMatch(html, /首页启动慢/);
   assert.doesNotMatch(html, /Acme Gallery/);
   assert.doesNotMatch(html, /执行摘要/);
-  assert.doesNotMatch(html, /重新生成 AI 建议/);
+  assert.doesNotMatch(html, /重新生成 AI 报告/);
+  const legacyRetryLabel = ["重新生成 AI", "建议"].join(" ");
+  const legacyMissingReportCopy = ["AI", "建议暂未生成"].join(" ");
+  assert.doesNotMatch(html, new RegExp(`${legacyRetryLabel}|${legacyMissingReportCopy}`));
 });
 
 test("server-renders the dedicated final report route without demo content", async () => {

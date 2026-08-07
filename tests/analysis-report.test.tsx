@@ -275,11 +275,13 @@ describe("AnalysisReportView", () => {
       <AnalysisReportView report={report("failed")} onRetrySynthesis={retry} retrying={false} />,
     );
 
-    expect(screen.getByRole("status")).toHaveTextContent("内核分析已完成，AI 建议暂未生成");
+    const status = screen.getByRole("status");
+    expect(status).toHaveTextContent("内核分析已完成，AI 最终报告暂未生成");
+    expect(status.querySelector("p")).toHaveTextContent(/你可以只重新生成 AI 报告。$/);
     expect(screen.getByText("真实问题 1")).toBeInTheDocument();
     expect(document.getElementById(`evidence-${EVIDENCE_IDS[0]}`)).toBeInTheDocument();
     expect(screen.queryByRole("heading", { name: "优化建议" })).not.toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "重新生成 AI 建议" }));
+    await user.click(screen.getByRole("button", { name: "重新生成 AI 报告" }));
     expect(retry).toHaveBeenCalledTimes(1);
   });
 

@@ -314,7 +314,7 @@ describe("FullAnalysisReport", () => {
         rerunner={rerunner}
       />,
     );
-    await user.click(await screen.findByRole("button", { name: "重新生成 AI 建议" }));
+    await user.click(await screen.findByRole("button", { name: "重新生成 AI 报告" }));
 
     expect(rerunner).toHaveBeenCalledOnce();
     expect(rerunner.mock.calls[0]?.[2]).toMatch(

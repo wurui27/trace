@@ -5,8 +5,8 @@ PerfPilot analyzes Android performance evidence and publishes versioned reports.
 ## Local report workspace
 
 The local runtime keeps SmartPerfetto and PerfPilot decoupled. Configure an
-OpenAI-compatible model for PerfPilot's three report passes, then use the
-one-command restart:
+OpenAI-compatible model for PerfPilot's one evidence-validated report pass,
+then restart the workspace with one command:
 
 ```bash
 export PERFPILOT_LOCAL_AI_BASE_URL="https://your-provider.example/v1/"
@@ -26,10 +26,12 @@ backend at `~/SmartPerfetto/backend`; when the checkout lives elsewhere, set
 the command. Logs and managed process IDs are stored in `.perfpilot/run`.
 
 Open `http://localhost:3000`. Completed analyses expose an **打开完整报告**
-link. The report page shows SmartPerfetto provenance, the three PerfPilot AI
-rounds, evidence-backed findings, recommendations, retest steps, and known
-limitations. Runtime state and every AI round are stored below
-`.perfpilot/local-runtime`; provider tokens are never persisted there.
+link. The report page shows SmartPerfetto provenance, one PerfPilot AI report
+pass, evidence-backed findings, recommendations, retest steps, known
+limitations, and a **下载 PDF** action. New reports run one AI round and store
+`round-1.json`; legacy three-round directories remain readable. Runtime state
+and report artifacts live below `.perfpilot/local-runtime`; PerfPilot never
+persists provider tokens there.
 
 For a local device analysis, connect exactly one authorized Android device and
 select it in the web page before uploading the APK. PerfPilot discovers `adb`

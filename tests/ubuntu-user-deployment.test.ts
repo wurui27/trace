@@ -26,6 +26,7 @@ describe("Ubuntu user deployment", () => {
     expect(script).toContain("PERFPILOT_LOCAL_AI_MODEL");
     expect(script).toContain("PERFPILOT_LOCAL_AI_TOKEN");
     expect(script).toContain("PERFPILOT_LOCAL_AI_THINKING=disabled");
+    expect(script).toContain("PerfPilot 单轮 AI 报告暂不启用");
     expect(script).not.toMatch(/\bsudo\b/);
     expect(script).not.toMatch(/rm\s+-rf[^\n]*data/);
   });

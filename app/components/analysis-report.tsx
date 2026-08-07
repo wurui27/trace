@@ -244,7 +244,7 @@ export function AnalysisReportView({
             <strong>
               {report.synthesis.state === "not_requested"
                 ? "真机内核报告已生成"
-                : "内核分析已完成，AI 建议暂未生成"}
+                : "内核分析已完成，AI 最终报告暂未生成"}
             </strong>
             <p>
               {report.synthesis.state === "not_requested"
@@ -252,13 +252,13 @@ export function AnalysisReportView({
                   ? "当前报告包含 SmartPerfetto 与 Android Memory 的指标和证据。"
                   : "当前报告包含 SmartPerfetto 的指标、问题和证据。"
                 : hasMemoryScenario
-                  ? "SmartPerfetto 与 Android Memory 的指标和证据仍可查看。你可以只重新生成 AI 建议。"
-                  : "SmartPerfetto 的指标、问题和证据仍可查看。你可以只重新生成 AI 建议。"}
+                  ? "SmartPerfetto 与 Android Memory 的指标和证据仍可查看。你可以只重新生成 AI 报告。"
+                  : "SmartPerfetto 的指标、问题和证据仍可查看。你可以只重新生成 AI 报告。"}
             </p>
           </div>
           {report.synthesis.state === "failed" ? (
             <button type="button" onClick={onRetrySynthesis} disabled={retrying}>
-              {retrying ? "正在重新生成" : "重新生成 AI 建议"}
+              {retrying ? "正在重新生成" : "重新生成 AI 报告"}
             </button>
           ) : null}
         </div>
