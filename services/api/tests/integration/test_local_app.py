@@ -664,6 +664,22 @@ def test_local_app_rejects_present_null_persisted_ai_rounds_after_restart(
             pass
 
 
+def test_local_app_rejects_present_null_evidence_format_after_restart(
+    tmp_path: Path,
+) -> None:
+    _, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    state["evidence_format_version"] = None
+    LocalAnalysisStore(tmp_path).save_state(analysis_id, state)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="^invalid persisted local analysis$"):
+        with TestClient(app):
+            pass
+
+
 def test_local_app_reports_the_device_currently_connected_over_adb(tmp_path: Path) -> None:
     device_probe = _FakeDeviceProbe(
         _FakeDeviceStatus(
@@ -1040,6 +1056,59 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
     assert restarted_gateway.submissions == []
     assert restarted_gateway.status_calls == 0
     assert restarted_gateway.fetch_calls == 0
+
+    store = LocalAnalysisStore(tmp_path)
+    parsed_analysis_id = UUID(analysis_id)
+    legacy_state = store.load_states()[parsed_analysis_id]
+    legacy_state.pop("evidence_format_version", None)
+    store.save_state(parsed_analysis_id, legacy_state)
+    analysis_directory = tmp_path / "analyses" / analysis_id
+    (analysis_directory / "normalized-core.json").unlink()
+    old_report_bytes = (analysis_directory / "report.json").read_bytes()
+    old_report = rerun_report.json()
+    legacy_provider = _InvalidReportProvider()
+    legacy_gateway = _UnavailableAfterRestartSmartPerfettoGateway()
+    legacy_app = create_local_app(
+        gateway=legacy_gateway,
+        synthesizer=LocalReportSynthesizer(provider=legacy_provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(legacy_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        rerun = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",
+            headers=headers,
+        )
+        assert rerun.status_code == 201
+        assert rerun.json()["generation"] == 3
+        for _ in range(100):
+            legacy_rerun_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if legacy_rerun_state["state"] in {
+                "completed",
+                "partially_completed",
+                "failed",
+            }:
+                break
+            time.sleep(0.01)
+        preserved_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert legacy_rerun_state["state"] == "partially_completed"
+    assert legacy_rerun_state["failure"]["code"] == "ai_source_evidence_unavailable"
+    assert preserved_report.json() == old_report
+    assert (analysis_directory / "report.json").read_bytes() == old_report_bytes
+    assert legacy_provider.calls == 0
+    assert legacy_gateway.submissions == []
+    assert legacy_gateway.status_calls == 0
+    assert legacy_gateway.fetch_calls == 0
+    assert store.load_states()[parsed_analysis_id]["ai_rounds"] == [
+        {"round": 1, "role": "report", "state": "failed", "attempts": 0}
+    ]
 
 
 def test_local_app_lists_one_active_analysis_and_rejects_a_second(
@@ -1750,6 +1819,10 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
 
     legacy_directory = tmp_path / "analyses" / analysis_id
     (legacy_directory / "normalized-core.json").unlink(missing_ok=True)
+    legacy_store = LocalAnalysisStore(tmp_path)
+    legacy_state = legacy_store.load_states()[UUID(analysis_id)]
+    legacy_state.pop("evidence_format_version", None)
+    legacy_store.save_state(UUID(analysis_id), legacy_state)
     assert {
         "projection.json",
         "report.json",
@@ -1800,10 +1873,22 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
     assert validate_contract("normalized-trace-report", migrated_core)[
         "analysis_id"
     ] == analysis_id
+    assert LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)][
+        "evidence_format_version"
+    ] == "normalized-core-v1"
 
 
-def test_local_app_rejects_tampered_rerun_evidence_and_keeps_the_old_report(
+@pytest.mark.parametrize(
+    ("core_mutation", "expected_failure_code"),
+    [
+        ("missing", "ai_source_evidence_unavailable"),
+        ("corrupt", "ai_source_evidence_invalid"),
+    ],
+)
+def test_local_app_rejects_invalid_versioned_core_and_keeps_the_old_report(
     tmp_path: Path,
+    core_mutation: str,
+    expected_failure_code: str,
 ) -> None:
     first_app = create_local_app(
         gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
@@ -1840,10 +1925,18 @@ def test_local_app_rejects_tampered_rerun_evidence_and_keeps_the_old_report(
 
     store = LocalAnalysisStore(tmp_path)
     parsed_analysis_id = UUID(analysis_id)
-    projection = store.load_document(parsed_analysis_id, "projection.json")
-    assert projection is not None
-    projection["question"] = "tampered persisted question"
-    store.save_document(parsed_analysis_id, "projection.json", projection)
+    state = store.load_states()[parsed_analysis_id]
+    assert state["evidence_format_version"] == "normalized-core-v1"
+    analysis_directory = tmp_path / "analyses" / analysis_id
+    old_report_bytes = (analysis_directory / "report.json").read_bytes()
+    if core_mutation == "missing":
+        (analysis_directory / "normalized-core.json").unlink()
+    else:
+        store.save_document(
+            parsed_analysis_id,
+            "normalized-core.json",
+            {"schema_version": "invalid"},
+        )
     provider = _InvalidReportProvider()
     restarted_gateway = _UnavailableAfterRestartSmartPerfettoGateway()
     second_app = create_local_app(
@@ -1873,7 +1966,7 @@ def test_local_app_rejects_tampered_rerun_evidence_and_keeps_the_old_report(
 
     assert failed_state["state"] == "partially_completed"
     assert failed_state["failure"] == {
-        "code": "ai_source_evidence_invalid",
+        "code": expected_failure_code,
         "message": "PerfPilot AI 最终报告无法从已保存的分析证据生成",
         "retryable": True,
     }
@@ -1888,7 +1981,9 @@ def test_local_app_rejects_tampered_rerun_evidence_and_keeps_the_old_report(
     ]
     assert preserved_report.status_code == 200
     assert preserved_report.json() == old_report
+    assert (analysis_directory / "report.json").read_bytes() == old_report_bytes
     assert provider.calls == 0
+    assert restarted_gateway.submissions == []
     assert restarted_gateway.status_calls == 0
     assert restarted_gateway.fetch_calls == 0
 

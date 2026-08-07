@@ -127,6 +127,7 @@ _TERMINAL_ANALYSIS_STATES = {
 _LOCAL_RECOVERY_NAMESPACE = UUID("e2ac7e9c-50e3-5d78-bd3f-53a56e2b2978")
 _LOCAL_DEVICE_NAMESPACE = UUID("06905aa0-0e0a-55c7-b63a-87e7a93775ca")
 _LOCAL_APPLICATION_NAMESPACE = UUID("60e4336a-f4c6-5aae-b62d-b54627317ccb")
+_LOCAL_EVIDENCE_FORMAT_VERSION = "normalized-core-v1"
 _EARLIEST_LOCAL_ANALYSIS_TIME = datetime.min.replace(tzinfo=UTC)
 _LOGGER = logging.getLogger(__name__)
 
@@ -526,6 +527,7 @@ class _LocalAnalysis:
     source_run: LocalEngineRun | None = None
     source_rounds: int | None = None
     source_verification: Literal["passed", "failed", "unknown"] = "unknown"
+    evidence_format_version: Literal["normalized-core-v1"] | None = None
     ai_rounds: list[_LocalAIRound] = field(default_factory=_default_ai_rounds)
     stages: dict[str, str] = field(
         default_factory=lambda: {
@@ -1353,7 +1355,7 @@ class _LocalRuntime:
         self.tasks: set[asyncio.Task[None]] = set()
 
     def _state_document(self, analysis: _LocalAnalysis) -> dict[str, object]:
-        return {
+        document: dict[str, object] = {
             "schema_version": "1.0",
             "analysis_id": str(analysis.analysis_id),
             "analysis_mode": analysis.analysis_mode,
@@ -1415,6 +1417,9 @@ class _LocalRuntime:
             ],
             "report_available": analysis.report is not None,
         }
+        if analysis.evidence_format_version is not None:
+            document["evidence_format_version"] = analysis.evidence_format_version
+        return document
 
     async def _persist(self, analysis: _LocalAnalysis) -> None:
         document = self._state_document(analysis)
@@ -1483,6 +1488,12 @@ class _LocalRuntime:
         completed_at = _parse_utc_datetime(raw_completed_at)
         if raw_completed_at is not None and completed_at is None:
             raise ValueError("invalid persisted local analysis")
+        evidence_format_version = document.get("evidence_format_version")
+        if (
+            "evidence_format_version" in document
+            and evidence_format_version != _LOCAL_EVIDENCE_FORMAT_VERSION
+        ):
+            raise ValueError("invalid persisted local analysis")
         analysis = _LocalAnalysis(
             analysis_id=analysis_id,
             profile=str(document["profile"]),
@@ -1529,6 +1540,7 @@ class _LocalRuntime:
             source_verification=(
                 str(document.get("source_verification", "unknown"))  # type: ignore[arg-type]
             ),
+            evidence_format_version=evidence_format_version,  # type: ignore[arg-type]
             ai_rounds=ai_rounds,
             stages={key: str(value) for key, value in stages.items()},
         )
@@ -1816,6 +1828,14 @@ class _LocalRuntime:
                 "normalized-core.json",
             )
             if source_value is None or projection_value is None:
+                raise _PersistedLocalEvidenceError(
+                    "ai_source_evidence_unavailable"
+                )
+            if (
+                core_value is None
+                and analysis.evidence_format_version
+                == _LOCAL_EVIDENCE_FORMAT_VERSION
+            ):
                 raise _PersistedLocalEvidenceError(
                     "ai_source_evidence_unavailable"
                 )
@@ -2306,6 +2326,16 @@ class _LocalRuntime:
             "normalized-core.json",
             prepared.core_document,
         )
+        marker_changed = False
+        async with self.lock:
+            if analysis.generation != generation:
+                raise _StaleLocalGeneration
+            if analysis.evidence_format_version is None:
+                analysis.evidence_format_version = _LOCAL_EVIDENCE_FORMAT_VERSION
+                analysis.version += 1
+                marker_changed = True
+        if marker_changed:
+            await self._persist(analysis)
         await asyncio.to_thread(
             self.store.save_document,
             analysis.analysis_id,
