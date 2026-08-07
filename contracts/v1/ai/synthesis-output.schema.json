@@ -1,6 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/ai/synthesis-output.schema.json",
+  "$comment": "For 2.0 output, semantic validation caps all source-fix diffs together at 65,536 UTF-8 bytes because JSON Schema maxLength counts characters.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "executive_summary", "top_findings", "recommendations", "retest_plan", "limitations"],
@@ -67,7 +68,7 @@
         "relative_path": {"$ref": "#/$defs/relativePath"},
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
-        "diff": {"type": "string", "minLength": 1, "maxLength": 65536},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate source-fix budget. Semantic validation requires all four header paths to equal relative_path and remain safe repository-relative paths."},
         "validation_profile_id": {"$ref": "#/$defs/uuid"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000}
       }

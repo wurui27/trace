@@ -39,6 +39,112 @@ def example(example_name: str) -> dict[str, object]:
     )
 
 
+def _canonical_json_bytes(document: object) -> bytes:
+    return json.dumps(
+        document,
+        ensure_ascii=False,
+        allow_nan=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def _validate_agent_contract(schema_name: str, document: dict[str, object]) -> None:
+    validator(schema_name).validate(document)
+    payload = document
+    if schema_name == "agents/task-poll-response.schema.json":
+        snapshot = document.get("snapshot")
+        if not isinstance(snapshot, dict):
+            return
+        payload = snapshot
+    if payload.get("task_type") == "patch_verification":
+        patch = payload.get("patch")
+        if isinstance(patch, str) and len(patch.encode("utf-8")) > 65_536:
+            raise jsonschema.ValidationError("patch exceeds UTF-8 byte budget")
+    if schema_name != "agents/source-task-completion.schema.json":
+        return
+    if len(_canonical_json_bytes(document)) > 128 * 1024:
+        raise jsonschema.ValidationError("completion exceeds canonical byte budget")
+    if document.get("task_type") != "source_context" or document.get("state") != "completed":
+        return
+    result = document.get("result")
+    if not isinstance(result, dict):
+        return
+    fragments = result.get("fragments")
+    if not isinstance(fragments, list):
+        return
+    fragment_bytes = sum(
+        len(fragment["content"].encode("utf-8"))
+        for fragment in fragments
+        if isinstance(fragment, dict) and isinstance(fragment.get("content"), str)
+    )
+    if fragment_bytes > 98_304:
+        raise jsonschema.ValidationError("fragments exceed UTF-8 byte budget")
+
+
+def _sized_unified_diff(path: str, target_bytes: int) -> str:
+    prefix = (
+        f"diff --git a/{path} b/{path}\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -1,1 +1,2 @@\n"
+        "-old\n"
+        "+new\n"
+        "+"
+    )
+    suffix = "\n"
+    fill_bytes = target_bytes - len((prefix + suffix).encode("utf-8"))
+    assert fill_bytes >= 0
+    return prefix + "界" * (fill_bytes // 3) + "x" * (fill_bytes % 3) + suffix
+
+
+def _heartbeat_v11() -> dict[str, object]:
+    heartbeat = example("agent-heartbeat.valid.json")
+    heartbeat.update(
+        {
+            "schema_version": "1.1",
+            "workspaces": [
+                {
+                    "workspace_id": "92000000-0000-4000-8000-000000000001",
+                    "name": "Demo Android",
+                    "state": "ready",
+                    "git_branch": "main",
+                    "git_head": "a" * 40,
+                    "tracked_dirty_count": 2,
+                    "snapshot_policy": "tracked_worktree",
+                    "validation_profiles": [
+                        {
+                            "profile_id": "94000000-0000-4000-8000-000000000001",
+                            "name": "Android check",
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+    return heartbeat
+
+
+def _patch_completion() -> dict[str, object]:
+    completion = example("source-task-completion.valid.json")
+    patch_completion = {key: value for key, value in completion.items() if key != "result"}
+    patch_completion.update(
+        {
+            "task_type": "patch_verification",
+            "state": "completed",
+            "result": {
+                "verification_state": "verified",
+                "exit_code": 0,
+                "duration_ms": 1200,
+                "profile_id": "94000000-0000-4000-8000-000000000001",
+                "patch_sha256": "d" * 64,
+                "log_summary": "Validation passed.",
+            },
+        }
+    )
+    return patch_completion
+
+
 @pytest.mark.parametrize(("schema_name", "example_name"), CONTRACT_EXAMPLES)
 def test_agent_examples_are_valid_and_closed(
     schema_name: str,
@@ -126,6 +232,42 @@ def test_source_task_snapshot_discriminator_and_bounds_are_strict() -> None:
             contract.validate(document)
 
 
+@pytest.mark.parametrize("embedded", [False, True], ids=["standalone", "task-poll"])
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("max_findings", 2),
+        ("max_findings", 4),
+        ("max_files", 11),
+        ("max_files", 13),
+        ("max_bytes", 98_303),
+        ("max_bytes", 98_305),
+    ],
+)
+def test_source_task_limits_are_exact_protocol_constants(
+    embedded: bool,
+    field: str,
+    value: int,
+) -> None:
+    snapshot = example("source-task-snapshot.valid.json")
+    snapshot["limits"][field] = value  # type: ignore[index]
+    if embedded:
+        contract = validator("agents/task-poll-response.schema.json")
+        document = {
+            "schema_version": "1.1",
+            "task_kind": "source",
+            "lease_token": "opaque-lease-token-123",
+            "snapshot": snapshot,
+            "signature_b64": "A" * 86 + "==",
+        }
+    else:
+        contract = validator("agents/source-task-snapshot.schema.json")
+        document = snapshot
+
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(document)
+
+
 def test_source_completion_is_closed_bounded_and_state_discriminated() -> None:
     contract = validator("agents/source-task-completion.schema.json")
     completion = example("source-task-completion.valid.json")
@@ -169,25 +311,7 @@ def test_source_completion_is_closed_bounded_and_state_discriminated() -> None:
     with pytest.raises(jsonschema.ValidationError):
         contract.validate(invalid)
 
-    patch_completion = {
-        key: value
-        for key, value in completion.items()
-        if key != "result"
-    }
-    patch_completion.update(
-        {
-            "task_type": "patch_verification",
-            "state": "completed",
-            "result": {
-                "verification_state": "verified",
-                "exit_code": 0,
-                "duration_ms": 1200,
-                "profile_id": "94000000-0000-4000-8000-000000000001",
-                "patch_sha256": "d" * 64,
-                "log_summary": "Validation passed.",
-            },
-        }
-    )
+    patch_completion = _patch_completion()
     contract.validate(patch_completion)
     failed_patch = deepcopy(patch_completion)
     failed_patch["state"] = "failed"
@@ -208,51 +332,139 @@ def test_source_completion_is_closed_bounded_and_state_discriminated() -> None:
     with pytest.raises(jsonschema.ValidationError):
         contract.validate(invalid)
 
-    oversized = deepcopy(completion)
-    oversized["result"]["fragments"] = [
+def test_source_completion_terminal_state_matrix_is_explicit() -> None:
+    contract = validator("agents/source-task-completion.schema.json")
+    completion = example("source-task-completion.valid.json")
+    failure_result = {"failure_code": "source_unavailable", "retryable": False}
+    for state in ("failed", "canceled", "expired"):
+        terminal = deepcopy(completion)
+        terminal["state"] = state
+        terminal["result"] = failure_result
+        contract.validate(terminal)
+
+    for state, verification_state in (
+        ("canceled", "canceled"),
+        ("expired", "timeout"),
+    ):
+        terminal = _patch_completion()
+        terminal["state"] = state
+        terminal["result"].update(  # type: ignore[union-attr]
+            {
+                "verification_state": verification_state,
+                "exit_code": None,
+                "duration_ms": None,
+                "log_summary": None,
+            }
+        )
+        contract.validate(terminal)
+
+    for invalid_state in ("queued", "running"):
+        invalid = deepcopy(completion)
+        invalid["state"] = invalid_state
+        with pytest.raises(jsonschema.ValidationError):
+            contract.validate(invalid)
+
+    invalid = _patch_completion()
+    invalid["state"] = "expired"
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(invalid)
+
+
+def test_source_completion_enforces_fragment_utf8_aggregate_budget() -> None:
+    completion = example("source-task-completion.valid.json")
+    fragment = completion["result"]["fragments"][0]  # type: ignore[index]
+
+    exact_unicode = deepcopy(completion)
+    exact_unicode["result"]["fragments"][0]["content"] = "界" * 32_768  # type: ignore[index]
+    _validate_agent_contract("agents/source-task-completion.schema.json", exact_unicode)
+
+    aggregate_over = deepcopy(completion)
+    aggregate_over["result"]["fragments"] = [  # type: ignore[index]
         {
             **deepcopy(fragment),
             "source_ref_id": f"97000000-0000-4000-8000-{index:012d}",
-            "content": character * 70_000,
+            "content": "界" * 16_385,
         }
-        for index, character in ((2, "x"), (3, "y"))
+        for index in (1, 2)
     ]
-    with pytest.raises(AssertionError):
-        assert len(
-            json.dumps(
-                oversized,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ) <= 128 * 1024
+    assert len(_canonical_json_bytes(aggregate_over)) <= 128 * 1024
+    with pytest.raises(jsonschema.ValidationError, match="UTF-8 byte budget"):
+        _validate_agent_contract("agents/source-task-completion.schema.json", aggregate_over)
+
+
+def test_source_completion_enforces_canonical_json_budget() -> None:
+    completion = example("source-task-completion.valid.json")
+    canonical_near = deepcopy(completion)
+    canonical_near["result"]["fragments"][0]["content"] = "x" * 70_000  # type: ignore[index]
+    canonical_near["result"]["exclusions"] = [  # type: ignore[index]
+        {
+            "relative_path": f"src/{index:02d}/" + "x" * 800 + ".kt",
+            "reason_code": "excluded_file",
+        }
+        for index in range(64)
+    ]
+    assert 120 * 1024 < len(_canonical_json_bytes(canonical_near)) <= 128 * 1024
+    _validate_agent_contract("agents/source-task-completion.schema.json", canonical_near)
+
+    canonical_over = deepcopy(completion)
+    canonical_over["result"]["fragments"][0]["content"] = "x" * 70_000  # type: ignore[index]
+    canonical_over["result"]["exclusions"] = [  # type: ignore[index]
+        {
+            "relative_path": f"src/{index:02d}/" + "x" * 940 + ".kt",
+            "reason_code": "excluded_file",
+        }
+        for index in range(64)
+    ]
+    assert sum(
+        len(item["content"].encode("utf-8"))
+        for item in canonical_over["result"]["fragments"]  # type: ignore[index]
+    ) <= 98_304
+    assert len(_canonical_json_bytes(canonical_over)) > 128 * 1024
+    with pytest.raises(jsonschema.ValidationError, match="canonical byte budget"):
+        _validate_agent_contract("agents/source-task-completion.schema.json", canonical_over)
+
+
+@pytest.mark.parametrize("embedded", [False, True], ids=["standalone", "task-poll"])
+def test_patch_task_enforces_utf8_bytes_not_character_count(embedded: bool) -> None:
+    path = "app/src/main/java/demo/MainActivity.kt"
+    snapshot = example("source-task-snapshot.valid.json")
+    snapshot = {
+        key: value for key, value in snapshot.items() if key not in {"finding_hints", "limits"}
+    }
+    snapshot.update(
+        {
+            "task_type": "patch_verification",
+            "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+            "snapshot_id": "95000000-0000-4000-8000-000000000001",
+            "snapshot_hash": "a" * 64,
+            "fix_id": "96000000-0000-4000-8000-000000000001",
+            "patch": _sized_unified_diff(path, 65_536),
+        }
+    )
+    if embedded:
+        schema_name = "agents/task-poll-response.schema.json"
+        document = {
+            "schema_version": "1.1",
+            "task_kind": "source",
+            "lease_token": "opaque-lease-token-123",
+            "snapshot": snapshot,
+            "signature_b64": "A" * 86 + "==",
+        }
+    else:
+        schema_name = "agents/source-task-snapshot.schema.json"
+        document = snapshot
+    assert len(snapshot["patch"]) <= 65_536  # type: ignore[arg-type]
+    _validate_agent_contract(schema_name, document)
+
+    snapshot["patch"] = _sized_unified_diff(path, 65_537)
+    assert len(snapshot["patch"]) <= 65_536  # type: ignore[arg-type]
+    with pytest.raises(jsonschema.ValidationError, match="UTF-8 byte budget"):
+        _validate_agent_contract(schema_name, document)
 
 
 def test_heartbeat_v11_workspaces_are_public_bounded_metadata() -> None:
     contract = validator("agents/heartbeat-request.schema.json")
-    heartbeat = example("agent-heartbeat.valid.json")
-    heartbeat.update(
-        {
-            "schema_version": "1.1",
-            "workspaces": [
-                {
-                    "workspace_id": "92000000-0000-4000-8000-000000000001",
-                    "name": "Demo Android",
-                    "state": "ready",
-                    "git_branch": "main",
-                    "git_head": "a" * 40,
-                    "tracked_dirty_count": 2,
-                    "snapshot_policy": "tracked_worktree",
-                    "validation_profiles": [
-                        {
-                            "profile_id": "94000000-0000-4000-8000-000000000001",
-                            "name": "Android check",
-                        }
-                    ],
-                }
-            ],
-        }
-    )
+    heartbeat = _heartbeat_v11()
     contract.validate(heartbeat)
 
     legacy = example("agent-heartbeat.valid.json")
@@ -274,6 +486,55 @@ def test_heartbeat_v11_workspaces_are_public_bounded_metadata() -> None:
     invalid["workspaces"] = [deepcopy(workspace) for _ in range(33)]
     with pytest.raises(jsonschema.ValidationError):
         contract.validate(invalid)
+
+
+def test_heartbeat_workspace_and_profile_caps_closure_and_privacy() -> None:
+    contract = validator("agents/heartbeat-request.schema.json")
+    heartbeat = _heartbeat_v11()
+    workspace = heartbeat["workspaces"][0]  # type: ignore[index]
+    profile = workspace["validation_profiles"][0]
+
+    too_many_workspaces = deepcopy(heartbeat)
+    too_many_workspaces["workspaces"] = [
+        {
+            **deepcopy(workspace),
+            "workspace_id": f"92000000-0000-4000-8000-{index:012d}",
+        }
+        for index in range(1, 34)
+    ]
+    errors = list(contract.iter_errors(too_many_workspaces))
+    assert "maxItems" in {error.validator for error in errors}
+
+    too_many_profiles = deepcopy(heartbeat)
+    too_many_profiles["workspaces"][0]["validation_profiles"] = [  # type: ignore[index]
+        {
+            **deepcopy(profile),
+            "profile_id": f"94000000-0000-4000-8000-{index:012d}",
+        }
+        for index in range(1, 10)
+    ]
+    errors = list(contract.iter_errors(too_many_profiles))
+    assert "maxItems" in {error.validator for error in errors}
+
+    for target, field, value in (
+        ("workspace", "path", "/private/repo"),
+        ("workspace", "argv", ["./gradlew", "test"]),
+        ("workspace", "unexpected", True),
+        ("profile", "path", "/private/repo"),
+        ("profile", "argv", ["./gradlew", "test"]),
+        ("profile", "unexpected", True),
+    ):
+        invalid = deepcopy(heartbeat)
+        selected = invalid["workspaces"][0]  # type: ignore[index]
+        if target == "profile":
+            selected = selected["validation_profiles"][0]
+        selected[field] = value
+        with pytest.raises(jsonschema.ValidationError):
+            contract.validate(invalid)
+
+    for schema_version in ("1.2", "2.0"):
+        with pytest.raises(jsonschema.ValidationError):
+            contract.validate({**heartbeat, "schema_version": schema_version})
 
 
 def test_task_poll_v11_discriminates_device_and_source_snapshots() -> None:

@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/agents/source-task-snapshot.schema.json",
-  "$comment": "A signed source task contains only public identifiers and bounded source hints; it never contains a local path, remote, environment, or free-form command.",
+  "$comment": "A signed source task contains only public identifiers and bounded source hints; it never contains a local path, remote, environment, or free-form command. Source-context limits are protocol constants, not caller-selected ranges. The signed-task boundary counts patch as UTF-8 bytes because JSON Schema maxLength counts characters.",
   "oneOf": [
     {"$ref": "#/$defs/sourceContextTask"},
     {"$ref": "#/$defs/patchVerificationTask"}
@@ -55,9 +55,9 @@
       "additionalProperties": false,
       "required": ["max_findings", "max_files", "max_bytes"],
       "properties": {
-        "max_findings": {"type": "integer", "minimum": 1, "maximum": 3},
-        "max_files": {"type": "integer", "minimum": 1, "maximum": 12},
-        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 98304}
+        "max_findings": {"type": "integer", "const": 3},
+        "max_files": {"type": "integer", "const": 12},
+        "max_bytes": {"type": "integer", "const": 98304}
       }
     },
     "sourceContextTask": {
@@ -139,7 +139,7 @@
           "pattern": "^[0-9a-f]{64}$"
         },
         "fix_id": {"$ref": "#/$defs/uuid"},
-        "patch": {"type": "string", "minLength": 1, "maxLength": 65536}
+        "patch": {"type": "string", "minLength": 1, "maxLength": 65536, "$comment": "Also limited to 65,536 UTF-8 bytes by semantic validation."}
       }
     }
   }

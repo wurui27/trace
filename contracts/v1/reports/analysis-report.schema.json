@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/reports/analysis-report.schema.json",
-  "$comment": "AnalysisReport is an immutable parent view. Versions 1.0 and 1.1 remain exact; version 1.2 adds concise synthesis and source-code verification without removing scenario reports.",
+  "$comment": "AnalysisReport is an immutable parent view. Versions 1.0 and 1.1 remain exact; version 1.2 adds concise synthesis and source-code verification without removing scenario reports. Semantic validation caps each copied source-fix collection at 65,536 aggregate UTF-8 bytes because JSON Schema maxLength counts characters.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -52,10 +52,16 @@
       }
     },
     "synthesis": {
-      "oneOf": [
-        {"$ref": "#/$defs/synthesis"},
-        {"$ref": "#/$defs/synthesisV2"}
-      ]
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "output", "synthesis_artifact_id", "failure_code", "provenance"],
+      "properties": {
+        "state": {},
+        "output": {},
+        "synthesis_artifact_id": {},
+        "failure_code": {},
+        "provenance": {}
+      }
     },
     "source_code": {"$ref": "#/$defs/sourceCode"}
   },
@@ -196,6 +202,131 @@
               {"minItems": 2, "maxItems": 2, "prefixItems": [{"$ref": "#/$defs/scrollScenarioReport"}, {"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false},
               {"minItems": 3, "maxItems": 3, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}, {"$ref": "#/$defs/scrollScenarioReport"}, {"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false}
             ]
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.2"}, "state": {"const": "completed"}},
+        "required": ["schema_version", "state"]
+      },
+      "then": {
+        "properties": {
+          "synthesis": {"properties": {"state": {"const": "completed"}}},
+          "scenario_reports": {"items": {"properties": {"result_state": {"const": "completed"}}}},
+          "source_code": {
+            "properties": {
+              "context_state": {"enum": ["not_requested", "available", "unavailable"]},
+              "fixes": {
+                "items": {
+                  "properties": {
+                    "verification": {
+                      "properties": {
+                        "state": {
+                          "enum": [
+                            "verified",
+                            "apply_failed",
+                            "validation_failed",
+                            "source_changed",
+                            "not_configured",
+                            "timeout",
+                            "canceled",
+                            "unavailable"
+                          ]
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.2"}, "state": {"const": "partially_completed"}},
+        "required": ["schema_version", "state"]
+      },
+      "then": {
+        "anyOf": [
+          {"properties": {"synthesis": {"properties": {"state": {"const": "failed"}}, "required": ["state"]}}},
+          {"properties": {"scenario_reports": {"contains": {"properties": {"result_state": {"enum": ["failed", "canceled"]}}, "required": ["result_state"]}, "minContains": 1}}},
+          {"properties": {"source_code": {"properties": {"requested": {"const": true}, "context_state": {"enum": ["waiting_for_agent", "extracting", "unavailable"]}}, "required": ["requested", "context_state"]}}},
+          {"properties": {"source_code": {"properties": {"requested": {"const": true}, "match_summary": {"enum": ["weak", "none"]}}, "required": ["requested", "match_summary"]}}},
+          {
+            "properties": {
+              "source_code": {
+                "properties": {
+                  "fixes": {
+                    "contains": {
+                      "properties": {
+                        "verification": {
+                          "properties": {
+                            "state": {
+                              "enum": [
+                                "not_requested",
+                                "pending",
+                                "validating",
+                                "apply_failed",
+                                "validation_failed",
+                                "source_changed",
+                                "not_configured",
+                                "timeout",
+                                "canceled",
+                                "unavailable"
+                              ]
+                            }
+                          },
+                          "required": ["state"]
+                        }
+                      },
+                      "required": ["verification"]
+                    },
+                    "minContains": 1
+                  }
+                },
+                "required": ["fixes"]
+              }
+            }
+          }
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"const": "1.2"},
+          "source_code": {"properties": {"requested": {"const": false}}, "required": ["requested"]}
+        },
+        "required": ["schema_version", "source_code"]
+      },
+      "then": {
+        "properties": {
+          "synthesis": {
+            "properties": {
+              "output": {"properties": {"source_fixes": {"maxItems": 0}}}
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"const": "1.2"},
+          "source_code": {"properties": {"match_summary": {"enum": ["weak", "none"]}}, "required": ["match_summary"]}
+        },
+        "required": ["schema_version", "source_code"]
+      },
+      "then": {
+        "properties": {
+          "synthesis": {
+            "properties": {
+              "output": {"properties": {"source_fixes": {"maxItems": 0}}}
+            }
           }
         }
       }
@@ -1405,7 +1536,7 @@
         "relative_path": {"$ref": "#/$defs/sourceFixPath"},
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
-        "diff": {"type": "string", "minLength": 1, "maxLength": 65536},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate synthesis-fix budget. Semantic validation requires all four header paths to equal relative_path and remain safe repository-relative paths."},
         "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000}
       }
@@ -1459,12 +1590,33 @@
       "additionalProperties": false,
       "required": ["state", "output", "synthesis_artifact_id", "failure_code", "provenance"],
       "properties": {
-        "state": {"const": "completed"},
-        "output": {"$ref": "#/$defs/synthesisOutputV2"},
-        "synthesis_artifact_id": {"$ref": "#/$defs/sourceUuid"},
-        "failure_code": {"type": "null"},
-        "provenance": {"$ref": "#/$defs/synthesisProvenance"}
-      }
+        "state": {"enum": ["completed", "failed"]},
+        "output": {"oneOf": [{"$ref": "#/$defs/synthesisOutputV2"}, {"type": "null"}]},
+        "synthesis_artifact_id": {"oneOf": [{"$ref": "#/$defs/sourceUuid"}, {"type": "null"}]},
+        "failure_code": {"oneOf": [{"$ref": "#/$defs/stableSourceCode"}, {"type": "null"}]},
+        "provenance": {"oneOf": [{"$ref": "#/$defs/synthesisProvenance"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"const": "completed"}}, "required": ["state"]},
+          "then": {
+            "properties": {
+              "output": {"$ref": "#/$defs/synthesisOutputV2"},
+              "synthesis_artifact_id": {"$ref": "#/$defs/sourceUuid"},
+              "failure_code": {"type": "null"},
+              "provenance": {"$ref": "#/$defs/synthesisProvenance"}
+            }
+          },
+          "else": {
+            "properties": {
+              "output": {"type": "null"},
+              "synthesis_artifact_id": {"type": "null"},
+              "failure_code": {"$ref": "#/$defs/stableSourceCode"},
+              "provenance": {"type": "null"}
+            }
+          }
+        }
+      ]
     },
     "sourceSnapshot": {
       "type": "object",
@@ -1556,7 +1708,7 @@
         "relative_path": {"$ref": "#/$defs/sourceFixPath"},
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
-        "diff": {"type": "string", "minLength": 1, "maxLength": 65536},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate public-fix budget. Semantic validation requires all four header paths to equal relative_path and remain safe repository-relative paths."},
         "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000},
         "verification": {"$ref": "#/$defs/patchVerification"}
@@ -1564,6 +1716,7 @@
     },
     "sourceCode": {
       "type": "object",
+      "$comment": "Semantic validation requires every source_refs snapshot_hash to equal snapshot.snapshot_hash; JSON Schema cannot compare sibling values.",
       "additionalProperties": false,
       "required": ["requested", "provider_kind", "agent_id", "workspace_id", "snapshot_policy", "validation_profile_id", "snapshot", "context_state", "match_summary", "source_refs", "exclusions", "fixes", "limitations"],
       "properties": {
@@ -1613,6 +1766,30 @@
         {
           "if": {"properties": {"match_summary": {"enum": ["weak", "none"]}}, "required": ["match_summary"]},
           "then": {"properties": {"fixes": {"maxItems": 0}}}
+        },
+        {
+          "if": {"properties": {"context_state": {"const": "unavailable"}}, "required": ["context_state"]},
+          "then": {
+            "properties": {
+              "match_summary": {"enum": ["weak", "none"]},
+              "snapshot": {"type": "null"},
+              "source_refs": {"maxItems": 0},
+              "fixes": {"maxItems": 0}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"context_state": {"const": "available"}}, "required": ["context_state"]},
+          "then": {"properties": {"snapshot": {"$ref": "#/$defs/sourceSnapshot"}}}
+        },
+        {
+          "if": {"properties": {"source_refs": {"minItems": 1}}, "required": ["source_refs"]},
+          "then": {
+            "properties": {
+              "context_state": {"const": "available"},
+              "snapshot": {"$ref": "#/$defs/sourceSnapshot"}
+            }
+          }
         },
         {
           "if": {"properties": {"fixes": {"minItems": 1}}, "required": ["fixes"]},

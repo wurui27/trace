@@ -353,8 +353,45 @@ def test_analysis_response_v11_separates_smartperfetto_and_source_code() -> None
 
     legacy = deepcopy(response)
     legacy["schema_version"] = "1.0"
-    del legacy["source_analysis"]
     del legacy["source_code_analysis"]
     contract.validate(legacy)
     with pytest.raises(jsonschema.ValidationError):
         contract.validate({**legacy, "source_code_analysis": not_requested})
+
+
+def test_analysis_response_v10_preserves_optional_smartperfetto_provenance() -> None:
+    contract = validator(load("contracts/v1/analyses/analysis-response.schema.json"))
+    legacy = deepcopy(_analysis_response_v11())
+    legacy["schema_version"] = "1.0"
+    del legacy["source_code_analysis"]
+
+    contract.validate(legacy)
+    without_provenance = deepcopy(legacy)
+    del without_provenance["source_analysis"]
+    contract.validate(without_provenance)
+
+    invalid = deepcopy(legacy)
+    invalid["source_analysis"]["provider_endpoint"] = "private"  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(invalid)
+
+    unrelated_memory_mode = {
+        **legacy,
+        "analysis_mode": "memory_upload",
+        "application_version_id": "71000000-0000-4000-8000-000000000001",
+        "application_metadata": {
+            "package_name": "dev.perfpilot.memory",
+            "version_name": "1.0",
+            "version_code": 1,
+            "launch_activity": "dev.perfpilot.memory.MainActivity",
+            "min_sdk": 28,
+            "target_sdk": 35,
+            "supported_abis": ["arm64-v8a"],
+            "has_native_libraries": False,
+        },
+        "question": None,
+    }
+    for field in ("analysis_profile", "input_uploads", "stages"):
+        del unrelated_memory_mode[field]
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(unrelated_memory_mode)

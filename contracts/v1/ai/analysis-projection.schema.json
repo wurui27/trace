@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/ai/analysis-projection.schema.json",
-  "$comment": "A deterministic, bounded tenant-private projection. Arrays are ordered by stable public ID; source is an allowlist and has no storage, checksum, provider, attempt, or timestamp data.",
+  "$comment": "A deterministic, bounded tenant-private projection. Arrays are ordered by stable public ID; source is an allowlist and has no storage, checksum, provider, attempt, or timestamp data. Semantic validation caps aggregate source fragment content at 98,304 UTF-8 bytes because JSON Schema maxLength counts characters.",
   "type": "object",
   "additionalProperties": false,
   "required": ["schema_version", "analysis_id", "analysis_profile", "question", "source", "scenarios", "limitations"],
@@ -53,7 +53,7 @@
         "start_line": {"type": "integer", "minimum": 1},
         "end_line": {"type": "integer", "minimum": 1},
         "content_sha256": {"$ref": "#/$defs/hex64"},
-        "content": {"type": "string", "minLength": 1, "maxLength": 98304},
+        "content": {"type": "string", "minLength": 1, "maxLength": 98304, "$comment": "Also subject to the 98,304 UTF-8 byte aggregate source-context budget."},
         "finding_ids": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
         "evidence_ids": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
         "rule_ids": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,127}$"}},

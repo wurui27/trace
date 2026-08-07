@@ -118,10 +118,20 @@
       },
       "then": {
         "properties": {
-          "source_analysis": false,
+          "source_analysis": {"$ref": "#/$defs/sourceAnalysis"},
           "source_code_analysis": false
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "schema_version": {"const": "1.0"},
+          "analysis_mode": {"enum": ["device", "memory_upload"]}
+        },
+        "required": ["schema_version", "analysis_mode"]
+      },
+      "then": {"properties": {"source_analysis": false}}
     },
     {
       "if": {
