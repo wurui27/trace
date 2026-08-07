@@ -185,6 +185,7 @@ export const LatestAnalysisReportEntry = memo(function LatestAnalysisReportEntry
       <Link
         className="latest-report-link"
         href={`/analyses/${analysis.analysis_id}/report`}
+        prefetch={false}
       >
         打开报告
         <ArrowUpRight aria-hidden="true" />

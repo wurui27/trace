@@ -503,7 +503,7 @@ export function AnalysisProgressView({
               <strong>最终性能报告已生成</strong>
               <p>在独立页面查看完整证据、AI 结论、优化建议与复测计划。</p>
             </div>
-            <Link href={`/analyses/${analysis.analysis_id}/report`}>
+            <Link href={`/analyses/${analysis.analysis_id}/report`} prefetch={false}>
               打开完整报告
               <ArrowUpRight aria-hidden="true" />
             </Link>

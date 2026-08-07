@@ -12,7 +12,7 @@ export function PlaceholderPage({ title }: PlaceholderPageProps) {
       <p className="placeholder-description">
         该能力尚未在当前前端切片中接入。
       </p>
-      <Link className="placeholder-back-link" href="/">
+      <Link className="placeholder-back-link" href="/" prefetch={false}>
         返回性能总览
       </Link>
     </section>

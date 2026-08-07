@@ -1,18 +1,31 @@
-import { readFileSync } from "node:fs";
+import { readdirSync, readFileSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 
-const source = readFileSync(
-  new URL("../app/components/full-analysis-report.tsx", import.meta.url),
-  "utf8",
-);
+const appDirectory = fileURLToPath(new URL("../app", import.meta.url));
 
-describe("final report navigation", () => {
-  it("disables unsupported vinext RSC prefetching on report navigation links", () => {
-    expect(source).toMatch(
-      /<Link\s+className="final-report-back"\s+href=\{`\/analyses\/\$\{analysisId\}`\}\s+prefetch=\{false\}>/,
+function tsxFiles(directory: string): string[] {
+  return readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const path = `${directory}/${entry.name}`;
+    if (entry.isDirectory()) return tsxFiles(path);
+    return entry.isFile() && entry.name.endsWith(".tsx") ? [path] : [];
+  });
+}
+
+describe("vinext navigation compatibility", () => {
+  it("disables unsupported RSC prefetching on every Next Link", () => {
+    const linkFiles = tsxFiles(appDirectory).filter((path) =>
+      readFileSync(path, "utf8").includes('from "next/link"'),
     );
-    expect(source).toMatch(
-      /<Link\s+className="analysis-page-brand"\s+href="\/"\s+prefetch=\{false\}\s+aria-label="返回 PerfPilot 首页"\s*>/,
-    );
+
+    expect(linkFiles.length).toBeGreaterThan(0);
+    for (const path of linkFiles) {
+      const source = readFileSync(path, "utf8");
+      const linkTags = source.match(/<Link\b[^>]*>/gs) ?? [];
+      expect(linkTags.length, path).toBeGreaterThan(0);
+      for (const tag of linkTags) {
+        expect(tag, path).toContain("prefetch={false}");
+      }
+    }
   });
 });

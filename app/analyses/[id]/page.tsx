@@ -12,7 +12,12 @@ export default async function AnalysisPage({ params }: AnalysisPageProps) {
   return (
     <div className="analysis-page">
       <header className="analysis-page-header">
-        <Link className="analysis-page-brand" href="/" aria-label="返回 PerfPilot 首页">
+        <Link
+          className="analysis-page-brand"
+          href="/"
+          prefetch={false}
+          aria-label="返回 PerfPilot 首页"
+        >
           <span className="brand-mark" aria-hidden="true">
             <span className="brand-mark-bar brand-mark-bar-short" />
             <span className="brand-mark-bar brand-mark-bar-medium" />
@@ -20,7 +25,7 @@ export default async function AnalysisPage({ params }: AnalysisPageProps) {
           </span>
           <span>PerfPilot</span>
         </Link>
-        <Link href="/">返回总览</Link>
+        <Link href="/" prefetch={false}>返回总览</Link>
       </header>
       <main className="analysis-page-main">
         <div className="analysis-page-heading">

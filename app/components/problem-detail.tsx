@@ -117,6 +117,7 @@ export function ProblemDetail({
             <Link
               className="inline-flex items-center gap-1.5 font-medium text-zinc-700 transition-colors hover:text-zinc-950"
               href="/"
+              prefetch={false}
             >
               <ArrowLeft aria-hidden="true" className="size-4" />
               性能总览

@@ -192,7 +192,7 @@ export function ActiveAnalysisTaskCard({
         </details>
       </div>
       <div className="active-analysis-task-actions">
-        <Link href={detailHref} className="active-analysis-detail-link">
+        <Link href={detailHref} className="active-analysis-detail-link" prefetch={false}>
           {detailLabel}
           <ArrowUpRight aria-hidden="true" />
         </Link>

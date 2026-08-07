@@ -294,7 +294,11 @@ export function Dashboard({
           )}
         </div>
         {reportProjection ? (
-          <Link className="all-problems-link" href={reportProjection.conclusion.href}>
+          <Link
+            className="all-problems-link"
+            href={reportProjection.conclusion.href}
+            prefetch={false}
+          >
             打开完整报告
             <ArrowUpRight aria-hidden="true" />
           </Link>
@@ -407,7 +411,7 @@ export function Dashboard({
                 <p className="focus-card-summary">{problem.summary}</p>
                 <footer className="focus-card-footer">
                   <span className="confidence">SmartPerfetto 证据</span>
-                  <Link className="focus-card-link" href={problem.href}>
+                  <Link className="focus-card-link" href={problem.href} prefetch={false}>
                     查看证据
                     <ArrowUpRight aria-hidden="true" />
                   </Link>

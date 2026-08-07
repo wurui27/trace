@@ -80,7 +80,12 @@ export function AppShell({
         跳到主要内容
       </a>
       <aside className="sidebar">
-        <Link className="sidebar-brand" href="/" aria-label="PerfPilot 首页">
+        <Link
+          className="sidebar-brand"
+          href="/"
+          prefetch={false}
+          aria-label="PerfPilot 首页"
+        >
           <span className="brand-mark" aria-hidden="true">
             <span className="brand-mark-bar brand-mark-bar-short" />
             <span className="brand-mark-bar brand-mark-bar-medium" />
@@ -100,6 +105,7 @@ export function AppShell({
                   <Link
                     className={`navigation-link${isActive ? " is-active" : ""}`}
                     href={item.href}
+                    prefetch={false}
                     aria-current={isActive ? "page" : undefined}
                   >
                     <Icon className="navigation-icon" aria-hidden="true" />
