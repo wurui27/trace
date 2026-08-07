@@ -1,0 +1,351 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/agents/source-task-completion.schema.json",
+  "$comment": "The HTTP boundary additionally rejects canonical completion JSON larger than 128 KiB and aggregate fragment content larger than 98,304 UTF-8 bytes.",
+  "oneOf": [
+    {"$ref": "#/$defs/contextCompleted"},
+    {"$ref": "#/$defs/contextFailed"},
+    {"$ref": "#/$defs/patchCompletion"}
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "hex40": {
+      "type": "string",
+      "minLength": 40,
+      "maxLength": 40,
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "hex64": {
+      "type": "string",
+      "minLength": 64,
+      "maxLength": 64,
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "stableCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "ruleId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_.]*$"
+    },
+    "relativePath": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1024,
+      "pattern": "^(?!/)(?![A-Za-z]:/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)[^\\u0000]+$"
+    },
+    "signature": {
+      "type": "string",
+      "minLength": 88,
+      "maxLength": 88,
+      "pattern": "^[A-Za-z0-9+/]{86}==$"
+    },
+    "sourceFragment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "source_ref_id",
+        "relative_path",
+        "language",
+        "symbol",
+        "start_line",
+        "end_line",
+        "content",
+        "content_sha256",
+        "finding_ids",
+        "evidence_ids",
+        "rule_ids",
+        "match_signals"
+      ],
+      "properties": {
+        "source_ref_id": {"$ref": "#/$defs/uuid"},
+        "relative_path": {"$ref": "#/$defs/relativePath"},
+        "language": {"enum": ["kotlin", "java", "xml", "gradle", "gradle_kts"]},
+        "symbol": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 512},
+            {"type": "null"}
+          ]
+        },
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "content": {"type": "string", "minLength": 1, "maxLength": 98304},
+        "content_sha256": {"$ref": "#/$defs/hex64"},
+        "finding_ids": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/uuid"}
+        },
+        "evidence_ids": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/uuid"}
+        },
+        "rule_ids": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/ruleId"}
+        },
+        "match_signals": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/stableCode"}
+        }
+      }
+    },
+    "exclusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "reason_code"],
+      "properties": {
+        "relative_path": {
+          "oneOf": [
+            {"$ref": "#/$defs/relativePath"},
+            {"type": "null"}
+          ]
+        },
+        "reason_code": {"$ref": "#/$defs/stableCode"}
+      }
+    },
+    "contextResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "snapshot_id",
+        "snapshot_hash",
+        "git_head",
+        "tracked_dirty_count",
+        "fragments",
+        "exclusions",
+        "truncated"
+      ],
+      "properties": {
+        "snapshot_id": {"$ref": "#/$defs/uuid"},
+        "snapshot_hash": {"$ref": "#/$defs/hex64"},
+        "git_head": {"$ref": "#/$defs/hex40"},
+        "tracked_dirty_count": {"type": "integer", "minimum": 0},
+        "fragments": {
+          "type": "array",
+          "maxItems": 12,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/sourceFragment"}
+        },
+        "exclusions": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/exclusion"}
+        },
+        "truncated": {"type": "boolean"}
+      }
+    },
+    "failureResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["failure_code", "retryable"],
+      "properties": {
+        "failure_code": {"$ref": "#/$defs/stableCode"},
+        "retryable": {"type": "boolean"}
+      }
+    },
+    "patchResult": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "verification_state",
+        "exit_code",
+        "duration_ms",
+        "profile_id",
+        "patch_sha256",
+        "log_summary"
+      ],
+      "properties": {
+        "verification_state": {
+          "enum": [
+            "verified",
+            "apply_failed",
+            "validation_failed",
+            "source_changed",
+            "not_configured",
+            "timeout",
+            "canceled",
+            "unavailable"
+          ]
+        },
+        "exit_code": {
+          "oneOf": [
+            {"type": "integer", "minimum": -255, "maximum": 255},
+            {"type": "null"}
+          ]
+        },
+        "duration_ms": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0, "maximum": 1200000},
+            {"type": "null"}
+          ]
+        },
+        "profile_id": {"$ref": "#/$defs/uuid"},
+        "patch_sha256": {"$ref": "#/$defs/hex64"},
+        "log_summary": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 2000},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "contextCompleted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "task_type",
+        "execution_id",
+        "analysis_id",
+        "workspace_id",
+        "lease_version",
+        "state",
+        "result",
+        "signature_b64"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "task_type": {"const": "source_context"},
+        "execution_id": {"$ref": "#/$defs/uuid"},
+        "analysis_id": {"$ref": "#/$defs/uuid"},
+        "workspace_id": {"$ref": "#/$defs/uuid"},
+        "lease_version": {"type": "integer", "minimum": 1},
+        "state": {"const": "completed"},
+        "result": {"$ref": "#/$defs/contextResult"},
+        "signature_b64": {"$ref": "#/$defs/signature"}
+      }
+    },
+    "contextFailed": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "task_type",
+        "execution_id",
+        "analysis_id",
+        "workspace_id",
+        "lease_version",
+        "state",
+        "result",
+        "signature_b64"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "task_type": {"const": "source_context"},
+        "execution_id": {"$ref": "#/$defs/uuid"},
+        "analysis_id": {"$ref": "#/$defs/uuid"},
+        "workspace_id": {"$ref": "#/$defs/uuid"},
+        "lease_version": {"type": "integer", "minimum": 1},
+        "state": {"enum": ["failed", "canceled", "expired"]},
+        "result": {"$ref": "#/$defs/failureResult"},
+        "signature_b64": {"$ref": "#/$defs/signature"}
+      }
+    },
+    "patchCompletion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "task_type",
+        "execution_id",
+        "analysis_id",
+        "workspace_id",
+        "lease_version",
+        "state",
+        "result",
+        "signature_b64"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "task_type": {"const": "patch_verification"},
+        "execution_id": {"$ref": "#/$defs/uuid"},
+        "analysis_id": {"$ref": "#/$defs/uuid"},
+        "workspace_id": {"$ref": "#/$defs/uuid"},
+        "lease_version": {"type": "integer", "minimum": 1},
+        "state": {"enum": ["completed", "failed", "canceled", "expired"]},
+        "result": {"$ref": "#/$defs/patchResult"},
+        "signature_b64": {"$ref": "#/$defs/signature"}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"const": "completed"}}, "required": ["state"]},
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "verification_state": {"const": "verified"},
+                  "exit_code": {"const": 0},
+                  "duration_ms": {"type": "integer"}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"state": {"const": "failed"}}, "required": ["state"]},
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "verification_state": {
+                    "enum": [
+                      "apply_failed",
+                      "validation_failed",
+                      "source_changed",
+                      "not_configured",
+                      "timeout",
+                      "unavailable"
+                    ]
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"state": {"const": "canceled"}}, "required": ["state"]},
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "verification_state": {"const": "canceled"},
+                  "exit_code": {"type": "null"}
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {"properties": {"state": {"const": "expired"}}, "required": ["state"]},
+          "then": {
+            "properties": {
+              "result": {
+                "properties": {
+                  "verification_state": {"enum": ["timeout", "unavailable"]}
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

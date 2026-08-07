@@ -5,18 +5,93 @@
   "additionalProperties": false,
   "required": ["schema_version", "executive_summary", "top_findings", "recommendations", "retest_plan", "limitations"],
   "properties": {
-    "schema_version": {"const": "1.0"},
+    "schema_version": {"enum": ["1.0", "2.0"]},
+    "verdict": {"type": "string", "minLength": 1, "maxLength": 2000},
     "executive_summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+    "key_metric_ids": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
     "top_findings": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/topFinding"}},
     "recommendations": {"type": "array", "maxItems": 10, "uniqueItems": true, "items": {"$ref": "#/$defs/recommendation"}},
+    "source_fixes": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceFix"}},
     "retest_plan": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/retestItem"}},
     "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}}
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.0"}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "verdict": false,
+          "key_metric_ids": false,
+          "source_fixes": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "2.0"}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "required": ["verdict", "key_metric_ids", "source_fixes"],
+        "properties": {
+          "top_findings": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/topFinding"}},
+          "recommendations": {"$ref": "#/$defs/v2Recommendations"},
+          "retest_plan": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/retestItem"}}
+        }
+      }
+    }
+  ],
   "$defs": {
     "uuid": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
     "topFinding": {"type": "object", "additionalProperties": false, "required": ["finding_id", "evidence_ids", "user_impact"], "properties": {"finding_id": {"$ref": "#/$defs/uuid"}, "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "user_impact": {"type": "string", "minLength": 1, "maxLength": 2000}}},
     "recommendation": {"type": "object", "additionalProperties": false, "required": ["priority", "title", "action", "expected_effect", "finding_ids", "evidence_ids"], "properties": {"priority": {"enum": ["p0", "p1", "p2", "p3"]}, "title": {"type": "string", "minLength": 1, "maxLength": 2000}, "action": {"type": "string", "minLength": 1, "maxLength": 2000}, "expected_effect": {"type": "string", "minLength": 1, "maxLength": 2000}, "finding_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}}},
     "limitation": {"type": "object", "additionalProperties": false, "required": ["limitation_id", "summary"], "properties": {"limitation_id": {"$ref": "#/$defs/uuid"}, "summary": {"type": "string", "minLength": 1, "maxLength": 2000}}},
-    "retestItem": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "verify_metric"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "limitation_ids": {"type": "array", "maxItems": 0}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"enum": ["meet_existing_threshold", "improve_from_baseline"]}, "failure_condition": {"const": "threshold_missed"}}}, {"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "collect_evidence"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "maxItems": 0}, "limitation_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"const": "evidence_collected"}, "failure_condition": {"const": "evidence_missing"}}}]}
+    "retestItem": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "verify_metric"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "limitation_ids": {"type": "array", "maxItems": 0}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"enum": ["meet_existing_threshold", "improve_from_baseline"]}, "failure_condition": {"const": "threshold_missed"}}}, {"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "collect_evidence"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "maxItems": 0}, "limitation_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"const": "evidence_collected"}, "failure_condition": {"const": "evidence_missing"}}}]},
+    "relativePath": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!/)(?![A-Za-z]:/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)[^\\u0000]+\\.(?:kt|java|xml)$"},
+    "ruleId": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z][a-z0-9_.]*$"},
+    "sourceFix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fix_id", "finding_id", "evidence_ids", "recommendation_priority", "source_ref_ids", "rule_id", "match_grade", "relative_path", "symbol", "diagnosis", "diff", "validation_profile_id", "retest_target"],
+      "properties": {
+        "fix_id": {"$ref": "#/$defs/uuid"},
+        "finding_id": {"$ref": "#/$defs/uuid"},
+        "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
+        "recommendation_priority": {"enum": ["p0", "p1", "p2"]},
+        "source_ref_ids": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
+        "rule_id": {"$ref": "#/$defs/ruleId"},
+        "match_grade": {"const": "strong"},
+        "relative_path": {"$ref": "#/$defs/relativePath"},
+        "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
+        "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536},
+        "validation_profile_id": {"$ref": "#/$defs/uuid"},
+        "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000}
+      }
+    },
+    "recommendationV2": {
+      "allOf": [
+        {"$ref": "#/$defs/recommendation"},
+        {"properties": {"priority": {"enum": ["p0", "p1", "p2"]}}}
+      ]
+    },
+    "v2Recommendations": {
+      "type": "array",
+      "maxItems": 3,
+      "uniqueItems": true,
+      "oneOf": [
+        {"maxItems": 0},
+        {"minItems": 1, "maxItems": 1, "prefixItems": [{"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p0"}}}]}], "items": false},
+        {"minItems": 1, "maxItems": 1, "prefixItems": [{"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p1"}}}]}], "items": false},
+        {"minItems": 1, "maxItems": 1, "prefixItems": [{"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p2"}}}]}], "items": false},
+        {"minItems": 2, "maxItems": 2, "prefixItems": [{"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p0"}}}]}, {"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p1"}}}]}], "items": false},
+        {"minItems": 2, "maxItems": 2, "prefixItems": [{"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p0"}}}]}, {"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p2"}}}]}], "items": false},
+        {"minItems": 2, "maxItems": 2, "prefixItems": [{"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p1"}}}]}, {"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p2"}}}]}], "items": false},
+        {"minItems": 3, "maxItems": 3, "prefixItems": [{"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p0"}}}]}, {"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p1"}}}]}, {"allOf": [{"$ref": "#/$defs/recommendationV2"}, {"properties": {"priority": {"const": "p2"}}}]}], "items": false}
+      ]
+    }
   }
 }

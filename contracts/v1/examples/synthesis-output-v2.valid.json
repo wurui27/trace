@@ -1,0 +1,60 @@
+{
+  "schema_version": "2.0",
+  "verdict": "Startup is blocked by synchronous main-thread initialization.",
+  "executive_summary": "Move the launch-critical lookup after the first frame, then repeat the same cold-start scenario.",
+  "key_metric_ids": ["84000000-0000-4000-8000-000000000001"],
+  "top_findings": [
+    {
+      "finding_id": "85000000-0000-4000-8000-000000000001",
+      "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+      "user_impact": "The first screen appears later than the existing target."
+    }
+  ],
+  "recommendations": [
+    {
+      "priority": "p0",
+      "title": "Defer the synchronous lookup",
+      "action": "Move the lookup after the first frame.",
+      "expected_effect": "Remove the identified Binder wait from the launch-critical path.",
+      "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+      "evidence_ids": ["86000000-0000-4000-8000-000000000001"]
+    },
+    {
+      "priority": "p1",
+      "title": "Repeat the startup capture",
+      "action": "Collect the same cold-start recipe after the change.",
+      "expected_effect": "Confirm the existing startup metric against its threshold.",
+      "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+      "evidence_ids": ["86000000-0000-4000-8000-000000000001"]
+    }
+  ],
+  "source_fixes": [
+    {
+      "fix_id": "96000000-0000-4000-8000-000000000001",
+      "finding_id": "85000000-0000-4000-8000-000000000001",
+      "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+      "recommendation_priority": "p0",
+      "source_ref_ids": ["97000000-0000-4000-8000-000000000001"],
+      "rule_id": "startup.main_thread_binder",
+      "match_grade": "strong",
+      "relative_path": "app/src/main/java/demo/MainActivity.kt",
+      "symbol": "demo.MainActivity.onCreate",
+      "diagnosis": "The matched startup method performs a synchronous settings lookup.",
+      "diff": "diff --git a/app/src/main/java/demo/MainActivity.kt b/app/src/main/java/demo/MainActivity.kt\n--- a/app/src/main/java/demo/MainActivity.kt\n+++ b/app/src/main/java/demo/MainActivity.kt\n@@ -10,1 +10,1 @@\n-        loadSettings()\n+        deferSettingsLoad()\n",
+      "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+      "retest_target": "Repeat the cold-start scenario and compare the existing display metric."
+    }
+  ],
+  "retest_plan": [
+    {
+      "mode": "verify_metric",
+      "scenario_type": "startup",
+      "metric_ids": ["84000000-0000-4000-8000-000000000001"],
+      "limitation_ids": [],
+      "steps": "Capture five cold starts with the same recipe.",
+      "success_condition": "meet_existing_threshold",
+      "failure_condition": "threshold_missed"
+    }
+  ],
+  "limitations": []
+}

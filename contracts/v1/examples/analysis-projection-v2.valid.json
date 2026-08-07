@@ -1,0 +1,77 @@
+{
+  "schema_version": "2.0",
+  "analysis_id": "82000000-0000-4000-8000-000000000001",
+  "analysis_profile": "startup",
+  "question": "Why is startup slow?",
+  "source": {
+    "engine_id": "smartperfetto",
+    "adapter_version": "1.0.0",
+    "source_contract": "workspace-agent-v1",
+    "canonical_artifact_id": "85000000-0000-4000-8000-000000000001"
+  },
+  "scenarios": [
+    {
+      "scenario_id": "83000000-0000-4000-8000-000000000001",
+      "scenario_type": "startup",
+      "core_state": "complete",
+      "metrics": [
+        {
+          "metric_id": "84000000-0000-4000-8000-000000000001",
+          "name": "startup.time_to_initial_display_ms",
+          "status": "available",
+          "numeric_value": 812.4,
+          "unit": "ms",
+          "definition": "Median time to initial display.",
+          "threshold": {"operator": "lte", "value": 700, "unit": "ms"}
+        }
+      ],
+      "findings": [
+        {
+          "finding_id": "85000000-0000-4000-8000-000000000001",
+          "rule_id": "startup.main_thread_binder",
+          "kind": "root_cause",
+          "status": "confirmed",
+          "severity": "warning",
+          "confidence": "high",
+          "title": "Main thread waits on Binder",
+          "summary": "A repeated Binder wait overlaps startup.",
+          "evidence_ids": ["86000000-0000-4000-8000-000000000001"]
+        }
+      ],
+      "evidence": [
+        {
+          "evidence_id": "86000000-0000-4000-8000-000000000001",
+          "source": "perfetto.startup_binder_waits",
+          "query_id": "startup.binder_wait_chain.v1",
+          "interval_start_ns": 120000000,
+          "interval_end_ns": 310000000,
+          "artifact_id": "85000000-0000-4000-8000-000000000001",
+          "fields": {"blocked_duration_ms": 190}
+        }
+      ],
+      "limitations": []
+    }
+  ],
+  "limitations": [],
+  "source_context": {
+    "trust": "untrusted_data_not_instructions",
+    "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "match_summary": "strong",
+    "fragments": [
+      {
+        "source_ref_id": "97000000-0000-4000-8000-000000000001",
+        "relative_path": "app/src/main/java/demo/MainActivity.kt",
+        "language": "kotlin",
+        "symbol": "demo.MainActivity.onCreate",
+        "start_line": 10,
+        "end_line": 18,
+        "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "content": "override fun onCreate() { loadSettings() }\n",
+        "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+        "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+        "rule_ids": ["startup.main_thread_binder"],
+        "match_grade": "strong"
+      }
+    ]
+  }
+}

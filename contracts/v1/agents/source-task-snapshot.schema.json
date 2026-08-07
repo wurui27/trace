@@ -1,0 +1,146 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://perfpilot.internal/contracts/v1/agents/source-task-snapshot.schema.json",
+  "$comment": "A signed source task contains only public identifiers and bounded source hints; it never contains a local path, remote, environment, or free-form command.",
+  "oneOf": [
+    {"$ref": "#/$defs/sourceContextTask"},
+    {"$ref": "#/$defs/patchVerificationTask"}
+  ],
+  "$defs": {
+    "uuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "nullableUuid": {
+      "oneOf": [
+        {"$ref": "#/$defs/uuid"},
+        {"type": "null"}
+      ]
+    },
+    "stableRuleId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "pattern": "^[a-z][a-z0-9_.]*$"
+    },
+    "findingHint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["finding_id", "evidence_ids", "rule_id", "symbol_hints"],
+      "properties": {
+        "finding_id": {"$ref": "#/$defs/uuid"},
+        "evidence_ids": {
+          "type": "array",
+          "maxItems": 20,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/uuid"}
+        },
+        "rule_id": {"$ref": "#/$defs/stableRuleId"},
+        "symbol_hints": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 255,
+            "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+          }
+        }
+      }
+    },
+    "limits": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["max_findings", "max_files", "max_bytes"],
+      "properties": {
+        "max_findings": {"type": "integer", "minimum": 1, "maximum": 3},
+        "max_files": {"type": "integer", "minimum": 1, "maximum": 12},
+        "max_bytes": {"type": "integer", "minimum": 1, "maximum": 98304}
+      }
+    },
+    "sourceContextTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "task_type",
+        "execution_id",
+        "analysis_id",
+        "team_id",
+        "agent_id",
+        "workspace_id",
+        "snapshot_policy",
+        "validation_profile_id",
+        "lease_version",
+        "expires_at",
+        "finding_hints",
+        "limits"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "task_type": {"const": "source_context"},
+        "execution_id": {"$ref": "#/$defs/uuid"},
+        "analysis_id": {"$ref": "#/$defs/uuid"},
+        "team_id": {"$ref": "#/$defs/uuid"},
+        "agent_id": {"$ref": "#/$defs/uuid"},
+        "workspace_id": {"$ref": "#/$defs/uuid"},
+        "snapshot_policy": {"const": "tracked_worktree"},
+        "validation_profile_id": {"$ref": "#/$defs/nullableUuid"},
+        "lease_version": {"type": "integer", "minimum": 1},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "finding_hints": {
+          "type": "array",
+          "maxItems": 3,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/findingHint"}
+        },
+        "limits": {"$ref": "#/$defs/limits"}
+      }
+    },
+    "patchVerificationTask": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "task_type",
+        "execution_id",
+        "analysis_id",
+        "team_id",
+        "agent_id",
+        "workspace_id",
+        "snapshot_policy",
+        "validation_profile_id",
+        "lease_version",
+        "expires_at",
+        "snapshot_id",
+        "snapshot_hash",
+        "fix_id",
+        "patch"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.0"},
+        "task_type": {"const": "patch_verification"},
+        "execution_id": {"$ref": "#/$defs/uuid"},
+        "analysis_id": {"$ref": "#/$defs/uuid"},
+        "team_id": {"$ref": "#/$defs/uuid"},
+        "agent_id": {"$ref": "#/$defs/uuid"},
+        "workspace_id": {"$ref": "#/$defs/uuid"},
+        "snapshot_policy": {"const": "tracked_worktree"},
+        "validation_profile_id": {"$ref": "#/$defs/uuid"},
+        "lease_version": {"type": "integer", "minimum": 1},
+        "expires_at": {"type": "string", "format": "date-time"},
+        "snapshot_id": {"$ref": "#/$defs/uuid"},
+        "snapshot_hash": {
+          "type": "string",
+          "minLength": 64,
+          "maxLength": 64,
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "fix_id": {"$ref": "#/$defs/uuid"},
+        "patch": {"type": "string", "minLength": 1, "maxLength": 65536}
+      }
+    }
+  }
+}

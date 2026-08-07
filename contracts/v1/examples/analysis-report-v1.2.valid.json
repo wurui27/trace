@@ -1,0 +1,174 @@
+{
+  "schema_version": "1.2",
+  "analysis_id": "82000000-0000-4000-8000-000000000001",
+  "analysis_mode": "trace_upload",
+  "state": "partially_completed",
+  "report_version": 2,
+  "generated_at": "2026-08-07T09:05:00Z",
+  "scenario_reports": [
+    {
+      "scenario_job_id": "83000000-0000-4000-8000-000000000001",
+      "scenario_type": "startup",
+      "result_state": "failed",
+      "device_group_id": null,
+      "device_group_reason": "not_applicable",
+      "bundle": null,
+      "failure": {
+        "code": "trace_incomplete",
+        "message": "The scenario report remains present when a downstream source step fails.",
+        "retryable": false
+      }
+    }
+  ],
+  "synthesis": {
+    "state": "completed",
+    "output": {
+      "schema_version": "2.0",
+      "verdict": "Startup is blocked by synchronous main-thread initialization.",
+      "executive_summary": "Move the launch-critical lookup after the first frame, then repeat the same cold-start scenario.",
+      "key_metric_ids": ["84000000-0000-4000-8000-000000000001"],
+      "top_findings": [
+        {
+          "finding_id": "85000000-0000-4000-8000-000000000001",
+          "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+          "user_impact": "The first screen appears later than the existing target."
+        }
+      ],
+      "recommendations": [
+        {
+          "priority": "p0",
+          "title": "Defer the synchronous lookup",
+          "action": "Move the lookup after the first frame.",
+          "expected_effect": "Remove the identified Binder wait from the launch-critical path.",
+          "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+          "evidence_ids": ["86000000-0000-4000-8000-000000000001"]
+        },
+        {
+          "priority": "p1",
+          "title": "Repeat the startup capture",
+          "action": "Collect the same cold-start recipe after the change.",
+          "expected_effect": "Confirm the existing startup metric against its threshold.",
+          "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+          "evidence_ids": ["86000000-0000-4000-8000-000000000001"]
+        }
+      ],
+      "source_fixes": [
+        {
+          "fix_id": "96000000-0000-4000-8000-000000000001",
+          "finding_id": "85000000-0000-4000-8000-000000000001",
+          "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+          "recommendation_priority": "p0",
+          "source_ref_ids": ["97000000-0000-4000-8000-000000000001"],
+          "rule_id": "startup.main_thread_binder",
+          "match_grade": "strong",
+          "relative_path": "app/src/main/java/demo/MainActivity.kt",
+          "symbol": "demo.MainActivity.onCreate",
+          "diagnosis": "The matched startup method performs a synchronous settings lookup.",
+          "diff": "diff --git a/app/src/main/java/demo/MainActivity.kt b/app/src/main/java/demo/MainActivity.kt\n--- a/app/src/main/java/demo/MainActivity.kt\n+++ b/app/src/main/java/demo/MainActivity.kt\n@@ -10,1 +10,1 @@\n-        loadSettings()\n+        deferSettingsLoad()\n",
+          "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+          "retest_target": "Repeat the cold-start scenario and compare the existing display metric."
+        }
+      ],
+      "retest_plan": [
+        {
+          "mode": "verify_metric",
+          "scenario_type": "startup",
+          "metric_ids": ["84000000-0000-4000-8000-000000000001"],
+          "limitation_ids": [],
+          "steps": "Capture five cold starts with the same recipe.",
+          "success_condition": "meet_existing_threshold",
+          "failure_condition": "threshold_missed"
+        }
+      ],
+      "limitations": []
+    },
+    "synthesis_artifact_id": "88000000-0000-4000-8000-000000000001",
+    "failure_code": null,
+    "provenance": {
+      "provider_protocol": "chat-completions-json-schema-v1",
+      "provider_name": "approved-provider",
+      "model": "approved-model",
+      "prompt_template_version": "2.0.0",
+      "prompt_template_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "normalizer_version": "smartperfetto-normalizer-1",
+      "report_worker_image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "projection_artifact_id": "89000000-0000-4000-8000-000000000001",
+      "projection_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "generated_at": "2026-08-07T09:04:00Z",
+      "prompt_tokens": 100,
+      "completion_tokens": 200,
+      "total_tokens": 300,
+      "generation": 1
+    }
+  },
+  "source_code": {
+    "requested": true,
+    "provider_kind": "agent_workspace",
+    "agent_id": "91000000-0000-4000-8000-000000000001",
+    "workspace_id": "92000000-0000-4000-8000-000000000001",
+    "snapshot_policy": "tracked_worktree",
+    "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+    "snapshot": {
+      "snapshot_id": "95000000-0000-4000-8000-000000000001",
+      "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "git_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    },
+    "context_state": "available",
+    "match_summary": "strong",
+    "source_refs": [
+      {
+        "source_ref_id": "97000000-0000-4000-8000-000000000001",
+        "relative_path": "app/src/main/java/demo/MainActivity.kt",
+        "language": "kotlin",
+        "symbol": "demo.MainActivity.onCreate",
+        "start_line": 10,
+        "end_line": 18,
+        "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "match_grade": "strong",
+        "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+        "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+        "rule_ids": ["startup.main_thread_binder"]
+      }
+    ],
+    "exclusions": [
+      {
+        "relative_path": "local.properties",
+        "reason_code": "sensitive_file"
+      }
+    ],
+    "fixes": [
+      {
+        "fix_id": "96000000-0000-4000-8000-000000000001",
+        "finding_id": "85000000-0000-4000-8000-000000000001",
+        "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+        "recommendation_priority": "p0",
+        "source_ref_ids": ["97000000-0000-4000-8000-000000000001"],
+        "rule_id": "startup.main_thread_binder",
+        "match_grade": "strong",
+        "relative_path": "app/src/main/java/demo/MainActivity.kt",
+        "symbol": "demo.MainActivity.onCreate",
+        "diagnosis": "The matched startup method performs a synchronous settings lookup.",
+        "diff": "diff --git a/app/src/main/java/demo/MainActivity.kt b/app/src/main/java/demo/MainActivity.kt\n--- a/app/src/main/java/demo/MainActivity.kt\n+++ b/app/src/main/java/demo/MainActivity.kt\n@@ -10,1 +10,1 @@\n-        loadSettings()\n+        deferSettingsLoad()\n",
+        "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+        "retest_target": "Repeat the cold-start scenario and compare the existing display metric.",
+        "verification": {
+          "state": "verified",
+          "exit_code": 0,
+          "duration_ms": 1200,
+          "profile_id": "94000000-0000-4000-8000-000000000001",
+          "patch_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+          "log_summary": "Validation passed.",
+          "patch_artifact": {
+            "artifact_id": "98000000-0000-4000-8000-000000000001",
+            "version_id": "source-patch-version-1",
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+            "size": 241,
+            "mime": "text/x-diff"
+          }
+        }
+      }
+    ],
+    "limitations": []
+  }
+}

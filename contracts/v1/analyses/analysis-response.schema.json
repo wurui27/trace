@@ -24,7 +24,7 @@
     "failure"
   ],
   "properties": {
-    "schema_version": {"const": "1.0"},
+    "schema_version": {"enum": ["1.0", "1.1"]},
     "analysis_id": {"type": "string", "format": "uuid"},
     "team_id": {"type": "string", "format": "uuid"},
     "analysis_mode": {"enum": ["device", "trace_upload", "memory_upload"]},
@@ -106,9 +106,35 @@
           {"$ref": "#/$defs/finalizedInputUpload"}
         ]
       }
-    }
+    },
+    "source_analysis": {"$ref": "#/$defs/sourceAnalysis"},
+    "source_code_analysis": {"$ref": "#/$defs/sourceCodeAnalysis"}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.0"}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "source_analysis": false,
+          "source_code_analysis": false
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.1"}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "required": ["source_code_analysis"],
+        "properties": {
+          "analysis_mode": {"enum": ["device", "trace_upload"]}
+        }
+      }
+    },
     {
       "oneOf": [
         {
@@ -225,6 +251,132 @@
     }
   ],
   "$defs": {
+    "canonicalUuid": {
+      "type": "string",
+      "format": "uuid",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "stableCode": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 96,
+      "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "sourceAnalysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["engine", "rounds", "verification", "session_id", "run_id"],
+      "properties": {
+        "engine": {"const": "smartperfetto"},
+        "rounds": {
+          "oneOf": [
+            {"type": "integer", "minimum": 0},
+            {"type": "null"}
+          ]
+        },
+        "verification": {"enum": ["passed", "failed", "unknown"]},
+        "session_id": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 255},
+            {"type": "null"}
+          ]
+        },
+        "run_id": {
+          "oneOf": [
+            {"type": "string", "minLength": 1, "maxLength": 255},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "sourceCodeAnalysis": {
+      "oneOf": [
+        {"$ref": "#/$defs/requestedSourceCodeAnalysis"},
+        {"$ref": "#/$defs/notRequestedSourceCodeAnalysis"}
+      ]
+    },
+    "requestedSourceCodeAnalysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested",
+        "provider_kind",
+        "agent_id",
+        "workspace_id",
+        "snapshot_policy",
+        "validation_profile_id",
+        "context_state",
+        "match_summary",
+        "verification_state",
+        "failure_code"
+      ],
+      "properties": {
+        "requested": {"const": true},
+        "provider_kind": {"const": "agent_workspace"},
+        "agent_id": {"$ref": "#/$defs/canonicalUuid"},
+        "workspace_id": {"$ref": "#/$defs/canonicalUuid"},
+        "snapshot_policy": {"const": "tracked_worktree"},
+        "validation_profile_id": {
+          "oneOf": [
+            {"$ref": "#/$defs/canonicalUuid"},
+            {"type": "null"}
+          ]
+        },
+        "context_state": {
+          "enum": ["waiting_for_agent", "extracting", "available", "unavailable"]
+        },
+        "match_summary": {"enum": ["strong", "weak", "none"]},
+        "verification_state": {
+          "enum": [
+            "not_requested",
+            "pending",
+            "validating",
+            "verified",
+            "apply_failed",
+            "validation_failed",
+            "source_changed",
+            "not_configured",
+            "timeout",
+            "canceled",
+            "unavailable"
+          ]
+        },
+        "failure_code": {
+          "oneOf": [
+            {"$ref": "#/$defs/stableCode"},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "notRequestedSourceCodeAnalysis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requested",
+        "provider_kind",
+        "agent_id",
+        "workspace_id",
+        "snapshot_policy",
+        "validation_profile_id",
+        "context_state",
+        "match_summary",
+        "verification_state",
+        "failure_code"
+      ],
+      "properties": {
+        "requested": {"const": false},
+        "provider_kind": {"type": "null"},
+        "agent_id": {"type": "null"},
+        "workspace_id": {"type": "null"},
+        "snapshot_policy": {"type": "null"},
+        "validation_profile_id": {"type": "null"},
+        "context_state": {"const": "not_requested"},
+        "match_summary": {"const": "none"},
+        "verification_state": {"const": "not_requested"},
+        "failure_code": {"type": "null"}
+      }
+    },
     "analysisStage": {
       "type": "object",
       "additionalProperties": false,

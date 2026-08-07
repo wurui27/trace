@@ -1,0 +1,19 @@
+{
+  "schema_version": "1.0",
+  "task_type": "source_context",
+  "execution_id": "93000000-0000-4000-8000-000000000001",
+  "analysis_id": "82000000-0000-4000-8000-000000000001",
+  "team_id": "81000000-0000-4000-8000-000000000001",
+  "agent_id": "91000000-0000-4000-8000-000000000001",
+  "workspace_id": "92000000-0000-4000-8000-000000000001",
+  "snapshot_policy": "tracked_worktree",
+  "validation_profile_id": null,
+  "lease_version": 1,
+  "expires_at": "2026-08-07T09:00:00Z",
+  "finding_hints": [],
+  "limits": {
+    "max_findings": 3,
+    "max_files": 12,
+    "max_bytes": 98304
+  }
+}

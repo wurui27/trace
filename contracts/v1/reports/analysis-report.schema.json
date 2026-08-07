@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://perfpilot.internal/contracts/v1/reports/analysis-report.schema.json",
-  "$comment": "AnalysisReport is an immutable parent view. Version 1.0 preserves legacy reports; version 1.1 adds explicit SmartPerfetto and PerfPilot synthesis for Trace upload and device analyses.",
+  "$comment": "AnalysisReport is an immutable parent view. Versions 1.0 and 1.1 remain exact; version 1.2 adds concise synthesis and source-code verification without removing scenario reports.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -15,7 +15,7 @@
   ],
   "properties": {
     "schema_version": {
-      "enum": ["1.0", "1.1"]
+      "enum": ["1.0", "1.1", "1.2"]
     },
     "analysis_id": {
       "type": "string",
@@ -52,10 +52,21 @@
       }
     },
     "synthesis": {
-      "$ref": "#/$defs/synthesis"
-    }
+      "oneOf": [
+        {"$ref": "#/$defs/synthesis"},
+        {"$ref": "#/$defs/synthesisV2"}
+      ]
+    },
+    "source_code": {"$ref": "#/$defs/sourceCode"}
   },
   "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"enum": ["1.0", "1.1"]}},
+        "required": ["schema_version"]
+      },
+      "then": {"properties": {"source_code": false}}
+    },
     {
       "if": {
         "properties": {
@@ -144,7 +155,7 @@
     },
     {
       "if": {"properties": {"schema_version": {"const": "1.0"}}, "required": ["schema_version"]},
-      "then": {"properties": {"synthesis": false}}
+      "then": {"properties": {"synthesis": false, "source_code": false}}
     },
     {
       "if": {"properties": {"schema_version": {"const": "1.1"}}, "required": ["schema_version"]},
@@ -152,6 +163,29 @@
         "required": ["synthesis"],
         "properties": {
           "analysis_mode": {"enum": ["trace_upload", "device"]},
+          "synthesis": {"$ref": "#/$defs/synthesis"},
+          "scenario_reports": {
+            "oneOf": [
+              {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}], "items": false},
+              {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/scrollScenarioReport"}], "items": false},
+              {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false},
+              {"minItems": 2, "maxItems": 2, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}, {"$ref": "#/$defs/scrollScenarioReport"}], "items": false},
+              {"minItems": 2, "maxItems": 2, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}, {"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false},
+              {"minItems": 2, "maxItems": 2, "prefixItems": [{"$ref": "#/$defs/scrollScenarioReport"}, {"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false},
+              {"minItems": 3, "maxItems": 3, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}, {"$ref": "#/$defs/scrollScenarioReport"}, {"$ref": "#/$defs/memoryCycleScenarioReport"}], "items": false}
+            ]
+          }
+        }
+      }
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "1.2"}}, "required": ["schema_version"]},
+      "then": {
+        "required": ["synthesis", "source_code"],
+        "properties": {
+          "analysis_mode": {"enum": ["trace_upload", "device"]},
+          "synthesis": {"$ref": "#/$defs/synthesisV2"},
+          "source_code": {"$ref": "#/$defs/sourceCode"},
           "scenario_reports": {
             "oneOf": [
               {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}], "items": false},
@@ -199,7 +233,7 @@
           }
         },
         "required": ["state"],
-        "not": {"properties": {"schema_version": {"const": "1.1"}}, "required": ["schema_version"]}
+        "not": {"properties": {"schema_version": {"enum": ["1.1", "1.2"]}}, "required": ["schema_version"]}
       },
       "then": {
         "properties": {
@@ -223,7 +257,7 @@
           }
         },
         "required": ["state"],
-        "not": {"properties": {"schema_version": {"const": "1.1"}}, "required": ["schema_version"]}
+        "not": {"properties": {"schema_version": {"enum": ["1.1", "1.2"]}}, "required": ["schema_version"]}
       },
       "then": {
         "properties": {
@@ -1349,6 +1383,243 @@
     "synthesisRecommendation": {"type": "object", "additionalProperties": false, "required": ["priority", "title", "action", "expected_effect", "finding_ids", "evidence_ids"], "properties": {"priority": {"enum": ["p0", "p1", "p2", "p3"]}, "title": {"type": "string", "minLength": 1, "maxLength": 2000}, "action": {"type": "string", "minLength": 1, "maxLength": 2000}, "expected_effect": {"type": "string", "minLength": 1, "maxLength": 2000}, "finding_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}, "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}}},
     "synthesisLimitation": {"type": "object", "additionalProperties": false, "required": ["limitation_id", "summary"], "properties": {"limitation_id": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}, "summary": {"type": "string", "minLength": 1, "maxLength": 2000}}},
     "synthesisRetest": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "verify_metric"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}, "limitation_ids": {"type": "array", "maxItems": 0}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"enum": ["meet_existing_threshold", "improve_from_baseline"]}, "failure_condition": {"const": "threshold_missed"}}}, {"type": "object", "additionalProperties": false, "required": ["mode", "scenario_type", "metric_ids", "limitation_ids", "steps", "success_condition", "failure_condition"], "properties": {"mode": {"const": "collect_evidence"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "metric_ids": {"type": "array", "maxItems": 0}, "limitation_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"}}, "steps": {"type": "string", "minLength": 1, "maxLength": 2000}, "success_condition": {"const": "evidence_collected"}, "failure_condition": {"const": "evidence_missing"}}}]},
+    "sourceUuid": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"},
+    "hex40": {"type": "string", "minLength": 40, "maxLength": 40, "pattern": "^[0-9a-f]{40}$"},
+    "hex64": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+    "stableSourceCode": {"type": "string", "minLength": 1, "maxLength": 96, "pattern": "^[a-z][a-z0-9_]*$"},
+    "sourceRuleId": {"type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[a-z][a-z0-9_.]*$"},
+    "sourceRelativePath": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!/)(?![A-Za-z]:/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)[^\\u0000]+$"},
+    "sourceFixPath": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!/)(?![A-Za-z]:/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)[^\\u0000]+\\.(?:kt|java|xml)$"},
+    "synthesisSourceFix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fix_id", "finding_id", "evidence_ids", "recommendation_priority", "source_ref_ids", "rule_id", "match_grade", "relative_path", "symbol", "diagnosis", "diff", "validation_profile_id", "retest_target"],
+      "properties": {
+        "fix_id": {"$ref": "#/$defs/sourceUuid"},
+        "finding_id": {"$ref": "#/$defs/sourceUuid"},
+        "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
+        "recommendation_priority": {"enum": ["p0", "p1", "p2"]},
+        "source_ref_ids": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
+        "rule_id": {"$ref": "#/$defs/sourceRuleId"},
+        "match_grade": {"const": "strong"},
+        "relative_path": {"$ref": "#/$defs/sourceFixPath"},
+        "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
+        "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536},
+        "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
+        "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000}
+      }
+    },
+    "synthesisRecommendationV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["priority", "title", "action", "expected_effect", "finding_ids", "evidence_ids"],
+      "properties": {
+        "priority": {"enum": ["p0", "p1", "p2"]},
+        "title": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "action": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "expected_effect": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "finding_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
+        "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}}
+      }
+    },
+    "synthesisRecommendationsV2": {
+      "type": "array",
+      "maxItems": 3,
+      "uniqueItems": true,
+      "oneOf": [
+        {"maxItems": 0},
+        {"minItems": 1, "maxItems": 1, "prefixItems": [{"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p0"}}}]}], "items": false},
+        {"minItems": 1, "maxItems": 1, "prefixItems": [{"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p1"}}}]}], "items": false},
+        {"minItems": 1, "maxItems": 1, "prefixItems": [{"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p2"}}}]}], "items": false},
+        {"minItems": 2, "maxItems": 2, "prefixItems": [{"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p0"}}}]}, {"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p1"}}}]}], "items": false},
+        {"minItems": 2, "maxItems": 2, "prefixItems": [{"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p0"}}}]}, {"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p2"}}}]}], "items": false},
+        {"minItems": 2, "maxItems": 2, "prefixItems": [{"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p1"}}}]}, {"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p2"}}}]}], "items": false},
+        {"minItems": 3, "maxItems": 3, "prefixItems": [{"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p0"}}}]}, {"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p1"}}}]}, {"allOf": [{"$ref": "#/$defs/synthesisRecommendationV2"}, {"properties": {"priority": {"const": "p2"}}}]}], "items": false}
+      ]
+    },
+    "synthesisOutputV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "verdict", "executive_summary", "key_metric_ids", "top_findings", "recommendations", "source_fixes", "retest_plan", "limitations"],
+      "properties": {
+        "schema_version": {"const": "2.0"},
+        "verdict": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "executive_summary": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "key_metric_ids": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
+        "top_findings": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisFinding"}},
+        "recommendations": {"$ref": "#/$defs/synthesisRecommendationsV2"},
+        "source_fixes": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisSourceFix"}},
+        "retest_plan": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisRetest"}},
+        "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisLimitation"}}
+      }
+    },
+    "synthesisV2": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "output", "synthesis_artifact_id", "failure_code", "provenance"],
+      "properties": {
+        "state": {"const": "completed"},
+        "output": {"$ref": "#/$defs/synthesisOutputV2"},
+        "synthesis_artifact_id": {"$ref": "#/$defs/sourceUuid"},
+        "failure_code": {"type": "null"},
+        "provenance": {"$ref": "#/$defs/synthesisProvenance"}
+      }
+    },
+    "sourceSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["snapshot_id", "snapshot_hash", "git_head"],
+      "properties": {
+        "snapshot_id": {"$ref": "#/$defs/sourceUuid"},
+        "snapshot_hash": {"$ref": "#/$defs/hex64"},
+        "git_head": {"$ref": "#/$defs/hex40"}
+      }
+    },
+    "reportSourceRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_ref_id", "relative_path", "language", "symbol", "start_line", "end_line", "content_sha256", "snapshot_hash", "match_grade", "finding_ids", "evidence_ids", "rule_ids"],
+      "properties": {
+        "source_ref_id": {"$ref": "#/$defs/sourceUuid"},
+        "relative_path": {"$ref": "#/$defs/sourceRelativePath"},
+        "language": {"enum": ["kotlin", "java", "xml", "gradle", "gradle_kts"]},
+        "symbol": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 512}, {"type": "null"}]},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "content_sha256": {"$ref": "#/$defs/hex64"},
+        "snapshot_hash": {"$ref": "#/$defs/hex64"},
+        "match_grade": {"enum": ["strong", "weak", "none"]},
+        "finding_ids": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
+        "evidence_ids": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
+        "rule_ids": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceRuleId"}}
+      }
+    },
+    "sourceExclusion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative_path", "reason_code"],
+      "properties": {
+        "relative_path": {"oneOf": [{"$ref": "#/$defs/sourceRelativePath"}, {"type": "null"}]},
+        "reason_code": {"$ref": "#/$defs/stableSourceCode"}
+      }
+    },
+    "patchArtifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["artifact_id", "version_id", "sha256_b64", "size", "mime"],
+      "properties": {
+        "artifact_id": {"$ref": "#/$defs/sourceUuid"},
+        "version_id": {"type": "string", "minLength": 1, "maxLength": 255},
+        "sha256_b64": {"$ref": "#/$defs/sha256"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 65536},
+        "mime": {"const": "text/x-diff"}
+      }
+    },
+    "patchVerification": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "exit_code", "duration_ms", "profile_id", "patch_sha256", "log_summary", "patch_artifact"],
+      "properties": {
+        "state": {"enum": ["not_requested", "pending", "validating", "verified", "apply_failed", "validation_failed", "source_changed", "not_configured", "timeout", "canceled", "unavailable"]},
+        "exit_code": {"oneOf": [{"type": "integer", "minimum": -255, "maximum": 255}, {"type": "null"}]},
+        "duration_ms": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1200000}, {"type": "null"}]},
+        "profile_id": {"$ref": "#/$defs/sourceUuid"},
+        "patch_sha256": {"$ref": "#/$defs/hex64"},
+        "log_summary": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 2000}, {"type": "null"}]},
+        "patch_artifact": {"oneOf": [{"$ref": "#/$defs/patchArtifact"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"state": {"const": "verified"}}, "required": ["state"]},
+          "then": {"properties": {"exit_code": {"const": 0}, "duration_ms": {"type": "integer"}, "patch_artifact": {"$ref": "#/$defs/patchArtifact"}}},
+          "else": {"properties": {"patch_artifact": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"state": {"enum": ["not_requested", "pending", "validating"]}}, "required": ["state"]},
+          "then": {"properties": {"exit_code": {"type": "null"}, "duration_ms": {"type": "null"}, "log_summary": {"type": "null"}}}
+        }
+      ]
+    },
+    "reportSourceFix": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["fix_id", "finding_id", "evidence_ids", "recommendation_priority", "source_ref_ids", "rule_id", "match_grade", "relative_path", "symbol", "diagnosis", "diff", "validation_profile_id", "retest_target", "verification"],
+      "properties": {
+        "fix_id": {"$ref": "#/$defs/sourceUuid"},
+        "finding_id": {"$ref": "#/$defs/sourceUuid"},
+        "evidence_ids": {"type": "array", "minItems": 1, "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
+        "recommendation_priority": {"enum": ["p0", "p1", "p2"]},
+        "source_ref_ids": {"type": "array", "minItems": 1, "maxItems": 2, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
+        "rule_id": {"$ref": "#/$defs/sourceRuleId"},
+        "match_grade": {"const": "strong"},
+        "relative_path": {"$ref": "#/$defs/sourceFixPath"},
+        "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
+        "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "diff": {"type": "string", "minLength": 1, "maxLength": 65536},
+        "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
+        "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000},
+        "verification": {"$ref": "#/$defs/patchVerification"}
+      }
+    },
+    "sourceCode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "provider_kind", "agent_id", "workspace_id", "snapshot_policy", "validation_profile_id", "snapshot", "context_state", "match_summary", "source_refs", "exclusions", "fixes", "limitations"],
+      "properties": {
+        "requested": {"type": "boolean"},
+        "provider_kind": {"oneOf": [{"const": "agent_workspace"}, {"type": "null"}]},
+        "agent_id": {"oneOf": [{"$ref": "#/$defs/sourceUuid"}, {"type": "null"}]},
+        "workspace_id": {"oneOf": [{"$ref": "#/$defs/sourceUuid"}, {"type": "null"}]},
+        "snapshot_policy": {"oneOf": [{"const": "tracked_worktree"}, {"type": "null"}]},
+        "validation_profile_id": {"oneOf": [{"$ref": "#/$defs/sourceUuid"}, {"type": "null"}]},
+        "snapshot": {"oneOf": [{"$ref": "#/$defs/sourceSnapshot"}, {"type": "null"}]},
+        "context_state": {"enum": ["not_requested", "waiting_for_agent", "extracting", "available", "unavailable"]},
+        "match_summary": {"enum": ["strong", "weak", "none"]},
+        "source_refs": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"$ref": "#/$defs/reportSourceRef"}},
+        "exclusions": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceExclusion"}},
+        "fixes": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/reportSourceFix"}},
+        "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisLimitation"}}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"requested": {"const": false}}, "required": ["requested"]},
+          "then": {
+            "properties": {
+              "provider_kind": {"type": "null"},
+              "agent_id": {"type": "null"},
+              "workspace_id": {"type": "null"},
+              "snapshot_policy": {"type": "null"},
+              "validation_profile_id": {"type": "null"},
+              "snapshot": {"type": "null"},
+              "context_state": {"const": "not_requested"},
+              "match_summary": {"const": "none"},
+              "source_refs": {"maxItems": 0},
+              "exclusions": {"maxItems": 0},
+              "fixes": {"maxItems": 0},
+              "limitations": {"maxItems": 0}
+            }
+          },
+          "else": {
+            "properties": {
+              "provider_kind": {"const": "agent_workspace"},
+              "agent_id": {"$ref": "#/$defs/sourceUuid"},
+              "workspace_id": {"$ref": "#/$defs/sourceUuid"},
+              "snapshot_policy": {"const": "tracked_worktree"},
+              "context_state": {"enum": ["waiting_for_agent", "extracting", "available", "unavailable"]}
+            }
+          }
+        },
+        {
+          "if": {"properties": {"match_summary": {"enum": ["weak", "none"]}}, "required": ["match_summary"]},
+          "then": {"properties": {"fixes": {"maxItems": 0}}}
+        },
+        {
+          "if": {"properties": {"fixes": {"minItems": 1}}, "required": ["fixes"]},
+          "then": {"properties": {"match_summary": {"const": "strong"}, "context_state": {"const": "available"}, "snapshot": {"$ref": "#/$defs/sourceSnapshot"}}}
+        }
+      ]
+    },
     "startupScenarioReport": {"allOf": [{"$ref": "#/$defs/scenarioReport"}, {"properties": {"scenario_type": {"const": "startup"}}}]},
     "scrollScenarioReport": {"allOf": [{"$ref": "#/$defs/scenarioReport"}, {"properties": {"scenario_type": {"const": "scroll"}}}]},
     "memoryCycleScenarioReport": {"allOf": [{"$ref": "#/$defs/scenarioReport"}, {"properties": {"scenario_type": {"const": "memory_cycle"}}}]},

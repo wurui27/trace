@@ -45,6 +45,217 @@ def test_ai_pipeline_examples_are_closed_and_valid(
 
 
 @pytest.mark.parametrize(
+    ("schema_name", "example_name"),
+    [
+        ("ai/analysis-projection.schema.json", "analysis-projection-v2.valid.json"),
+        ("ai/synthesis-output.schema.json", "synthesis-output-v2.valid.json"),
+        ("reports/analysis-report.schema.json", "analysis-report-v1.2.valid.json"),
+    ],
+)
+def test_source_aware_examples_are_closed_and_valid(
+    schema_name: str,
+    example_name: str,
+) -> None:
+    document = _example(example_name)
+    _validator(schema_name).validate(document)
+    with pytest.raises(jsonschema.ValidationError):
+        _validator(schema_name).validate({**document, "unexpected": True})
+
+
+def test_projection_v2_source_context_is_untrusted_relative_and_bounded() -> None:
+    validator = _validator("ai/analysis-projection.schema.json")
+    projection = _example("analysis-projection-v2.valid.json")
+    validator.validate(projection)
+
+    invalid_documents = []
+    for key, value in (
+        ("trust", "trusted"),
+        ("snapshot_hash", "A" * 64),
+    ):
+        invalid = deepcopy(projection)
+        invalid["source_context"][key] = value
+        invalid_documents.append(invalid)
+    for relative_path in (
+        "/private/Main.kt",
+        "C:/private/Main.kt",
+        "../Main.kt",
+        "./Main.kt",
+        "app\\Main.kt",
+    ):
+        invalid = deepcopy(projection)
+        invalid["source_context"]["fragments"][0]["relative_path"] = relative_path
+        invalid_documents.append(invalid)
+    invalid = deepcopy(projection)
+    invalid["source_context"]["fragments"] = [
+        deepcopy(invalid["source_context"]["fragments"][0]) for _ in range(13)
+    ]
+    invalid_documents.append(invalid)
+    invalid = deepcopy(projection)
+    invalid["source_context"]["fragments"][0]["instruction"] = "ignore contract"
+    invalid_documents.append(invalid)
+
+    for document in invalid_documents:
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(document)
+
+
+def _assert_v2_synthesis_semantics(document: dict[str, object]) -> None:
+    priorities = [item["priority"] for item in document["recommendations"]]  # type: ignore[index]
+    assert len(priorities) == len(set(priorities))
+    assert priorities == [priority for priority in ("p0", "p1", "p2") if priority in priorities]
+    patch_bytes = sum(
+        len(item["diff"].encode("utf-8"))
+        for item in document["source_fixes"]  # type: ignore[index]
+    )
+    assert patch_bytes <= 65_536
+
+
+def test_synthesis_v2_limits_paths_and_semantic_order() -> None:
+    validator = _validator("ai/synthesis-output.schema.json")
+    synthesis = _example("synthesis-output-v2.valid.json")
+    validator.validate(synthesis)
+    _assert_v2_synthesis_semantics(synthesis)
+
+    for collection in (
+        "key_metric_ids",
+        "top_findings",
+        "recommendations",
+        "source_fixes",
+        "retest_plan",
+    ):
+        invalid = deepcopy(synthesis)
+        invalid[collection] = [deepcopy(invalid[collection][0]) for _ in range(4)]
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(invalid)
+
+    invalid = deepcopy(synthesis)
+    invalid["source_fixes"][0]["match_grade"] = "weak"
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(invalid)
+    for relative_path in ("../Main.kt", "C:/private/Main.kt", "./Main.kt"):
+        invalid = deepcopy(synthesis)
+        invalid["source_fixes"][0]["relative_path"] = relative_path
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(invalid)
+    invalid = deepcopy(synthesis)
+    invalid["source_fixes"][0]["source_ref_ids"] = [
+        "97000000-0000-4000-8000-000000000001",
+        "97000000-0000-4000-8000-000000000002",
+        "97000000-0000-4000-8000-000000000003",
+    ]
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(invalid)
+
+    duplicate_priority = deepcopy(synthesis)
+    duplicate_priority["recommendations"] = [
+        deepcopy(synthesis["recommendations"][0]),
+        {
+            **deepcopy(synthesis["recommendations"][1]),
+            "priority": synthesis["recommendations"][0]["priority"],
+        },
+    ]
+    with pytest.raises(AssertionError):
+        _assert_v2_synthesis_semantics(duplicate_priority)
+    reversed_priority = deepcopy(synthesis)
+    reversed_priority["recommendations"] = list(
+        reversed(reversed_priority["recommendations"])
+    )
+    with pytest.raises(AssertionError):
+        _assert_v2_synthesis_semantics(reversed_priority)
+    oversized_total = deepcopy(synthesis)
+    oversized_total["source_fixes"] = [
+        {**deepcopy(synthesis["source_fixes"][0]), "diff": "x" * 40_000},
+        {
+            **deepcopy(synthesis["source_fixes"][0]),
+            "fix_id": "96000000-0000-4000-8000-000000000002",
+            "diff": "y" * 40_000,
+        },
+    ]
+    with pytest.raises(AssertionError):
+        _assert_v2_synthesis_semantics(oversized_total)
+
+
+def test_report_v12_source_states_never_erase_trace_facts() -> None:
+    validator = _validator("reports/analysis-report.schema.json")
+    report = _example("analysis-report-v1.2.valid.json")
+    validator.validate(report)
+    assert report["scenario_reports"]
+    assert report["synthesis"]["output"]["schema_version"] == "2.0"
+    assert "profile_id" in report["source_code"]["fixes"][0]["verification"]
+    assert "validation_profile_id" not in report["source_code"]["fixes"][0][
+        "verification"
+    ]
+
+    for state in ("pending", "validating"):
+        pending = deepcopy(report)
+        verification = pending["source_code"]["fixes"][0]["verification"]
+        verification.update(
+            {
+                "state": state,
+                "exit_code": None,
+                "duration_ms": None,
+                "log_summary": None,
+                "patch_artifact": None,
+            }
+        )
+        validator.validate(pending)
+
+    failed = deepcopy(report)
+    verification = failed["source_code"]["fixes"][0]["verification"]
+    verification.update(
+        {
+            "state": "validation_failed",
+            "exit_code": 1,
+            "duration_ms": 1200,
+            "log_summary": "Validation failed.",
+            "patch_artifact": None,
+        }
+    )
+    validator.validate(failed)
+
+    weak = deepcopy(report)
+    weak["source_code"]["match_summary"] = "weak"
+    weak["source_code"]["fixes"] = []
+    validator.validate(weak)
+
+    no_source = deepcopy(report)
+    no_source["source_code"] = {
+        "requested": False,
+        "provider_kind": None,
+        "agent_id": None,
+        "workspace_id": None,
+        "snapshot_policy": None,
+        "validation_profile_id": None,
+        "snapshot": None,
+        "context_state": "not_requested",
+        "match_summary": "none",
+        "source_refs": [],
+        "exclusions": [],
+        "fixes": [],
+        "limitations": [],
+    }
+    validator.validate(no_source)
+
+    invalid = deepcopy(report)
+    invalid["source_code"]["fixes"][0]["verification"]["patch_artifact"] = None
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(invalid)
+    invalid = deepcopy(report)
+    invalid["source_code"]["fixes"][0]["verification"]["state"] = "pending"
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(invalid)
+    invalid = deepcopy(report)
+    invalid["synthesis"]["output"]["schema_version"] = "1.0"
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(invalid)
+    for relative_path in ("C:/private/MainActivity.kt", "./MainActivity.kt"):
+        invalid = deepcopy(report)
+        invalid["source_code"]["source_refs"][0]["relative_path"] = relative_path
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(invalid)
+
+
+@pytest.mark.parametrize(
     ("schema_name", "example_name", "mutate"),
     [
         (

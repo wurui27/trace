@@ -184,3 +184,177 @@ def test_trace_v11_rejects_uppercase_synthesis_artifact_id() -> None:
     }
     with pytest.raises(jsonschema.ValidationError):
         report_schema.validate(trace_ai)
+
+
+def _source_binding() -> dict[str, object]:
+    return {
+        "provider_kind": "agent_workspace",
+        "agent_id": "91000000-0000-4000-8000-000000000001",
+        "workspace_id": "92000000-0000-4000-8000-000000000001",
+        "snapshot_policy": "tracked_worktree",
+        "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+    }
+
+
+def _trace_create_request(schema_version: str) -> dict[str, object]:
+    return {
+        "schema_version": schema_version,
+        "analysis_mode": "trace_upload",
+        "analysis_profile": "auto",
+        "question": None,
+        "inputs": [
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4096,
+                "sha256_b64": "A" * 43 + "=",
+            }
+        ],
+    }
+
+
+def test_create_request_v11_binds_source_without_weakening_v10_or_memory() -> None:
+    contract = validator(load("contracts/v1/analyses/create-request.schema.json"))
+    trace = {**_trace_create_request("1.1"), "source_binding": _source_binding()}
+    contract.validate(trace)
+    contract.validate(
+        {
+            "schema_version": "1.1",
+            "analysis_mode": "device",
+            "device_id": "72000000-0000-4000-8000-000000000001",
+            "scenarios": ["cold_start", "scroll", "memory_cycle"],
+            "apk": {
+                "artifact_kind": "apk",
+                "mime": "application/vnd.android.package-archive",
+                "size": 4096,
+                "sha256_b64": "A" * 43 + "=",
+            },
+            "source_binding": {
+                **_source_binding(),
+                "agent_id": "91000000-0000-4000-8000-000000000002",
+                "validation_profile_id": None,
+            },
+        }
+    )
+
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(
+            {**_trace_create_request("1.0"), "source_binding": _source_binding()}
+        )
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(
+            {
+                "schema_version": "1.0",
+                "analysis_mode": "memory_upload",
+                "application_version_id": "71000000-0000-4000-8000-000000000001",
+                "source_binding": _source_binding(),
+            }
+        )
+
+    for forbidden in ("path", "repo_url", "remote", "argv", "command"):
+        invalid = deepcopy(trace)
+        invalid["source_binding"][forbidden] = "private"  # type: ignore[index]
+        with pytest.raises(jsonschema.ValidationError):
+            contract.validate(invalid)
+
+
+def _analysis_response_v11() -> dict[str, object]:
+    return {
+        "schema_version": "1.1",
+        "analysis_id": "31000000-0000-4000-8000-000000000001",
+        "team_id": "21000000-0000-4000-8000-000000000001",
+        "analysis_mode": "trace_upload",
+        "state": "analyzing",
+        "version": 3,
+        "application_version_id": None,
+        "application_metadata": None,
+        "apk_upload": None,
+        "scenarios": [],
+        "sample_verdict_counts": {
+            "valid": 0,
+            "invalid": 0,
+            "pending": 0,
+            "validation_error": 0,
+            "total": 0,
+        },
+        "active_lease": None,
+        "report_available": False,
+        "created_at": "2026-08-07T08:00:00Z",
+        "started_at": "2026-08-07T08:01:00Z",
+        "completed_at": None,
+        "failure": None,
+        "analysis_profile": "auto",
+        "question": None,
+        "input_uploads": [
+            {
+                "state": "awaiting_upload",
+                "artifact_kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4096,
+                "sha256_b64": "A" * 43 + "=",
+            }
+        ],
+        "stages": [
+            {"stage": "input_validation", "state": "completed", "failure": None},
+            {"stage": "smartperfetto", "state": "completed", "failure": None},
+            {"stage": "perfpilot_ai", "state": "running", "failure": None},
+            {"stage": "report", "state": "pending", "failure": None},
+        ],
+        "source_analysis": {
+            "engine": "smartperfetto",
+            "rounds": 53,
+            "verification": "passed",
+            "session_id": "session-local-1",
+            "run_id": "run-local-1",
+        },
+        "source_code_analysis": {
+            "requested": True,
+            **_source_binding(),
+            "context_state": "available",
+            "match_summary": "strong",
+            "verification_state": "verified",
+            "failure_code": None,
+        },
+    }
+
+
+def test_analysis_response_v11_separates_smartperfetto_and_source_code() -> None:
+    contract = validator(load("contracts/v1/analyses/analysis-response.schema.json"))
+    response = _analysis_response_v11()
+    contract.validate(response)
+
+    not_requested = deepcopy(response)
+    not_requested["source_code_analysis"] = {
+        "requested": False,
+        "provider_kind": None,
+        "agent_id": None,
+        "workspace_id": None,
+        "snapshot_policy": None,
+        "validation_profile_id": None,
+        "context_state": "not_requested",
+        "match_summary": "none",
+        "verification_state": "not_requested",
+        "failure_code": None,
+    }
+    contract.validate(not_requested)
+
+    invalid = deepcopy(response)
+    invalid["source_code_analysis"]["path"] = "/private/repo"  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(invalid)
+    invalid = deepcopy(not_requested)
+    invalid["source_code_analysis"]["context_state"] = "available"  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(invalid)
+    invalid = deepcopy(response)
+    invalid["stages"] = list(reversed(invalid["stages"]))  # type: ignore[arg-type]
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate(invalid)
+
+    legacy = deepcopy(response)
+    legacy["schema_version"] = "1.0"
+    del legacy["source_analysis"]
+    del legacy["source_code_analysis"]
+    contract.validate(legacy)
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate({**legacy, "source_code_analysis": not_requested})

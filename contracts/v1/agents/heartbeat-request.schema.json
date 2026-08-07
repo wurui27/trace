@@ -15,7 +15,7 @@
     "devices"
   ],
   "properties": {
-    "schema_version": {"const": "1.0"},
+    "schema_version": {"enum": ["1.0", "1.1"]},
     "agent_version": {
       "type": "string",
       "minLength": 1,
@@ -60,8 +60,30 @@
       "type": "array",
       "maxItems": 32,
       "items": {"$ref": "#/$defs/device"}
+    },
+    "workspaces": {
+      "type": "array",
+      "maxItems": 32,
+      "uniqueItems": true,
+      "items": {"$ref": "#/$defs/workspace"}
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.0"}},
+        "required": ["schema_version"]
+      },
+      "then": {"properties": {"workspaces": false}}
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.1"}},
+        "required": ["schema_version"]
+      },
+      "then": {"required": ["workspaces"]}
+    }
+  ],
   "$defs": {
     "uuid": {
       "type": "string",
@@ -73,6 +95,68 @@
       "minLength": 1,
       "maxLength": 96,
       "pattern": "^[a-z][a-z0-9_]*$"
+    },
+    "validationProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["profile_id", "name"],
+      "properties": {
+        "profile_id": {"$ref": "#/$defs/uuid"},
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "workspace_id",
+        "name",
+        "state",
+        "git_head",
+        "tracked_dirty_count",
+        "snapshot_policy",
+        "validation_profiles"
+      ],
+      "properties": {
+        "workspace_id": {"$ref": "#/$defs/uuid"},
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+        },
+        "state": {"enum": ["ready", "invalid"]},
+        "git_branch": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 255,
+              "pattern": "^[^\\u0000-\\u001f\\u007f]+$"
+            },
+            {"type": "null"}
+          ]
+        },
+        "git_head": {
+          "type": "string",
+          "minLength": 40,
+          "maxLength": 40,
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "tracked_dirty_count": {"type": "integer", "minimum": 0},
+        "snapshot_policy": {"const": "tracked_worktree"},
+        "validation_profiles": {
+          "type": "array",
+          "maxItems": 8,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/validationProfile"}
+        }
+      }
     },
     "device": {
       "type": "object",

@@ -1,0 +1,39 @@
+{
+  "schema_version": "1.0",
+  "task_type": "source_context",
+  "execution_id": "93000000-0000-4000-8000-000000000001",
+  "analysis_id": "82000000-0000-4000-8000-000000000001",
+  "workspace_id": "92000000-0000-4000-8000-000000000001",
+  "lease_version": 1,
+  "state": "completed",
+  "result": {
+    "snapshot_id": "95000000-0000-4000-8000-000000000001",
+    "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "git_head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "tracked_dirty_count": 1,
+    "fragments": [
+      {
+        "source_ref_id": "97000000-0000-4000-8000-000000000001",
+        "relative_path": "app/src/main/java/demo/MainActivity.kt",
+        "language": "kotlin",
+        "symbol": "demo.MainActivity.onCreate",
+        "start_line": 1,
+        "end_line": 1,
+        "content": "class MainActivity {}\n",
+        "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+        "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+        "rule_ids": ["startup.main_thread_binder"],
+        "match_signals": ["trace_symbol"]
+      }
+    ],
+    "exclusions": [
+      {
+        "relative_path": "local.properties",
+        "reason_code": "sensitive_file"
+      }
+    ],
+    "truncated": false
+  },
+  "signature_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=="
+}

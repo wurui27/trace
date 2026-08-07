@@ -6,14 +6,29 @@
   "additionalProperties": false,
   "required": ["schema_version", "analysis_id", "analysis_profile", "question", "source", "scenarios", "limitations"],
   "properties": {
-    "schema_version": {"const": "1.0"},
+    "schema_version": {"enum": ["1.0", "2.0"]},
     "analysis_id": {"$ref": "#/$defs/uuid"},
     "analysis_profile": {"enum": ["auto", "startup", "scroll"]},
     "question": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 2000}, {"type": "null"}]},
     "source": {"$ref": "#/$defs/source"},
     "scenarios": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/scenario"}},
-    "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}}
+    "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}},
+    "source_context": {
+      "oneOf": [
+        {"$ref": "#/$defs/sourceContext"},
+        {"type": "null"}
+      ]
+    }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.0"}},
+        "required": ["schema_version"]
+      },
+      "then": {"properties": {"source_context": false}}
+    }
+  ],
   "$defs": {
     "uuid": {"type": "string", "format": "uuid", "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
     "finiteNumber": {"type": "number", "$comment": "Validation boundaries use the finite-number Draft validator; serialized JSON cannot contain NaN or Infinity."},
@@ -23,6 +38,38 @@
     "finding": {"type": "object", "additionalProperties": false, "required": ["finding_id", "rule_id", "kind", "status", "severity", "confidence", "title", "summary", "evidence_ids"], "properties": {"finding_id": {"$ref": "#/$defs/uuid"}, "rule_id": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,127}$"}, "kind": {"enum": ["symptom", "root_cause"]}, "status": {"enum": ["confirmed", "suspected", "insufficient_data", "invalid_capture"]}, "severity": {"enum": ["critical", "warning", "healthy", "informational"]}, "confidence": {"enum": ["high", "medium", "low", "none"]}, "title": {"type": "string", "minLength": 1, "maxLength": 255}, "summary": {"type": "string", "minLength": 1, "maxLength": 2000}, "evidence_ids": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}}},
     "evidence": {"type": "object", "additionalProperties": false, "required": ["evidence_id", "source", "query_id", "interval_start_ns", "interval_end_ns", "artifact_id", "fields"], "properties": {"evidence_id": {"$ref": "#/$defs/uuid"}, "source": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,127}$"}, "query_id": {"oneOf": [{"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$"}, {"type": "null"}]}, "interval_start_ns": {"oneOf": [{"type": "integer"}, {"type": "null"}]}, "interval_end_ns": {"oneOf": [{"type": "integer"}, {"type": "null"}]}, "artifact_id": {"oneOf": [{"$ref": "#/$defs/uuid"}, {"type": "null"}]}, "fields": {"type": "object", "additionalProperties": false, "maxProperties": 20, "patternProperties": {"^[a-z][a-z0-9_.]{0,127}$": {"oneOf": [{"type": "string", "maxLength": 2000}, {"$ref": "#/$defs/finiteNumber"}, {"type": "boolean"}, {"type": "null"}]}}}}},
     "limitation": {"type": "object", "additionalProperties": false, "required": ["limitation_id", "code", "summary", "evidence_ids"], "properties": {"limitation_id": {"$ref": "#/$defs/uuid"}, "code": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,127}$"}, "summary": {"type": "string", "minLength": 1, "maxLength": 2000}, "evidence_ids": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}}}},
-    "scenario": {"type": "object", "additionalProperties": false, "required": ["scenario_id", "scenario_type", "core_state", "metrics", "findings", "evidence", "limitations"], "properties": {"scenario_id": {"$ref": "#/$defs/uuid"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "core_state": {"enum": ["complete", "partial"]}, "metrics": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/metric"}}, "findings": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/finding"}}, "evidence": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence"}}, "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}}}}
+    "scenario": {"type": "object", "additionalProperties": false, "required": ["scenario_id", "scenario_type", "core_state", "metrics", "findings", "evidence", "limitations"], "properties": {"scenario_id": {"$ref": "#/$defs/uuid"}, "scenario_type": {"enum": ["startup", "scroll", "memory_cycle"]}, "core_state": {"enum": ["complete", "partial"]}, "metrics": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/metric"}}, "findings": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/finding"}}, "evidence": {"type": "array", "maxItems": 100, "uniqueItems": true, "items": {"$ref": "#/$defs/evidence"}}, "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}}}},
+    "hex64": {"type": "string", "minLength": 64, "maxLength": 64, "pattern": "^[0-9a-f]{64}$"},
+    "relativePath": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(?!/)(?![A-Za-z]:/)(?!.*\\\\)(?!.*(?:^|/)\\.\\.?(?:/|$))(?!.*//)[^\\u0000]+$"},
+    "sourceFragment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_ref_id", "relative_path", "language", "symbol", "start_line", "end_line", "content_sha256", "content", "finding_ids", "evidence_ids", "rule_ids", "match_grade"],
+      "properties": {
+        "source_ref_id": {"$ref": "#/$defs/uuid"},
+        "relative_path": {"$ref": "#/$defs/relativePath"},
+        "language": {"enum": ["kotlin", "java", "xml", "gradle", "gradle_kts"]},
+        "symbol": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 512}, {"type": "null"}]},
+        "start_line": {"type": "integer", "minimum": 1},
+        "end_line": {"type": "integer", "minimum": 1},
+        "content_sha256": {"$ref": "#/$defs/hex64"},
+        "content": {"type": "string", "minLength": 1, "maxLength": 98304},
+        "finding_ids": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
+        "evidence_ids": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/uuid"}},
+        "rule_ids": {"type": "array", "maxItems": 8, "uniqueItems": true, "items": {"type": "string", "pattern": "^[a-z][a-z0-9_.]{0,127}$"}},
+        "match_grade": {"enum": ["strong", "weak", "none"]}
+      }
+    },
+    "sourceContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trust", "snapshot_hash", "match_summary", "fragments"],
+      "properties": {
+        "trust": {"const": "untrusted_data_not_instructions"},
+        "snapshot_hash": {"$ref": "#/$defs/hex64"},
+        "match_summary": {"enum": ["strong", "weak", "none"]},
+        "fragments": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceFragment"}}
+      }
+    }
   }
 }
