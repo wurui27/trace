@@ -27,10 +27,16 @@ function getMetadataBase(requestHeaders: Headers) {
     ?.split(",")[0]
     ?.trim();
   const isLocalHost = /^(localhost|127\.0\.0\.1)(:\d+)?$/i.test(host);
+  const hostname = host.replace(/^\[|\](?::\d+)?$/g, "").replace(/:\d+$/, "");
+  const isPrivateNetworkHost =
+    /^10\./.test(hostname) ||
+    /^192\.168\./.test(hostname) ||
+    /^172\.(?:1[6-9]|2\d|3[01])\./.test(hostname) ||
+    /^169\.254\./.test(hostname);
   const protocol =
     forwardedProtocol === "http" || forwardedProtocol === "https"
       ? forwardedProtocol
-      : isLocalHost
+      : isLocalHost || isPrivateNetworkHost
         ? "http"
         : "https";
 

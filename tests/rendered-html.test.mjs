@@ -1,14 +1,15 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 
-async function render(path = "/") {
+async function render(path = "/", origin = "http://localhost") {
   const workerUrl = new URL("../dist/server/index.js", import.meta.url);
   workerUrl.searchParams.set("test", `${process.pid}-${Date.now()}`);
   const { default: worker } = await import(workerUrl.href);
+  const requestUrl = new URL(path, origin);
 
   return worker.fetch(
-    new Request(`http://localhost${path}`, {
-      headers: { accept: "text/html" },
+    new Request(requestUrl, {
+      headers: { accept: "text/html", host: requestUrl.host },
     }),
     {
       ASSETS: {
@@ -21,6 +22,15 @@ async function render(path = "/") {
     },
   );
 }
+
+test("keeps absolute metadata assets on HTTP for private-network deployments", async () => {
+  const response = await render("/", "http://10.166.0.125:3000");
+  assert.equal(response.status, 200);
+
+  const html = await response.text();
+  assert.match(html, /href="http:\/\/10\.166\.0\.125:3000\/favicon\.svg"/);
+  assert.doesNotMatch(html, /https:\/\/10\.166\.0\.125:3000\/favicon\.svg/);
+});
 
 test("server-renders a clean PerfPilot dashboard without demo analysis data", async () => {
   const response = await render();

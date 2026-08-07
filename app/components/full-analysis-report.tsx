@@ -81,7 +81,7 @@ export function FullAnalysisReport({
 
   const current = snapshot?.requestKey === requestKey ? snapshot : null;
   const backLink = (
-    <Link className="final-report-back" href={`/analyses/${analysisId}`}>
+    <Link className="final-report-back" href={`/analyses/${analysisId}`} prefetch={false}>
       <ArrowLeft aria-hidden="true" />
       返回分析进度
     </Link>
@@ -156,7 +156,12 @@ export function FullAnalysisReport({
   return (
     <div className="final-report-page">
       <header className="final-report-topbar">
-        <Link className="analysis-page-brand" href="/" aria-label="返回 PerfPilot 首页">
+        <Link
+          className="analysis-page-brand"
+          href="/"
+          prefetch={false}
+          aria-label="返回 PerfPilot 首页"
+        >
           <span className="brand-mark" aria-hidden="true">
             <span className="brand-mark-bar brand-mark-bar-short" />
             <span className="brand-mark-bar brand-mark-bar-medium" />
