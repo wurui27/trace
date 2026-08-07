@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 
 import httpx
 import pytest
@@ -89,7 +90,7 @@ async def test_provider_posts_exact_bounded_chat_completion_request() -> None:
 
 
 @pytest.mark.asyncio
-async def test_invalid_output_retry_sends_only_the_stable_code_not_prior_candidate() -> None:
+async def test_invalid_output_retry_sends_safe_instructions_without_prior_candidate() -> None:
     from perfpilot_api.ai.openai_compatible import OpenAICompatibleSynthesisProvider
 
     requests: list[httpx.Request] = []
@@ -112,10 +113,17 @@ async def test_invalid_output_retry_sends_only_the_stable_code_not_prior_candida
         await provider.synthesize(_projection(), retry_code="ai_output_invalid")
 
     body = json.loads(requests[0].content)
-    assert body["messages"][-1] == {
+    retry_message = body["messages"][-1]
+    assert retry_message == {
         "role": "user",
-        "content": "Previous output was rejected: ai_output_invalid.",
+        "content": (
+            "The previous output failed validation. Generate a complete new JSON "
+            "object from the authoritative projection. Strictly check the schema and "
+            "every referenced identifier. Narrative fields must contain no ASCII "
+            "digits; measurements belong only in report metric sections."
+        ),
     }
+    assert re.search(r"[0-9]", retry_message["content"]) is None
     assert "candidate" not in json.dumps(body).casefold()
 
 

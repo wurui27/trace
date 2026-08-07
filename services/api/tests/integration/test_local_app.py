@@ -231,7 +231,13 @@ class _ProjectionReportProvider:
         "ascii"
     )
 
-    async def complete(self, *, projection) -> SynthesisCandidate:
+    async def complete(
+        self,
+        *,
+        projection,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
+        del retry_code
         projected = projection.document
         findings = []
         recommendations = []
@@ -313,10 +319,17 @@ class _InvalidReportProvider:
 
     def __init__(self) -> None:
         self.calls = 0
+        self.retry_codes: list[str | None] = []
 
-    async def complete(self, *, projection) -> SynthesisCandidate:
+    async def complete(
+        self,
+        *,
+        projection,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
         del projection
         self.calls += 1
+        self.retry_codes.append(retry_code)
         return SynthesisCandidate(
             candidate_json=b"{}",
             prompt_tokens=1,
@@ -336,7 +349,12 @@ class _RerunBarrierReportProvider(_ProjectionReportProvider):
         self.second_rerun_started = threading.Event()
         self.release_reruns = threading.Event()
 
-    async def complete(self, *, projection) -> SynthesisCandidate:
+    async def complete(
+        self,
+        *,
+        projection,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
         self.calls += 1
         if self.calls > 1:
             self.rerun_calls += 1
@@ -346,15 +364,25 @@ class _RerunBarrierReportProvider(_ProjectionReportProvider):
                 self.second_rerun_started.set()
             while not self.release_reruns.is_set():
                 await asyncio.sleep(0.001)
-        return await super().complete(projection=projection)
+        return await super().complete(
+            projection=projection,
+            retry_code=retry_code,
+        )
 
 
 class _AggregateTokenUsageReportProvider(_ProjectionReportProvider):
     def __init__(self) -> None:
         self.calls = 0
+        self.retry_codes: list[str | None] = []
 
-    async def complete(self, *, projection) -> SynthesisCandidate:
+    async def complete(
+        self,
+        *,
+        projection,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
         self.calls += 1
+        self.retry_codes.append(retry_code)
         if self.calls == 1:
             return SynthesisCandidate(
                 candidate_json=b"{}",
@@ -362,7 +390,10 @@ class _AggregateTokenUsageReportProvider(_ProjectionReportProvider):
                 completion_tokens=5,
                 latency_ms=7,
             )
-        valid = await super().complete(projection=projection)
+        valid = await super().complete(
+            projection=projection,
+            retry_code=retry_code,
+        )
         return SynthesisCandidate(
             candidate_json=valid.candidate_json,
             prompt_tokens=11,
@@ -1538,6 +1569,7 @@ def test_local_app_persists_bounded_single_pass_failure(tmp_path: Path) -> None:
         )
 
     assert provider.calls == 2
+    assert provider.retry_codes == [None, "ai_output_invalid"]
     assert published.status_code == 200
     report = validate_contract("analysis-report", published.json())
     assert report["synthesis"]["state"] == "failed"
@@ -1605,6 +1637,7 @@ def test_local_app_publishes_aggregate_token_usage_after_a_valid_retry(
 
     assert provider.calls == 2
     assert published.status_code == 200
+    assert provider.retry_codes == [None, "ai_output_invalid"]
     report = validate_contract("analysis-report", published.json())
     provenance = report["synthesis"]["provenance"]
     assert provenance["prompt_tokens"] == 14

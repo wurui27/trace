@@ -33,6 +33,7 @@ from perfpilot_api.reports.projection import AIProjection
 
 ReportRole = Literal["report"]
 ReportState = Literal["running", "completed", "failed"]
+OutputRetryCode = Literal["ai_output_invalid"]
 ReportObserver = Callable[
     [int, ReportRole, ReportState, int, AISynthesisOutput | None],
     Awaitable[None],
@@ -56,7 +57,12 @@ class LocalSynthesisError(RuntimeError):
 
 
 class LocalReportProvider(Protocol):
-    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate: ...
+    async def complete(
+        self,
+        *,
+        projection: AIProjection,
+        retry_code: OutputRetryCode | None = None,
+    ) -> SynthesisCandidate: ...
 
     async def aclose(self) -> None: ...
 
@@ -176,9 +182,17 @@ class LocalOpenAICompatibleReportProvider:
             ),
         )
 
-    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+    async def complete(
+        self,
+        *,
+        projection: AIProjection,
+        retry_code: OutputRetryCode | None = None,
+    ) -> SynthesisCandidate:
         provider_projection = build_local_report_projection(projection)
-        return await self._provider.synthesize(provider_projection)
+        return await self._provider.synthesize(
+            provider_projection,
+            retry_code=retry_code,
+        )
 
     async def aclose(self) -> None:
         await self._provider.aclose()
@@ -276,10 +290,14 @@ class LocalReportSynthesizer:
         prompt_tokens = 0
         completion_tokens = 0
         latency_ms = 0
+        retry_code: OutputRetryCode | None = None
         while attempts < 2:
             attempts += 1
             try:
-                candidate = await self._provider.complete(projection=projection)
+                candidate = await self._provider.complete(
+                    projection=projection,
+                    retry_code=retry_code,
+                )
                 prompt_tokens += candidate.prompt_tokens
                 completion_tokens += candidate.completion_tokens
                 latency_ms += candidate.latency_ms
@@ -302,10 +320,12 @@ class LocalReportSynthesizer:
                 failure_code = "ai_output_invalid"
                 retryable = True
                 detail_code = "semantic_validation"
+                retry_code = "ai_output_invalid"
             except AIProviderError as error:
                 failure_code = error.stable_code
                 retryable = error.retryable
                 detail_code = error.detail_code
+                retry_code = None
                 if not retryable:
                     break
             except asyncio.CancelledError:
@@ -327,6 +347,7 @@ __all__ = [
     "LocalReportUsage",
     "LocalSynthesisError",
     "LocalSynthesisResult",
+    "OutputRetryCode",
     "ReportObserver",
     "ReportRole",
     "ReportState",

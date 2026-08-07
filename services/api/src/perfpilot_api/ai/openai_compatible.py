@@ -292,7 +292,13 @@ class OpenAICompatibleSynthesisProvider:
             messages.append(
                 {
                     "role": "user",
-                    "content": "Previous output was rejected: ai_output_invalid.",
+                    "content": (
+                        "The previous output failed validation. Generate a complete "
+                        "new JSON object from the authoritative projection. Strictly "
+                        "check the schema and every referenced identifier. Narrative "
+                        "fields must contain no ASCII digits; measurements belong only "
+                        "in report metric sections."
+                    ),
                 }
             )
         response_format: dict[str, object]

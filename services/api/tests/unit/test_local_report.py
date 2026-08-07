@@ -96,11 +96,18 @@ class FakeReportProvider:
     def __init__(self, candidates: list[bytes]) -> None:
         self.candidates = candidates
         self.calls = 0
+        self.retry_codes: list[str | None] = []
         self.closed = False
 
-    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+    async def complete(
+        self,
+        *,
+        projection: AIProjection,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
         assert projection.document["analysis_profile"] == "auto"
         self.calls += 1
+        self.retry_codes.append(retry_code)
         return SynthesisCandidate(
             candidate_json=self.candidates.pop(0),
             prompt_tokens=10,
@@ -117,9 +124,15 @@ class FailingReportProvider(FakeReportProvider):
         super().__init__([])
         self.errors = errors
 
-    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+    async def complete(
+        self,
+        *,
+        projection: AIProjection,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
         assert projection.document["analysis_profile"] == "auto"
         self.calls += 1
+        self.retry_codes.append(retry_code)
         raise self.errors.pop(0)
 
 
@@ -131,13 +144,44 @@ class ScriptedReportProvider(FakeReportProvider):
         super().__init__([])
         self.events = events
 
-    async def complete(self, *, projection: AIProjection) -> SynthesisCandidate:
+    async def complete(
+        self,
+        *,
+        projection: AIProjection,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
         assert projection.document["analysis_profile"] == "auto"
         self.calls += 1
+        self.retry_codes.append(retry_code)
         event = self.events.pop(0)
         if isinstance(event, AIProviderError):
             raise event
         return event
+
+
+class RetryAwareReportProvider(FakeReportProvider):
+    def __init__(self, *, invalid: bytes, valid: bytes) -> None:
+        super().__init__([])
+        self.invalid = invalid
+        self.valid = valid
+
+    async def complete(
+        self,
+        *,
+        projection: AIProjection,
+        retry_code: str | None = None,
+    ) -> SynthesisCandidate:
+        assert projection.document["analysis_profile"] == "auto"
+        self.calls += 1
+        self.retry_codes.append(retry_code)
+        return SynthesisCandidate(
+            candidate_json=(
+                self.valid if retry_code == "ai_output_invalid" else self.invalid
+            ),
+            prompt_tokens=10,
+            completion_tokens=20,
+            latency_ms=30,
+        )
 
 
 @pytest.mark.asyncio
@@ -155,6 +199,7 @@ async def test_report_synthesizer_uses_one_provider_request() -> None:
     )
 
     assert provider.calls == 1
+    assert provider.retry_codes == [None]
     assert observed == [
         (1, "report", "running", 0),
         (1, "report", "completed", 1),
@@ -167,12 +212,23 @@ async def test_report_synthesizer_uses_one_provider_request() -> None:
 
 @pytest.mark.asyncio
 async def test_report_synthesizer_retries_invalid_output_once() -> None:
-    candidate = canonical_json_bytes(_load("synthesis-output.valid.json"))
-    provider = FakeReportProvider([b"{}", candidate])
+    valid_document = _load("synthesis-output.valid.json")
+    invalid_document = dict(valid_document)
+    invalid_document["executive_summary"] = (
+        "Startup remains blocked by 101 unsupported delay units."
+    )
+    provider = RetryAwareReportProvider(
+        invalid=canonical_json_bytes(invalid_document),
+        valid=canonical_json_bytes(valid_document),
+    )
 
     result = await LocalReportSynthesizer(provider=provider).synthesize(_projection())
 
     assert provider.calls == 2
+    assert provider.retry_codes == [None, "ai_output_invalid"]
+    assert len(result.rounds) == 1
+    assert result.rounds[0].number == 1
+    assert result.rounds[0].role == "report"
     assert result.rounds[0].attempts == 2
 
 
@@ -225,6 +281,7 @@ async def test_report_synthesizer_retries_retryable_provider_error() -> None:
     )
 
     assert provider.calls == 2
+    assert provider.retry_codes == [None, None]
     assert result.rounds == (
         LocalReportUsage(1, "report", 2, 10, 20, 30),
     )
@@ -488,8 +545,14 @@ async def test_openai_compatible_report_provider_uses_bounded_json_configuration
             self.closed = False
             instances.append(self)
 
-        async def synthesize(self, projection: AIProjection) -> SynthesisCandidate:
+        async def synthesize(
+            self,
+            projection: AIProjection,
+            *,
+            retry_code: str | None = None,
+        ) -> SynthesisCandidate:
             captured["projection"] = projection
+            captured["retry_code"] = retry_code
             return SynthesisCandidate(b"{}", 1, 2, 3)
 
         async def aclose(self) -> None:
@@ -508,7 +571,10 @@ async def test_openai_compatible_report_provider_uses_bounded_json_configuration
         thinking_mode="disabled",
     )
 
-    candidate = await provider.complete(projection=_projection())
+    candidate = await provider.complete(
+        projection=_projection(),
+        retry_code="ai_output_invalid",
+    )
     await provider.aclose()
 
     timeout = captured["timeout"]
@@ -522,8 +588,25 @@ async def test_openai_compatible_report_provider_uses_bounded_json_configuration
     assert timeout.write == 30.0
     assert timeout.pool == 10.0
     assert captured["projection"].document["round_role"] == "report"
+    assert captured["retry_code"] == "ai_output_invalid"
     assert candidate.prompt_tokens == 1
     assert instances[0].closed is True
+
+
+def test_local_report_prompt_forbids_ascii_digits_in_every_narrative_field() -> None:
+    instruction = local_report._local_prompt().system_instruction
+
+    assert "must not contain ASCII digits" in instruction
+    for field_name in (
+        "executive_summary",
+        "user_impact",
+        "recommendation title",
+        "recommendation action",
+        "recommendation expected_effect",
+        "retest steps",
+        "limitation summary",
+    ):
+        assert field_name in instruction
 
 
 @pytest.mark.asyncio
