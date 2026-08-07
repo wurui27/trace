@@ -1,11 +1,12 @@
 "use client";
 
-import { ArrowLeft, CheckCircle2 } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Download } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
 
 import { completedAiProcessCopy } from "../lib/analysis-ai-status";
 import { createRandomUuid } from "../lib/perfpilot-api";
+import { printAnalysisReport, supportsReportPrint } from "../lib/report-print";
 import {
   createAnalysisLoader,
   createSynthesisRerunner,
@@ -23,6 +24,7 @@ interface FullAnalysisReportProps {
   readonly loader?: AnalysisLoader;
   readonly rerunner?: SynthesisRerunner;
   readonly randomUUID?: () => string;
+  readonly printer?: (analysisId: string) => boolean;
 }
 
 interface ReportSnapshot {
@@ -36,10 +38,12 @@ export function FullAnalysisReport({
   loader = defaultLoader,
   rerunner = defaultRerunner,
   randomUUID = createRandomUuid,
+  printer = printAnalysisReport,
 }: FullAnalysisReportProps) {
   const [attempt, setAttempt] = useState(0);
   const [snapshot, setSnapshot] = useState<ReportSnapshot | null>(null);
   const [retrying, setRetrying] = useState(false);
+  const [printSupported, setPrintSupported] = useState<boolean | null>(null);
   const retryController = useRef<AbortController | null>(null);
   const requestKey = `${analysisId}:${attempt}`;
 
@@ -63,6 +67,17 @@ export function FullAnalysisReport({
     },
     [analysisId],
   );
+
+  useEffect(() => {
+    const supported = supportsReportPrint();
+    let active = true;
+    void Promise.resolve().then(() => {
+      if (active) setPrintSupported(supported);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
 
   const current = snapshot?.requestKey === requestKey ? snapshot : null;
   const backLink = (
@@ -149,7 +164,28 @@ export function FullAnalysisReport({
           </span>
           <span>PerfPilot</span>
         </Link>
-        {backLink}
+        <div className="final-report-actions">
+          {backLink}
+          <button
+            aria-describedby={printSupported === false ? "report-print-unavailable" : undefined}
+            className="final-report-download"
+            disabled={printSupported !== true}
+            onClick={() => printer(analysisId)}
+            type="button"
+          >
+            <Download aria-hidden="true" />
+            下载 PDF
+          </button>
+          {printSupported === false ? (
+            <p
+              className="final-report-print-unavailable"
+              id="report-print-unavailable"
+              role="status"
+            >
+              当前浏览器不支持打印，请使用浏览器菜单保存报告。
+            </p>
+          ) : null}
+        </div>
       </header>
 
       <main className="final-report-main">

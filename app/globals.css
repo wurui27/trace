@@ -3219,6 +3219,52 @@ select:disabled {
   stroke-width: 1.8;
 }
 
+.final-report-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.final-report-download {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  padding: 0 13px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  color: var(--surface);
+  font-size: 12px;
+  font-weight: 750;
+  cursor: pointer;
+}
+
+.final-report-download:hover:not(:disabled) {
+  border-color: var(--primary-dark);
+  background: var(--primary-dark);
+}
+
+.final-report-download:disabled {
+  border-color: var(--border-strong);
+  background: var(--border-strong);
+  color: var(--text-muted);
+}
+
+.final-report-download svg {
+  width: 15px;
+  height: 15px;
+  stroke-width: 1.9;
+}
+
+.final-report-print-unavailable {
+  max-width: 220px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
 .final-report-main {
   width: min(1040px, calc(100vw - 40px));
   display: grid;
@@ -3381,8 +3427,10 @@ select:disabled {
 
 @media print {
   .final-report-topbar,
+  .final-report-download,
+  .final-report-print-unavailable,
   .analysis-report-partial button {
-    display: none;
+    display: none !important;
   }
 
   .final-report-page,
@@ -3399,6 +3447,42 @@ select:disabled {
   .analysis-report-card {
     border-color: var(--border-strong);
     box-shadow: none;
+  }
+
+  .analysis-report-metric-details > :not(summary),
+  .analysis-memory-evidence-details > :not(summary),
+  .analysis-report-evidence details > :not(summary),
+  .analysis-report-provenance > :not(summary) {
+    display: block !important;
+  }
+
+  .analysis-report-metric-details > summary,
+  .analysis-memory-evidence-details > summary,
+  .analysis-report-evidence summary,
+  .analysis-report-provenance summary {
+    list-style: none;
+    pointer-events: none;
+  }
+
+  .analysis-report-metric-details > summary::-webkit-details-marker,
+  .analysis-memory-evidence-details > summary::-webkit-details-marker,
+  .analysis-report-evidence summary::-webkit-details-marker,
+  .analysis-report-provenance summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .analysis-report-section,
+  .analysis-report-findings > li,
+  .analysis-recommendation-list > li,
+  .analysis-retest-list > li,
+  .analysis-report-evidence > div {
+    break-inside: avoid;
+    page-break-inside: avoid;
+  }
+
+  .analysis-reference-list a {
+    color: inherit;
+    text-decoration: none;
   }
 }
 

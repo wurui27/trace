@@ -70,4 +70,18 @@ describe("Focus Light design system", () => {
       /@media\s*\(\s*prefers-color-scheme\s*:\s*dark\s*\)/i,
     );
   });
+
+  it("keeps final reports printable and expands their evidence", () => {
+    const printBlock = css.match(/@media\s+print\s*\{([\s\S]*?)\n\}\n\n\/\*/)?.[1] ?? "";
+
+    expect(printBlock).toMatch(/\.final-report-download[\s\S]*display\s*:\s*none\s*!important/i);
+    expect(printBlock).toMatch(/\.final-report-print-unavailable[\s\S]*display\s*:\s*none\s*!important/i);
+    expect(printBlock).toMatch(/\.analysis-report-partial button[\s\S]*display\s*:\s*none\s*!important/i);
+    expect(printBlock).toMatch(/\.analysis-report-metric-details\s*>\s*:not\(summary\)[\s\S]*display\s*:\s*block\s*!important/i);
+    expect(printBlock).toMatch(/\.analysis-memory-evidence-details\s*>\s*:not\(summary\)[\s\S]*display\s*:\s*block\s*!important/i);
+    expect(printBlock).toMatch(/\.analysis-report-evidence details\s*>\s*:not\(summary\)[\s\S]*display\s*:\s*block\s*!important/i);
+    expect(printBlock).toMatch(/\.analysis-report-provenance\s*>\s*:not\(summary\)[\s\S]*display\s*:\s*block\s*!important/i);
+    expect(printBlock).toMatch(/\.analysis-report-section[\s\S]*break-inside\s*:\s*avoid/i);
+    expect(printBlock).toMatch(/\.analysis-reference-list a[\s\S]*text-decoration\s*:\s*none/i);
+  });
 });

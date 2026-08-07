@@ -100,6 +100,65 @@ const report: AnalysisReport = {
 };
 
 describe("FullAnalysisReport", () => {
+  it("offers an enabled PDF download after detecting print support", async () => {
+    const printer = vi.fn(() => true);
+    const loader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({ teamId: "team-1", analysis, report, reportLoadFailed: false });
+    });
+    const print = window.print;
+    Object.defineProperty(window, "print", { configurable: true, value: vi.fn() });
+
+    render(<FullAnalysisReport analysisId="analysis-live-1" loader={loader} printer={printer} />);
+    const button = await screen.findByRole("button", { name: "下载 PDF" });
+
+    expect(button).toBeEnabled();
+    await userEvent.setup().click(button);
+    expect(printer).toHaveBeenCalledTimes(1);
+    expect(printer).toHaveBeenCalledWith("analysis-live-1");
+    expect(window.print).not.toHaveBeenCalled();
+    Object.defineProperty(window, "print", { configurable: true, value: print });
+  });
+
+  it("shows a disabled PDF action and guidance when printing is unavailable", async () => {
+    const print = window.print;
+    Object.defineProperty(window, "print", { configurable: true, value: undefined });
+    const loader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({ teamId: "team-1", analysis, report, reportLoadFailed: false });
+    });
+
+    render(<FullAnalysisReport analysisId="analysis-live-1" loader={loader} />);
+
+    expect(await screen.findByRole("button", { name: "下载 PDF" })).toBeDisabled();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "当前浏览器不支持打印，请使用浏览器菜单保存报告。",
+    );
+    Object.defineProperty(window, "print", { configurable: true, value: print });
+  });
+
+  it("does not offer PDF download while loading, failing, or without a report", async () => {
+    const pendingLoader = vi.fn(() => new Promise<void>(() => {}));
+    const { unmount } = render(<FullAnalysisReport analysisId="analysis-live-1" loader={pendingLoader} />);
+    expect(screen.queryByRole("button", { name: "下载 PDF" })).not.toBeInTheDocument();
+    unmount();
+
+    const failedLoader = vi.fn(async () => {
+      throw new Error("unavailable");
+    });
+    const { unmount: unmountFailed } = render(
+      <FullAnalysisReport analysisId="analysis-live-1" loader={failedLoader} />,
+    );
+    expect(await screen.findByRole("alert")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "下载 PDF" })).not.toBeInTheDocument();
+    unmountFailed();
+
+    const noReportLoader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({ teamId: "team-1", analysis, report: null, reportLoadFailed: false });
+    });
+    render(<FullAnalysisReport analysisId="analysis-live-1" loader={noReportLoader} />);
+    expect(await screen.findByText("最终报告尚未生成")).toBeVisible();
+    expect(screen.queryByRole("button", { name: "下载 PDF" })).not.toBeInTheDocument();
+  });
+
   it("renders the final report with source and AI process context", async () => {
     const loader = vi.fn(async (_id, _signal, onSnapshot) => {
       onSnapshot({
