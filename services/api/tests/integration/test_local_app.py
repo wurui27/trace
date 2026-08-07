@@ -109,6 +109,40 @@ class _BlockingSmartPerfettoGateway(_FakeSmartPerfettoGateway):
         return "running"
 
 
+class _UnavailableAfterRestartSmartPerfettoGateway:
+    def __init__(self) -> None:
+        self.submissions: list[tuple[bytes, str, str | None]] = []
+        self.status_calls = 0
+        self.fetch_calls = 0
+
+    async def submit(
+        self,
+        *,
+        trace_path: Path,
+        profile: str,
+        question: str | None,
+    ) -> LocalEngineRun:
+        self.submissions.append((trace_path.read_bytes(), profile, question))
+        raise AssertionError("AI-only rerun must not submit SmartPerfetto work")
+
+    async def status(self, run: LocalEngineRun) -> str:
+        del run
+        self.status_calls += 1
+        raise AssertionError("AI-only rerun must not query a prior SmartPerfetto session")
+
+    async def fetch_result(self, run: LocalEngineRun) -> EngineResult:
+        del run
+        self.fetch_calls += 1
+        raise AssertionError("AI-only rerun must not fetch a prior SmartPerfetto session")
+
+    async def cancel(self, run: LocalEngineRun) -> None:
+        del run
+        raise AssertionError("AI-only rerun must not cancel a prior SmartPerfetto session")
+
+    async def aclose(self) -> None:
+        return None
+
+
 @dataclass(frozen=True)
 class _FakeDevice:
     serial: str
@@ -973,6 +1007,40 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
     assert metric_values["memory.meminfo.native_heap.private_dirty_kb"] == 30000
     assert serial not in json.dumps(report)
 
+    restarted_gateway = _UnavailableAfterRestartSmartPerfettoGateway()
+    restarted_app = create_local_app(
+        gateway=restarted_gateway,
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(restarted_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        rerun = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",
+            headers=headers,
+        )
+        assert rerun.status_code == 201
+        assert rerun.json()["generation"] == 2
+        for _ in range(100):
+            rerun_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if rerun_state["state"] in {"completed", "partially_completed", "failed"}:
+                break
+            time.sleep(0.01)
+        rerun_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert rerun_state["state"] == "partially_completed"
+    assert rerun_report.status_code == 200
+    assert rerun_report.json()["report_version"] == 2
+    assert restarted_gateway.submissions == []
+    assert restarted_gateway.status_calls == 0
+    assert restarted_gateway.fetch_calls == 0
+
 
 def test_local_app_lists_one_active_analysis_and_rejects_a_second(
     tmp_path: Path,
@@ -1523,6 +1591,24 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     assert legacy_report["report_version"] == 1
     store.save_state(legacy_id, legacy_state)
     store.save_document(legacy_id, "report.json", legacy_report)
+    legacy_projection = store.load_document(original_id, "projection.json")
+    legacy_core = store.load_document(original_id, "normalized-core.json")
+    legacy_source_report = store.load_document(
+        original_id,
+        "smartperfetto-report.json",
+    )
+    assert legacy_projection is not None
+    assert legacy_core is not None
+    assert legacy_source_report is not None
+    legacy_projection["analysis_id"] = str(legacy_id)
+    legacy_core["analysis_id"] = str(legacy_id)
+    store.save_document(legacy_id, "projection.json", legacy_projection)
+    store.save_document(legacy_id, "normalized-core.json", legacy_core)
+    store.save_document(
+        legacy_id,
+        "smartperfetto-report.json",
+        legacy_source_report,
+    )
     legacy_round_2 = {"sentinel": "legacy-round-2"}
     legacy_round_3 = {"sentinel": "legacy-round-3"}
     store.save_document(legacy_id, "round-2.json", legacy_round_2)
@@ -1626,6 +1712,185 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         assert (legacy_directory / "round-3.json").read_bytes() == legacy_round_3_bytes
 
     assert restored_gateway.submissions == []
+
+
+def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
+    tmp_path: Path,
+) -> None:
+    first_app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(first_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+        )
+        for _ in range(100):
+            first_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if first_state["report_available"]:
+                break
+            time.sleep(0.01)
+        assert first_state["state"] == "completed"
+
+    legacy_directory = tmp_path / "analyses" / analysis_id
+    (legacy_directory / "normalized-core.json").unlink(missing_ok=True)
+    assert {
+        "projection.json",
+        "report.json",
+        "smartperfetto-report.json",
+    }.issubset(path.name for path in legacy_directory.iterdir())
+
+    restarted_gateway = _UnavailableAfterRestartSmartPerfettoGateway()
+    second_app = create_local_app(
+        gateway=restarted_gateway,
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(second_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        rerun = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",
+            headers=headers,
+        )
+        assert rerun.status_code == 201
+        assert rerun.json()["generation"] == 2
+        for _ in range(100):
+            rerun_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if rerun_state["state"] in {"completed", "partially_completed", "failed"}:
+                break
+            time.sleep(0.01)
+        rerun_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert rerun_state["state"] == "completed"
+    assert rerun_state["ai_rounds"] == [
+        {"round": 1, "role": "report", "state": "completed", "attempts": 1}
+    ]
+    assert rerun_report.status_code == 200
+    assert rerun_report.json()["report_version"] == 2
+    assert restarted_gateway.submissions == []
+    assert restarted_gateway.status_calls == 0
+    assert restarted_gateway.fetch_calls == 0
+    migrated_core = LocalAnalysisStore(tmp_path).load_document(
+        UUID(analysis_id),
+        "normalized-core.json",
+    )
+    assert migrated_core is not None
+    assert validate_contract("normalized-trace-report", migrated_core)[
+        "analysis_id"
+    ] == analysis_id
+
+
+def test_local_app_rejects_tampered_rerun_evidence_and_keeps_the_old_report(
+    tmp_path: Path,
+) -> None:
+    first_app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(first_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+        )
+        for _ in range(100):
+            first_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if first_state["report_available"]:
+                break
+            time.sleep(0.01)
+        old_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        ).json()
+
+    store = LocalAnalysisStore(tmp_path)
+    parsed_analysis_id = UUID(analysis_id)
+    projection = store.load_document(parsed_analysis_id, "projection.json")
+    assert projection is not None
+    projection["question"] = "tampered persisted question"
+    store.save_document(parsed_analysis_id, "projection.json", projection)
+    provider = _InvalidReportProvider()
+    restarted_gateway = _UnavailableAfterRestartSmartPerfettoGateway()
+    second_app = create_local_app(
+        gateway=restarted_gateway,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(second_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        rerun = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",
+            headers=headers,
+        )
+        assert rerun.status_code == 201
+        for _ in range(100):
+            failed_state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if failed_state["state"] in {"completed", "partially_completed", "failed"}:
+                break
+            time.sleep(0.01)
+        preserved_report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert failed_state["state"] == "partially_completed"
+    assert failed_state["failure"] == {
+        "code": "ai_source_evidence_invalid",
+        "message": "PerfPilot AI 最终报告无法从已保存的分析证据生成",
+        "retryable": True,
+    }
+    assert failed_state["ai_rounds"] == [
+        {"round": 1, "role": "report", "state": "failed", "attempts": 0}
+    ]
+    assert [item["state"] for item in failed_state["stages"]] == [
+        "completed",
+        "completed",
+        "failed",
+        "completed",
+    ]
+    assert preserved_report.status_code == 200
+    assert preserved_report.json() == old_report
+    assert provider.calls == 0
+    assert restarted_gateway.status_calls == 0
+    assert restarted_gateway.fetch_calls == 0
 
 
 def test_local_app_installs_recovery_task_before_persisting_initial_state(

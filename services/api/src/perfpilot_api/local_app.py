@@ -49,10 +49,11 @@ from perfpilot_api.engines.smartperfetto_contracts import (
     SmartPerfettoReportResponse,
     SmartPerfettoStatusResponse,
     SmartPerfettoTraceUploadResponse,
+    validate_sanitized_report_payload,
 )
 from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
 from perfpilot_api.local_device import AdbDeviceProbe, LocalDevice, LocalDeviceProbe
-from perfpilot_api.local_analysis_store import LocalAnalysisStore
+from perfpilot_api.local_analysis_store import LocalAnalysisStore, LocalAnalysisStoreError
 from perfpilot_api.local_device_capture import (
     LocalAndroidToolchain,
     LocalDeviceCaptureError,
@@ -149,6 +150,12 @@ class LocalEngineRun:
 
 class _StaleLocalGeneration(RuntimeError):
     pass
+
+
+class _PersistedLocalEvidenceError(RuntimeError):
+    def __init__(self, stable_code: str) -> None:
+        self.stable_code = stable_code
+        super().__init__(stable_code)
 
 
 class LocalAnalysisGateway(Protocol):
@@ -1151,6 +1158,169 @@ def _source_metadata(
     return rounds, verification
 
 
+def _validated_persisted_source_report(value: object) -> dict[str, object]:
+    try:
+        if not isinstance(value, Mapping):
+            raise ValueError
+        report_id = value.get("reportId")
+        validated = validate_sanitized_report_payload(
+            {"reportId": report_id, "report": value}
+        )
+        report = validated["report"]
+        if not isinstance(report, dict):
+            raise ValueError
+        return report
+    except (TypeError, ValueError):
+        raise _PersistedLocalEvidenceError("ai_source_evidence_invalid") from None
+
+
+def _remap_projection_artifact(
+    projection_document: Mapping[str, object],
+    *,
+    replacement: UUID,
+) -> dict[str, object]:
+    migrated = dict(projection_document)
+    source = migrated.get("source")
+    scenarios = migrated.get("scenarios")
+    if not isinstance(source, Mapping) or not isinstance(scenarios, list):
+        raise _PersistedLocalEvidenceError("ai_source_evidence_invalid")
+    original = source.get("canonical_artifact_id")
+    migrated["source"] = {**source, "canonical_artifact_id": str(replacement)}
+    migrated_scenarios: list[dict[str, object]] = []
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping) or not isinstance(
+            scenario.get("evidence"), list
+        ):
+            raise _PersistedLocalEvidenceError("ai_source_evidence_invalid")
+        migrated_evidence = [
+            {
+                **evidence,
+                "artifact_id": (
+                    str(replacement)
+                    if evidence.get("artifact_id") == original
+                    else evidence.get("artifact_id")
+                ),
+            }
+            for evidence in scenario["evidence"]
+            if isinstance(evidence, Mapping)
+        ]
+        if len(migrated_evidence) != len(scenario["evidence"]):
+            raise _PersistedLocalEvidenceError("ai_source_evidence_invalid")
+        migrated_scenarios.append({**scenario, "evidence": migrated_evidence})
+    migrated["scenarios"] = migrated_scenarios
+    return validate_contract("analysis-projection", migrated)
+
+
+def _prepared_from_persisted_documents(
+    analysis: _LocalAnalysis,
+    *,
+    source_value: object,
+    core_value: object | None,
+    projection_value: object,
+) -> _PreparedLocalReport:
+    source_report = _validated_persisted_source_report(source_value)
+    try:
+        projection_document = validate_contract("analysis-projection", projection_value)
+        projection_bytes = canonical_json_bytes(projection_document)
+        projection = AIProjection(
+            canonical_bytes=projection_bytes,
+            sha256_b64=_sha256_b64(projection_bytes),
+        )
+        source_rounds, source_verification = _source_metadata(source_report)
+        if (
+            analysis.source_rounds is not None
+            and source_rounds != analysis.source_rounds
+        ) or (
+            analysis.source_verification != "unknown"
+            and source_verification != analysis.source_verification
+        ):
+            raise ValueError
+        if core_value is None:
+            if analysis.analysis_mode != "trace_upload":
+                raise _PersistedLocalEvidenceError("ai_source_evidence_unavailable")
+            for source_state in ("completed", "insufficient_data"):
+                rebuilt = _prepare_local_report(
+                    analysis,
+                    EngineResult(
+                        contract="workspace-agent-v1",
+                        state=source_state,
+                        payload={
+                            "reportId": source_report["reportId"],
+                            "report": source_report,
+                        },
+                    ),
+                )
+                migrated_projection = _remap_projection_artifact(
+                    projection_document,
+                    replacement=rebuilt.canonical_artifact_id,
+                )
+                if canonical_json_bytes(migrated_projection) == (
+                    rebuilt.projection.canonical_bytes
+                ):
+                    return rebuilt
+            raise ValueError
+        core_document = validate_contract("normalized-trace-report", core_value)
+        if (
+            core_document["analysis_id"] != str(analysis.analysis_id)
+            or core_document["analysis_mode"] != analysis.analysis_mode
+            or projection_document["analysis_id"] != str(analysis.analysis_id)
+            or projection_document["analysis_profile"] != analysis.profile
+            or projection_document["question"] != analysis.question
+        ):
+            raise ValueError
+        core_bytes = canonical_json_bytes(core_document)
+        normalized = NormalizedTraceReport(
+            canonical_bytes=core_bytes,
+            sha256_b64=_sha256_b64(core_bytes),
+        )
+        provenance = core_document.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise ValueError
+        canonical_artifact_id = UUID(str(provenance["canonical_artifact_id"]))
+        projection_failure_code: str | None = None
+        try:
+            expected_projection = build_ai_projection(
+                normalized,
+                analysis_profile=analysis.profile,  # type: ignore[arg-type]
+                question=analysis.question,
+            )
+        except (ProjectionPrivacyError, ProjectionQuestionError, ProjectionSizeError) as error:
+            projection_failure_code = {
+                ProjectionPrivacyError: "ai_projection_private_data",
+                ProjectionQuestionError: "ai_projection_invalid_question",
+                ProjectionSizeError: "ai_projection_too_large",
+            }[type(error)]
+            expected_projection = _blocked_ai_projection(
+                analysis_id=analysis.analysis_id,
+                analysis_profile=analysis.profile,
+                canonical_artifact_id=canonical_artifact_id,
+            )
+        if (
+            expected_projection.canonical_bytes != projection.canonical_bytes
+            or expected_projection.sha256_b64 != projection.sha256_b64
+        ):
+            raise ValueError
+        canonical_sha256_b64 = _validated_checksum(
+            str(provenance["canonical_sha256_b64"])
+        )
+        normalizer_version = provenance.get("normalizer_version")
+        if not isinstance(normalizer_version, str) or not normalizer_version:
+            raise ValueError
+        return _PreparedLocalReport(
+            core_document=core_document,
+            projection=projection,
+            projection_failure_code=projection_failure_code,
+            canonical_artifact_id=canonical_artifact_id,
+            canonical_sha256_b64=canonical_sha256_b64,
+            normalizer_version=normalizer_version,
+            source_report=source_report,
+        )
+    except _PersistedLocalEvidenceError:
+        raise
+    except Exception:
+        raise _PersistedLocalEvidenceError("ai_source_evidence_invalid") from None
+
+
 class _LocalRuntime:
     def __init__(
         self,
@@ -1566,28 +1736,20 @@ class _LocalRuntime:
         start_gate = asyncio.Event()
 
         async def execute_reserved(
-            run: LocalEngineRun,
             generation: int,
         ) -> None:
             await start_gate.wait()
-            await self._execute_run(
+            await self._execute_persisted_synthesis(
                 analysis,
-                run,
                 generation=generation,
             )
 
         async with self.lock:
-            if analysis.source_run is None:
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    "SmartPerfetto source analysis is unavailable",
-                )
             if analysis.task is not None and not analysis.task.done():
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     "analysis is already running",
                 )
-            source_run = analysis.source_run
             previous_generation = analysis.generation
             previous_state = analysis.state
             previous_failure = (
@@ -1609,7 +1771,7 @@ class _LocalRuntime:
             analysis.version += 1
             generation = analysis.generation
             reserved_version = analysis.version
-            task = asyncio.create_task(execute_reserved(source_run, generation))
+            task = asyncio.create_task(execute_reserved(generation))
             analysis.task = task
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
@@ -1635,6 +1797,81 @@ class _LocalRuntime:
             raise
         start_gate.set()
         return generation
+
+    def _load_persisted_prepared(
+        self,
+        analysis: _LocalAnalysis,
+    ) -> _PreparedLocalReport:
+        try:
+            source_value = self.store.load_document(
+                analysis.analysis_id,
+                "smartperfetto-report.json",
+            )
+            projection_value = self.store.load_document(
+                analysis.analysis_id,
+                "projection.json",
+            )
+            core_value = self.store.load_document(
+                analysis.analysis_id,
+                "normalized-core.json",
+            )
+            if source_value is None or projection_value is None:
+                raise _PersistedLocalEvidenceError(
+                    "ai_source_evidence_unavailable"
+                )
+            return _prepared_from_persisted_documents(
+                analysis,
+                source_value=source_value,
+                core_value=core_value,
+                projection_value=projection_value,
+            )
+        except _PersistedLocalEvidenceError:
+            raise
+        except LocalAnalysisStoreError:
+            raise _PersistedLocalEvidenceError(
+                "ai_source_evidence_invalid"
+            ) from None
+
+    async def _execute_persisted_synthesis(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        generation: int,
+    ) -> None:
+        try:
+            prepared = await asyncio.to_thread(
+                self._load_persisted_prepared,
+                analysis,
+            )
+            await self._publish_prepared(
+                analysis,
+                prepared,
+                generation=generation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except _StaleLocalGeneration:
+            return
+        except _PersistedLocalEvidenceError as error:
+            _LOGGER.warning(
+                "Local AI rerun evidence rejected code=%s",
+                error.stable_code,
+            )
+            await self._fail_synthesis_rerun(
+                analysis,
+                generation=generation,
+                failure_code=error.stable_code,
+            )
+        except Exception as error:
+            _LOGGER.exception(
+                "Local AI rerun failed type=%s",
+                type(error).__name__,
+            )
+            await self._fail_synthesis_rerun(
+                analysis,
+                generation=generation,
+                failure_code="ai_report_rerun_failed",
+            )
 
     async def analysis(self, analysis_id: UUID) -> _LocalAnalysis:
         async with self.lock:
@@ -2066,6 +2303,12 @@ class _LocalRuntime:
         await asyncio.to_thread(
             self.store.save_document,
             analysis.analysis_id,
+            "normalized-core.json",
+            prepared.core_document,
+        )
+        await asyncio.to_thread(
+            self.store.save_document,
+            analysis.analysis_id,
             "smartperfetto-report.json",
             prepared.source_report,
         )
@@ -2177,6 +2420,38 @@ class _LocalRuntime:
             analysis.state = str(report["state"])
             analysis.completed_at = datetime.now(UTC)
             analysis.stages["report"] = "completed"
+            analysis.version += 1
+        await self._persist(analysis)
+
+    async def _fail_synthesis_rerun(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        generation: int,
+        failure_code: str,
+    ) -> None:
+        async with self.lock:
+            if analysis.generation != generation:
+                return
+            if analysis.cancel_requested_at is not None or analysis.state == "canceled":
+                return
+            for round_state in analysis.ai_rounds:
+                if round_state.state in {"pending", "running"}:
+                    round_state.state = "failed"
+            analysis.state = (
+                "partially_completed" if analysis.report is not None else "failed"
+            )
+            analysis.failure = {
+                "code": failure_code,
+                "message": "PerfPilot AI 最终报告无法从已保存的分析证据生成",
+                "retryable": True,
+            }
+            analysis.stages["smartperfetto"] = "completed"
+            analysis.stages["perfpilot_ai"] = "failed"
+            analysis.stages["report"] = (
+                "completed" if analysis.report is not None else "not_requested"
+            )
+            analysis.completed_at = datetime.now(UTC)
             analysis.version += 1
         await self._persist(analysis)
 
