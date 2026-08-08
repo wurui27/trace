@@ -11,6 +11,8 @@ from typing import Literal
 
 from jsonschema import Draft202012Validator, FormatChecker, validators
 
+from perfpilot_api.reports.semantics import validate_source_aware_semantics
+
 
 ContractName = Literal[
     "analysis-report",
@@ -85,8 +87,9 @@ def validate_contract(name: ContractName, value: object) -> dict[str, object]:
     try:
         copied = json.loads(canonical_json_bytes(value))
         _validator(name).validate(copied)
+        if not isinstance(copied, dict):
+            raise ReportContractError
+        validate_source_aware_semantics(name, copied)
     except Exception:
         raise ReportContractError from None
-    if not isinstance(copied, dict):
-        raise ReportContractError
     return copied

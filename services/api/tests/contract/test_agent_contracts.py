@@ -8,6 +8,12 @@ from pathlib import Path
 import jsonschema
 import pytest
 
+from perfpilot_agent.source_contracts import (
+    SourceContractError,
+    canonical_source_contract_bytes,
+    validate_source_contract_semantics,
+)
+
 ROOT = Path(__file__).parents[4]
 
 CONTRACT_EXAMPLES = (
@@ -39,47 +45,12 @@ def example(example_name: str) -> dict[str, object]:
     )
 
 
-def _canonical_json_bytes(document: object) -> bytes:
-    return json.dumps(
-        document,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-
-
 def _validate_agent_contract(schema_name: str, document: dict[str, object]) -> None:
     validator(schema_name).validate(document)
-    payload = document
-    if schema_name == "agents/task-poll-response.schema.json":
-        snapshot = document.get("snapshot")
-        if not isinstance(snapshot, dict):
-            return
-        payload = snapshot
-    if payload.get("task_type") == "patch_verification":
-        patch = payload.get("patch")
-        if isinstance(patch, str) and len(patch.encode("utf-8")) > 65_536:
-            raise jsonschema.ValidationError("patch exceeds UTF-8 byte budget")
-    if schema_name != "agents/source-task-completion.schema.json":
-        return
-    if len(_canonical_json_bytes(document)) > 128 * 1024:
-        raise jsonschema.ValidationError("completion exceeds canonical byte budget")
-    if document.get("task_type") != "source_context" or document.get("state") != "completed":
-        return
-    result = document.get("result")
-    if not isinstance(result, dict):
-        return
-    fragments = result.get("fragments")
-    if not isinstance(fragments, list):
-        return
-    fragment_bytes = sum(
-        len(fragment["content"].encode("utf-8"))
-        for fragment in fragments
-        if isinstance(fragment, dict) and isinstance(fragment.get("content"), str)
-    )
-    if fragment_bytes > 98_304:
-        raise jsonschema.ValidationError("fragments exceed UTF-8 byte budget")
+    try:
+        validate_source_contract_semantics(schema_name, document)
+    except SourceContractError as exc:
+        raise jsonschema.ValidationError("source task semantics are invalid") from exc
 
 
 def _sized_unified_diff(path: str, target_bytes: int) -> str:
@@ -387,8 +358,8 @@ def test_source_completion_enforces_fragment_utf8_aggregate_budget() -> None:
         }
         for index in (1, 2)
     ]
-    assert len(_canonical_json_bytes(aggregate_over)) <= 128 * 1024
-    with pytest.raises(jsonschema.ValidationError, match="UTF-8 byte budget"):
+    assert len(canonical_source_contract_bytes(aggregate_over)) <= 128 * 1024
+    with pytest.raises(jsonschema.ValidationError):
         _validate_agent_contract("agents/source-task-completion.schema.json", aggregate_over)
 
 
@@ -403,7 +374,11 @@ def test_source_completion_enforces_canonical_json_budget() -> None:
         }
         for index in range(64)
     ]
-    assert 120 * 1024 < len(_canonical_json_bytes(canonical_near)) <= 128 * 1024
+    assert (
+        120 * 1024
+        < len(canonical_source_contract_bytes(canonical_near))
+        <= 128 * 1024
+    )
     _validate_agent_contract("agents/source-task-completion.schema.json", canonical_near)
 
     canonical_over = deepcopy(completion)
@@ -419,8 +394,8 @@ def test_source_completion_enforces_canonical_json_budget() -> None:
         len(item["content"].encode("utf-8"))
         for item in canonical_over["result"]["fragments"]  # type: ignore[index]
     ) <= 98_304
-    assert len(_canonical_json_bytes(canonical_over)) > 128 * 1024
-    with pytest.raises(jsonschema.ValidationError, match="canonical byte budget"):
+    assert len(canonical_source_contract_bytes(canonical_over)) > 128 * 1024
+    with pytest.raises(jsonschema.ValidationError):
         _validate_agent_contract("agents/source-task-completion.schema.json", canonical_over)
 
 
@@ -458,8 +433,32 @@ def test_patch_task_enforces_utf8_bytes_not_character_count(embedded: bool) -> N
 
     snapshot["patch"] = _sized_unified_diff(path, 65_537)
     assert len(snapshot["patch"]) <= 65_536  # type: ignore[arg-type]
-    with pytest.raises(jsonschema.ValidationError, match="UTF-8 byte budget"):
+    with pytest.raises(jsonschema.ValidationError):
         _validate_agent_contract(schema_name, document)
+
+
+def test_source_contract_semantic_failures_are_redacted() -> None:
+    snapshot = example("source-task-snapshot.valid.json")
+    snapshot = {
+        key: value for key, value in snapshot.items() if key not in {"finding_hints", "limits"}
+    }
+    snapshot.update(
+        {
+            "task_type": "patch_verification",
+            "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+            "snapshot_id": "95000000-0000-4000-8000-000000000001",
+            "snapshot_hash": "a" * 64,
+            "fix_id": "96000000-0000-4000-8000-000000000001",
+            "patch": "private-token" + "界" * 21_846,
+        }
+    )
+    with pytest.raises(SourceContractError) as exc_info:
+        validate_source_contract_semantics(
+            "agents/source-task-snapshot.schema.json",
+            snapshot,
+        )
+    assert str(exc_info.value) == "source task contract is invalid"
+    assert "private-token" not in str(exc_info.value)
 
 
 def test_heartbeat_v11_workspaces_are_public_bounded_metadata() -> None:

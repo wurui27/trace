@@ -3,7 +3,6 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
-import re
 from copy import deepcopy
 from functools import lru_cache
 from pathlib import Path
@@ -11,6 +10,11 @@ from typing import Callable
 
 import jsonschema
 import pytest
+
+from perfpilot_api.reports.semantics import (
+    SourceAwareSemanticError,
+    validate_source_aware_semantics,
+)
 
 ROOT = Path(__file__).parents[4]
 AI_SOURCE_FIX_FIELDS = (
@@ -28,22 +32,6 @@ AI_SOURCE_FIX_FIELDS = (
     "validation_profile_id",
     "retest_target",
 )
-ALLOWED_SOURCE_FIX_EXTENSIONS = (".kt", ".java", ".xml")
-FORBIDDEN_DIFF_METADATA_PREFIXES = (
-    "Binary files ",
-    "new file mode ",
-    "deleted file mode ",
-    "old mode ",
-    "new mode ",
-    "similarity index ",
-    "dissimilarity index ",
-    "rename from ",
-    "rename to ",
-    "copy from ",
-    "copy to ",
-)
-
-
 @lru_cache
 def _validator(schema_name: str) -> jsonschema.Draft202012Validator:
     schema = json.loads((ROOT / "contracts/v1" / schema_name).read_text(encoding="utf-8"))
@@ -59,287 +47,18 @@ def _example(example_name: str) -> dict[str, object]:
 
 def _validate_ai_contract(schema_name: str, document: dict[str, object]) -> None:
     _validator(schema_name).validate(document)
-    if schema_name == "ai/analysis-projection.schema.json":
-        source_context = document.get("source_context")
-        if isinstance(source_context, dict):
-            _enforce_utf8_collection_limit(
-                source_context.get("fragments"),
-                field="content",
-                limit=98_304,
-                label="source fragments",
-            )
+    contract_name_by_schema = {
+        "ai/analysis-projection.schema.json": "analysis-projection",
+        "ai/synthesis-output.schema.json": "synthesis-output",
+        "reports/analysis-report.schema.json": "analysis-report",
+    }
+    contract_name = contract_name_by_schema.get(schema_name)
+    if contract_name is None:
         return
-    output: object = document
-    if schema_name == "reports/analysis-report.schema.json":
-        synthesis = document.get("synthesis")
-        output = synthesis.get("output") if isinstance(synthesis, dict) else None
-        source_code = document.get("source_code")
-        if isinstance(source_code, dict):
-            _enforce_utf8_collection_limit(
-                source_code.get("fixes"),
-                field="diff",
-                limit=65_536,
-                label="report source fixes",
-            )
-            _enforce_unified_diff_headers(source_code.get("fixes"))
-            if document.get("schema_version") == "1.2":
-                _enforce_report_source_coherence(output, source_code)
-                _enforce_verified_patch_artifacts(source_code)
-    if isinstance(output, dict) and output.get("schema_version") == "2.0":
-        _enforce_utf8_collection_limit(
-            output.get("source_fixes"),
-            field="diff",
-            limit=65_536,
-            label="synthesis source fixes",
-        )
-        _enforce_unified_diff_headers(output.get("source_fixes"))
-
-
-def _enforce_utf8_collection_limit(
-    items: object,
-    *,
-    field: str,
-    limit: int,
-    label: str,
-) -> None:
-    if not isinstance(items, list):
-        return
-    total = sum(
-        len(item[field].encode("utf-8"))
-        for item in items
-        if isinstance(item, dict) and isinstance(item.get(field), str)
-    )
-    if total > limit:
-        raise jsonschema.ValidationError(f"{label} exceed UTF-8 byte budget")
-
-
-def _enforce_report_source_coherence(
-    synthesis_output: object,
-    source_code: dict[str, object],
-) -> None:
-    source_refs = source_code.get("source_refs")
-    public_fixes = source_code.get("fixes")
-    if not isinstance(source_refs, list) or not isinstance(public_fixes, list):
-        return
-
-    ref_by_id: dict[object, dict[str, object]] = {}
-    for source_ref in source_refs:
-        if not isinstance(source_ref, dict):
-            continue
-        source_ref_id = source_ref.get("source_ref_id")
-        if source_ref_id in ref_by_id:
-            raise jsonschema.ValidationError("source ref IDs must be unique")
-        ref_by_id[source_ref_id] = source_ref
-
-    match_summary = source_code.get("match_summary")
-    if match_summary == "weak" and any(
-        source_ref.get("match_grade") != "weak" for source_ref in ref_by_id.values()
-    ):
-        raise jsonschema.ValidationError("weak match summary requires weak source refs")
-    if match_summary == "none" and (source_refs or public_fixes):
-        raise jsonschema.ValidationError("none match summary carries no source refs or fixes")
-    if match_summary == "strong" and not any(
-        source_ref.get("match_grade") == "strong"
-        for source_ref in ref_by_id.values()
-    ):
-        raise jsonschema.ValidationError("strong match summary requires a strong source ref")
-
-    snapshot = source_code.get("snapshot")
-    snapshot_hash = snapshot.get("snapshot_hash") if isinstance(snapshot, dict) else None
-    if any(
-        source_ref.get("snapshot_hash") != snapshot_hash
-        for source_ref in ref_by_id.values()
-    ):
-        raise jsonschema.ValidationError("source ref snapshot hash is incoherent")
-
-    synthesis_fixes = (
-        synthesis_output.get("source_fixes")
-        if isinstance(synthesis_output, dict)
-        else []
-    )
-    if not isinstance(synthesis_fixes, list):
-        return
-    fix_ids = [
-        synthesis_fix.get("fix_id")
-        for synthesis_fix in synthesis_fixes
-        if isinstance(synthesis_fix, dict)
-    ]
-    if len(fix_ids) != len(set(fix_ids)):
-        raise jsonschema.ValidationError("source fix IDs must be unique")
-    if len(public_fixes) != len(synthesis_fixes):
-        raise jsonschema.ValidationError(
-            "report source fixes must exactly enrich synthesis source fixes"
-        )
-
-    report_profile_id = source_code.get("validation_profile_id")
-    for synthesis_fix, public_fix in zip(synthesis_fixes, public_fixes, strict=True):
-        if not isinstance(synthesis_fix, dict) or not isinstance(public_fix, dict):
-            continue
-        if any(
-            synthesis_fix.get(field) != public_fix.get(field)
-            for field in AI_SOURCE_FIX_FIELDS
-        ):
-            raise jsonschema.ValidationError(
-                "report source fixes must exactly enrich synthesis source fixes in order"
-            )
-
-        for source_ref_id in synthesis_fix.get("source_ref_ids", []):
-            source_ref = ref_by_id.get(source_ref_id)
-            if source_ref is None:
-                raise jsonschema.ValidationError("source fix has a dangling source ref")
-            if source_ref.get("snapshot_hash") != snapshot_hash:
-                raise jsonschema.ValidationError("source fix snapshot hash is incoherent")
-            if source_ref.get("relative_path") != synthesis_fix.get("relative_path"):
-                raise jsonschema.ValidationError("source fix path does not match source ref")
-            if source_ref.get("symbol") != synthesis_fix.get("symbol"):
-                raise jsonschema.ValidationError("source fix symbol does not match source ref")
-            if synthesis_fix.get("finding_id") not in source_ref.get("finding_ids", []):
-                raise jsonschema.ValidationError(
-                    "source fix finding is not linked by source ref"
-                )
-            if not set(synthesis_fix.get("evidence_ids", [])).issubset(
-                source_ref.get("evidence_ids", [])
-            ):
-                raise jsonschema.ValidationError(
-                    "source fix evidence is not linked by source ref"
-                )
-            if synthesis_fix.get("rule_id") not in source_ref.get("rule_ids", []):
-                raise jsonschema.ValidationError("source fix rule is not allowed by source ref")
-            if not (
-                synthesis_fix.get("match_grade")
-                == source_ref.get("match_grade")
-                == "strong"
-            ):
-                raise jsonschema.ValidationError("source fix requires a strong source ref")
-
-        verification = public_fix.get("verification")
-        if not isinstance(verification, dict):
-            continue
-        fix_profile_id = public_fix.get("validation_profile_id")
-        if not (
-            verification.get("profile_id")
-            == fix_profile_id
-            == report_profile_id
-        ):
-            raise jsonschema.ValidationError(
-                "source fix verification profile is incoherent"
-            )
-
-
-def _enforce_verified_patch_artifacts(source_code: dict[str, object]) -> None:
-    public_fixes = source_code.get("fixes")
-    if not isinstance(public_fixes, list):
-        return
-    for public_fix in public_fixes:
-        if not isinstance(public_fix, dict):
-            continue
-        verification = public_fix.get("verification")
-        if not isinstance(verification, dict) or verification.get("state") != "verified":
-            continue
-        artifact = verification.get("patch_artifact")
-        diff = public_fix.get("diff")
-        if not isinstance(artifact, dict) or not isinstance(diff, str):
-            continue
-        diff_bytes = diff.encode("utf-8")
-        digest = hashlib.sha256(diff_bytes).digest()
-        if (
-            artifact.get("size") != len(diff_bytes)
-            or verification.get("patch_sha256") != digest.hex()
-            or artifact.get("sha256_b64")
-            != base64.b64encode(digest).decode("ascii")
-            or artifact.get("mime") != "text/x-diff"
-        ):
-            raise jsonschema.ValidationError(
-                "verified patch artifact does not match canonical UTF-8 diff bytes"
-            )
-
-
-def _enforce_unified_diff_headers(items: object) -> None:
-    if not isinstance(items, list):
-        return
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        relative_path = item.get("relative_path")
-        diff = item.get("diff")
-        if not isinstance(relative_path, str) or not isinstance(diff, str):
-            continue
-        lines = diff.splitlines()
-        if len(lines) < 3:
-            raise jsonschema.ValidationError("source fix is not a unified diff")
-        section_headers = [
-            index for index, line in enumerate(lines) if line.startswith("diff --git ")
-        ]
-        if section_headers != [0]:
-            raise jsonschema.ValidationError(
-                "source fix must contain exactly one diff section"
-            )
-        old_file_headers = [
-            index for index, line in enumerate(lines) if line.startswith("--- ")
-        ]
-        new_file_headers = [
-            index for index, line in enumerate(lines) if line.startswith("+++ ")
-        ]
-        if old_file_headers != [1] or new_file_headers != [2]:
-            raise jsonschema.ValidationError(
-                "source fix must contain exactly one leading file header pair"
-            )
-        matches = (
-            re.fullmatch(r"diff --git a/([^\r\n]+) b/([^\r\n]+)", lines[0]),
-            re.fullmatch(r"--- a/([^\r\n]+)", lines[1]),
-            re.fullmatch(r"\+\+\+ b/([^\r\n]+)", lines[2]),
-        )
-        if any(match is None for match in matches):
-            raise jsonschema.ValidationError("source fix is not a unified diff")
-        header_paths = (
-            matches[0].group(1),  # type: ignore[union-attr]
-            matches[0].group(2),  # type: ignore[union-attr]
-            matches[1].group(1),  # type: ignore[union-attr]
-            matches[2].group(1),  # type: ignore[union-attr]
-        )
-        if any(not _safe_relative_diff_path(path) for path in header_paths):
-            raise jsonschema.ValidationError("source fix has an unsafe diff path")
-        if any(path != relative_path for path in header_paths):
-            raise jsonschema.ValidationError("source fix diff headers do not match path")
-
-        seen_hunk = False
-        seen_change = False
-        for line in lines[3:]:
-            if line == "GIT binary patch" or line.startswith(
-                FORBIDDEN_DIFF_METADATA_PREFIXES
-            ):
-                raise jsonschema.ValidationError(
-                    "source fix contains forbidden diff metadata"
-                )
-            if re.fullmatch(
-                r"@@ -\d+(?:,\d+)? \+\d+(?:,\d+)? @@(?: .*)?",
-                line,
-            ):
-                seen_hunk = True
-                continue
-            if not seen_hunk:
-                raise jsonschema.ValidationError("source fix has content before its hunk")
-            if line.startswith(("+", "-")):
-                seen_change = True
-                continue
-            if line.startswith(" ") or line == r"\ No newline at end of file":
-                continue
-            raise jsonschema.ValidationError("source fix has invalid hunk content")
-        if not seen_hunk or not seen_change:
-            raise jsonschema.ValidationError("source fix requires a complete changed hunk")
-
-
-def _safe_relative_diff_path(path: str) -> bool:
-    parts = path.split("/")
-    return not (
-        path.startswith("/")
-        or re.match(r"^[A-Za-z]:/", path)
-        or "\\" in path
-        or "//" in path
-        or any(part in {"", ".", ".."} for part in parts)
-        or any(part.casefold() == ".git" for part in parts)
-        or not path.endswith(ALLOWED_SOURCE_FIX_EXTENSIONS)
-    )
+    try:
+        validate_source_aware_semantics(contract_name, document)
+    except SourceAwareSemanticError as exc:
+        raise jsonschema.ValidationError("source-aware semantics are invalid") from exc
 
 
 def _validation_keywords(
@@ -698,7 +417,7 @@ def test_projection_v2_enforces_aggregate_fragment_utf8_bytes() -> None:
         }
         for index in (1, 2)
     ]
-    with pytest.raises(jsonschema.ValidationError, match="UTF-8 byte budget"):
+    with pytest.raises(jsonschema.ValidationError):
         _validate_ai_contract("ai/analysis-projection.schema.json", projection)
 
 
@@ -743,7 +462,7 @@ def test_v2_synthesis_enforces_aggregate_diff_utf8_bytes(
         ]
         _bind_verified_patch_metadata(document["source_code"]["fixes"][1])  # type: ignore[index]
     assert all(len(item["diff"]) <= 65_536 for item in output["source_fixes"])
-    with pytest.raises(jsonschema.ValidationError, match="UTF-8 byte budget"):
+    with pytest.raises(jsonschema.ValidationError):
         _validate_ai_contract(schema_name, document)
 
 
@@ -775,7 +494,7 @@ def test_report_v12_enforces_aggregate_public_fix_diff_utf8_bytes() -> None:
         report["source_code"]["fixes"][1]["diff"]  # type: ignore[index]
     )
     _bind_verified_patch_metadata(report["source_code"]["fixes"][1])  # type: ignore[index]
-    with pytest.raises(jsonschema.ValidationError, match="UTF-8 byte budget"):
+    with pytest.raises(jsonschema.ValidationError):
         _validate_ai_contract("reports/analysis-report.schema.json", report)
 
 
@@ -1173,7 +892,7 @@ def test_report_v12_source_refs_match_snapshot_hash() -> None:
     report["synthesis"]["output"]["source_fixes"] = []  # type: ignore[index]
     mismatched_hash = deepcopy(report)
     mismatched_hash["source_code"]["source_refs"][0]["snapshot_hash"] = "e" * 64  # type: ignore[index]
-    with pytest.raises(jsonschema.ValidationError, match="snapshot hash"):
+    with pytest.raises(jsonschema.ValidationError):
         _validate_ai_contract("reports/analysis-report.schema.json", mismatched_hash)
 
 
@@ -1688,6 +1407,114 @@ def test_canonical_validation_rejects_non_finite_numbers() -> None:
     value["scenarios"][0]["metrics"][0]["numeric_value"] = float("nan")
     with pytest.raises(ReportContractError):
         validate_contract("analysis-projection", value)
+
+
+@pytest.mark.parametrize(
+    "semantic_case",
+    [
+        "synthesis-traditional-second-file",
+        "synthesis-aggregate-diff-bytes",
+        "report-mismatched-symbol",
+        "report-mismatched-snapshot",
+        "report-forged-artifact-size",
+        "report-forged-patch-sha256",
+        "report-forged-artifact-sha256",
+        "report-aggregate-diff-bytes",
+        "projection-contradictory-grade",
+        "projection-aggregate-fragment-bytes",
+    ],
+)
+def test_production_boundary_rejects_source_aware_semantic_failures(
+    semantic_case: str,
+) -> None:
+    from perfpilot_api.reports import ReportContractError, validate_contract
+
+    contract_name: str
+    if semantic_case.startswith("synthesis-"):
+        contract_name = "synthesis-output"
+        document = _example("synthesis-output-v2.valid.json")
+        source_fix = document["source_fixes"][0]
+        path = source_fix["relative_path"]
+        if semantic_case == "synthesis-traditional-second-file":
+            source_fix["diff"] += (
+                "--- a/private/Secret.kt\n"
+                "+++ b/private/Secret.kt\n"
+                "@@ -1,1 +1,1 @@\n-old\n+new\n"
+            )
+        else:
+            document["source_fixes"] = [
+                {**deepcopy(source_fix), "diff": _sized_unified_diff(path, 32_768)},
+                {
+                    **deepcopy(source_fix),
+                    "fix_id": "96000000-0000-4000-8000-000000000002",
+                    "diff": _sized_unified_diff(path, 32_769),
+                },
+            ]
+    elif semantic_case.startswith("projection-"):
+        contract_name = "analysis-projection"
+        document = _example("analysis-projection-v2.valid.json")
+        fragment = document["source_context"]["fragments"][0]
+        if semantic_case == "projection-contradictory-grade":
+            document["source_context"]["fragments"].append(  # type: ignore[index]
+                {
+                    **deepcopy(fragment),
+                    "source_ref_id": "97000000-0000-4000-8000-000000000002",
+                    "match_grade": "weak",
+                }
+            )
+        else:
+            document["source_context"]["fragments"] = [  # type: ignore[index]
+                {
+                    **deepcopy(fragment),
+                    "source_ref_id": f"97000000-0000-4000-8000-{index:012d}",
+                    "content": "界" * 16_385,
+                }
+                for index in (1, 2)
+            ]
+    else:
+        contract_name = "analysis-report"
+        document = _completed_report_v12()
+        synthesis_fix = document["synthesis"]["output"]["source_fixes"][0]  # type: ignore[index]
+        public_fix = document["source_code"]["fixes"][0]  # type: ignore[index]
+        if semantic_case == "report-mismatched-symbol":
+            for source_fix in (synthesis_fix, public_fix):
+                source_fix["symbol"] = "private.Secret.onCreate"
+        elif semantic_case == "report-mismatched-snapshot":
+            document["source_code"]["source_refs"][0]["snapshot_hash"] = "e" * 64  # type: ignore[index]
+        elif semantic_case == "report-forged-artifact-size":
+            public_fix["verification"]["patch_artifact"]["size"] += 1
+        elif semantic_case == "report-forged-patch-sha256":
+            public_fix["verification"]["patch_sha256"] = "e" * 64
+        elif semantic_case == "report-forged-artifact-sha256":
+            public_fix["verification"]["patch_artifact"]["sha256_b64"] = (  # type: ignore[index]
+                "A" * 43 + "="
+            )
+        else:
+            path = synthesis_fix["relative_path"]
+            verification = deepcopy(public_fix["verification"])
+            synthesis_fixes = [
+                {
+                    **deepcopy(synthesis_fix),
+                    "diff": _sized_unified_diff(path, 32_768),
+                },
+                {
+                    **deepcopy(synthesis_fix),
+                    "fix_id": "96000000-0000-4000-8000-000000000002",
+                    "diff": _sized_unified_diff(path, 32_769),
+                },
+            ]
+            document["synthesis"]["output"]["source_fixes"] = synthesis_fixes  # type: ignore[index]
+            document["source_code"]["fixes"] = [  # type: ignore[index]
+                {**deepcopy(source_fix), "verification": deepcopy(verification)}
+                for source_fix in synthesis_fixes
+            ]
+            for report_fix in document["source_code"]["fixes"]:  # type: ignore[index]
+                _bind_verified_patch_metadata(report_fix)
+
+    with pytest.raises(ReportContractError) as exc_info:
+        validate_contract(contract_name, document)  # type: ignore[arg-type]
+    assert str(exc_info.value) == "report contract is invalid"
+    assert "private.Secret" not in str(exc_info.value)
 
 
 def test_projection_uses_the_approved_source_and_scenarios_shape() -> None:
