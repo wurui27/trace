@@ -2,14 +2,28 @@ from __future__ import annotations
 
 import io
 import logging
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
 
 import pytest
 
 from perfpilot_agent.adb import AdbDeviceListing, ProcessResult
-from perfpilot_agent.devices import AdbDeviceProbe, DeviceInventory, DeviceProbeResult
+from perfpilot_agent.control_client import HeartbeatRequest, HeartbeatResponse
+from perfpilot_agent.credentials import AgentCredentials
+from perfpilot_agent.devices import (
+    AdbDeviceProbe,
+    DeviceInventory,
+    DeviceProbeResult,
+    HeartbeatPublisher,
+)
 from perfpilot_agent.logging import RedactingFilter, SecretRedactor
+from perfpilot_agent.platform.base import PlatformMetadata
+from perfpilot_agent.state import AgentRuntimeState
+
+NOW = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
+WORKSPACE_ID = UUID("92000000-0000-4000-8000-000000000001")
+PROFILE_ID = UUID("94000000-0000-4000-8000-000000000001")
 
 
 class FakeHost:
@@ -57,6 +71,33 @@ class FakeProbe:
             fingerprint="google/panther/demo",
             perfetto_available=True,
         )
+
+
+class EmptyInventory:
+    async def read_all(self):
+        return ()
+
+
+class CapturingHeartbeatControl:
+    def __init__(self) -> None:
+        self.request: HeartbeatRequest | None = None
+
+    async def heartbeat(self, request: HeartbeatRequest, *, access_token: str):
+        self.request = request
+        assert access_token == "ppat_" + "A" * 43
+        return HeartbeatResponse(
+            schema_version="1.0",
+            accepted_at=NOW.isoformat(),
+            next_heartbeat_seconds=10,
+            devices=(),
+        )
+
+
+def _heartbeat_credentials() -> AgentCredentials:
+    return AgentCredentials.model_construct(
+        access_token="ppat_" + "A" * 43,
+        refresh_token="pprt_" + "B" * 43,
+    )
 
 
 @pytest.mark.asyncio
@@ -180,3 +221,118 @@ def test_logging_filter_redacts_live_serials_tokens_registration_codes_and_queri
     assert "ppreg_" not in rendered
     assert "X-Amz-Signature" not in rendered
     assert rendered.count("[redacted]") >= 5
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_publishes_only_public_source_workspace_metadata(tmp_path: Path) -> None:
+    private_path = tmp_path / "private-source"
+
+    class PublicRegistry:
+        def public_workspaces(self):
+            return (
+                {
+                    "workspace_id": str(WORKSPACE_ID),
+                    "name": "Demo Android",
+                    "state": "ready",
+                    "git_branch": "main",
+                    "git_head": "a" * 40,
+                    "tracked_dirty_count": 1,
+                    "snapshot_policy": "tracked_worktree",
+                    "validation_profiles": [
+                        {"profile_id": str(PROFILE_ID), "name": "Android check"}
+                    ],
+                },
+            )
+
+    control = CapturingHeartbeatControl()
+    publisher = HeartbeatPublisher(
+        inventory=EmptyInventory(),
+        control=control,
+        credentials=_heartbeat_credentials(),
+        metadata=PlatformMetadata(platform="linux", hostname="test", os_version="test"),
+        state=AgentRuntimeState(),
+        workspace_root=tmp_path,
+        source_registry=PublicRegistry(),
+        clock=lambda: NOW,
+        disk_free=lambda _path: 1,
+    )
+
+    await publisher.publish()
+
+    assert control.request is not None
+    assert control.request.schema_version == "1.1"
+    assert control.request.model_dump(mode="json")["workspaces"] == [
+        {
+            "workspace_id": str(WORKSPACE_ID),
+            "name": "Demo Android",
+            "state": "ready",
+            "git_branch": "main",
+            "git_head": "a" * 40,
+            "tracked_dirty_count": 1,
+            "snapshot_policy": "tracked_worktree",
+            "validation_profiles": [
+                {"profile_id": str(PROFILE_ID), "name": "Android check"}
+            ],
+        }
+    ]
+    rendered = repr(control.request)
+    assert str(private_path) not in rendered
+    assert "gradlew" not in rendered
+    assert "remote" not in rendered
+
+
+@pytest.mark.asyncio
+async def test_source_registry_failure_does_not_break_device_heartbeat_or_leak_path(
+    tmp_path: Path,
+    caplog,
+) -> None:
+    private_path = tmp_path / "private-source"
+
+    class BrokenRegistry:
+        def public_workspaces(self):
+            raise RuntimeError(f"cannot inspect {private_path}")
+
+    control = CapturingHeartbeatControl()
+    publisher = HeartbeatPublisher(
+        inventory=EmptyInventory(),
+        control=control,
+        credentials=_heartbeat_credentials(),
+        metadata=PlatformMetadata(platform="linux", hostname="test", os_version="test"),
+        state=AgentRuntimeState(),
+        workspace_root=tmp_path,
+        source_registry=BrokenRegistry(),
+        clock=lambda: NOW,
+        disk_free=lambda _path: 1,
+    )
+
+    receipt = await publisher.publish()
+
+    assert receipt.devices == ()
+    assert control.request is not None
+    assert control.request.schema_version == "1.1"
+    assert control.request.workspaces == ()
+    assert str(private_path) not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_without_source_registry_remains_schema_1_0(tmp_path: Path) -> None:
+    control = CapturingHeartbeatControl()
+    publisher = HeartbeatPublisher(
+        inventory=EmptyInventory(),
+        control=control,
+        credentials=_heartbeat_credentials(),
+        metadata=PlatformMetadata(platform="linux", hostname="test", os_version="test"),
+        state=AgentRuntimeState(),
+        workspace_root=tmp_path,
+        clock=lambda: NOW,
+        disk_free=lambda _path: 1,
+    )
+
+    await publisher.publish()
+
+    assert control.request is not None
+    assert control.request.schema_version == "1.0"
+    assert "workspaces" not in control.request.model_fields_set
+    assert control.request.model_dump(mode="json", exclude={"workspaces"})[
+        "schema_version"
+    ] == "1.0"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -17,6 +18,7 @@ from perfpilot_agent.control_client import ControlClient
 from perfpilot_agent.credentials import AgentCredentials, TaskSigningKey
 from perfpilot_agent.devices import DeviceInventoryItem, DeviceObservation, HeartbeatPublisher
 from perfpilot_agent.platform.base import PlatformMetadata
+from perfpilot_agent.source_registry import SourceWorkspaceRegistry
 from perfpilot_agent.state import AgentRuntimeState
 
 CLIENT_REF = UUID("74000000-0000-4000-8000-000000000001")
@@ -26,6 +28,8 @@ DEVICE_DIGEST = "a" * 64
 SERIAL = "R3CN30SECRET"
 NOW = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
 TASK_KID = "task-key-2026-08"
+WORKSPACE_ID = UUID("92000000-0000-4000-8000-000000000001")
+PROFILE_ID = UUID("94000000-0000-4000-8000-000000000001")
 
 
 class FakeInventory:
@@ -90,6 +94,42 @@ async def test_heartbeat_publishes_full_snapshot_and_keeps_digest_mapping_only_i
     ca_bundle.write_text("unused-by-mock", encoding="utf-8")
     workspace = tmp_path / "work"
     workspace.mkdir()
+    source = tmp_path / "private-source"
+    source.mkdir()
+    subprocess.run(
+        ["git", "-C", str(source), "init", "--quiet", "--initial-branch=main"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.name", "PerfPilot Test"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(source), "config", "user.email", "perfpilot@example.test"],
+        check=True,
+    )
+    wrapper = source / "gradlew"
+    wrapper.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    wrapper.chmod(0o755)
+    subprocess.run(["git", "-C", str(source), "add", "gradlew"], check=True)
+    subprocess.run(
+        ["git", "-C", str(source), "commit", "--quiet", "-m", "initial"],
+        check=True,
+    )
+    identifiers = iter((WORKSPACE_ID, PROFILE_ID))
+    source_registry = SourceWorkspaceRegistry(
+        workspace,
+        uuid_factory=lambda: next(identifiers),
+    )
+    source_registry.add(name="Demo Android", path=source)
+    source_registry.add_validation(
+        workspace_id=WORKSPACE_ID,
+        name="Android check",
+        argv=("./gradlew", ":app:lintDebug", "--no-daemon", "--console=plain"),
+        working_directory=".",
+        timeout_seconds=600,
+        allowed_exit_codes=(0,),
+    )
     config = AgentConfig(
         schema_version="1.0",
         server_url="https://10.166.0.125",
@@ -132,6 +172,7 @@ async def test_heartbeat_publishes_full_snapshot_and_keeps_digest_mapping_only_i
             ),
             state=state,
             workspace_root=workspace,
+            source_registry=source_registry,
             clock=lambda: NOW,
             disk_free=lambda _path: 107_374_182_400,
         )
@@ -151,8 +192,32 @@ async def test_heartbeat_publishes_full_snapshot_and_keeps_digest_mapping_only_i
         ).read_text(encoding="utf-8")
     )
     Draft202012Validator(contract, format_checker=FormatChecker()).validate(payload)
+    assert payload["schema_version"] == "1.1"
     assert payload["devices"][0]["serial"] == SERIAL
     assert payload["execution_slot"] == {"state": "idle", "execution_id": None}
+    assert payload["workspaces"] == [
+        {
+            "workspace_id": str(WORKSPACE_ID),
+            "name": "Demo Android",
+            "state": "ready",
+            "git_branch": "main",
+            "git_head": subprocess.run(
+                ["git", "-C", str(source), "rev-parse", "HEAD"],
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "tracked_dirty_count": 0,
+            "snapshot_policy": "tracked_worktree",
+            "validation_profiles": [
+                {"profile_id": str(PROFILE_ID), "name": "Android check"}
+            ],
+        }
+    ]
+    serialized_payload = json.dumps(payload)
+    assert str(source) not in serialized_payload
+    assert "./gradlew" not in serialized_payload
+    assert ":app:lintDebug" not in serialized_payload
     assert receipt.devices[0].device_digest == DEVICE_DIGEST
     assert state.serial_for_digest(DEVICE_DIGEST) == SERIAL
     assert SERIAL not in repr(state)

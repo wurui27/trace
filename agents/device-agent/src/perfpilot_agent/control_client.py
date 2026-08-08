@@ -233,10 +233,42 @@ class HeartbeatDevice(BaseModel):
     )
 
 
+class HeartbeatValidationProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    profile_id: UUID
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")
+
+
+class HeartbeatWorkspace(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    workspace_id: UUID
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")
+    state: Literal["ready", "invalid"]
+    git_branch: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
+    )
+    git_head: str = Field(pattern=r"^[0-9a-f]{40}$")
+    tracked_dirty_count: int = Field(strict=True, ge=0)
+    snapshot_policy: Literal["tracked_worktree"]
+    validation_profiles: tuple[HeartbeatValidationProfile, ...] = Field(max_length=8)
+
+    @model_validator(mode="after")
+    def validate_profile_ids(self) -> Self:
+        identifiers = [profile.profile_id for profile in self.validation_profiles]
+        if len(set(identifiers)) != len(identifiers):
+            raise ValueError("validation profiles must be unique")
+        return self
+
+
 class HeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     agent_version: str
     platform: AgentPlatform
     hostname: str = Field(min_length=1, max_length=200, pattern=r"^[^\x00-\x1f\x7f]+$")
@@ -245,6 +277,7 @@ class HeartbeatRequest(BaseModel):
     disk_available_bytes: int = Field(strict=True, ge=0, le=2**63 - 1)
     execution_slot: ExecutionSlot
     devices: tuple[HeartbeatDevice, ...] = Field(max_length=32)
+    workspaces: tuple[HeartbeatWorkspace, ...] | None = Field(default=None, max_length=32)
 
     @field_validator("agent_version")
     @classmethod
@@ -257,6 +290,20 @@ class HeartbeatRequest(BaseModel):
     @classmethod
     def validate_observed_at(cls, value: datetime) -> datetime:
         return _aware(value)
+
+    @model_validator(mode="after")
+    def validate_workspace_version(self) -> Self:
+        if self.schema_version == "1.0" and (
+            self.workspaces is not None or "workspaces" in self.model_fields_set
+        ):
+            raise ValueError("heartbeat workspace version is invalid")
+        if self.schema_version == "1.1" and self.workspaces is None:
+            raise ValueError("heartbeat workspace version is invalid")
+        if self.workspaces is not None:
+            identifiers = [workspace.workspace_id for workspace in self.workspaces]
+            if len(set(identifiers)) != len(identifiers):
+                raise ValueError("heartbeat workspaces must be unique")
+        return self
 
 
 class HeartbeatDeviceReceipt(BaseModel):
@@ -820,11 +867,14 @@ class ControlClient:
     ) -> HeartbeatResponse:
         try:
             normalized = HeartbeatRequest.model_validate(request)
+            document = normalized.model_dump(mode="json")
+            if normalized.workspaces is None:
+                document.pop("workspaces", None)
             payload = await self._authorized_request(
                 "POST",
                 "/v1/agent/heartbeat",
                 expected_status=200,
-                json=normalized.model_dump(mode="json"),
+                json=document,
                 access_token=access_token,
             )
             return HeartbeatResponse.model_validate_json(payload)
@@ -1108,6 +1158,8 @@ __all__ = [
     "HeartbeatDevice",
     "HeartbeatDeviceReceipt",
     "HeartbeatRequest",
+    "HeartbeatValidationProfile",
+    "HeartbeatWorkspace",
     "HeartbeatResponse",
     "InputAuthorizationResponse",
     "LeaseLost",

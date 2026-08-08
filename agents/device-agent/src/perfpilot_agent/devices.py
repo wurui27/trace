@@ -25,6 +25,7 @@ from perfpilot_agent.control_client import (
     HeartbeatDevice,
     HeartbeatRequest,
     HeartbeatResponse,
+    HeartbeatWorkspace,
 )
 from perfpilot_agent.credentials import AgentCredentials
 from perfpilot_agent.logging import SecretRedactor
@@ -327,6 +328,10 @@ class HeartbeatInventory(Protocol):
     async def read_all(self) -> tuple[DeviceInventoryItem, ...]: ...
 
 
+class HeartbeatSourceRegistry(Protocol):
+    def public_workspaces(self) -> tuple[dict[str, object], ...]: ...
+
+
 class HeartbeatPublisher:
     def __init__(
         self,
@@ -340,6 +345,7 @@ class HeartbeatPublisher:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         disk_free: Callable[[Path], int] = lambda path: shutil.disk_usage(path).free,
         redactor: SecretRedactor | None = None,
+        source_registry: HeartbeatSourceRegistry | None = None,
     ) -> None:
         self._inventory = inventory
         self._control = control
@@ -350,6 +356,7 @@ class HeartbeatPublisher:
         self._clock = clock
         self._disk_free = disk_free
         self._redactor = redactor
+        self._source_registry = source_registry
 
     async def publish(self) -> HeartbeatResponse:
         started_at = self._clock()
@@ -365,8 +372,22 @@ class HeartbeatPublisher:
                 },
             )
         execution_id = self._state.execution_id
+        schema_version = "1.0"
+        workspaces: tuple[HeartbeatWorkspace, ...] | None = None
+        if self._source_registry is not None:
+            schema_version = "1.1"
+            try:
+                workspaces = tuple(
+                    HeartbeatWorkspace.model_validate(document)
+                    for document in self._source_registry.public_workspaces()
+                )
+            except Exception:
+                workspaces = ()
+        source_fields: dict[str, object] = {}
+        if workspaces is not None:
+            source_fields["workspaces"] = workspaces
         request = HeartbeatRequest(
-            schema_version="1.0",
+            schema_version=schema_version,
             agent_version=__version__,
             platform=self._metadata.platform,
             hostname=self._metadata.hostname,
@@ -378,6 +399,7 @@ class HeartbeatPublisher:
                 execution_id=execution_id,
             ),
             devices=tuple(item.observation for item in snapshot),
+            **source_fields,
         )
         receipt = await self._control.heartbeat(
             request,

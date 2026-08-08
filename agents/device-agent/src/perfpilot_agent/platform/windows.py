@@ -9,6 +9,41 @@ from perfpilot_agent.credentials import CredentialBackendError
 _MAXIMUM_CREDENTIAL_BYTES = 64 * 1024
 
 
+def restrict_file_to_current_user(path: Path) -> None:
+    """Install a protected DACL containing only the process user."""
+
+    try:
+        import ntsecuritycon
+        import win32api
+        import win32con
+        import win32security
+
+        token = win32security.OpenProcessToken(
+            win32api.GetCurrentProcess(),
+            win32con.TOKEN_QUERY,
+        )
+        user_sid = win32security.GetTokenInformation(token, win32security.TokenUser)[0]
+        acl = win32security.ACL()
+        acl.AddAccessAllowedAce(
+            win32security.ACL_REVISION,
+            ntsecuritycon.FILE_ALL_ACCESS,
+            user_sid,
+        )
+        descriptor = win32security.SECURITY_DESCRIPTOR()
+        descriptor.SetSecurityDescriptorDacl(True, acl, False)
+        descriptor.SetSecurityDescriptorControl(
+            win32security.SE_DACL_PROTECTED,
+            win32security.SE_DACL_PROTECTED,
+        )
+        win32security.SetFileSecurity(
+            str(path),
+            win32security.DACL_SECURITY_INFORMATION,
+            descriptor,
+        )
+    except Exception:
+        raise OSError("unable to protect private Agent file") from None
+
+
 def default_credential_path() -> Path:
     program_data = os.environ.get("ProgramData")
     if not program_data:
@@ -124,4 +159,8 @@ class WindowsDpapiCredentialBackend:
             raise CredentialBackendError from None
 
 
-__all__ = ["WindowsDpapiCredentialBackend", "default_credential_path"]
+__all__ = [
+    "WindowsDpapiCredentialBackend",
+    "default_credential_path",
+    "restrict_file_to_current_user",
+]

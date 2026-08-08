@@ -7,6 +7,7 @@ import json
 import logging
 import sys
 from pathlib import Path
+from uuid import UUID
 
 from perfpilot_agent.adb import AdbError, resolve_adb
 from perfpilot_agent.config import AgentConfig, load_config
@@ -23,6 +24,7 @@ from perfpilot_agent.logging import RedactingFilter, SecretRedactor
 from perfpilot_agent.platform.base import current_platform_metadata, current_platform_name
 from perfpilot_agent.registration import RegistrationError, RegistrationService
 from perfpilot_agent.service import AgentService, TaskLoop
+from perfpilot_agent.source_registry import SourceRegistryError, SourceWorkspaceRegistry
 from perfpilot_agent.state import AgentRuntimeState
 
 
@@ -54,6 +56,46 @@ def _parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true", required=True)
     unregister = commands.add_parser("unregister", help="revoke this Agent")
     unregister.add_argument("--local-only", action="store_true")
+
+    source = commands.add_parser("source", help="manage Agent-local source workspaces")
+    source_commands = source.add_subparsers(dest="source_command", required=True)
+    source_add = source_commands.add_parser("add", help="register a source workspace")
+    source_add.add_argument("--name", required=True)
+    source_add.add_argument("--path", type=Path, required=True)
+    source_list = source_commands.add_parser("list", help="list source workspaces")
+    source_list.add_argument("--json", action="store_true", required=True)
+    source_remove = source_commands.add_parser("remove", help="remove a source workspace")
+    source_remove.add_argument("--workspace-id", type=UUID, required=True)
+    source_doctor = source_commands.add_parser("doctor", help="inspect a source workspace")
+    source_doctor.add_argument("--workspace-id", type=UUID, required=True)
+    source_doctor.add_argument("--json", action="store_true", required=True)
+
+    validation = source_commands.add_parser("validation", help="manage validation profiles")
+    validation_commands = validation.add_subparsers(
+        dest="validation_command",
+        required=True,
+    )
+    validation_add = validation_commands.add_parser("add", help="add a validation profile")
+    validation_add.add_argument("--workspace-id", type=UUID, required=True)
+    validation_add.add_argument("--name", required=True)
+    validation_add.add_argument("--working-directory", required=True)
+    validation_add.add_argument("--timeout-seconds", type=int, required=True)
+    validation_add.add_argument(
+        "--allowed-exit-code",
+        type=int,
+        action="append",
+        required=True,
+    )
+    validation_add.add_argument("command_argv", nargs=argparse.REMAINDER)
+    validation_list = validation_commands.add_parser("list", help="list validation profiles")
+    validation_list.add_argument("--workspace-id", type=UUID, required=True)
+    validation_list.add_argument("--json", action="store_true", required=True)
+    validation_remove = validation_commands.add_parser(
+        "remove",
+        help="remove a validation profile",
+    )
+    validation_remove.add_argument("--workspace-id", type=UUID, required=True)
+    validation_remove.add_argument("--profile-id", type=UUID, required=True)
     return parser
 
 
@@ -142,6 +184,59 @@ async def _doctor(config_path: Path | None) -> int:
     return 0
 
 
+def _source_registry(config: AgentConfig) -> SourceWorkspaceRegistry:
+    return SourceWorkspaceRegistry(config.workspace_root)
+
+
+def _source(config_path: Path | None, arguments: argparse.Namespace) -> int:
+    config = load_config(config_path)
+    registry = _source_registry(config)
+    if arguments.source_command == "add":
+        workspace = registry.add(name=arguments.name, path=arguments.path)
+        _write_json(workspace.public_document())
+        return 0
+    if arguments.source_command == "list":
+        _write_json(list(registry.public_workspaces()))
+        return 0
+    if arguments.source_command == "remove":
+        registry.remove(arguments.workspace_id)
+        _write_json({"removed": True, "workspace_id": str(arguments.workspace_id)})
+        return 0
+    if arguments.source_command == "doctor":
+        _write_json(registry.doctor(arguments.workspace_id))
+        return 0
+    if arguments.source_command != "validation":
+        return 2
+    if arguments.validation_command == "add":
+        command_argv = arguments.command_argv
+        if not command_argv or command_argv[0] != "--" or len(command_argv) == 1:
+            print("Validation command must follow an explicit -- separator.", file=sys.stderr)
+            return 2
+        profile = registry.add_validation(
+            workspace_id=arguments.workspace_id,
+            name=arguments.name,
+            argv=tuple(command_argv[1:]),
+            working_directory=arguments.working_directory,
+            timeout_seconds=arguments.timeout_seconds,
+            allowed_exit_codes=tuple(arguments.allowed_exit_code),
+        )
+        _write_json(profile.public_document())
+        return 0
+    if arguments.validation_command == "list":
+        _write_json(
+            [
+                profile.public_document()
+                for profile in registry.list_validation(arguments.workspace_id)
+            ]
+        )
+        return 0
+    if arguments.validation_command == "remove":
+        registry.remove_validation(arguments.workspace_id, arguments.profile_id)
+        _write_json({"profile_id": str(arguments.profile_id), "removed": True})
+        return 0
+    return 2
+
+
 def _configure_logging(redactor: SecretRedactor) -> None:
     logger = logging.getLogger("perfpilot-agent")
     if not logger.handlers:
@@ -200,6 +295,7 @@ async def _run(config_path: Path | None) -> int:
             state=state,
             workspace_root=config.workspace_root,
             redactor=redactor,
+            source_registry=_source_registry(config),
         )
         executor = TaskExecutor(
             control=control,
@@ -258,12 +354,15 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_doctor(arguments.config))
         if arguments.command == "unregister":
             return asyncio.run(_unregister(arguments.config, local_only=arguments.local_only))
+        if arguments.command == "source":
+            return _source(arguments.config, arguments)
     except (
         AdbError,
         ControlClientError,
         CredentialStoreError,
         ImportError,
         RegistrationError,
+        SourceRegistryError,
         TaskExecutionError,
         OSError,
         ValueError,

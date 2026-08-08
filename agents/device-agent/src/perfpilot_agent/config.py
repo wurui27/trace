@@ -21,6 +21,10 @@ class AgentConfig(BaseModel):
     adb_path: Path | None = None
     workspace_root: Path
 
+    @property
+    def source_registry_path(self) -> Path:
+        return self.workspace_root / "source-workspaces.json"
+
     @field_validator("server_url")
     @classmethod
     def validate_server_url(cls, value: str) -> str:
