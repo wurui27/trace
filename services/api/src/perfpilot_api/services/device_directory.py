@@ -22,7 +22,10 @@ from perfpilot_api.db.control.models import (
     Device as StoredDeviceModel,
 )
 from perfpilot_api.services.agents import AgentPlatform, AgentRepository
-from perfpilot_api.services.source_workspaces import SourceAgentCapabilityRecord
+from perfpilot_api.services.source_workspaces import (
+    SourceAgentCapabilityRecord,
+    is_public_source_display_name,
+)
 
 ConnectionType = Literal["usb", "wifi", "unknown"]
 AdbState = Literal["device", "unauthorized", "offline", "booting"]
@@ -702,11 +705,13 @@ class DeviceDirectory:
     async def list_source_agents(
         self, team_id: UUID
     ) -> tuple[SourceAgentCapabilityRecord, ...]:
+        await self.expire_stale()
         return await self._repository.list_source_agents(team_id)
 
     async def get_source_agent(
         self, agent_id: UUID
     ) -> SourceAgentCapabilityRecord | None:
+        await self.expire_stale()
         return await self._repository.get_source_agent(agent_id)
 
 
@@ -794,6 +799,7 @@ def _validate_source_workspaces(
             or not isinstance(name, str)
             or not 1 <= len(name) <= 128
             or any(unicodedata.category(character) == "Cc" for character in name)
+            or not is_public_source_display_name(name)
             or workspace["state"] not in {"ready", "invalid"}
             or (branch is not None and (
                 not isinstance(branch, str)
@@ -830,6 +836,7 @@ def _validate_source_workspaces(
                 or profile_id in profile_ids
                 or not isinstance(profile_name, str)
                 or not 1 <= len(profile_name) <= 128
+                or not is_public_source_display_name(profile_name)
                 or any(unicodedata.category(character) == "Cc" for character in profile_name)
             ):
                 raise DeviceHeartbeatRejected

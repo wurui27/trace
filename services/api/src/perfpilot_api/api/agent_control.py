@@ -23,6 +23,7 @@ from perfpilot_api.services.device_directory import (
     DeviceDirectory,
     DeviceHeartbeatRejected,
 )
+from perfpilot_api.services.source_workspaces import is_public_source_display_name
 from perfpilot_api.services.agent_tasks import (
     AgentTaskCancellation,
     AgentTaskConflict,
@@ -149,6 +150,13 @@ class HeartbeatValidationProfile(BaseModel):
     def canonical_profile_id(cls, value: object) -> object:
         return _canonical_uuid(value)
 
+    @field_validator("name")
+    @classmethod
+    def public_profile_name(cls, value: str) -> str:
+        if not is_public_source_display_name(value):
+            raise ValueError("validation profile name must not be path-shaped")
+        return value
+
 
 class HeartbeatWorkspace(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -171,6 +179,13 @@ class HeartbeatWorkspace(BaseModel):
     @classmethod
     def canonical_workspace_id(cls, value: object) -> object:
         return _canonical_uuid(value)
+
+    @field_validator("name")
+    @classmethod
+    def public_workspace_name(cls, value: str) -> str:
+        if not is_public_source_display_name(value):
+            raise ValueError("workspace name must not be path-shaped")
+        return value
 
     @field_validator("validation_profiles")
     @classmethod

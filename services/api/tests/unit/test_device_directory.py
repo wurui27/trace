@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from uuid import UUID, uuid4
@@ -24,6 +24,11 @@ from perfpilot_api.services.device_directory import (
     DeviceDirectory,
     DeviceHeartbeatRejected,
     InMemoryDeviceDirectoryRepository,
+)
+from perfpilot_api.services.source_workspaces import (
+    SourceBinding,
+    SourceBindingInvalid,
+    SourceWorkspaceService,
 )
 
 TEAM_ID = UUID("20000000-0000-4000-8000-000000000001")
@@ -143,6 +148,31 @@ def heartbeat(*, execution_state: str = "idle") -> AgentHeartbeat:
         disk_available_bytes=100 * 1024 * 1024,
         execution_state=execution_state,
         execution_id=None,
+    )
+
+
+def source_heartbeat() -> AgentHeartbeat:
+    return AgentHeartbeat(
+        agent_version="1.2.3",
+        platform="macos",
+        hostname="Ray Mac",
+        observed_at=NOW,
+        clock_skew_ms=12,
+        disk_available_bytes=100 * 1024 * 1024,
+        execution_state="idle",
+        execution_id=None,
+        source_workspaces=(
+            {
+                "workspace_id": "92000000-0000-4000-8000-000000000001",
+                "name": "Demo Android",
+                "state": "ready",
+                "git_branch": "main",
+                "git_head": "1" * 40,
+                "tracked_dirty_count": 0,
+                "snapshot_policy": "tracked_worktree",
+                "validation_profiles": [],
+            },
+        ),
     )
 
 
@@ -266,6 +296,76 @@ async def test_duplicate_serial_is_rejected_without_echoing_it(
         )
 
     assert raw_serial not in str(captured.value)
+
+
+@pytest.mark.asyncio
+async def test_source_workspace_reads_expire_stale_agent_before_listing_or_binding(
+    harness: DirectoryHarness,
+) -> None:
+    workspace_id = UUID("92000000-0000-4000-8000-000000000001")
+    await harness.directory.replace_heartbeat(
+        agent_id=harness.agent_id,
+        heartbeat=source_heartbeat(),
+        devices=(),
+    )
+    service = SourceWorkspaceService(
+        repository=harness.directory,
+        enabled=True,
+    )
+    binding = SourceBinding(
+        provider_kind="agent_workspace",
+        agent_id=harness.agent_id,
+        workspace_id=workspace_id,
+        snapshot_policy="tracked_worktree",
+        validation_profile_id=None,
+    )
+    assert len(await service.list_for_team(team_id=TEAM_ID)) == 1
+
+    harness.clock.advance(seconds=31)
+
+    assert await service.list_for_team(team_id=TEAM_ID) == ()
+    with pytest.raises(SourceBindingInvalid):
+        await service.require_binding(team_id=TEAM_ID, binding=binding)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "private_name"),
+    (
+        ("workspace", "/Users/ray/private/demo"),
+        ("profile", r"C:\Users\ray\private\demo"),
+        ("workspace", r"\\server\share\demo"),
+    ),
+)
+async def test_heartbeat_rejects_path_shaped_public_source_names_at_directory_boundary(
+    harness: DirectoryHarness,
+    field: str,
+    private_name: str,
+) -> None:
+    base = source_heartbeat()
+    workspace = dict(base.source_workspaces[0])  # type: ignore[index]
+    if field == "workspace":
+        workspace["name"] = private_name
+    else:
+        workspace["validation_profiles"] = [
+            {
+                "profile_id": "94000000-0000-4000-8000-000000000001",
+                "name": private_name,
+            }
+        ]
+
+    with pytest.raises(DeviceHeartbeatRejected) as captured:
+        await harness.directory.replace_heartbeat(
+            agent_id=harness.agent_id,
+            heartbeat=replace(base, source_workspaces=(workspace,)),
+            devices=(),
+        )
+
+    assert private_name not in str(captured.value)
+    agents = await harness.directory.list_source_agents(TEAM_ID)
+    assert len(agents) == 1
+    assert agents[0].state == "offline"
+    assert agents[0].capabilities == {}
 
 
 def test_sanitizer_rejects_values_outside_database_bounds(

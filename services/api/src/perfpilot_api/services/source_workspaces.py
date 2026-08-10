@@ -150,6 +150,21 @@ class SourceWorkspaceService:
         return binding
 
 
+def is_public_source_display_name(value: str) -> bool:
+    candidate = value.lstrip()
+    return not (
+        candidate.startswith(("/", "\\", "~/", "~\\", "./", ".\\", "../", "..\\"))
+        or candidate.casefold().startswith("file:")
+        or (
+            len(candidate) >= 3
+            and candidate[0].isascii()
+            and candidate[0].isalpha()
+            and candidate[1] == ":"
+            and candidate[2] in {"/", "\\"}
+        )
+    )
+
+
 def _parse_capabilities(
     agent: SourceAgentCapabilityRecord,
 ) -> tuple[SourceWorkspaceView, ...]:
@@ -185,6 +200,7 @@ def _parse_capabilities(
                 or not isinstance(name, str)
                 or not 1 <= len(name) <= 128
                 or any(unicodedata.category(character) == "Cc" for character in name)
+                or not is_public_source_display_name(name)
                 or state not in {"ready", "invalid"}
                 or (branch is not None and (not isinstance(branch, str) or not 1 <= len(branch) <= 255))
                 or (
@@ -214,6 +230,7 @@ def _parse_capabilities(
                     or profile_id.version not in range(1, 6)
                     or not isinstance(profile_name, str)
                     or not 1 <= len(profile_name) <= 128
+                    or not is_public_source_display_name(profile_name)
                     or any(
                         unicodedata.category(character) == "Cc"
                         for character in profile_name
@@ -255,4 +272,5 @@ __all__ = [
     "SourceWorkspaceRepository",
     "SourceWorkspaceService",
     "SourceWorkspaceView",
+    "is_public_source_display_name",
 ]

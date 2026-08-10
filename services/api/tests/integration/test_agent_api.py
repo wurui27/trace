@@ -627,6 +627,107 @@ def test_heartbeat_v11_rejects_noncanonical_workspace_uuid() -> None:
     assert response.status_code == 422
 
 
+def test_heartbeat_v11_rejects_path_shaped_public_names_before_persistence() -> None:
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    private_names = (
+        "/Users/ray/private/demo",
+        r"C:\Users\ray\private\demo",
+        r"\\server\share\demo",
+        "~/private/demo",
+        "../private/demo",
+        "file:///Users/ray/private/demo",
+        "  /Users/ray/private/demo",
+    )
+    with _client(source_code_analysis_enabled=True) as client:
+        issued = _create_code(client)
+        registered = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.0",
+                "registration_code": issued["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "Ray Mac",
+                "os_version": "macOS 15.6",
+            },
+        ).json()
+
+        def heartbeat_with_names(workspace_name: str, profile_name: str) -> dict[str, object]:
+            return {
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "Ray Mac",
+                "observed_at": "2026-08-05T08:00:00Z",
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [],
+                "workspaces": [
+                    {
+                        "workspace_id": "92000000-0000-4000-8000-000000000001",
+                        "name": workspace_name,
+                        "state": "ready",
+                        "git_branch": "feature/source-binding",
+                        "git_head": "1" * 40,
+                        "tracked_dirty_count": 0,
+                        "snapshot_policy": "tracked_worktree",
+                        "validation_profiles": [
+                            {
+                                "profile_id": "94000000-0000-4000-8000-000000000001",
+                                "name": profile_name,
+                            }
+                        ],
+                    }
+                ],
+            }
+
+        for index, private_name in enumerate(private_names):
+            field_names = (
+                (private_name, "Android check"),
+                ("Demo Android", private_name),
+            )
+            for field_index, (workspace_name, profile_name) in enumerate(field_names):
+                response = client.post(
+                    "/v1/agent/heartbeat",
+                    headers={
+                        "authorization": f"Bearer {registered['access_token']}"
+                    },
+                    json=heartbeat_with_names(workspace_name, profile_name),
+                )
+                assert response.status_code == 422, (index, field_index)
+                assert response.json()["error"]["code"] == "request_validation_failed"
+                assert private_name not in response.text
+
+        target = f"/v1/teams/{TEAM_A_ID}/source-workspaces"
+        empty = _browser_request(
+            client,
+            method="GET",
+            target=target,
+            payload={},
+            request_id="req-path-name-empty",
+        )
+        valid = client.post(
+            "/v1/agent/heartbeat",
+            headers={"authorization": f"Bearer {registered['access_token']}"},
+            json=heartbeat_with_names("Android / Wear 中文", "检查 / Release"),
+        )
+        listed = _browser_request(
+            client,
+            method="GET",
+            target=target,
+            payload={},
+            request_id="req-path-name-valid",
+        )
+
+    assert empty.json()["workspaces"] == []
+    assert valid.status_code == 200
+    assert listed.json()["workspaces"][0]["name"] == "Android / Wear 中文"
+    assert listed.json()["workspaces"][0]["git_branch"] == "feature/source-binding"
+    assert listed.json()["workspaces"][0]["validation_profiles"][0]["name"] == "检查 / Release"
+
+
 def test_heartbeat_rejects_missing_agent_access_token_without_proxy_headers() -> None:
     with _client() as client:
         response = client.post(
