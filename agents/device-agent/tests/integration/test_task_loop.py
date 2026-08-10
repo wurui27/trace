@@ -14,6 +14,7 @@ from perfpilot_agent.config import AgentConfig
 from perfpilot_agent.control_client import (
     ControlClient,
     ControlClientError,
+    SourceTaskExecuteResponse,
     TaskExecuteResponse,
     TaskWaitResponse,
 )
@@ -31,7 +32,7 @@ class FakeExecutor:
     def __init__(self) -> None:
         self.tasks = []
 
-    async def run(self, task) -> None:
+    async def run(self, task, **kwargs) -> None:
         self.tasks.append(task)
 
 
@@ -119,6 +120,62 @@ async def test_task_loop_verifies_snapshot_before_dispatch(
     assert [task.execution_id for task in executor.tasks] == [UUID(task_claims["execution_id"])]
 
 
+@pytest.mark.asyncio
+async def test_task_loop_dispatches_source_context_without_capture_executor(
+    signing_key,
+) -> None:
+    now = datetime.fromisoformat("2026-08-05T08:00:00+00:00")
+    agent_id = UUID("71000000-0000-4000-8000-000000000001")
+    credentials = _credentials(signing_key, "task-key-2026-08", agent_id, now)
+    snapshot = {
+        "schema_version": "1.0",
+        "task_type": "source_context",
+        "execution_id": "73000000-0000-4000-8000-000000000001",
+        "analysis_id": "30000000-0000-4000-8000-000000000001",
+        "team_id": "10000000-0000-4000-8000-000000000001",
+        "agent_id": str(agent_id),
+        "workspace_id": "91000000-0000-4000-8000-000000000001",
+        "snapshot_policy": "tracked_worktree",
+        "validation_profile_id": None,
+        "lease_version": 1,
+        "expires_at": (now + timedelta(seconds=60)).isoformat(),
+        "finding_hints": [],
+        "limits": {"max_findings": 3, "max_files": 12, "max_bytes": 98_304},
+    }
+    canonical = json.dumps(
+        snapshot,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    response = SourceTaskExecuteResponse(
+        schema_version="1.1",
+        task_kind="source",
+        lease_token="opaque-lease-token-123",
+        snapshot=snapshot,
+        signature_b64=base64.b64encode(signing_key.sign(canonical)).decode("ascii"),
+    )
+    capture = FakeExecutor()
+    source = FakeExecutor()
+    loop = TaskLoop(
+        control=FakePollControl(response, credentials),
+        executor=capture,
+        source_executor=source,
+        state=AgentRuntimeState(),
+        clock=lambda: now,
+        sleep=lambda _: _completed_sleep(),
+    )
+
+    handled = await loop.poll_once()
+
+    assert handled is True
+    assert capture.tasks == []
+    assert [task.execution_id for task in source.tasks] == [
+        UUID("73000000-0000-4000-8000-000000000001")
+    ]
+
+
 async def _completed_sleep() -> None:
     return None
 
@@ -169,6 +226,103 @@ async def test_control_client_retries_only_retryable_statuses(tmp_path) -> None:
         retry_after_seconds=1,
     )
     assert attempts == 2
+
+
+@pytest.mark.asyncio
+async def test_control_client_sends_source_lease_token_only_as_fence_header(
+    tmp_path,
+    signing_key,
+) -> None:
+    ca = tmp_path / "ca.crt"
+    ca.write_text("test", encoding="utf-8")
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    config = AgentConfig(
+        server_url="https://control.example.test",
+        ca_bundle=ca,
+        workspace_root=workspace,
+    )
+    now = datetime.fromisoformat("2026-08-05T08:00:00+00:00")
+    credentials = _credentials(
+        signing_key,
+        "task-key-2026-08",
+        UUID("71000000-0000-4000-8000-000000000001"),
+        now,
+    )
+    execution_id = UUID("73000000-0000-4000-8000-000000000001")
+    lease_token = "opaque-source-lease-token"
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["x-perfpilot-lease-token"] == lease_token
+        assert lease_token.encode("ascii") not in request.content
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "schema_version": "1.1",
+                "execution_id": str(execution_id),
+                "analysis_id": "30000000-0000-4000-8000-000000000001",
+                "lease_version": 1,
+                "state": "failed",
+                "artifact_id": "40000000-0000-4000-8000-000000000001",
+                "checksum": "a" * 64,
+                "accepted_at": now.isoformat(),
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = ControlClient(config, http_client=http_client, credentials=credentials)
+        response = await client.complete_source_task(
+            execution_id=execution_id,
+            lease_version=1,
+            lease_token=lease_token,
+            completion={
+                "schema_version": "1.0",
+                "task_type": "source_context",
+                "execution_id": str(execution_id),
+                "analysis_id": "30000000-0000-4000-8000-000000000001",
+                "workspace_id": "91000000-0000-4000-8000-000000000001",
+                "lease_version": 1,
+                "state": "failed",
+                "result": {"failure_code": "source_unavailable", "retryable": False},
+                "signature_b64": "A" * 86 + "==",
+            },
+        )
+
+    assert response.state == "failed"
+
+
+@pytest.mark.asyncio
+async def test_control_client_safely_rejects_unknown_source_task_type(
+    tmp_path,
+) -> None:
+    ca = tmp_path / "ca.crt"
+    ca.write_text("test", encoding="utf-8")
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    config = AgentConfig(
+        server_url="https://control.example.test",
+        ca_bundle=ca,
+        workspace_root=workspace,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "schema_version": "1.1",
+                "task_kind": "source",
+                "lease_token": "opaque-source-lease-token",
+                "snapshot": {"schema_version": "1.0", "task_type": "device_capture"},
+                "signature_b64": "A" * 86 + "==",
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = ControlClient(config, http_client=http_client)
+        with pytest.raises(ControlClientError):
+            await client.poll_task(wait_seconds=0, access_token="ppat_" + "A" * 43)
 
 
 @pytest.mark.asyncio

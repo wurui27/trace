@@ -9,6 +9,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from perfpilot_api.security.agent_signatures import encode_ed25519_public_key
 from perfpilot_api.security.task_snapshots import (
+    SourceTaskSnapshotSigner,
     TaskSnapshotRejected,
     TaskSnapshotSigner,
     snapshot_digest,
@@ -97,3 +98,35 @@ def test_rejects_tampering_and_snapshots_longer_than_ninety_seconds() -> None:
         )
     with pytest.raises(TaskSnapshotRejected):
         signer.sign(_claims(expires_at=NOW + timedelta(seconds=91)))
+
+
+def test_signs_source_snapshot_as_detached_canonical_json() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    signer = SourceTaskSnapshotSigner(private_key=private_key, kid="lan-test", clock=lambda: NOW)
+    snapshot = {
+        "schema_version": "1.0",
+        "task_type": "source_context",
+        "execution_id": str(EXECUTION_ID),
+        "analysis_id": str(ANALYSIS_ID),
+        "team_id": "10000000-0000-4000-8000-000000000001",
+        "agent_id": str(AGENT_ID),
+        "workspace_id": "91000000-0000-4000-8000-000000000001",
+        "snapshot_policy": "tracked_worktree",
+        "validation_profile_id": None,
+        "lease_version": 1,
+        "expires_at": (NOW + timedelta(seconds=60)).isoformat(),
+        "finding_hints": [],
+        "limits": {"max_findings": 3, "max_files": 12, "max_bytes": 98_304},
+    }
+
+    signature = signer.sign(snapshot)
+
+    canonical = __import__("json").dumps(
+        snapshot,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    private_key.public_key().verify(base64.b64decode(signature), canonical)
+    assert "private_key" not in repr(signer)

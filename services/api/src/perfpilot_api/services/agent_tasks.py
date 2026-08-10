@@ -25,6 +25,7 @@ from perfpilot_api.db.control.models import (
     GlobalJob,
     OutboxEvent,
     ScenarioJob,
+    SourceTask,
 )
 from perfpilot_api.db.tenant.models import Analysis, ApplicationVersion, Artifact, ScenarioResult
 from perfpilot_api.db.tenant.router import TenantRouter
@@ -1266,6 +1267,19 @@ class SQLAlchemyAgentTaskRepository:
                         .limit(1)
                     )
                     if active_agent_lease is not None:
+                        return None
+                    active_source_task = await session.scalar(
+                        select(SourceTask.id)
+                        .where(
+                            SourceTask.agent_id == agent.id,
+                            SourceTask.state.in_(
+                                ("leased", "running", "cancel_requested")
+                            ),
+                            SourceTask.expires_at > now,
+                        )
+                        .limit(1)
+                    )
+                    if active_source_task is not None:
                         return None
                     lease = AgentLease(
                         id=self._lease_id_source(),

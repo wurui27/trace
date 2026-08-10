@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import json
 import re
 import secrets
 from collections.abc import Awaitable, Callable, Mapping, Sequence
@@ -22,7 +23,6 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-
 from perfpilot_agent.config import AgentConfig
 from perfpilot_agent.credentials import (
     AgentCredentials,
@@ -30,8 +30,13 @@ from perfpilot_agent.credentials import (
     TaskSigningKey,
 )
 from perfpilot_agent.platform.base import AgentPlatform
+from perfpilot_agent.security import (
+    TaskSnapshot,
+    VerifiedPatchVerificationTask,
+    VerifiedSourceContextTask,
+)
 
-_MAXIMUM_RESPONSE_BYTES = 64 * 1024
+_MAXIMUM_RESPONSE_BYTES = 128 * 1024
 _KEY_ID_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
 _AGENT_VERSION = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$")
 _ACCESS_TOKEN = re.compile(r"^ppat_[A-Za-z0-9_-]{43}$")
@@ -366,6 +371,37 @@ class TaskExecuteResponse(BaseModel):
         return _aware(value)
 
 
+class SourceTaskExecuteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.1"]
+    task_kind: Literal["source"]
+    lease_token: str = Field(min_length=16, max_length=256, pattern=r"^[A-Za-z0-9_-]+$", repr=False)
+    snapshot: dict[str, object] = Field(repr=False)
+    signature_b64: str = Field(pattern=r"^[A-Za-z0-9+/]{86}==$", repr=False)
+
+    @field_validator("snapshot")
+    @classmethod
+    def validate_closed_snapshot(cls, value: dict[str, object]) -> dict[str, object]:
+        TypeAdapter(
+            Annotated[
+                VerifiedSourceContextTask | VerifiedPatchVerificationTask,
+                Field(discriminator="task_type"),
+            ]
+        ).validate_python(value)
+        return value
+
+
+class DeviceTaskExecuteResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.1"]
+    task_kind: Literal["device"]
+    lease_token: str = Field(min_length=16, max_length=256, pattern=r"^[A-Za-z0-9_-]+$", repr=False)
+    snapshot: TaskSnapshot
+    signature_b64: str = Field(pattern=r"^[A-Za-z0-9+/]{86}==$", repr=False)
+
+
 class TaskCancellationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -401,6 +437,41 @@ class TaskRenewalResponse(BaseModel):
     @classmethod
     def validate_timestamp(cls, value: datetime) -> datetime:
         return _aware(value)
+
+
+class SourceTaskMutationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.1"]
+    execution_id: UUID
+    analysis_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    state: Literal["running", "cancel_requested"]
+    accepted_at: datetime
+
+
+class SourceTaskCancellationResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.1"]
+    execution_id: UUID
+    analysis_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    state: Literal["canceled"]
+    acknowledged_at: datetime
+
+
+class SourceTaskCompletionResponse(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.1"]
+    execution_id: UUID
+    analysis_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    state: Literal["completed", "failed", "canceled", "expired"]
+    artifact_id: UUID
+    checksum: str = Field(pattern=r"^[0-9a-f]{64}$")
+    accepted_at: datetime
 
 
 class CancellationAcknowledgementResponse(BaseModel):
@@ -581,10 +652,13 @@ class _ErrorEnvelope(BaseModel):
     error: _ErrorDetail
 
 
-TaskPollResponse = Annotated[
-    TaskWaitResponse | TaskExecuteResponse | TaskCancellationResponse,
-    Field(discriminator="action"),
-]
+TaskPollResponse = (
+    TaskWaitResponse
+    | TaskExecuteResponse
+    | TaskCancellationResponse
+    | DeviceTaskExecuteResponse
+    | SourceTaskExecuteResponse
+)
 TaskRenewResponse = TaskRenewalResponse | TaskCancellationResponse
 _TASK_POLL_ADAPTER = TypeAdapter(TaskPollResponse)
 _TASK_RENEW_ADAPTER = TypeAdapter(TaskRenewResponse)
@@ -686,12 +760,13 @@ class ControlClient:
         access_token: str | None = None,
         retry: bool,
         lease_fenced: bool = False,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> bytes:
-        headers = None
+        headers = dict(extra_headers or {})
         if access_token is not None:
             if _ACCESS_TOKEN.fullmatch(access_token) is None:
                 raise ControlClientError
-            headers = {"authorization": f"Bearer {access_token}"}
+            headers["authorization"] = f"Bearer {access_token}"
         attempts = _MAXIMUM_ATTEMPTS if retry else 1
         for attempt in range(attempts):
             try:
@@ -740,6 +815,7 @@ class ControlClient:
         access_token: str | None = None,
         lease_fenced: bool = False,
         retry: bool = True,
+        extra_headers: Mapping[str, str] | None = None,
     ) -> bytes:
         bound = self._credentials
         token = bound.access_token if bound is not None else access_token
@@ -755,6 +831,7 @@ class ControlClient:
                 access_token=token,
                 retry=retry,
                 lease_fenced=lease_fenced,
+                extra_headers=extra_headers,
             )
         except ControlClientError as error:
             if error.status_code != 401 or bound is None:
@@ -769,7 +846,16 @@ class ControlClient:
             access_token=self.credentials.access_token,
             retry=retry,
             lease_fenced=lease_fenced,
+            extra_headers=extra_headers,
         )
+
+    @staticmethod
+    def _source_lease_headers(lease_token: str) -> dict[str, str]:
+        if not 16 <= len(lease_token) <= 256 or re.fullmatch(
+            r"[A-Za-z0-9_-]+", lease_token
+        ) is None:
+            raise ControlClientError
+        return {"x-perfpilot-lease-token": lease_token}
 
     async def register(
         self,
@@ -1087,6 +1173,91 @@ class ControlClient:
         except (ValidationError, ValueError, TypeError, UnicodeError):
             raise ControlClientError from None
 
+    async def renew_source_task(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        lease_token: str,
+        access_token: str | None = None,
+    ) -> SourceTaskMutationResponse:
+        payload = await self._authorized_request(
+            "POST",
+            f"/v1/agent/tasks/{execution_id}/renew",
+            expected_status=200,
+            json={"schema_version": "1.0", "lease_version": lease_version},
+            access_token=access_token,
+            lease_fenced=True,
+            extra_headers=self._source_lease_headers(lease_token),
+        )
+        response = SourceTaskMutationResponse.model_validate_json(payload)
+        if response.execution_id != execution_id or response.lease_version != lease_version:
+            raise ControlClientError
+        return response
+
+    async def acknowledge_source_cancellation(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        lease_token: str,
+        access_token: str | None = None,
+    ) -> SourceTaskCancellationResponse:
+        payload = await self._authorized_request(
+            "POST",
+            f"/v1/agent/tasks/{execution_id}/cancel-ack",
+            expected_status=200,
+            json={
+                "schema_version": "1.0",
+                "lease_version": lease_version,
+                "reason_code": "analysis_canceled",
+            },
+            access_token=access_token,
+            lease_fenced=True,
+            extra_headers=self._source_lease_headers(lease_token),
+        )
+        response = SourceTaskCancellationResponse.model_validate_json(payload)
+        if response.execution_id != execution_id or response.lease_version != lease_version:
+            raise ControlClientError
+        return response
+
+    async def complete_source_task(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        lease_token: str,
+        completion: Mapping[str, object],
+        access_token: str | None = None,
+    ) -> SourceTaskCompletionResponse:
+        document = dict(completion)
+        canonical = json.dumps(
+            document,
+            ensure_ascii=True,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("ascii")
+        if (
+            len(canonical) > 128 * 1024
+            or document.get("execution_id") not in {execution_id, str(execution_id)}
+            or document.get("lease_version") != lease_version
+        ):
+            raise ControlClientError
+        payload = await self._authorized_request(
+            "POST",
+            f"/v1/agent/tasks/{execution_id}/complete",
+            expected_status=200,
+            json=document,
+            access_token=access_token,
+            lease_fenced=True,
+            extra_headers=self._source_lease_headers(lease_token),
+        )
+        response = SourceTaskCompletionResponse.model_validate_json(payload)
+        if response.execution_id != execution_id or response.lease_version != lease_version:
+            raise ControlClientError
+        return response
+
     async def acknowledge_cancellation(
         self,
         *,
@@ -1154,6 +1325,7 @@ __all__ = [
     "CompletionAcknowledgementResponse",
     "ControlClient",
     "ControlClientError",
+    "DeviceTaskExecuteResponse",
     "ExecutionSlot",
     "HeartbeatDevice",
     "HeartbeatDeviceReceipt",
@@ -1173,6 +1345,10 @@ __all__ = [
     "TaskRenewalResponse",
     "TaskSigningKeyResponse",
     "TaskWaitResponse",
+    "SourceTaskExecuteResponse",
+    "SourceTaskCancellationResponse",
+    "SourceTaskCompletionResponse",
+    "SourceTaskMutationResponse",
     "UnregistrationResponse",
     "UploadPartAuthorizationResponse",
     "UploadPartReceipt",

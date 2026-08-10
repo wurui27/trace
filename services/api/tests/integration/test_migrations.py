@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import os
 import re
+import asyncio
 from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from decimal import Decimal
 from importlib import import_module
 from pathlib import Path
 from time import monotonic, sleep
+from types import SimpleNamespace
 from typing import Literal, get_args
 from uuid import UUID, uuid4
 
@@ -24,6 +27,7 @@ from sqlalchemy import create_engine, inspect, text
 from sqlalchemy.engine import Engine, URL, make_url
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.pool import NullPool
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 CONTROL_TABLES = {
     "users",
@@ -35,6 +39,7 @@ CONTROL_TABLES = {
     "global_jobs",
     "scenario_jobs",
     "agent_leases",
+    "source_tasks",
     "sample_validation_claims",
     "worker_claims",
     "team_engine_workspaces",
@@ -74,6 +79,7 @@ _VERSIONED_CONTROL_TABLES = {
     "global_jobs",
     "scenario_jobs",
     "agent_leases",
+    "source_tasks",
     "sample_validation_claims",
     "worker_claims",
     "team_engine_workspaces",
@@ -337,6 +343,186 @@ def test_remote_agent_orm_contains_only_sanitized_device_identity_and_multipart_
         "created_at",
         "updated_at",
     }
+
+
+def test_source_task_orm_keeps_device_identity_and_completion_body_out() -> None:
+    from perfpilot_api.db.control.models import AgentLease, SourceTask
+
+    columns = set(SourceTask.__table__.columns.keys())
+    assert columns == {
+        "id",
+        "team_id",
+        "analysis_id",
+        "agent_id",
+        "workspace_id",
+        "task_type",
+        "state",
+        "lease_version",
+        "lease_token_digest",
+        "expires_at",
+        "request_document",
+        "request_sha256",
+        "completion_artifact_id",
+        "completion_sha256",
+        "failure_code",
+        "created_at",
+        "updated_at",
+        "started_at",
+        "completed_at",
+        "version",
+    }
+    assert "device_id" not in columns
+    assert "completion_document" not in columns
+    assert AgentLease.__table__.c.device_id.nullable is False
+
+
+@pytest.mark.asyncio
+async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
+    migration_databases: MigrationDatabases,
+) -> None:
+    from perfpilot_api.services.source_tasks import (
+        SQLAlchemySourceTaskRepository,
+        SourceCompletionArtifact,
+        SourceTaskConflict,
+        SourceTaskService,
+    )
+
+    _upgrade("control", migration_databases.control_url)
+    user_id = UUID("11000000-0000-4000-8000-000000000001")
+    team_id = UUID("12000000-0000-4000-8000-000000000001")
+    agent_id = UUID("71000000-0000-4000-8000-000000000001")
+    analysis_ids = (
+        UUID("30000000-0000-4000-8000-000000000001"),
+        UUID("30000000-0000-4000-8000-000000000002"),
+    )
+    with migration_databases.control_engine.begin() as connection:
+        connection.execute(text("INSERT INTO users (id, username, password_hash, state) VALUES (:id, 'source-owner', 'x', 'active')"), {"id": user_id})
+        connection.execute(text("INSERT INTO teams (id, name, state) VALUES (:id, 'source-team', 'active')"), {"id": team_id})
+        connection.execute(text("INSERT INTO agents (id, team_id, owner_user_id, name, state) VALUES (:id, :team, :owner, 'source-agent', 'online')"), {"id": agent_id, "team": team_id, "owner": user_id})
+        for index, analysis_id in enumerate(analysis_ids):
+            connection.execute(
+                text("INSERT INTO global_jobs (id, team_id, idempotency_key, analysis_mode, state) VALUES (:id, :team, :key, 'trace_upload', 'analyzing')"),
+                {"id": analysis_id, "team": team_id, "key": f"source-{index}"},
+            )
+
+    async_engine = create_async_engine(migration_databases.control_url, poolclass=NullPool)
+    sessions = async_sessionmaker(async_engine, expire_on_commit=False)
+    execution_ids = iter(
+        (
+            UUID("73000000-0000-4000-8000-000000000001"),
+            UUID("73000000-0000-4000-8000-000000000002"),
+        )
+    )
+    service = SourceTaskService(
+        repository=SQLAlchemySourceTaskRepository(sessions),
+        clock=lambda: datetime(2026, 8, 5, 8, 0, tzinfo=UTC),
+        execution_id_source=lambda: next(execution_ids),
+        lease_token_source=lambda: b"source-lease-token",
+    )
+    try:
+        for analysis_id in analysis_ids:
+            await service.create_context_task(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                agent_id=agent_id,
+                workspace_id=UUID("91000000-0000-4000-8000-000000000001"),
+                validation_profile_id=None,
+                finding_hints=(),
+            )
+        first, second = await asyncio.gather(
+            service.lease_next(agent_id=agent_id),
+            service.lease_next(agent_id=agent_id),
+        )
+        leases = [item for item in (first, second) if item is not None]
+        assert len(leases) == 1
+        lease = leases[0]
+
+        class Recorder:
+            async def record_completion(self, *, task, document, checksum, now):
+                await asyncio.sleep(0)
+                marker = "1" if document["result"]["failure_code"] == "first" else "2"
+                return SourceCompletionArtifact(
+                    artifact_id=UUID(f"40000000-0000-4000-8000-00000000000{marker}"),
+                    checksum=checksum,
+                )
+
+        def completion(code: str) -> dict[str, object]:
+            return {
+                "schema_version": "1.0",
+                "task_type": "source_context",
+                "execution_id": str(lease.execution_id),
+                "analysis_id": str(lease.analysis_id),
+                "workspace_id": "91000000-0000-4000-8000-000000000001",
+                "lease_version": lease.lease_version,
+                "state": "failed",
+                "result": {"failure_code": code, "retryable": False},
+                "signature_b64": "A" * 86 + "==",
+            }
+
+        outcomes = await asyncio.gather(
+            service.complete(
+                execution_id=lease.execution_id,
+                agent_id=agent_id,
+                lease_version=lease.lease_version,
+                lease_token=lease.lease_token,
+                completion_document=completion("first"),
+                recorder=Recorder(),
+            ),
+            service.complete(
+                execution_id=lease.execution_id,
+                agent_id=agent_id,
+                lease_version=lease.lease_version,
+                lease_token=lease.lease_token,
+                completion_document=completion("second"),
+                recorder=Recorder(),
+            ),
+            return_exceptions=True,
+        )
+        assert sum(not isinstance(item, BaseException) for item in outcomes) == 1
+        assert sum(isinstance(item, SourceTaskConflict) for item in outcomes) == 1
+
+        active_source = await service.lease_next(agent_id=agent_id)
+        assert active_source is not None
+        device_id = UUID("72000000-0000-4000-8000-000000000001")
+        device_analysis_id = UUID("30000000-0000-4000-8000-000000000003")
+        with migration_databases.control_engine.begin() as connection:
+            connection.execute(
+                text("UPDATE agents SET capabilities = CAST(:capabilities AS jsonb), last_heartbeat_at = :now WHERE id = :id"),
+                {
+                    "id": agent_id,
+                    "now": datetime(2026, 8, 5, 8, 0, tzinfo=UTC),
+                    "capabilities": '{"execution_slot":{"state":"idle","execution_id":null}}',
+                },
+            )
+            connection.execute(
+                text("INSERT INTO devices (id, team_id, agent_id, serial_digest, serial_suffix, connection_type, adb_state, state, last_seen_at) VALUES (:id, :team, :agent, :digest, '0001', 'usb', 'device', 'ready', :now)"),
+                {
+                    "id": device_id,
+                    "team": team_id,
+                    "agent": agent_id,
+                    "digest": "d" * 64,
+                    "now": datetime(2026, 8, 5, 8, 0, tzinfo=UTC),
+                },
+            )
+            connection.execute(
+                text("INSERT INTO global_jobs (id, team_id, idempotency_key, analysis_mode, state, selected_device_id) VALUES (:id, :team, 'device-cross-kind', 'device', 'queued', :device)"),
+                {"id": device_analysis_id, "team": team_id, "device": device_id},
+            )
+        from perfpilot_api.services.agent_tasks import SQLAlchemyAgentTaskRepository
+
+        device_repository = SQLAlchemyAgentTaskRepository(
+            control_session_factory=sessions,
+            tenant_router=SimpleNamespace(),  # stopped by source lease before tenant access
+        )
+        assert (
+            await device_repository.schedule(
+                analysis_id=device_analysis_id,
+                now=datetime(2026, 8, 5, 8, 0, tzinfo=UTC),
+            )
+            is None
+        )
+    finally:
+        await async_engine.dispose()
 
 
 def test_engine_execution_orm_uses_external_run_identifiers_and_tenant_version() -> None:
@@ -930,7 +1116,7 @@ def test_control_execution_tenant_version_migration_round_trips_empty_table(
     assert tenant_version["default"] is None
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0012_source_bindings"
+            "0013_source_code_tasks"
         )
 
     command.downgrade(config, "0005_memory_upload_mode")
@@ -1033,7 +1219,7 @@ def test_control_execution_tenant_version_downgrade_refuses_rows(
 
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0012_source_bindings"
+            "0013_source_code_tasks"
         )
     assert "tenant_resource_version" in {
         column["name"]
@@ -2104,7 +2290,7 @@ def test_control_ai_synthesis_downgrade_refuses_audit_records(
         assert connection.scalar(text("SELECT count(*) FROM synthesis_executions")) == 1
         assert connection.scalar(text("SELECT count(*) FROM ai_invocations")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0012_source_bindings"
+            "0013_source_code_tasks"
         )
 
 
@@ -2157,7 +2343,7 @@ def test_control_ai_synthesis_downgrade_refuses_retained_outbox_authority(
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM outbox_events")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0012_source_bindings"
+            "0013_source_code_tasks"
         )
 
 
@@ -2281,7 +2467,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
 @pytest.mark.parametrize(
     ("tree", "downgrade_revision", "head_revision"),
     [
-        ("control", "0004_external_engine_foundation", "0012_source_bindings"),
+        ("control", "0004_external_engine_foundation", "0013_source_code_tasks"),
         ("tenant", "0003_analysis_orchestration", "0008_agent_multipart_uploads"),
     ],
 )
@@ -2337,7 +2523,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "control",
             "0004_external_engine_foundation",
-            "0012_source_bindings",
+            "0013_source_code_tasks",
             "global_jobs",
             "ck_global_jobs_analysis_mode",
         ),

@@ -34,6 +34,13 @@ _CONTRACT = (
     / "agents"
     / "task-snapshot.schema.json"
 )
+_SOURCE_CONTRACT = (
+    Path(__file__).resolve().parents[5]
+    / "contracts"
+    / "v1"
+    / "agents"
+    / "source-task-snapshot.schema.json"
+)
 
 
 class TaskSnapshotRejected(RuntimeError):
@@ -101,6 +108,16 @@ def _closed_json(value: bytes) -> dict[str, object]:
 def _validator() -> Draft202012Validator:
     try:
         schema = json.loads(_CONTRACT.read_text(encoding="utf-8"))
+        Draft202012Validator.check_schema(schema)
+    except (OSError, UnicodeError, json.JSONDecodeError, SchemaError):
+        raise TaskSnapshotRejected from None
+    return Draft202012Validator(schema, format_checker=FormatChecker())
+
+
+@lru_cache(maxsize=1)
+def _source_validator() -> Draft202012Validator:
+    try:
+        schema = json.loads(_SOURCE_CONTRACT.read_text(encoding="utf-8"))
         Draft202012Validator.check_schema(schema)
     except (OSError, UnicodeError, json.JSONDecodeError, SchemaError):
         raise TaskSnapshotRejected from None
@@ -185,6 +202,43 @@ class TaskSnapshotSigner:
         return compact
 
 
+class SourceTaskSnapshotSigner:
+    """Signs a closed source-task snapshot without wrapping or logging its body."""
+
+    __slots__ = ("_clock", "_kid", "_private_key")
+
+    def __init__(
+        self,
+        *,
+        private_key: Ed25519PrivateKey,
+        kid: str,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+    ) -> None:
+        if not isinstance(private_key, Ed25519PrivateKey) or _KID_PATTERN.fullmatch(kid) is None:
+            raise ValueError("Source task signer configuration is invalid")
+        self._private_key = private_key
+        self._kid = kid
+        self._clock = clock
+
+    def __repr__(self) -> str:
+        return f"SourceTaskSnapshotSigner(kid={self._kid!r})"
+
+    def sign(self, snapshot: dict[str, object]) -> str:
+        now = self._clock()
+        if now.tzinfo is None or now.utcoffset() is None:
+            raise TaskSnapshotRejected
+        try:
+            _source_validator().validate(snapshot)
+        except ValidationError:
+            raise TaskSnapshotRejected from None
+        expires_at = _parse_timestamp(snapshot.get("expires_at"))
+        remaining = expires_at - now.astimezone(UTC)
+        if remaining <= timedelta(0) or remaining > _MAXIMUM_LIFETIME:
+            raise TaskSnapshotRejected
+        canonical = _canonical_json(snapshot)
+        return base64.b64encode(self._private_key.sign(canonical)).decode("ascii")
+
+
 def verify_task_jws(
     compact: str,
     public_key_b64: str,
@@ -241,6 +295,7 @@ def snapshot_digest(compact: str) -> str:
 
 
 __all__ = [
+    "SourceTaskSnapshotSigner",
     "TaskSnapshotRejected",
     "TaskSnapshotSigner",
     "snapshot_digest",

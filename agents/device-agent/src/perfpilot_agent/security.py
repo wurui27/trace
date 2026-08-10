@@ -19,6 +19,7 @@ from pydantic import (
     ValidationError,
     field_validator,
     model_validator,
+    TypeAdapter,
 )
 
 _SEGMENT_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -113,6 +114,104 @@ class TaskSnapshot(BaseModel):
         if len(set(self.allowed_uploads)) != len(self.allowed_uploads):
             raise ValueError("task uploads must be unique")
         return self
+
+
+VerifiedCaptureTask = TaskSnapshot
+
+
+class SourceFindingHint(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    finding_id: UUID
+    evidence_ids: tuple[UUID, ...] = Field(max_length=20)
+    rule_id: str = Field(min_length=1, max_length=128, pattern=r"^[a-z][a-z0-9_.]*$")
+    symbol_hints: tuple[
+        Annotated[
+            str,
+            StringConstraints(
+                min_length=1,
+                max_length=255,
+                pattern=r"^[^\x00-\x1f\x7f]+$",
+            ),
+        ],
+        ...,
+    ] = Field(max_length=8)
+
+    @model_validator(mode="after")
+    def validate_unique_hints(self) -> Self:
+        if len(set(self.evidence_ids)) != len(self.evidence_ids) or len(
+            set(self.symbol_hints)
+        ) != len(self.symbol_hints):
+            raise ValueError("source finding hints must be unique")
+        return self
+
+
+class SourceLimits(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    max_findings: Literal[3]
+    max_files: Literal[12]
+    max_bytes: Literal[98_304]
+
+
+class VerifiedSourceTask(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.0"]
+    task_type: str
+    execution_id: UUID
+    analysis_id: UUID
+    team_id: UUID
+    agent_id: UUID
+    workspace_id: UUID
+    snapshot_policy: Literal["tracked_worktree"]
+    validation_profile_id: UUID | None
+    lease_version: int = Field(strict=True, ge=1)
+    expires_at: datetime
+
+    @field_validator("expires_at", mode="before")
+    @classmethod
+    def require_string_expiry(cls, value: object) -> object:
+        if not isinstance(value, str):
+            raise ValueError("task timestamp must be an ISO 8601 string")
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expiry(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("task timestamp must include a timezone")
+        return value.astimezone(UTC)
+
+
+class VerifiedSourceContextTask(VerifiedSourceTask):
+    task_type: Literal["source_context"]
+    finding_hints: tuple[SourceFindingHint, ...] = Field(max_length=3)
+    limits: SourceLimits
+
+
+class VerifiedPatchVerificationTask(VerifiedSourceTask):
+    task_type: Literal["patch_verification"]
+    validation_profile_id: UUID
+    snapshot_id: UUID
+    snapshot_hash: HexDigest
+    fix_id: UUID
+    patch: str = Field(min_length=1, max_length=65_536, repr=False)
+
+    @field_validator("patch")
+    @classmethod
+    def validate_patch_bytes(cls, value: str) -> str:
+        if len(value.encode("utf-8")) > 65_536:
+            raise ValueError("patch exceeds byte limit")
+        return value
+
+
+_SOURCE_TASK_ADAPTER = TypeAdapter(
+    Annotated[
+        VerifiedSourceContextTask | VerifiedPatchVerificationTask,
+        Field(discriminator="task_type"),
+    ]
+)
 
 
 def _encode_segment(value: bytes) -> str:
@@ -242,6 +341,58 @@ class TaskVerifier:
         ):
             raise TaskRejected from None
 
+    def verify_source(
+        self,
+        snapshot: object,
+        signature_b64: str,
+        *,
+        expected_agent_id: UUID,
+        expected_execution_id: UUID,
+        expected_lease_version: int | None,
+    ) -> VerifiedSourceTask:
+        try:
+            if not isinstance(snapshot, dict):
+                raise TaskRejected
+            canonical = json.dumps(
+                snapshot,
+                ensure_ascii=True,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("ascii")
+            signature = base64.b64decode(signature_b64, validate=True)
+            if len(signature) != 64 or base64.b64encode(signature).decode("ascii") != signature_b64:
+                raise TaskRejected
+            self._public_key.verify(signature, canonical)
+            task = _SOURCE_TASK_ADAPTER.validate_python(snapshot)
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise TaskRejected
+            remaining = task.expires_at - now.astimezone(UTC)
+            if (
+                remaining <= timedelta(0)
+                or remaining > _MAXIMUM_LIFETIME
+                or task.agent_id != expected_agent_id
+                or task.execution_id != expected_execution_id
+                or (
+                    expected_lease_version is not None
+                    and task.lease_version != expected_lease_version
+                )
+            ):
+                raise TaskRejected
+            return task
+        except TaskRejected:
+            raise
+        except (
+            InvalidSignature,
+            ValidationError,
+            UnicodeError,
+            ValueError,
+            TypeError,
+            binascii.Error,
+        ):
+            raise TaskRejected from None
+
 
 __all__ = [
     "TaskInputArtifact",
@@ -249,4 +400,8 @@ __all__ = [
     "TaskScenario",
     "TaskSnapshot",
     "TaskVerifier",
+    "VerifiedCaptureTask",
+    "VerifiedPatchVerificationTask",
+    "VerifiedSourceContextTask",
+    "VerifiedSourceTask",
 ]

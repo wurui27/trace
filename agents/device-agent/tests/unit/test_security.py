@@ -10,7 +10,7 @@ import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
-from perfpilot_agent.security import TaskRejected, TaskVerifier
+from perfpilot_agent.security import TaskRejected, TaskVerifier, VerifiedSourceTask
 
 AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
 OTHER_AGENT_ID = UUID("71000000-0000-4000-8000-000000000002")
@@ -104,4 +104,51 @@ def test_task_rejects_unbound_or_open_claims(
             expected_agent_id=AGENT_ID,
             expected_lease_version=lease,
             known_device_digests=digests,
+        )
+
+
+def test_source_task_verifier_accepts_only_closed_agent_bound_snapshot(
+    signing_key: Ed25519PrivateKey,
+) -> None:
+    snapshot = {
+        "schema_version": "1.0",
+        "task_type": "source_context",
+        "execution_id": "73000000-0000-4000-8000-000000000001",
+        "analysis_id": "30000000-0000-4000-8000-000000000001",
+        "team_id": "10000000-0000-4000-8000-000000000001",
+        "agent_id": str(AGENT_ID),
+        "workspace_id": "91000000-0000-4000-8000-000000000001",
+        "snapshot_policy": "tracked_worktree",
+        "validation_profile_id": None,
+        "lease_version": 1,
+        "expires_at": (NOW + timedelta(seconds=60)).isoformat(),
+        "finding_hints": [],
+        "limits": {"max_findings": 3, "max_files": 12, "max_bytes": 98_304},
+    }
+    canonical = __import__("json").dumps(
+        snapshot,
+        ensure_ascii=True,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("ascii")
+    signature = base64.b64encode(signing_key.sign(canonical)).decode("ascii")
+
+    task = verifier(signing_key).verify_source(
+        snapshot,
+        signature,
+        expected_agent_id=AGENT_ID,
+        expected_execution_id=UUID(snapshot["execution_id"]),
+        expected_lease_version=1,
+    )
+
+    assert isinstance(task, VerifiedSourceTask)
+    assert task.workspace_id == UUID("91000000-0000-4000-8000-000000000001")
+    with pytest.raises(TaskRejected):
+        verifier(signing_key).verify_source(
+            {**snapshot, "device_digest": DEVICE_DIGEST},
+            signature,
+            expected_agent_id=AGENT_ID,
+            expected_execution_id=UUID(snapshot["execution_id"]),
+            expected_lease_version=1,
         )

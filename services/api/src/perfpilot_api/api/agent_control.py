@@ -24,6 +24,15 @@ from perfpilot_api.services.device_directory import (
     DeviceHeartbeatRejected,
 )
 from perfpilot_api.services.source_workspaces import is_public_source_display_name
+from perfpilot_api.services.source_tasks import (
+    SourceTaskConflict,
+    SourceTaskCompletionRecorder,
+    SourceTaskInvalid,
+    SourceTaskNotFound,
+    SourceTaskService,
+    SourceTaskTooLarge,
+    StaleSourceTaskLease,
+)
 from perfpilot_api.services.agent_tasks import (
     AgentTaskCancellation,
     AgentTaskConflict,
@@ -389,6 +398,20 @@ class CompleteAgentExecutionRequest(BaseModel):
         return value
 
 
+class CompleteSourceTaskRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    schema_version: Literal["1.0"]
+    task_type: Literal["source_context", "patch_verification"]
+    execution_id: UUID
+    analysis_id: UUID
+    workspace_id: UUID
+    lease_version: int = Field(strict=True, ge=1)
+    state: Literal["completed", "failed", "canceled", "expired"]
+    result: dict[str, object] = Field(repr=False)
+    signature_b64: str = Field(pattern=_SIGNATURE_PATTERN, repr=False)
+
+
 def _reject_browser_credentials(request: Request) -> None:
     forbidden = (
         "cookie",
@@ -442,6 +465,37 @@ def get_agent_task_service(request: Request) -> AgentTaskService:
     if service is None:
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
     return service
+
+
+def get_source_task_service(request: Request) -> SourceTaskService | None:
+    return getattr(request.app.state, "source_task_service", None)
+
+
+def get_source_task_completion_recorder(
+    request: Request,
+) -> SourceTaskCompletionRecorder | None:
+    return getattr(request.app.state, "source_task_completion_recorder", None)
+
+
+def _source_lease_token(request: Request) -> str:
+    values = request.headers.getlist("x-perfpilot-lease-token")
+    if len(values) != 1 or not 16 <= len(values[0]) <= 256:
+        raise ApiError("stale_lease_version", "租约版本已经变化", 409, True)
+    return values[0]
+
+
+def _raise_source_task_error(error: Exception) -> None:
+    if isinstance(error, SourceTaskTooLarge):
+        raise ApiError("payload_too_large", "源码任务结果过大", 413, False) from None
+    if isinstance(error, StaleSourceTaskLease):
+        raise ApiError("stale_lease_version", "租约版本已经变化", 409, True) from None
+    if isinstance(error, SourceTaskConflict):
+        raise ApiError("source_task_conflict", "源码任务结果冲突", 409, False) from None
+    if isinstance(error, SourceTaskNotFound):
+        raise ApiError("resource_not_found", "资源不存在", 404, False) from None
+    if isinstance(error, SourceTaskInvalid):
+        raise ApiError("invalid_request", "源码任务请求无效", 400, False) from None
+    raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
 
 
 def get_agent_upload_service(request: Request) -> AgentUploadService:
@@ -638,14 +692,26 @@ async def poll_next_task(
     response: Response,
     agent_service: Annotated[AgentService, Depends(get_agent_service)],
     task_service: Annotated[AgentTaskService, Depends(get_agent_task_service)],
+    source_task_service: Annotated[
+        SourceTaskService | None, Depends(get_source_task_service)
+    ],
     wait_seconds: Annotated[int, Query(ge=0, le=20)] = 20,
 ) -> dict[str, object]:
     principal = await _authenticate_access(request, agent_service)
     try:
         task = await task_service.poll(
             agent_id=principal.agent_id,
-            wait_seconds=wait_seconds,
+            wait_seconds=0,
         )
+        if task is None and source_task_service is not None:
+            task = await source_task_service.lease_next(agent_id=principal.agent_id)
+        if task is None and wait_seconds:
+            task = await task_service.poll(
+                agent_id=principal.agent_id,
+                wait_seconds=wait_seconds,
+            )
+            if task is None and source_task_service is not None:
+                task = await source_task_service.lease_next(agent_id=principal.agent_id)
     except AgentTaskUnavailable:
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
     response.headers["cache-control"] = "no-store"
@@ -654,6 +720,16 @@ async def poll_next_task(
             "schema_version": "1.0",
             "action": "wait",
             "retry_after_seconds": max(1, min(20, wait_seconds or 1)),
+        }
+    from perfpilot_api.services.source_tasks import SourceTaskDelivery
+
+    if isinstance(task, SourceTaskDelivery):
+        return {
+            "schema_version": "1.1",
+            "task_kind": "source",
+            "lease_token": task.lease_token,
+            "snapshot": task.snapshot,
+            "signature_b64": task.signature_b64,
         }
     if isinstance(task, AgentTaskCancellation):
         return _cancellation_payload(task)
@@ -674,8 +750,33 @@ async def renew_task(
     response: Response,
     agent_service: Annotated[AgentService, Depends(get_agent_service)],
     task_service: Annotated[AgentTaskService, Depends(get_agent_task_service)],
+    source_task_service: Annotated[
+        SourceTaskService | None, Depends(get_source_task_service)
+    ],
 ) -> dict[str, object]:
     principal = await _authenticate_access(request, agent_service)
+    if source_task_service is not None and await source_task_service.owns(
+        execution_id=execution_id,
+        agent_id=principal.agent_id,
+    ):
+        try:
+            renewal = await source_task_service.renew(
+                execution_id=execution_id,
+                agent_id=principal.agent_id,
+                lease_version=payload.lease_version,
+                lease_token=_source_lease_token(request),
+            )
+        except (SourceTaskConflict, SourceTaskInvalid, SourceTaskNotFound, StaleSourceTaskLease) as error:
+            _raise_source_task_error(error)
+        response.headers["cache-control"] = "no-store"
+        return {
+            "schema_version": "1.1",
+            "execution_id": str(renewal.execution_id),
+            "analysis_id": str(renewal.analysis_id),
+            "lease_version": renewal.lease_version,
+            "state": renewal.state,
+            "accepted_at": _utc(renewal.occurred_at),
+        }
     try:
         renewal = await task_service.renew(
             agent_id=principal.agent_id,
@@ -708,9 +809,34 @@ async def acknowledge_agent_cancellation(
     response: Response,
     agent_service: Annotated[AgentService, Depends(get_agent_service)],
     task_service: Annotated[AgentTaskService, Depends(get_agent_task_service)],
+    source_task_service: Annotated[
+        SourceTaskService | None, Depends(get_source_task_service)
+    ],
     upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
 ) -> dict[str, object]:
     principal = await _authenticate_access(request, agent_service)
+    if source_task_service is not None and await source_task_service.owns(
+        execution_id=execution_id,
+        agent_id=principal.agent_id,
+    ):
+        try:
+            acknowledgement = await source_task_service.ack_cancel(
+                execution_id=execution_id,
+                agent_id=principal.agent_id,
+                lease_version=payload.lease_version,
+                lease_token=_source_lease_token(request),
+            )
+        except (SourceTaskConflict, SourceTaskInvalid, SourceTaskNotFound, StaleSourceTaskLease) as error:
+            _raise_source_task_error(error)
+        response.headers["cache-control"] = "no-store"
+        return {
+            "schema_version": "1.1",
+            "execution_id": str(acknowledgement.execution_id),
+            "analysis_id": str(acknowledgement.analysis_id),
+            "lease_version": acknowledgement.lease_version,
+            "state": acknowledgement.state,
+            "acknowledged_at": _utc(acknowledgement.occurred_at),
+        }
     try:
         acknowledgement = await task_service.acknowledge_cancellation(
             agent_id=principal.agent_id,
@@ -741,14 +867,53 @@ async def acknowledge_agent_cancellation(
 @router.post("/tasks/{execution_id}/complete")
 async def complete_agent_execution(
     execution_id: UUID,
-    payload: CompleteAgentExecutionRequest,
+    payload: CompleteAgentExecutionRequest | CompleteSourceTaskRequest,
     request: Request,
     response: Response,
     agent_service: Annotated[AgentService, Depends(get_agent_service)],
     task_service: Annotated[AgentTaskService, Depends(get_agent_task_service)],
+    source_task_service: Annotated[
+        SourceTaskService | None, Depends(get_source_task_service)
+    ],
+    source_recorder: Annotated[
+        SourceTaskCompletionRecorder | None,
+        Depends(get_source_task_completion_recorder),
+    ],
     upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
 ) -> dict[str, object]:
     principal = await _authenticate_access(request, agent_service)
+    if isinstance(payload, CompleteSourceTaskRequest):
+        if (
+            source_task_service is None
+            or source_recorder is None
+            or not await source_task_service.owns(
+                execution_id=execution_id,
+                agent_id=principal.agent_id,
+            )
+        ):
+            raise ApiError("resource_not_found", "资源不存在", 404, False)
+        try:
+            completion = await source_task_service.complete(
+                execution_id=execution_id,
+                agent_id=principal.agent_id,
+                lease_version=payload.lease_version,
+                lease_token=_source_lease_token(request),
+                completion_document=payload.model_dump(mode="json"),
+                recorder=source_recorder,
+            )
+        except (SourceTaskConflict, SourceTaskInvalid, SourceTaskNotFound, StaleSourceTaskLease) as error:
+            _raise_source_task_error(error)
+        response.headers["cache-control"] = "no-store"
+        return {
+            "schema_version": "1.1",
+            "execution_id": str(completion.execution_id),
+            "analysis_id": str(completion.analysis_id),
+            "lease_version": completion.lease_version,
+            "state": completion.state,
+            "artifact_id": str(completion.artifact_id),
+            "checksum": completion.checksum,
+            "accepted_at": _utc(completion.occurred_at),
+        }
     try:
         completion = await task_service.complete(
             agent_id=principal.agent_id,

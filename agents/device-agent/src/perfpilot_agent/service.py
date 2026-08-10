@@ -9,16 +9,18 @@ from uuid import UUID
 
 from perfpilot_agent.control_client import (
     ControlClientError,
+    DeviceTaskExecuteResponse,
     HeartbeatResponse,
     LeaseLost,
     TaskCancellationResponse,
     TaskExecuteResponse,
     TaskPollResponse,
     TaskWaitResponse,
+    SourceTaskExecuteResponse,
 )
 from perfpilot_agent.credentials import AgentCredentials, CredentialStoreError
 from perfpilot_agent.executor import TaskExecutionError
-from perfpilot_agent.security import TaskRejected, TaskVerifier
+from perfpilot_agent.security import TaskRejected, TaskVerifier, VerifiedSourceTask
 from perfpilot_agent.state import AgentRuntimeState, RuntimeStateError
 
 _LOGGER = logging.getLogger("perfpilot-agent.service")
@@ -42,18 +44,24 @@ class TaskLoopExecutor(Protocol):
     async def run(self, task: object) -> None: ...
 
 
+class SourceTaskLoopExecutor(Protocol):
+    async def run(self, task: VerifiedSourceTask, *, lease_token: str) -> None: ...
+
+
 class TaskLoop:
     def __init__(
         self,
         *,
         control: TaskLoopControl,
         executor: TaskLoopExecutor,
+        source_executor: SourceTaskLoopExecutor | None = None,
         state: AgentRuntimeState,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     ) -> None:
         self._control = control
         self._executor = executor
+        self._source_executor = source_executor
         self._state = state
         self._clock = clock
         self._sleep = sleep
@@ -72,7 +80,27 @@ class TaskLoop:
             )
             return True
         if not isinstance(response, TaskExecuteResponse):
-            raise ControlClientError
+            if not isinstance(response, SourceTaskExecuteResponse):
+                if isinstance(response, DeviceTaskExecuteResponse):
+                    raise TaskRejected
+                raise ControlClientError
+            credentials = self._control.credentials
+            snapshot = response.snapshot
+            task = TaskVerifier(
+                public_key_b64=credentials.task_signing_key.public_key_b64,
+                kid=credentials.task_signing_key.kid,
+                clock=self._clock,
+            ).verify_source(
+                snapshot,
+                response.signature_b64,
+                expected_agent_id=credentials.agent_id,
+                expected_execution_id=UUID(str(snapshot.get("execution_id"))),
+                expected_lease_version=int(str(snapshot.get("lease_version"))),
+            )
+            if not isinstance(task, VerifiedSourceTask) or self._source_executor is None:
+                raise TaskRejected
+            await self._source_executor.run(task, lease_token=response.lease_token)
+            return True
         credentials = self._control.credentials
         task = TaskVerifier(
             public_key_b64=credentials.task_signing_key.public_key_b64,

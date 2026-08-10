@@ -63,7 +63,7 @@ from perfpilot_api.security.agent_signatures import (
     RedisAgentNonceStore,
     encode_ed25519_public_key,
 )
-from perfpilot_api.security.task_snapshots import TaskSnapshotSigner
+from perfpilot_api.security.task_snapshots import SourceTaskSnapshotSigner, TaskSnapshotSigner
 from perfpilot_api.runtime.artifacts import ArtifactRuntime, build_artifact_runtime
 from perfpilot_api.services.auth import (
     AuthService,
@@ -87,6 +87,11 @@ from perfpilot_api.services.agent_tasks import (
 from perfpilot_api.services.agent_uploads import (
     AgentUploadService,
     SQLAlchemyAgentUploadRepository,
+)
+from perfpilot_api.services.source_tasks import (
+    SQLAlchemySourceTaskRepository,
+    SourceTaskCompletionRecorder,
+    SourceTaskService,
 )
 from perfpilot_api.services.analyses import (
     AnalysisService,
@@ -219,6 +224,8 @@ def create_app(
     device_directory: DeviceDirectory | None = None,
     source_workspace_service: SourceWorkspaceService | None = None,
     agent_task_service: AgentTaskService | None = None,
+    source_task_service: SourceTaskService | None = None,
+    source_task_completion_recorder: SourceTaskCompletionRecorder | None = None,
     agent_upload_service: AgentUploadService | None = None,
     android_memory_worker: AndroidMemoryWorker | None = None,
     apk_inspector: ApkInspector | None = None,
@@ -252,8 +259,10 @@ def create_app(
     resolved_device_directory = device_directory
     resolved_source_workspace_service = source_workspace_service
     resolved_agent_task_service = agent_task_service
+    resolved_source_task_service = source_task_service
     resolved_agent_upload_service = agent_upload_service
     resolved_task_snapshot_signer: TaskSnapshotSigner | None = None
+    resolved_source_task_signer: SourceTaskSnapshotSigner | None = None
     resolved_android_memory_worker = android_memory_worker
     active_android_memory_worker: AndroidMemoryWorker | None = None
     owned_android_memory_artifact_client: httpx.AsyncClient | None = None
@@ -333,6 +342,10 @@ def create_app(
             private_key=task_private_key,
             kid=task_signing_kid,
         )
+        resolved_source_task_signer = SourceTaskSnapshotSigner(
+            private_key=task_private_key,
+            kid=task_signing_kid,
+        )
         resolved_agent_service = AgentService(
             repository=SQLAlchemyAgentRepository(control_session_factory),
             credentials=AgentCredentialCodec(credential_secret),
@@ -371,6 +384,7 @@ def create_app(
         nonlocal resolved_memory_capture_service
         nonlocal resolved_upload_service
         nonlocal resolved_agent_task_service
+        nonlocal resolved_source_task_service
         nonlocal resolved_agent_upload_service
         nonlocal active_android_memory_worker
         nonlocal engine_adapter_registry
@@ -436,6 +450,16 @@ def create_app(
                 lifespan_app.state.android_memory_image_digest = (
                     None if image_reference is None else image_reference.rpartition("@")[2]
                 )
+            if (
+                resolved_source_task_service is None
+                and control_session_factory is not None
+                and resolved_source_task_signer is not None
+            ):
+                resolved_source_task_service = SourceTaskService(
+                    repository=SQLAlchemySourceTaskRepository(control_session_factory),
+                    signer=resolved_source_task_signer,
+                )
+                lifespan_app.state.source_task_service = resolved_source_task_service
             if settings.app_env == "production" and apk_inspector is None:
                 raise RuntimeError("An externally isolated APK inspector is unavailable")
             if artifact_runtime_required:
@@ -596,6 +620,8 @@ def create_app(
     app.state.device_directory = resolved_device_directory
     app.state.source_workspace_service = resolved_source_workspace_service
     app.state.agent_task_service = resolved_agent_task_service
+    app.state.source_task_service = resolved_source_task_service
+    app.state.source_task_completion_recorder = source_task_completion_recorder
     app.state.agent_upload_service = resolved_agent_upload_service
     app.state.engine_adapter_registry = engine_adapter_registry
     app.state.android_memory_worker = None

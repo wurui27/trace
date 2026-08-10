@@ -10,6 +10,7 @@ from perfpilot_api.db.control.models.jobs import (
     WorkerClaim,
 )
 from perfpilot_api.db.control.models.synthesis import AIInvocation, SynthesisExecution
+from perfpilot_api.db.control.models.source_tasks import SourceTask
 from perfpilot_api.db.control.models.tenancy import (
     IdempotencyKey,
     Membership,
@@ -39,6 +40,7 @@ __all__ = [
     "TenantQuota",
     "TenantResource",
     "SynthesisExecution",
+    "SourceTask",
     "User",
     "WorkerClaim",
 ]
