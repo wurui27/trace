@@ -108,7 +108,11 @@ class SourceWorkspaceRegistry:
         *arguments: str,
         allowed_returncodes: tuple[int, ...] = (0,),
     ) -> subprocess.CompletedProcess[bytes]:
-        environment = os.environ.copy()
+        environment = {
+            key: value
+            for key, value in os.environ.items()
+            if not key.upper().startswith("GIT_")
+        }
         environment.update(
             {
                 "GIT_TERMINAL_PROMPT": "0",

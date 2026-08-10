@@ -174,6 +174,27 @@ def test_registration_rejects_unsafe_workspace_paths_without_echoing_them(
     assert str(candidate) not in repr(captured.value)
 
 
+def test_registration_rejects_plain_directory_despite_hostile_git_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = _git_repo(tmp_path / "real-repository")
+    candidate = tmp_path / "plain-directory"
+    candidate.mkdir()
+    monkeypatch.setenv("GIT_DIR", str(repo / ".git"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(candidate))
+    registry = SourceWorkspaceRegistry(
+        tmp_path / "agent-state",
+        uuid_factory=lambda: WORKSPACE_ID,
+    )
+
+    with pytest.raises(SourceRegistryError) as captured:
+        registry.add(name="Demo", path=candidate)
+
+    assert str(repo) not in str(captured.value)
+    assert str(candidate) not in str(captured.value)
+
+
 def test_registration_rejects_duplicate_names_and_non_v4_generated_ids(tmp_path: Path) -> None:
     first = _git_repo(tmp_path / "first")
     second = _git_repo(tmp_path / "second")
