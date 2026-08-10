@@ -109,7 +109,7 @@ def _validate_https_url(value: str) -> str:
 class RegistrationRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     registration_code: str = Field(pattern=r"^ppreg_[A-Za-z0-9_-]{43}$", repr=False)
     public_key_b64: str = Field(repr=False)
     platform: AgentPlatform
@@ -152,8 +152,9 @@ class TaskSigningKeyResponse(BaseModel):
 class RegistrationResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     agent_id: UUID
+    team_id: UUID | None = None
     access_token: str = Field(pattern=r"^ppat_[A-Za-z0-9_-]{43}$", repr=False)
     access_token_expires_at: datetime
     refresh_token: str = Field(pattern=r"^pprt_[A-Za-z0-9_-]{43}$", repr=False)
@@ -170,13 +171,15 @@ class RegistrationResponse(BaseModel):
     def validate_expirations(self) -> Self:
         if self.refresh_token_expires_at <= self.access_token_expires_at:
             raise ValueError("credential expirations are invalid")
+        if (self.schema_version == "1.1") != (self.team_id is not None):
+            raise ValueError("credential team binding is invalid")
         return self
 
 
 class RefreshRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     agent_id: UUID
     refresh_token: str = Field(pattern=r"^pprt_[A-Za-z0-9_-]{43}$", repr=False)
     nonce: str
@@ -905,7 +908,7 @@ class ControlClient:
                 base64.b64decode(current.private_key_b64, validate=True)
             )
             request = RefreshRequest(
-                schema_version="1.0",
+                schema_version=current.schema_version,
                 agent_id=current.agent_id,
                 refresh_token=current.refresh_token,
                 nonce=nonce,
@@ -923,8 +926,9 @@ class ControlClient:
             if response.agent_id != current.agent_id:
                 raise ControlClientError
             refreshed = AgentCredentials(
-                schema_version="1.0",
+                schema_version=response.schema_version,
                 agent_id=current.agent_id,
+                team_id=response.team_id,
                 private_key_b64=current.private_key_b64,
                 access_token=response.access_token,
                 access_token_expires_at=response.access_token_expires_at,
@@ -1231,13 +1235,34 @@ class ControlClient:
         access_token: str | None = None,
     ) -> SourceTaskCompletionResponse:
         document = dict(completion)
-        canonical = json.dumps(
+        credentials = self._credentials
+        if credentials is None or credentials.team_id is None or "signature_b64" in document:
+            raise ControlClientError
+        document["agent_id"] = str(credentials.agent_id)
+        document["team_id"] = str(credentials.team_id)
+        unsigned = json.dumps(
             document,
-            ensure_ascii=True,
+            ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("ascii")
+        ).encode("utf-8")
+        try:
+            private_key = Ed25519PrivateKey.from_private_bytes(
+                base64.b64decode(credentials.private_key_b64, validate=True)
+            )
+        except (ValueError, TypeError, binascii.Error):
+            raise ControlClientError from None
+        document["signature_b64"] = base64.b64encode(private_key.sign(unsigned)).decode(
+            "ascii"
+        )
+        canonical = json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
         if (
             len(canonical) > 128 * 1024
             or document.get("execution_id") not in {execution_id, str(execution_id)}

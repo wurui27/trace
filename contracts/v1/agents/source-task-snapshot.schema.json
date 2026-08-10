@@ -65,6 +65,7 @@
       "additionalProperties": false,
       "required": [
         "schema_version",
+        "aud",
         "task_type",
         "execution_id",
         "analysis_id",
@@ -80,6 +81,7 @@
       ],
       "properties": {
         "schema_version": {"const": "1.0"},
+        "aud": {"const": "perfpilot-agent"},
         "task_type": {"const": "source_context"},
         "execution_id": {"$ref": "#/$defs/uuid"},
         "analysis_id": {"$ref": "#/$defs/uuid"},
@@ -104,6 +106,7 @@
       "additionalProperties": false,
       "required": [
         "schema_version",
+        "aud",
         "task_type",
         "execution_id",
         "analysis_id",
@@ -121,6 +124,7 @@
       ],
       "properties": {
         "schema_version": {"const": "1.0"},
+        "aud": {"const": "perfpilot-agent"},
         "task_type": {"const": "patch_verification"},
         "execution_id": {"$ref": "#/$defs/uuid"},
         "analysis_id": {"$ref": "#/$defs/uuid"},

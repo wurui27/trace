@@ -16,6 +16,7 @@ from perfpilot_agent.credentials import (
     InMemoryCredentialBackend,
     TaskSigningKey,
 )
+from pydantic import ValidationError
 from perfpilot_agent.platform.linux import LinuxFileCredentialBackend
 
 AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
@@ -87,6 +88,31 @@ def test_credentials_and_store_errors_do_not_reveal_secrets(
     with pytest.raises(CredentialStoreError) as caught:
         CredentialStore(backend).load()
     assert "pprt_leak" not in str(caught.value)
+
+
+def test_source_capable_credentials_bind_team_only_in_version_1_1(
+    signing_key: Ed25519PrivateKey,
+) -> None:
+    legacy = credentials(signing_key)
+    source_capable = legacy.model_copy(
+        update={
+            "schema_version": "1.1",
+            "team_id": UUID("10000000-0000-4000-8000-000000000001"),
+        }
+    )
+
+    assert source_capable.team_id == UUID("10000000-0000-4000-8000-000000000001")
+    with pytest.raises(ValidationError):
+        AgentCredentials.model_validate(
+            {**legacy.model_dump(mode="json"), "schema_version": "1.1"}
+        )
+    with pytest.raises(ValidationError):
+        AgentCredentials.model_validate(
+            {
+                **legacy.model_dump(mode="json"),
+                "team_id": "10000000-0000-4000-8000-000000000001",
+            }
+        )
 
 
 def test_linux_file_backend_replaces_atomically_with_mode_0600(tmp_path: Path) -> None:

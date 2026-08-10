@@ -12,6 +12,8 @@ from perfpilot_api.services.source_tasks import (
     SourceTaskConflict,
     SourceTaskService,
     SourceTaskTooLarge,
+    SourcePatchArtifactBinding,
+    SourcePatchArtifactPayload,
     StaleSourceTaskLease,
 )
 
@@ -31,6 +33,29 @@ class FixedRecorder:
     async def record_completion(self, *, task, document, checksum, now):
         self.calls += 1
         return SourceCompletionArtifact(artifact_id=ARTIFACT_ID, checksum=checksum)
+
+
+class PrivatePatchStore:
+    def __init__(self) -> None:
+        self.values: dict[UUID, SourcePatchArtifactPayload] = {}
+
+    async def write_patch(
+        self, *, team_id, analysis_id, patch, checksum, idempotency_key
+    ):
+        artifact_id = UUID("98000000-0000-4000-8000-000000000001")
+        self.values[artifact_id] = SourcePatchArtifactPayload(
+            patch=patch,
+            checksum=checksum,
+        )
+        return SourcePatchArtifactBinding(artifact_id=artifact_id, checksum=checksum)
+
+    async def read_patch(self, *, team_id, artifact_id):
+        return self.values[artifact_id]
+
+
+class CorruptPatchStore(PrivatePatchStore):
+    async def read_patch(self, *, team_id, artifact_id):
+        return SourcePatchArtifactPayload(patch="tampered", checksum="b" * 64)
 
 
 def _service() -> tuple[SourceTaskService, InMemorySourceTaskRepository]:
@@ -102,6 +127,24 @@ async def test_lease_returns_token_but_stores_only_digest() -> None:
 
 
 @pytest.mark.asyncio
+async def test_active_lease_never_redelivers_plaintext_token_even_after_restart() -> None:
+    service, repository = _service()
+    first = await _lease_context(service)
+
+    repeated = await service.lease_next(agent_id=AGENT_ID)
+    restarted = SourceTaskService(
+        repository=repository,
+        clock=lambda: NOW,
+        lease_token_source=lambda: b"different-source-token",
+    )
+    recovered = await restarted.lease_next(agent_id=AGENT_ID)
+
+    assert first.lease_token == "c291cmNlLWxlYXNlLXRva2Vu"
+    assert repeated is None
+    assert recovered is None
+
+
+@pytest.mark.asyncio
 async def test_mutations_require_execution_agent_version_and_token_fence() -> None:
     service, _ = _service()
     lease = await _lease_context(service)
@@ -130,6 +173,8 @@ async def test_completion_is_idempotent_only_for_equal_checksum() -> None:
         "task_type": "source_context",
         "execution_id": str(lease.execution_id),
         "analysis_id": str(ANALYSIS_ID),
+        "team_id": str(TEAM_ID),
+        "agent_id": str(AGENT_ID),
         "workspace_id": str(WORKSPACE_ID),
         "lease_version": lease.lease_version,
         "state": "failed",
@@ -173,6 +218,9 @@ async def test_completion_is_idempotent_only_for_equal_checksum() -> None:
 @pytest.mark.asyncio
 async def test_equal_patch_fix_ids_do_not_collide_across_analyses() -> None:
     service, _ = _service()
+    patch_store = PrivatePatchStore()
+    service._patch_writer = patch_store
+    service._patch_reader = patch_store
     arguments = {
         "team_id": TEAM_ID,
         "agent_id": AGENT_ID,
@@ -192,6 +240,93 @@ async def test_equal_patch_fix_ids_do_not_collide_across_analyses() -> None:
 
 
 @pytest.mark.asyncio
+async def test_patch_body_is_private_artifact_and_only_resolved_for_delivery() -> None:
+    service, repository = _service()
+    patch_store = PrivatePatchStore()
+    service._patch_writer = patch_store
+    service._patch_reader = patch_store
+    sentinel = "diff --git a/SECRET.kt b/SECRET.kt\n+private-token-sentinel\n"
+
+    created = await service.create_patch_task(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        agent_id=AGENT_ID,
+        workspace_id=WORKSPACE_ID,
+        validation_profile_id=UUID("94000000-0000-4000-8000-000000000001"),
+        snapshot_id=UUID("95000000-0000-4000-8000-000000000001"),
+        snapshot_hash="a" * 64,
+        fix_id=UUID("96000000-0000-4000-8000-000000000001"),
+        patch=sentinel,
+    )
+
+    stored = repository.tasks[created.id]
+    assert sentinel not in repr(stored)
+    assert sentinel not in str(stored.request_document)
+    assert "patch" not in stored.request_document
+    assert set(stored.request_document) == {
+        "snapshot_policy",
+        "validation_profile_id",
+        "snapshot_id",
+        "snapshot_hash",
+        "fix_id",
+        "patch_artifact_id",
+        "patch_sha256",
+    }
+    delivery = await service.lease_next(agent_id=AGENT_ID)
+    assert delivery is not None
+    assert delivery.snapshot["patch"] == sentinel
+
+
+@pytest.mark.asyncio
+async def test_invalid_closed_request_leaves_no_control_row() -> None:
+    service, repository = _service()
+
+    with pytest.raises(Exception):
+        await service.create_context_task(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            agent_id=AGENT_ID,
+            workspace_id=WORKSPACE_ID,
+            validation_profile_id=None,
+            finding_hints=(
+                {
+                    "finding_id": str(UUID(int=1)),
+                    "evidence_ids": [],
+                    "rule_id": "startup.main_thread",
+                    "symbol_hints": [],
+                },
+            ),
+        )
+
+    assert repository.tasks == {}
+
+
+@pytest.mark.asyncio
+async def test_corrupt_private_patch_never_leaves_an_undelivered_lease() -> None:
+    service, repository = _service()
+    patch_store = CorruptPatchStore()
+    service._patch_writer = patch_store
+    service._patch_reader = patch_store
+    created = await service.create_patch_task(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        agent_id=AGENT_ID,
+        workspace_id=WORKSPACE_ID,
+        validation_profile_id=UUID("94000000-0000-4000-8000-000000000001"),
+        snapshot_id=UUID("95000000-0000-4000-8000-000000000001"),
+        snapshot_hash="a" * 64,
+        fix_id=UUID("96000000-0000-4000-8000-000000000001"),
+        patch="diff --git a/a.kt b/a.kt\n",
+    )
+
+    with pytest.raises(Exception):
+        await service.lease_next(agent_id=AGENT_ID)
+
+    assert repository.tasks[created.id].state == "failed"
+    assert repository.tasks[created.id].failure_code == "source_patch_artifact_invalid"
+
+
+@pytest.mark.asyncio
 async def test_completion_rejects_canonical_json_over_128_kib_before_recording() -> None:
     service, _ = _service()
     lease = await _lease_context(service)
@@ -207,6 +342,8 @@ async def test_completion_rejects_canonical_json_over_128_kib_before_recording()
                 "task_type": "source_context",
                 "execution_id": str(lease.execution_id),
                 "analysis_id": str(ANALYSIS_ID),
+                "team_id": str(TEAM_ID),
+                "agent_id": str(AGENT_ID),
                 "workspace_id": str(WORKSPACE_ID),
                 "lease_version": 1,
                 "state": "failed",

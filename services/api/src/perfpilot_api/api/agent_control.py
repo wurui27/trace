@@ -1,15 +1,30 @@
 from __future__ import annotations
 
+import base64
+import binascii
 from datetime import UTC, datetime
 from decimal import Decimal
+import json
 from typing import Annotated, Literal, Self
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from cryptography.exceptions import InvalidSignature
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from perfpilot_api.api.agents import get_agent_service, get_device_directory
 from perfpilot_api.errors import ApiError
+from perfpilot_api.security.agent_signatures import (
+    AgentProofRejected,
+    decode_ed25519_public_key,
+)
 from perfpilot_api.services.agents import (
     AgentAuthenticationRejected,
     AgentNotFoundError,
@@ -71,12 +86,14 @@ _REFRESH_TOKEN_PATTERN = r"^pprt_[A-Za-z0-9_-]{43}$"
 _NONCE_PATTERN = r"^[A-Za-z0-9_-]{22,128}$"
 _SIGNATURE_PATTERN = r"^[A-Za-z0-9+/]{86}==$"
 _AGENT_VERSION_PATTERN = r"^[0-9]+\.[0-9]+\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+_MAX_SOURCE_COMPLETION_BYTES = 128 * 1024
+_MAX_SOURCE_COMPLETION_TRANSPORT_BYTES = 512 * 1024
 
 
 class RegisterAgentRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     registration_code: str = Field(pattern=_REGISTRATION_CODE_PATTERN)
     public_key_b64: str = Field(min_length=44, max_length=44, pattern=_PUBLIC_KEY_PATTERN)
     platform: Literal["macos", "windows", "linux"]
@@ -88,7 +105,7 @@ class RegisterAgentRequest(BaseModel):
 class RefreshAgentTokenRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     agent_id: UUID
     refresh_token: str = Field(pattern=_REFRESH_TOKEN_PATTERN)
     nonce: str = Field(pattern=_NONCE_PATTERN)
@@ -405,6 +422,8 @@ class CompleteSourceTaskRequest(BaseModel):
     task_type: Literal["source_context", "patch_verification"]
     execution_id: UUID
     analysis_id: UUID
+    team_id: UUID
+    agent_id: UUID
     workspace_id: UUID
     lease_version: int = Field(strict=True, ge=1)
     state: Literal["completed", "failed", "canceled", "expired"]
@@ -428,9 +447,12 @@ def _utc(value: datetime) -> str:
     return value.astimezone(UTC).isoformat()
 
 
-def _credentials_payload(credentials: IssuedAgentCredentials) -> dict[str, object]:
-    return {
-        "schema_version": "1.0",
+def _credentials_payload(
+    credentials: IssuedAgentCredentials,
+    schema_version: Literal["1.0", "1.1"],
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "schema_version": schema_version,
         "agent_id": str(credentials.agent_id),
         "access_token": credentials.access_token,
         "access_token_expires_at": _utc(credentials.access_token_expires_at),
@@ -442,6 +464,9 @@ def _credentials_payload(credentials: IssuedAgentCredentials) -> dict[str, objec
         },
         "heartbeat_interval_seconds": credentials.heartbeat_interval_seconds,
     }
+    if schema_version == "1.1":
+        payload["team_id"] = str(credentials.team_id)
+    return payload
 
 
 async def _authenticate_access(
@@ -482,6 +507,68 @@ def _source_lease_token(request: Request) -> str:
     if len(values) != 1 or not 16 <= len(values[0]) <= 256:
         raise ApiError("stale_lease_version", "租约版本已经变化", 409, True)
     return values[0]
+
+
+async def _completion_json(request: Request) -> dict[str, object]:
+    content_length = request.headers.get("content-length")
+    try:
+        if content_length is not None and int(content_length) > _MAX_SOURCE_COMPLETION_TRANSPORT_BYTES:
+            raise SourceTaskTooLarge
+    except ValueError:
+        raise ApiError("invalid_request", "请求正文无效", 422, False) from None
+    body = bytearray()
+    async for chunk in request.stream():
+        body.extend(chunk)
+        if len(body) > _MAX_SOURCE_COMPLETION_TRANSPORT_BYTES:
+            raise SourceTaskTooLarge
+    try:
+        document = json.loads(bytes(body).decode("utf-8"))
+        if not isinstance(document, dict):
+            raise ValueError
+        canonical = json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    except (UnicodeDecodeError, json.JSONDecodeError, TypeError, ValueError):
+        raise ApiError("invalid_request", "请求正文无效", 422, False) from None
+    if len(canonical) > _MAX_SOURCE_COMPLETION_BYTES:
+        raise SourceTaskTooLarge
+    return document
+
+
+def _verify_source_completion_signature(
+    document: dict[str, object],
+    *,
+    public_key_b64: str,
+) -> None:
+    unsigned = dict(document)
+    signature_b64 = unsigned.pop("signature_b64", None)
+    try:
+        if not isinstance(signature_b64, str):
+            raise AgentProofRejected
+        signature = base64.b64decode(signature_b64, validate=True)
+        if len(signature) != 64 or base64.b64encode(signature).decode("ascii") != signature_b64:
+            raise AgentProofRejected
+        canonical = json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        decode_ed25519_public_key(public_key_b64).verify(signature, canonical)
+    except (
+        AgentProofRejected,
+        InvalidSignature,
+        binascii.Error,
+        TypeError,
+        UnicodeError,
+        ValueError,
+    ):
+        raise ApiError("agent_signature_invalid", "Agent 签名无效", 401, False) from None
 
 
 def _raise_source_task_error(error: Exception) -> None:
@@ -574,7 +661,7 @@ async def register_agent(
     except AgentRegistrationRejected:
         raise ApiError("registration_rejected", "Agent 注册失败", 401, False) from None
     response.headers["cache-control"] = "no-store"
-    return _credentials_payload(credentials)
+    return _credentials_payload(credentials, payload.schema_version)
 
 
 @router.post("/token/refresh")
@@ -594,7 +681,7 @@ async def refresh_agent_token(
     except AgentAuthenticationRejected:
         raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
     response.headers["cache-control"] = "no-store"
-    return _credentials_payload(credentials)
+    return _credentials_payload(credentials, payload.schema_version)
 
 
 @router.post("/unregister")
@@ -698,20 +785,57 @@ async def poll_next_task(
     wait_seconds: Annotated[int, Query(ge=0, le=20)] = 20,
 ) -> dict[str, object]:
     principal = await _authenticate_access(request, agent_service)
-    try:
-        task = await task_service.poll(
+
+    async def available_task():
+        active_device = await task_service.poll(
             agent_id=principal.agent_id,
             wait_seconds=0,
         )
-        if task is None and source_task_service is not None:
-            task = await source_task_service.lease_next(agent_id=principal.agent_id)
+        if active_device is not None:
+            return active_device
+        if source_task_service is None:
+            return None
+        if await source_task_service.has_active(agent_id=principal.agent_id):
+            return None
+        device_candidate = await task_service.oldest_queued(
+            agent_id=principal.agent_id
+        )
+        source_candidate = await source_task_service.oldest_queued(
+            agent_id=principal.agent_id
+        )
+        prefer_device = device_candidate is not None and (
+            source_candidate is None or device_candidate <= source_candidate
+        )
+        if prefer_device:
+            await task_service.schedule(
+                analysis_id=device_candidate[1],
+                agent_id=principal.agent_id,
+            )
+            selected = await task_service.poll(
+                agent_id=principal.agent_id,
+                wait_seconds=0,
+            )
+            if selected is not None:
+                return selected
+            return await source_task_service.lease_next(agent_id=principal.agent_id)
+        selected = await source_task_service.lease_next(agent_id=principal.agent_id)
+        if selected is not None or device_candidate is None:
+            return selected
+        await task_service.schedule(
+            analysis_id=device_candidate[1],
+            agent_id=principal.agent_id,
+        )
+        return await task_service.poll(agent_id=principal.agent_id, wait_seconds=0)
+
+    try:
+        task = await available_task()
         if task is None and wait_seconds:
             task = await task_service.poll(
                 agent_id=principal.agent_id,
                 wait_seconds=wait_seconds,
             )
-            if task is None and source_task_service is not None:
-                task = await source_task_service.lease_next(agent_id=principal.agent_id)
+            if task is None:
+                task = await available_task()
     except AgentTaskUnavailable:
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True) from None
     response.headers["cache-control"] = "no-store"
@@ -867,7 +991,6 @@ async def acknowledge_agent_cancellation(
 @router.post("/tasks/{execution_id}/complete")
 async def complete_agent_execution(
     execution_id: UUID,
-    payload: CompleteAgentExecutionRequest | CompleteSourceTaskRequest,
     request: Request,
     response: Response,
     agent_service: Annotated[AgentService, Depends(get_agent_service)],
@@ -882,16 +1005,30 @@ async def complete_agent_execution(
     upload_service: Annotated[AgentUploadService, Depends(get_agent_upload_service)],
 ) -> dict[str, object]:
     principal = await _authenticate_access(request, agent_service)
-    if isinstance(payload, CompleteSourceTaskRequest):
+    is_source_task = source_task_service is not None and await source_task_service.owns(
+        execution_id=execution_id,
+        agent_id=principal.agent_id,
+    )
+    if is_source_task:
+        if source_recorder is None:
+            raise ApiError("resource_not_found", "资源不存在", 404, False)
+        try:
+            raw_payload = await _completion_json(request)
+            payload = CompleteSourceTaskRequest.model_validate(raw_payload)
+        except SourceTaskTooLarge as error:
+            _raise_source_task_error(error)
+        except ValidationError:
+            raise ApiError("invalid_request", "源码任务请求无效", 422, False) from None
         if (
-            source_task_service is None
-            or source_recorder is None
-            or not await source_task_service.owns(
-                execution_id=execution_id,
-                agent_id=principal.agent_id,
-            )
+            payload.execution_id != execution_id
+            or payload.agent_id != principal.agent_id
+            or payload.team_id != principal.team_id
         ):
             raise ApiError("resource_not_found", "资源不存在", 404, False)
+        _verify_source_completion_signature(
+            raw_payload,
+            public_key_b64=principal.public_key_b64,
+        )
         try:
             completion = await source_task_service.complete(
                 execution_id=execution_id,
@@ -914,6 +1051,16 @@ async def complete_agent_execution(
             "checksum": completion.checksum,
             "accepted_at": _utc(completion.occurred_at),
         }
+    try:
+        raw_payload = json.loads((await request.body()).decode("utf-8"))
+        if not isinstance(raw_payload, dict):
+            raise ValueError
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        raise ApiError("invalid_request", "请求正文无效", 422, False) from None
+    try:
+        payload = CompleteAgentExecutionRequest.model_validate(raw_payload)
+    except ValidationError:
+        raise ApiError("invalid_request", "执行结果请求无效", 422, False) from None
     try:
         completion = await task_service.complete(
             agent_id=principal.agent_id,

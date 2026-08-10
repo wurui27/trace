@@ -64,8 +64,9 @@ class TaskSigningKey(BaseModel):
 class AgentCredentials(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     agent_id: UUID
+    team_id: UUID | None = None
     private_key_b64: str = Field(repr=False)
     access_token: str = Field(repr=False)
     access_token_expires_at: datetime
@@ -103,6 +104,8 @@ class AgentCredentials(BaseModel):
     def validate_expirations(self) -> Self:
         if self.refresh_token_expires_at <= self.access_token_expires_at:
             raise ValueError("credential expirations are invalid")
+        if (self.schema_version == "1.1") != (self.team_id is not None):
+            raise ValueError("credential team binding is invalid")
         return self
 
 

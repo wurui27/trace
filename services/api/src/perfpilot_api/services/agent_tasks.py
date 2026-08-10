@@ -436,7 +436,12 @@ class AgentTaskRepository(Protocol):
         *,
         analysis_id: UUID | None,
         now: datetime,
+        agent_id: UUID | None = None,
     ) -> ScheduledAgentTask | None: ...
+
+    async def oldest_queued(
+        self, *, agent_id: UUID, now: datetime
+    ) -> tuple[datetime, UUID] | None: ...
 
     async def load_active(
         self,
@@ -580,6 +585,7 @@ class InMemoryAgentTaskRepository:
         *,
         analysis_id: UUID | None,
         now: datetime,
+        agent_id: UUID | None = None,
     ) -> ScheduledAgentTask | None:
         _require_aware(now)
         candidates = (
@@ -589,6 +595,8 @@ class InMemoryAgentTaskRepository:
         )
         for definition in candidates:
             if definition is None:
+                continue
+            if agent_id is not None and definition.agent_id != agent_id:
                 continue
             existing = next(
                 (
@@ -622,6 +630,12 @@ class InMemoryAgentTaskRepository:
             )
             self._leases[lease.execution_id] = lease
             return _scheduled(lease)
+        return None
+
+    async def oldest_queued(
+        self, *, agent_id: UUID, now: datetime
+    ) -> tuple[datetime, UUID] | None:
+        del agent_id, now
         return None
 
     async def load_cancellation(
@@ -996,12 +1010,29 @@ class AgentTaskService:
         self._wakeup = wakeup
         self._clock = clock
 
-    async def schedule(self, *, analysis_id: UUID | None = None) -> ScheduledAgentTask | None:
+    async def schedule(
+        self,
+        *,
+        analysis_id: UUID | None = None,
+        agent_id: UUID | None = None,
+    ) -> ScheduledAgentTask | None:
         now = _aware_now(self._clock())
-        scheduled = await self._repository.schedule(analysis_id=analysis_id, now=now)
+        scheduled = await self._repository.schedule(
+            analysis_id=analysis_id,
+            agent_id=agent_id,
+            now=now,
+        )
         if scheduled is not None:
             await self._wakeup.wake(scheduled.agent_id)
         return scheduled
+
+    async def oldest_queued(
+        self, *, agent_id: UUID
+    ) -> tuple[datetime, UUID] | None:
+        return await self._repository.oldest_queued(
+            agent_id=agent_id,
+            now=_aware_now(self._clock()),
+        )
 
     async def poll(
         self,
@@ -1219,6 +1250,7 @@ class SQLAlchemyAgentTaskRepository:
         *,
         analysis_id: UUID | None,
         now: datetime,
+        agent_id: UUID | None = None,
     ) -> ScheduledAgentTask | None:
         _require_aware(now)
         try:
@@ -1244,6 +1276,8 @@ class SQLAlchemyAgentTaskRepository:
                     )
                     if analysis_id is not None:
                         statement = statement.where(GlobalJob.id == analysis_id)
+                    if agent_id is not None:
+                        statement = statement.where(Agent.id == agent_id)
                     job = await session.scalar(statement)
                     if job is None or job.selected_device_id is None:
                         return None
@@ -1256,6 +1290,22 @@ class SQLAlchemyAgentTaskRepository:
                         select(Agent).where(Agent.id == device.agent_id).with_for_update()
                     )
                     if agent is None or not _agent_is_idle(agent):
+                        return None
+                    oldest_source = (
+                        await session.execute(
+                            select(SourceTask.created_at, SourceTask.id)
+                            .where(
+                                SourceTask.agent_id == agent.id,
+                                SourceTask.state == "queued",
+                            )
+                            .order_by(SourceTask.created_at, SourceTask.id)
+                            .limit(1)
+                        )
+                    ).one_or_none()
+                    if oldest_source is not None and (
+                        oldest_source.created_at,
+                        oldest_source.id,
+                    ) <= (job.created_at, job.id):
                         return None
                     active_agent_lease = await session.scalar(
                         select(AgentLease.id)
@@ -1327,6 +1377,33 @@ class SQLAlchemyAgentTaskRepository:
                     )
         except IntegrityError:
             return None
+
+    async def oldest_queued(
+        self, *, agent_id: UUID, now: datetime
+    ) -> tuple[datetime, UUID] | None:
+        _require_aware(now)
+        async with self._control_sessions() as session:
+            row = (
+                await session.execute(
+                    select(GlobalJob.created_at, GlobalJob.id)
+                    .join(Device, Device.id == GlobalJob.selected_device_id)
+                    .join(Agent, Agent.id == Device.agent_id)
+                    .where(
+                        Agent.id == agent_id,
+                        GlobalJob.analysis_mode == "device",
+                        GlobalJob.state == "queued",
+                        GlobalJob.selected_device_id.is_not(None),
+                        Device.state == "ready",
+                        Device.adb_state == "device",
+                        Device.last_seen_at > now - _FRESHNESS,
+                        Agent.state == "online",
+                        Agent.last_heartbeat_at > now - _FRESHNESS,
+                    )
+                    .order_by(GlobalJob.created_at, GlobalJob.id)
+                    .limit(1)
+                )
+            ).one_or_none()
+        return None if row is None else (row.created_at, row.id)
 
     async def load_active(
         self,

@@ -112,6 +112,7 @@ def test_source_task_verifier_accepts_only_closed_agent_bound_snapshot(
 ) -> None:
     snapshot = {
         "schema_version": "1.0",
+        "aud": "perfpilot-agent",
         "task_type": "source_context",
         "execution_id": "73000000-0000-4000-8000-000000000001",
         "analysis_id": "30000000-0000-4000-8000-000000000001",
@@ -138,8 +139,7 @@ def test_source_task_verifier_accepts_only_closed_agent_bound_snapshot(
         snapshot,
         signature,
         expected_agent_id=AGENT_ID,
-        expected_execution_id=UUID(snapshot["execution_id"]),
-        expected_lease_version=1,
+        expected_team_id=UUID(snapshot["team_id"]),
     )
 
     assert isinstance(task, VerifiedSourceTask)
@@ -149,6 +149,5 @@ def test_source_task_verifier_accepts_only_closed_agent_bound_snapshot(
             {**snapshot, "device_digest": DEVICE_DIGEST},
             signature,
             expected_agent_id=AGENT_ID,
-            expected_execution_id=UUID(snapshot["execution_id"]),
-            expected_lease_version=1,
+            expected_team_id=UUID(snapshot["team_id"]),
         )

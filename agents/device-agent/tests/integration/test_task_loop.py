@@ -24,7 +24,7 @@ from perfpilot_agent.credentials import (
     InMemoryCredentialBackend,
     TaskSigningKey,
 )
-from perfpilot_agent.service import AgentService, TaskLoop
+from perfpilot_agent.service import AgentService, SourceTaskExecutor, TaskLoop
 from perfpilot_agent.state import AgentRuntimeState, DeviceBinding
 
 
@@ -40,6 +40,8 @@ class FakePollControl:
     def __init__(self, response, credentials: AgentCredentials) -> None:
         self.response = response
         self.credentials = credentials
+        self.source_completions = []
+        self.state = None
 
     async def poll_task(self, *, wait_seconds: int = 20):
         return self.response
@@ -47,8 +49,16 @@ class FakePollControl:
     async def acknowledge_cancellation(self, *, execution_id, lease_version):
         raise AssertionError("unexpected cancellation")
 
+    async def complete_source_task(self, **kwargs):
+        if self.state is not None:
+            assert self.state.execution_id == kwargs["execution_id"]
+        self.source_completions.append(kwargs)
+        return object()
 
-def _credentials(signing_key, task_kid: str, agent_id, now) -> AgentCredentials:
+
+def _credentials(
+    signing_key, task_kid: str, agent_id, now, *, team_id: UUID | None = None
+) -> AgentCredentials:
     public = signing_key.public_key().public_bytes(
         serialization.Encoding.Raw,
         serialization.PublicFormat.Raw,
@@ -59,8 +69,9 @@ def _credentials(signing_key, task_kid: str, agent_id, now) -> AgentCredentials:
         serialization.NoEncryption(),
     )
     return AgentCredentials(
-        schema_version="1.0",
+        schema_version="1.1" if team_id is not None else "1.0",
         agent_id=agent_id,
+        team_id=team_id,
         private_key_b64=base64.b64encode(private).decode("ascii"),
         access_token="ppat_" + "A" * 43,
         access_token_expires_at=now + timedelta(minutes=15),
@@ -126,13 +137,17 @@ async def test_task_loop_dispatches_source_context_without_capture_executor(
 ) -> None:
     now = datetime.fromisoformat("2026-08-05T08:00:00+00:00")
     agent_id = UUID("71000000-0000-4000-8000-000000000001")
-    credentials = _credentials(signing_key, "task-key-2026-08", agent_id, now)
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    credentials = _credentials(
+        signing_key, "task-key-2026-08", agent_id, now, team_id=team_id
+    )
     snapshot = {
         "schema_version": "1.0",
+        "aud": "perfpilot-agent",
         "task_type": "source_context",
         "execution_id": "73000000-0000-4000-8000-000000000001",
         "analysis_id": "30000000-0000-4000-8000-000000000001",
-        "team_id": "10000000-0000-4000-8000-000000000001",
+        "team_id": str(team_id),
         "agent_id": str(agent_id),
         "workspace_id": "91000000-0000-4000-8000-000000000001",
         "snapshot_policy": "tracked_worktree",
@@ -144,11 +159,11 @@ async def test_task_loop_dispatches_source_context_without_capture_executor(
     }
     canonical = json.dumps(
         snapshot,
-        ensure_ascii=True,
+        ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),
         sort_keys=True,
-    ).encode("ascii")
+    ).encode("utf-8")
     response = SourceTaskExecuteResponse(
         schema_version="1.1",
         task_kind="source",
@@ -157,12 +172,14 @@ async def test_task_loop_dispatches_source_context_without_capture_executor(
         signature_b64=base64.b64encode(signing_key.sign(canonical)).decode("ascii"),
     )
     capture = FakeExecutor()
-    source = FakeExecutor()
+    state = AgentRuntimeState()
+    control = FakePollControl(response, credentials)
+    control.state = state
     loop = TaskLoop(
-        control=FakePollControl(response, credentials),
+        control=control,
         executor=capture,
-        source_executor=source,
-        state=AgentRuntimeState(),
+        source_executor=SourceTaskExecutor(control=control),
+        state=state,
         clock=lambda: now,
         sleep=lambda _: _completed_sleep(),
     )
@@ -171,9 +188,11 @@ async def test_task_loop_dispatches_source_context_without_capture_executor(
 
     assert handled is True
     assert capture.tasks == []
-    assert [task.execution_id for task in source.tasks] == [
-        UUID("73000000-0000-4000-8000-000000000001")
-    ]
+    assert control.source_completions[0]["completion"]["result"] == {
+        "failure_code": "source_runner_unavailable",
+        "retryable": False,
+    }
+    assert state.execution_id is None
 
 
 async def _completed_sleep() -> None:
@@ -248,6 +267,7 @@ async def test_control_client_sends_source_lease_token_only_as_fence_header(
         "task-key-2026-08",
         UUID("71000000-0000-4000-8000-000000000001"),
         now,
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
     )
     execution_id = UUID("73000000-0000-4000-8000-000000000001")
     lease_token = "opaque-source-lease-token"
@@ -255,6 +275,20 @@ async def test_control_client_sends_source_lease_token_only_as_fence_header(
     def handler(request: httpx.Request) -> httpx.Response:
         assert request.headers["x-perfpilot-lease-token"] == lease_token
         assert lease_token.encode("ascii") not in request.content
+        document = json.loads(request.content)
+        signature = base64.b64decode(document.pop("signature_b64"), validate=True)
+        signing_key.public_key().verify(
+            signature,
+            json.dumps(
+                document,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8"),
+        )
+        assert document["agent_id"] == str(credentials.agent_id)
+        assert document["team_id"] == str(credentials.team_id)
         return httpx.Response(
             200,
             request=request,
@@ -285,11 +319,33 @@ async def test_control_client_sends_source_lease_token_only_as_fence_header(
                 "lease_version": 1,
                 "state": "failed",
                 "result": {"failure_code": "source_unavailable", "retryable": False},
-                "signature_b64": "A" * 86 + "==",
             },
         )
 
     assert response.state == "failed"
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = ControlClient(config, http_client=http_client, credentials=credentials)
+        with pytest.raises(ControlClientError):
+            await client.complete_source_task(
+                execution_id=execution_id,
+                lease_version=1,
+                lease_token=lease_token,
+                completion={
+                    "schema_version": "1.0",
+                    "task_type": "source_context",
+                    "execution_id": str(execution_id),
+                    "analysis_id": "30000000-0000-4000-8000-000000000001",
+                    "workspace_id": "91000000-0000-4000-8000-000000000001",
+                    "lease_version": 1,
+                    "state": "failed",
+                    "result": {
+                        "failure_code": "source_unavailable",
+                        "retryable": False,
+                    },
+                    "signature_b64": "A" * 86 + "==",
+                },
+            )
 
 
 @pytest.mark.asyncio

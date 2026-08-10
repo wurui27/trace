@@ -21,6 +21,7 @@ from perfpilot_agent.platform.base import PlatformMetadata
 from perfpilot_agent.registration import RegistrationAlreadyExists, RegistrationService
 
 AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
+TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 TASK_KID = "task-key-2026-08"
 
 
@@ -45,8 +46,9 @@ class FakeClient:
 def registration_response(signing_key: Ed25519PrivateKey) -> RegistrationResponse:
     now = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
     return RegistrationResponse(
-        schema_version="1.0",
+        schema_version="1.1",
         agent_id=AGENT_ID,
+        team_id=TEAM_ID,
         access_token="ppat_" + "A" * 43,
         access_token_expires_at=now + timedelta(minutes=15),
         refresh_token="pprt_" + "B" * 43,
@@ -86,6 +88,9 @@ async def test_registration_generates_key_saves_credentials_and_zeroes_code(
     assert client.requests[0].public_key_b64 == public_key_b64(registration_key)
     assert store.load() == saved
     assert saved.agent_id == AGENT_ID
+    assert saved.schema_version == "1.1"
+    assert saved.team_id == TEAM_ID
+    assert client.requests[0].schema_version == "1.1"
 
 
 @pytest.mark.asyncio

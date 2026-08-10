@@ -158,6 +158,7 @@ class VerifiedSourceTask(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     schema_version: Literal["1.0"]
+    aud: Literal["perfpilot-agent"]
     task_type: str
     execution_id: UUID
     analysis_id: UUID
@@ -347,19 +348,18 @@ class TaskVerifier:
         signature_b64: str,
         *,
         expected_agent_id: UUID,
-        expected_execution_id: UUID,
-        expected_lease_version: int | None,
+        expected_team_id: UUID,
     ) -> VerifiedSourceTask:
         try:
             if not isinstance(snapshot, dict):
                 raise TaskRejected
             canonical = json.dumps(
                 snapshot,
-                ensure_ascii=True,
+                ensure_ascii=False,
                 allow_nan=False,
                 separators=(",", ":"),
                 sort_keys=True,
-            ).encode("ascii")
+            ).encode("utf-8")
             signature = base64.b64decode(signature_b64, validate=True)
             if len(signature) != 64 or base64.b64encode(signature).decode("ascii") != signature_b64:
                 raise TaskRejected
@@ -373,11 +373,7 @@ class TaskVerifier:
                 remaining <= timedelta(0)
                 or remaining > _MAXIMUM_LIFETIME
                 or task.agent_id != expected_agent_id
-                or task.execution_id != expected_execution_id
-                or (
-                    expected_lease_version is not None
-                    and task.lease_version != expected_lease_version
-                )
+                or task.team_id != expected_team_id
             ):
                 raise TaskRejected
             return task

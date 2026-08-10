@@ -105,6 +105,7 @@ def test_signs_source_snapshot_as_detached_canonical_json() -> None:
     signer = SourceTaskSnapshotSigner(private_key=private_key, kid="lan-test", clock=lambda: NOW)
     snapshot = {
         "schema_version": "1.0",
+        "aud": "perfpilot-agent",
         "task_type": "source_context",
         "execution_id": str(EXECUTION_ID),
         "analysis_id": str(ANALYSIS_ID),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
@@ -48,6 +49,57 @@ class SourceTaskLoopExecutor(Protocol):
     async def run(self, task: VerifiedSourceTask, *, lease_token: str) -> None: ...
 
 
+class SourceTaskCompletionControl(Protocol):
+    async def complete_source_task(
+        self,
+        *,
+        execution_id: UUID,
+        lease_version: int,
+        lease_token: str,
+        completion: dict[str, object],
+    ) -> object: ...
+
+
+class SourceTaskExecutor:
+    """Task 4 production shell; Task 5 replaces the unavailable result with a runner."""
+
+    def __init__(self, *, control: SourceTaskCompletionControl) -> None:
+        self._control = control
+
+    async def run(self, task: VerifiedSourceTask, *, lease_token: str) -> None:
+        result: dict[str, object]
+        if task.task_type == "patch_verification":
+            patch = getattr(task, "patch", "")
+            result = {
+                "verification_state": "unavailable",
+                "exit_code": None,
+                "duration_ms": None,
+                "profile_id": str(task.validation_profile_id),
+                "patch_sha256": hashlib.sha256(patch.encode("utf-8")).hexdigest(),
+                "log_summary": None,
+            }
+        else:
+            result = {
+                "failure_code": "source_runner_unavailable",
+                "retryable": False,
+            }
+        await self._control.complete_source_task(
+            execution_id=task.execution_id,
+            lease_version=task.lease_version,
+            lease_token=lease_token,
+            completion={
+                "schema_version": "1.0",
+                "task_type": task.task_type,
+                "execution_id": str(task.execution_id),
+                "analysis_id": str(task.analysis_id),
+                "workspace_id": str(task.workspace_id),
+                "lease_version": task.lease_version,
+                "state": "failed",
+                "result": result,
+            },
+        )
+
+
 class TaskLoop:
     def __init__(
         self,
@@ -85,6 +137,8 @@ class TaskLoop:
                     raise TaskRejected
                 raise ControlClientError
             credentials = self._control.credentials
+            if credentials.team_id is None:
+                raise TaskRejected
             snapshot = response.snapshot
             task = TaskVerifier(
                 public_key_b64=credentials.task_signing_key.public_key_b64,
@@ -94,12 +148,17 @@ class TaskLoop:
                 snapshot,
                 response.signature_b64,
                 expected_agent_id=credentials.agent_id,
-                expected_execution_id=UUID(str(snapshot.get("execution_id"))),
-                expected_lease_version=int(str(snapshot.get("lease_version"))),
+                expected_team_id=credentials.team_id,
             )
             if not isinstance(task, VerifiedSourceTask) or self._source_executor is None:
                 raise TaskRejected
-            await self._source_executor.run(task, lease_token=response.lease_token)
+            if self._state.execution_id is not None:
+                raise RuntimeStateError
+            self._state.set_execution(task.execution_id)
+            try:
+                await self._source_executor.run(task, lease_token=response.lease_token)
+            finally:
+                self._state.set_execution(None)
             return True
         credentials = self._control.credentials
         task = TaskVerifier(
@@ -199,4 +258,4 @@ class AgentService:
                 worker.cancel()
 
 
-__all__ = ["AgentService", "TaskLoop"]
+__all__ = ["AgentService", "SourceTaskExecutor", "TaskLoop"]

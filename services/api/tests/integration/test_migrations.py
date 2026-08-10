@@ -384,6 +384,7 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
         SQLAlchemySourceTaskRepository,
         SourceCompletionArtifact,
         SourceTaskConflict,
+        SourceTaskInvalid,
         SourceTaskService,
     )
 
@@ -409,6 +410,7 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
     sessions = async_sessionmaker(async_engine, expire_on_commit=False)
     execution_ids = iter(
         (
+            UUID("73000000-0000-4000-8000-000000000000"),
             UUID("73000000-0000-4000-8000-000000000001"),
             UUID("73000000-0000-4000-8000-000000000002"),
         )
@@ -420,6 +422,24 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
         lease_token_source=lambda: b"source-lease-token",
     )
     try:
+        with pytest.raises(SourceTaskInvalid):
+            await service.create_context_task(
+                team_id=team_id,
+                analysis_id=analysis_ids[0],
+                agent_id=agent_id,
+                workspace_id=UUID("91000000-0000-4000-8000-000000000001"),
+                validation_profile_id=None,
+                finding_hints=(
+                    {
+                        "finding_id": str(UUID(int=1)),
+                        "evidence_ids": [],
+                        "rule_id": "startup.main_thread",
+                        "symbol_hints": [],
+                    },
+                ),
+            )
+        with migration_databases.control_engine.connect() as connection:
+            assert connection.scalar(text("SELECT count(*) FROM source_tasks")) == 0
         for analysis_id in analysis_ids:
             await service.create_context_task(
                 team_id=team_id,
@@ -452,6 +472,8 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
                 "task_type": "source_context",
                 "execution_id": str(lease.execution_id),
                 "analysis_id": str(lease.analysis_id),
+                "team_id": str(team_id),
+                "agent_id": "71000000-0000-4000-8000-000000000001",
                 "workspace_id": "91000000-0000-4000-8000-000000000001",
                 "lease_version": lease.lease_version,
                 "state": "failed",
@@ -481,8 +503,6 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
         assert sum(not isinstance(item, BaseException) for item in outcomes) == 1
         assert sum(isinstance(item, SourceTaskConflict) for item in outcomes) == 1
 
-        active_source = await service.lease_next(agent_id=agent_id)
-        assert active_source is not None
         device_id = UUID("72000000-0000-4000-8000-000000000001")
         device_analysis_id = UUID("30000000-0000-4000-8000-000000000003")
         with migration_databases.control_engine.begin() as connection:
@@ -505,8 +525,13 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
                 },
             )
             connection.execute(
-                text("INSERT INTO global_jobs (id, team_id, idempotency_key, analysis_mode, state, selected_device_id) VALUES (:id, :team, 'device-cross-kind', 'device', 'queued', :device)"),
-                {"id": device_analysis_id, "team": team_id, "device": device_id},
+                text("INSERT INTO global_jobs (id, team_id, idempotency_key, analysis_mode, state, selected_device_id, created_at, updated_at) VALUES (:id, :team, 'device-cross-kind', 'device', 'queued', :device, :created, :created)"),
+                {
+                    "id": device_analysis_id,
+                    "team": team_id,
+                    "device": device_id,
+                    "created": datetime(2026, 8, 5, 8, 0, 1, tzinfo=UTC),
+                },
             )
         from perfpilot_api.services.agent_tasks import SQLAlchemyAgentTaskRepository
 
@@ -521,6 +546,8 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
             )
             is None
         )
+        active_source = await service.lease_next(agent_id=agent_id)
+        assert active_source is not None
     finally:
         await async_engine.dispose()
 

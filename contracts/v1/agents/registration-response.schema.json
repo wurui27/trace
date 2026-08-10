@@ -14,8 +14,9 @@
     "heartbeat_interval_seconds"
   ],
   "properties": {
-    "schema_version": {"const": "1.0"},
+    "schema_version": {"enum": ["1.0", "1.1"]},
     "agent_id": {"$ref": "#/$defs/uuid"},
+    "team_id": {"$ref": "#/$defs/uuid"},
     "access_token": {"type": "string", "pattern": "^ppat_[A-Za-z0-9_-]{43}$"},
     "access_token_expires_at": {"type": "string", "format": "date-time"},
     "refresh_token": {"type": "string", "pattern": "^pprt_[A-Za-z0-9_-]{43}$"},
@@ -41,6 +42,16 @@
     },
     "heartbeat_interval_seconds": {"const": 10}
   },
+  "allOf": [
+    {
+      "if": {"properties": {"schema_version": {"const": "1.1"}}, "required": ["schema_version"]},
+      "then": {"required": ["team_id"]}
+    },
+    {
+      "if": {"properties": {"schema_version": {"const": "1.0"}}, "required": ["schema_version"]},
+      "then": {"not": {"required": ["team_id"]}}
+    }
+  ],
   "$defs": {
     "uuid": {
       "type": "string",

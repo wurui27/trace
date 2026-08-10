@@ -129,6 +129,34 @@ def test_agent_examples_are_valid_and_closed(
         contract.validate({**payload, "unexpected": True})
 
 
+def test_registration_1_1_adds_only_the_server_bound_team_identity() -> None:
+    request_contract = validator("agents/registration-request.schema.json")
+    response_contract = validator("agents/registration-response.schema.json")
+    request = {
+        **example("agent-registration-request.valid.json"),
+        "schema_version": "1.1",
+    }
+    response = {
+        **example("agent-registration-response.valid.json"),
+        "schema_version": "1.1",
+        "team_id": "10000000-0000-4000-8000-000000000001",
+    }
+
+    request_contract.validate(request)
+    response_contract.validate(response)
+    with pytest.raises(jsonschema.ValidationError):
+        response_contract.validate(
+            {key: value for key, value in response.items() if key != "team_id"}
+        )
+    with pytest.raises(jsonschema.ValidationError):
+        response_contract.validate(
+            {
+                **example("agent-registration-response.valid.json"),
+                "team_id": response["team_id"],
+            }
+        )
+
+
 def test_device_list_contract_never_accepts_raw_serial() -> None:
     payload = example("agent-device-list.valid.json")
     devices = payload["devices"]
@@ -159,6 +187,7 @@ def test_task_snapshot_binds_agent_device_execution_and_lease() -> None:
 def test_source_task_is_not_a_device_capture_task() -> None:
     source = example("source-task-snapshot.valid.json")
     validator("agents/source-task-snapshot.schema.json").validate(source)
+    assert source["aud"] == "perfpilot-agent"
     assert source["task_type"] == "source_context"
     assert "device_digest" not in source
 
@@ -189,6 +218,7 @@ def test_source_task_snapshot_discriminator_and_bounds_are_strict() -> None:
     contract.validate(patch)
 
     invalid_documents = (
+        {key: value for key, value in source.items() if key != "aud"},
         {**source, "schema_version": "1.1"},
         {**source, "task_type": "device"},
         {**source, "device_digest": "a" * 64},

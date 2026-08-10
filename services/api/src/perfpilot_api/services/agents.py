@@ -99,6 +99,7 @@ class RegistrationCodeIssue:
 @dataclass(frozen=True, slots=True)
 class IssuedAgentCredentials:
     agent_id: UUID
+    team_id: UUID
     access_token: str = dataclass_field(repr=False)
     access_token_expires_at: datetime
     refresh_token: str = dataclass_field(repr=False)
@@ -112,6 +113,7 @@ class AgentPrincipal:
     agent_id: UUID
     team_id: UUID
     token_version: int
+    public_key_b64: str = dataclass_field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -772,6 +774,7 @@ class AgentService:
             raise AgentRegistrationRejected
         return self._issued_credentials(
             agent_id=record.id,
+            team_id=record.team_id,
             access_token=access_token,
             access_expires_at=access_expires_at,
             refresh_token=refresh_token,
@@ -833,6 +836,7 @@ class AgentService:
             raise AgentAuthenticationRejected
         return self._issued_credentials(
             agent_id=rotated.id,
+            team_id=rotated.team_id,
             access_token=access_token,
             access_expires_at=access_expires_at,
             refresh_token=next_refresh_token,
@@ -849,14 +853,17 @@ class AgentService:
             access_token_digest=digest,
             now=now,
         )
-        if record is None or not self._credentials.matches(
-            access_token, record.access_token_digest
+        if (
+            record is None
+            or record.public_key_b64 is None
+            or not self._credentials.matches(access_token, record.access_token_digest)
         ):
             raise AgentAuthenticationRejected
         return AgentPrincipal(
             agent_id=record.id,
             team_id=record.team_id,
             token_version=record.token_version,
+            public_key_b64=record.public_key_b64,
         )
 
     async def list_agents(self, *, team_id: UUID) -> tuple[AgentView, ...]:
@@ -893,6 +900,7 @@ class AgentService:
         self,
         *,
         agent_id: UUID,
+        team_id: UUID,
         access_token: str,
         access_expires_at: datetime,
         refresh_token: str,
@@ -900,6 +908,7 @@ class AgentService:
     ) -> IssuedAgentCredentials:
         return IssuedAgentCredentials(
             agent_id=agent_id,
+            team_id=team_id,
             access_token=access_token,
             access_token_expires_at=access_expires_at,
             refresh_token=refresh_token,

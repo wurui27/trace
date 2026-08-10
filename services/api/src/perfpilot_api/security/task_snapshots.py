@@ -52,11 +52,11 @@ def _canonical_json(value: object) -> bytes:
     try:
         return json.dumps(
             value,
-            ensure_ascii=True,
+            ensure_ascii=False,
             allow_nan=False,
             separators=(",", ":"),
             sort_keys=True,
-        ).encode("ascii")
+        ).encode("utf-8")
     except (TypeError, ValueError):
         raise TaskSnapshotRejected from None
 
@@ -156,6 +156,21 @@ def _validate_claims(claims: dict[str, object], *, now: datetime) -> None:
         raise TaskSnapshotRejected
 
 
+def validate_source_task_snapshot(
+    snapshot: dict[str, object], *, now: datetime
+) -> None:
+    if now.tzinfo is None or now.utcoffset() is None:
+        raise TaskSnapshotRejected
+    try:
+        _source_validator().validate(snapshot)
+    except ValidationError:
+        raise TaskSnapshotRejected from None
+    expires_at = _parse_timestamp(snapshot.get("expires_at"))
+    remaining = expires_at - now.astimezone(UTC)
+    if remaining <= timedelta(0) or remaining > _MAXIMUM_LIFETIME:
+        raise TaskSnapshotRejected
+
+
 class TaskSnapshotSigner:
     __slots__ = ("_clock", "_kid", "_private_key")
 
@@ -225,16 +240,7 @@ class SourceTaskSnapshotSigner:
 
     def sign(self, snapshot: dict[str, object]) -> str:
         now = self._clock()
-        if now.tzinfo is None or now.utcoffset() is None:
-            raise TaskSnapshotRejected
-        try:
-            _source_validator().validate(snapshot)
-        except ValidationError:
-            raise TaskSnapshotRejected from None
-        expires_at = _parse_timestamp(snapshot.get("expires_at"))
-        remaining = expires_at - now.astimezone(UTC)
-        if remaining <= timedelta(0) or remaining > _MAXIMUM_LIFETIME:
-            raise TaskSnapshotRejected
+        validate_source_task_snapshot(snapshot, now=now)
         canonical = _canonical_json(snapshot)
         return base64.b64encode(self._private_key.sign(canonical)).decode("ascii")
 
@@ -299,5 +305,6 @@ __all__ = [
     "TaskSnapshotRejected",
     "TaskSnapshotSigner",
     "snapshot_digest",
+    "validate_source_task_snapshot",
     "verify_task_jws",
 ]

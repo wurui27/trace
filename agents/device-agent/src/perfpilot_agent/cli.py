@@ -23,7 +23,7 @@ from perfpilot_agent.executor import TaskExecutionError, TaskExecutor
 from perfpilot_agent.logging import RedactingFilter, SecretRedactor
 from perfpilot_agent.platform.base import current_platform_metadata, current_platform_name
 from perfpilot_agent.registration import RegistrationError, RegistrationService
-from perfpilot_agent.service import AgentService, TaskLoop
+from perfpilot_agent.service import AgentService, SourceTaskExecutor, TaskLoop
 from perfpilot_agent.source_registry import SourceRegistryError, SourceWorkspaceRegistry
 from perfpilot_agent.state import AgentRuntimeState
 
@@ -265,15 +265,74 @@ def _capture_runner(
     )
 
 
+class _LazyAdb:
+    def __init__(self, *, config: AgentConfig) -> None:
+        self._config = config
+        self._binary: Path | None = None
+        self._lock = asyncio.Lock()
+
+    async def get(self) -> Path:
+        async with self._lock:
+            if self._binary is None:
+                self._binary = await resolve_adb(
+                    configured=self._config.adb_path,
+                    workspace_root=self._config.workspace_root,
+                )
+            return self._binary
+
+
+class _LazyDeviceInventory:
+    def __init__(self, adb: _LazyAdb) -> None:
+        self._adb = adb
+
+    async def read_all(self):
+        try:
+            return await create_device_inventory(binary=await self._adb.get()).read_all()
+        except (AdbError, OSError):
+            logging.getLogger("perfpilot-agent.cli").warning("ADB inventory unavailable")
+            return ()
+
+
+class _LazyCaptureExecutor:
+    def __init__(
+        self,
+        *,
+        config: AgentConfig,
+        adb: _LazyAdb,
+        control: ControlClient,
+        state: AgentRuntimeState,
+        redactor: SecretRedactor,
+    ) -> None:
+        self._config = config
+        self._adb = adb
+        self._control = control
+        self._state = state
+        self._redactor = redactor
+        self._executor: TaskExecutor | None = None
+
+    async def run(self, task: object) -> None:
+        if self._executor is None:
+            binary = await self._adb.get()
+            self._executor = TaskExecutor(
+                control=self._control,
+                runner=_capture_runner(
+                    config=self._config,
+                    adb_binary=binary,
+                    control=self._control,
+                    state=self._state,
+                    redactor=self._redactor,
+                ),
+                state=self._state,
+            )
+        await self._executor.run(task)
+
+
 async def _run(config_path: Path | None) -> int:
     config = load_config(config_path)
     store = CredentialStore(_credential_backend())
     credentials = _load_registered(store)
     config.workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    adb = await resolve_adb(
-        configured=config.adb_path,
-        workspace_root=config.workspace_root,
-    )
+    adb = _LazyAdb(config=config)
     metadata = current_platform_metadata()
     state = AgentRuntimeState()
     redactor = SecretRedactor()
@@ -288,7 +347,7 @@ async def _run(config_path: Path | None) -> int:
         credential_store=store,
     ) as control:
         heartbeat = HeartbeatPublisher(
-            inventory=create_device_inventory(binary=adb),
+            inventory=_LazyDeviceInventory(adb),
             control=control,
             credentials=credentials,
             metadata=metadata,
@@ -297,18 +356,19 @@ async def _run(config_path: Path | None) -> int:
             redactor=redactor,
             source_registry=_source_registry(config),
         )
-        executor = TaskExecutor(
+        executor = _LazyCaptureExecutor(
+            config=config,
+            adb=adb,
             control=control,
-            runner=_capture_runner(
-                config=config,
-                adb_binary=adb,
-                control=control,
-                state=state,
-                redactor=redactor,
-            ),
+            state=state,
+            redactor=redactor,
+        )
+        tasks = TaskLoop(
+            control=control,
+            executor=executor,
+            source_executor=SourceTaskExecutor(control=control),
             state=state,
         )
-        tasks = TaskLoop(control=control, executor=executor, state=state)
         await AgentService(
             heartbeat=heartbeat,
             tasks=tasks,

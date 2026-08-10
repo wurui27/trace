@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import base64
 from datetime import UTC, datetime
+import json
 from types import SimpleNamespace
 from uuid import UUID
 
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from fastapi.testclient import TestClient
 
 from perfpilot_api.config import Settings
@@ -16,6 +20,29 @@ NOW = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
 AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
 EXECUTION_ID = UUID("73000000-0000-4000-8000-000000000001")
 TOKEN = "ppat_" + "A" * 43
+TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
+AGENT_PRIVATE_KEY = Ed25519PrivateKey.generate()
+AGENT_PUBLIC_KEY_B64 = base64.b64encode(
+    AGENT_PRIVATE_KEY.public_key().public_bytes(
+        serialization.Encoding.Raw,
+        serialization.PublicFormat.Raw,
+    )
+).decode("ascii")
+
+
+def _sign_completion(document: dict[str, object]) -> dict[str, object]:
+    signed = dict(document)
+    canonical = json.dumps(
+        signed,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    signed["signature_b64"] = base64.b64encode(
+        AGENT_PRIVATE_KEY.sign(canonical)
+    ).decode("ascii")
+    return signed
 
 
 class FakeAgentService:
@@ -24,7 +51,11 @@ class FakeAgentService:
             from perfpilot_api.services.agents import AgentAuthenticationRejected
 
             raise AgentAuthenticationRejected
-        return SimpleNamespace(agent_id=AGENT_ID)
+        return SimpleNamespace(
+            agent_id=AGENT_ID,
+            team_id=TEAM_ID,
+            public_key_b64=AGENT_PUBLIC_KEY_B64,
+        )
 
 
 class FakeTaskService:
@@ -33,6 +64,8 @@ class FakeTaskService:
         self.poll_result = None
         self.renew_result = None
         self.acknowledgement = None
+        self.queued = None
+        self.queued_delivery = None
 
     async def poll(self, **kwargs: object):
         self.calls.append(("poll", kwargs))
@@ -64,12 +97,22 @@ class FakeTaskService:
             acknowledged_at=NOW,
         )
 
+    async def oldest_queued(self, **kwargs):
+        self.calls.append(("oldest_queued", kwargs))
+        return self.queued
+
+    async def schedule(self, **kwargs):
+        self.calls.append(("schedule", kwargs))
+        self.poll_result = self.queued_delivery
+        return None
+
 
 class FakeSourceTaskService:
     def __init__(self) -> None:
         self.delivery = None
         self.calls: list[tuple[str, dict[str, object]]] = []
         self.reject_too_large = False
+        self.active = False
 
     async def lease_next(self, **kwargs):
         self.calls.append(("lease_next", kwargs))
@@ -79,6 +122,16 @@ class FakeSourceTaskService:
     async def owns(self, **kwargs):
         self.calls.append(("owns", kwargs))
         return True
+
+    async def has_active(self, **kwargs):
+        self.calls.append(("has_active", kwargs))
+        return self.active
+
+    async def oldest_queued(self, **kwargs):
+        self.calls.append(("oldest_queued", kwargs))
+        if self.delivery is None:
+            return None
+        return (self.delivery.created_at, self.delivery.execution_id)
 
     async def renew(self, **kwargs):
         self.calls.append(("renew", kwargs))
@@ -155,6 +208,7 @@ def test_agent_poll_returns_closed_source_task_and_routes_fenced_renewal() -> No
         lease_expires_at=NOW,
         snapshot={
             "schema_version": "1.0",
+            "aud": "perfpilot-agent",
             "task_type": "source_context",
             "execution_id": str(EXECUTION_ID),
             "analysis_id": "30000000-0000-4000-8000-000000000001",
@@ -200,19 +254,82 @@ def test_agent_poll_returns_closed_source_task_and_routes_fenced_renewal() -> No
     )
 
 
+def test_agent_poll_fairly_selects_oldest_queued_kind_in_both_orderings() -> None:
+    from datetime import timedelta
+    from perfpilot_api.services.agent_tasks import AgentTaskDelivery
+
+    compact = f"{'A' * 24}.{'B' * 24}.{'C' * 86}"
+
+    def source_delivery(created_at):
+        return SourceTaskDelivery(
+            execution_id=EXECUTION_ID,
+            analysis_id=UUID("30000000-0000-4000-8000-000000000001"),
+            agent_id=AGENT_ID,
+            task_type="source_context",
+            lease_version=1,
+            lease_token="opaque-lease-token-123",
+            lease_expires_at=NOW,
+            snapshot={
+                "schema_version": "1.0",
+                "aud": "perfpilot-agent",
+                "task_type": "source_context",
+            },
+            signature_b64="A" * 86 + "==",
+            created_at=created_at,
+        )
+
+    device = FakeTaskService()
+    source = FakeSourceTaskService()
+    device.queued = (NOW - timedelta(seconds=2), UUID(int=2))
+    device.queued_delivery = AgentTaskDelivery(
+        snapshot_jws=compact,
+        lease_expires_at=NOW,
+    )
+    source.delivery = source_delivery(NOW - timedelta(seconds=1))
+    with _client(device, source) as client:
+        older_device = client.get(
+            "/v1/agent/tasks/next?wait_seconds=0",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert older_device.status_code == 200
+    assert older_device.json()["schema_version"] == "1.0"
+    assert any(call[0] == "schedule" for call in device.calls)
+    assert not any(call[0] == "lease_next" for call in source.calls)
+
+    device = FakeTaskService()
+    source = FakeSourceTaskService()
+    device.queued = (NOW - timedelta(seconds=1), UUID(int=2))
+    device.queued_delivery = AgentTaskDelivery(
+        snapshot_jws=compact,
+        lease_expires_at=NOW,
+    )
+    source.delivery = source_delivery(NOW - timedelta(seconds=2))
+    with _client(device, source) as client:
+        older_source = client.get(
+            "/v1/agent/tasks/next?wait_seconds=0",
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert older_source.status_code == 200
+    assert older_source.json()["task_kind"] == "source"
+    assert not any(call[0] == "schedule" for call in device.calls)
+
+
 def test_agent_complete_routes_source_body_to_injected_recorder_service() -> None:
     source = FakeSourceTaskService()
-    completion = {
+    completion = _sign_completion({
         "schema_version": "1.0",
         "task_type": "source_context",
         "execution_id": str(EXECUTION_ID),
         "analysis_id": "30000000-0000-4000-8000-000000000001",
+        "team_id": str(TEAM_ID),
+        "agent_id": str(AGENT_ID),
         "workspace_id": "91000000-0000-4000-8000-000000000001",
         "lease_version": 1,
         "state": "failed",
         "result": {"failure_code": "source_unavailable", "retryable": False},
-        "signature_b64": "A" * 86 + "==",
-    }
+    })
     with _client(FakeTaskService(), source) as client:
         response = client.post(
             f"/v1/agent/tasks/{EXECUTION_ID}/complete",
@@ -229,6 +346,136 @@ def test_agent_complete_routes_source_body_to_injected_recorder_service() -> Non
     assert call[0] == "complete"
     assert call[1]["recorder"] is not None
     assert call[1]["completion_document"] == completion
+
+
+def test_agent_complete_authenticates_before_parsing_the_completion_body() -> None:
+    source = FakeSourceTaskService()
+    malformed = {"schema_version": "1.0", "task_type": "source_context"}
+    with _client(FakeTaskService(), source) as client:
+        response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/complete",
+            json=malformed,
+            headers={"Authorization": "Bearer invalid"},
+        )
+
+    assert response.status_code == 401
+    assert source.calls == []
+
+
+def test_agent_complete_resolves_server_owned_task_before_closed_body_validation() -> None:
+    source = FakeSourceTaskService()
+    malformed = {"schema_version": "1.0", "task_type": "source_context"}
+    with _client(FakeTaskService(), source) as client:
+        response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/complete",
+            json=malformed,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert response.status_code == 422
+    assert source.calls == [
+        ("owns", {"execution_id": EXECUTION_ID, "agent_id": AGENT_ID})
+    ]
+
+
+def test_agent_complete_rejects_tampered_or_misbound_source_documents() -> None:
+    base = {
+        "schema_version": "1.0",
+        "task_type": "source_context",
+        "execution_id": str(EXECUTION_ID),
+        "analysis_id": "30000000-0000-4000-8000-000000000001",
+        "team_id": str(TEAM_ID),
+        "agent_id": str(AGENT_ID),
+        "workspace_id": "91000000-0000-4000-8000-000000000001",
+        "lease_version": 1,
+        "state": "failed",
+        "result": {"failure_code": "source_unavailable", "retryable": False},
+    }
+    tampered = _sign_completion(base)
+    tampered["state"] = "canceled"
+    wrong_agent = _sign_completion(
+        {**base, "agent_id": "71000000-0000-4000-8000-000000000002"}
+    )
+    client_kind = _sign_completion({**base, "task_kind": "source"})
+    source = FakeSourceTaskService()
+
+    with _client(FakeTaskService(), source) as client:
+        tampered_response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/complete",
+            json=tampered,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        wrong_agent_response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/complete",
+            json=wrong_agent,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+        client_kind_response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/complete",
+            json=client_kind,
+            headers={"Authorization": f"Bearer {TOKEN}"},
+        )
+
+    assert tampered_response.status_code == 401
+    assert wrong_agent_response.status_code == 404
+    assert client_kind_response.status_code == 422
+    assert all(call[0] == "owns" for call in source.calls)
+
+
+def test_source_completion_budget_counts_canonical_utf8_not_json_escapes() -> None:
+    base = {
+        "schema_version": "1.0",
+        "task_type": "source_context",
+        "execution_id": str(EXECUTION_ID),
+        "analysis_id": "30000000-0000-4000-8000-000000000001",
+        "team_id": str(TEAM_ID),
+        "agent_id": str(AGENT_ID),
+        "workspace_id": "91000000-0000-4000-8000-000000000001",
+        "lease_version": 1,
+        "state": "failed",
+    }
+    accepted = _sign_completion(
+        {
+            **base,
+            "result": {
+                "failure_code": "source_unavailable",
+                "retryable": False,
+                "note": "界" * 22_000,
+            },
+        }
+    )
+    rejected = _sign_completion(
+        {
+            **base,
+            "result": {
+                "failure_code": "source_unavailable",
+                "retryable": False,
+                "note": "界" * 44_000,
+            },
+        }
+    )
+    source = FakeSourceTaskService()
+    with _client(FakeTaskService(), source) as client:
+        accepted_response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/complete",
+            json=accepted,
+            headers={
+                "Authorization": f"Bearer {TOKEN}",
+                "X-PerfPilot-Lease-Token": "opaque-lease-token-123",
+            },
+        )
+        rejected_response = client.post(
+            f"/v1/agent/tasks/{EXECUTION_ID}/complete",
+            json=rejected,
+            headers={
+                "Authorization": f"Bearer {TOKEN}",
+                "X-PerfPilot-Lease-Token": "opaque-lease-token-123",
+            },
+        )
+
+    assert accepted_response.status_code == 200
+    assert rejected_response.status_code == 413
+    assert [call[0] for call in source.calls].count("complete") == 1
 
 
 def test_source_cancel_ack_and_oversized_completion_use_source_fence() -> None:
@@ -249,17 +496,18 @@ def test_source_cancel_ack_and_oversized_completion_use_source_fence() -> None:
         source.reject_too_large = True
         oversized = client.post(
             f"/v1/agent/tasks/{EXECUTION_ID}/complete",
-            json={
+            json=_sign_completion({
                 "schema_version": "1.0",
                 "task_type": "source_context",
                 "execution_id": str(EXECUTION_ID),
                 "analysis_id": "30000000-0000-4000-8000-000000000001",
+                "team_id": str(TEAM_ID),
+                "agent_id": str(AGENT_ID),
                 "workspace_id": "91000000-0000-4000-8000-000000000001",
                 "lease_version": 1,
                 "state": "failed",
                 "result": {"failure_code": "source_unavailable", "retryable": False},
-                "signature_b64": "A" * 86 + "==",
-            },
+            }),
             headers={
                 "Authorization": f"Bearer {TOKEN}",
                 "X-PerfPilot-Lease-Token": "opaque-lease-token-123",
@@ -305,8 +553,6 @@ def test_agent_renews_only_its_fenced_execution() -> None:
         "lease_expires_at": NOW.isoformat(),
         "renew_after_seconds": 20,
     }
-
-
 def test_agent_poll_returns_only_the_signed_execution_contract() -> None:
     from perfpilot_api.services.agent_tasks import AgentTaskDelivery
 
@@ -330,6 +576,12 @@ def test_agent_poll_returns_only_the_signed_execution_contract() -> None:
         "lease_expires_at": NOW.isoformat(),
         "renew_after_seconds": 20,
     }
+    assert response.content == (
+        b'{"schema_version":"1.0","action":"execute","snapshot_jws":"'
+        + compact.encode("ascii")
+        + b'","lease_expires_at":"2026-08-05T08:00:00+00:00",'
+        b'"renew_after_seconds":20}'
+    )
 
 
 def test_agent_poll_and_renew_return_the_closed_cancel_action() -> None:

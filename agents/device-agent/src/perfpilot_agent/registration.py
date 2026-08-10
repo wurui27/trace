@@ -77,7 +77,7 @@ class RegistrationService:
                 serialization.PublicFormat.Raw,
             )
             request = RegistrationRequest(
-                schema_version="1.0",
+                schema_version="1.1",
                 registration_code=raw_code.decode("ascii"),
                 public_key_b64=base64.b64encode(public_raw).decode("ascii"),
                 platform=self.metadata.platform,
@@ -87,8 +87,9 @@ class RegistrationService:
             )
             response = await self._client.register(request)
             credentials = AgentCredentials(
-                schema_version="1.0",
+                schema_version=response.schema_version,
                 agent_id=response.agent_id,
+                team_id=response.team_id,
                 private_key_b64=base64.b64encode(private_raw).decode("ascii"),
                 access_token=response.access_token,
                 access_token_expires_at=response.access_token_expires_at,
