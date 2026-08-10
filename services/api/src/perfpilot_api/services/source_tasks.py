@@ -251,6 +251,21 @@ class SourceTaskRepository(Protocol):
     ) -> tuple[_MemorySourceTask, bool]: ...
 
 
+def _same_task_identity(
+    existing: _MemorySourceTask,
+    requested: _MemorySourceTask,
+) -> bool:
+    return (
+        existing.team_id == requested.team_id
+        and existing.analysis_id == requested.analysis_id
+        and existing.agent_id == requested.agent_id
+        and existing.workspace_id == requested.workspace_id
+        and existing.task_type == requested.task_type
+        and existing.request_document == requested.request_document
+        and existing.request_sha256 == requested.request_sha256
+    )
+
+
 class InMemorySourceTaskRepository:
     def __init__(self) -> None:
         self.tasks: dict[UUID, _MemorySourceTask] = {}
@@ -260,10 +275,7 @@ class InMemorySourceTaskRepository:
             if existing.state not in _ACTIVE_STATES or existing.task_type != task.task_type:
                 continue
             if task.task_type == "source_context" and existing.analysis_id == task.analysis_id:
-                if (
-                    existing.request_sha256 == task.request_sha256
-                    and existing.request_document == task.request_document
-                ):
+                if _same_task_identity(existing, task):
                     return existing
                 raise SourceTaskConflict
             if (
@@ -271,10 +283,7 @@ class InMemorySourceTaskRepository:
                 and existing.analysis_id == task.analysis_id
                 and existing.request_document.get("fix_id") == task.request_document.get("fix_id")
             ):
-                if (
-                    existing.request_sha256 == task.request_sha256
-                    and existing.request_document == task.request_document
-                ):
+                if _same_task_identity(existing, task):
                     return existing
                 raise SourceTaskConflict
         self.tasks[task.id] = task
@@ -570,10 +579,7 @@ class SQLAlchemySourceTaskRepository:
                 if existing is None:
                     raise
                 loaded = _memory_task(existing)
-                if (
-                    loaded.request_sha256 != task.request_sha256
-                    or loaded.request_document != task.request_document
-                ):
+                if not _same_task_identity(loaded, task):
                     raise SourceTaskConflict
                 return loaded
 
@@ -1073,6 +1079,22 @@ class SourceTaskService:
                 now=now,
                 validation_request=validation_request,
             )
+        except SourceTaskConflict:
+            winner = await self._repository.active_patch(
+                analysis_id=analysis_id,
+                fix_id=fix_id,
+            )
+            if (
+                winner is None
+                or winner.request_document.get("patch_artifact_id")
+                != str(artifact.artifact_id)
+            ):
+                await self._abort_patch_artifact(
+                    team_id=team_id,
+                    analysis_id=analysis_id,
+                    artifact=artifact,
+                )
+            raise
         except Exception:
             await self._abort_patch_artifact(
                 team_id=team_id,

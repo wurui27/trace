@@ -383,6 +383,7 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
     from perfpilot_api.services.source_tasks import (
         SQLAlchemySourceTaskRepository,
         SourceCompletionArtifact,
+        SourcePatchArtifactBinding,
         SourceTaskConflict,
         SourceTaskInvalid,
         SourceTaskService,
@@ -392,6 +393,11 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
     user_id = UUID("11000000-0000-4000-8000-000000000001")
     team_id = UUID("12000000-0000-4000-8000-000000000001")
     agent_id = UUID("71000000-0000-4000-8000-000000000001")
+    secondary_agent_ids = (
+        UUID("71000000-0000-4000-8000-000000000002"),
+        UUID("71000000-0000-4000-8000-000000000003"),
+    )
+    patch_analysis_id = UUID("30000000-0000-4000-8000-000000000004")
     analysis_ids = (
         UUID("30000000-0000-4000-8000-000000000001"),
         UUID("30000000-0000-4000-8000-000000000002"),
@@ -400,11 +406,25 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
         connection.execute(text("INSERT INTO users (id, username, password_hash, state) VALUES (:id, 'source-owner', 'x', 'active')"), {"id": user_id})
         connection.execute(text("INSERT INTO teams (id, name, state) VALUES (:id, 'source-team', 'active')"), {"id": team_id})
         connection.execute(text("INSERT INTO agents (id, team_id, owner_user_id, name, state) VALUES (:id, :team, :owner, 'source-agent', 'online')"), {"id": agent_id, "team": team_id, "owner": user_id})
+        for index, secondary_agent_id in enumerate(secondary_agent_ids, start=2):
+            connection.execute(
+                text("INSERT INTO agents (id, team_id, owner_user_id, name, state) VALUES (:id, :team, :owner, :name, 'online')"),
+                {
+                    "id": secondary_agent_id,
+                    "team": team_id,
+                    "owner": user_id,
+                    "name": f"source-agent-{index}",
+                },
+            )
         for index, analysis_id in enumerate(analysis_ids):
             connection.execute(
                 text("INSERT INTO global_jobs (id, team_id, idempotency_key, analysis_mode, state) VALUES (:id, :team, :key, 'trace_upload', 'analyzing')"),
                 {"id": analysis_id, "team": team_id, "key": f"source-{index}"},
             )
+        connection.execute(
+            text("INSERT INTO global_jobs (id, team_id, idempotency_key, analysis_mode, state) VALUES (:id, :team, 'source-patch-binding', 'trace_upload', 'analyzing')"),
+            {"id": patch_analysis_id, "team": team_id},
+        )
 
     async_engine = create_async_engine(migration_databases.control_url, poolclass=NullPool)
     sessions = async_sessionmaker(async_engine, expire_on_commit=False)
@@ -413,6 +433,7 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
             UUID("73000000-0000-4000-8000-000000000000"),
             UUID("73000000-0000-4000-8000-000000000001"),
             UUID("73000000-0000-4000-8000-000000000002"),
+            UUID("73000000-0000-4000-8000-000000000003"),
         )
     )
     service = SourceTaskService(
@@ -449,6 +470,88 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
                 validation_profile_id=None,
                 finding_hints=(),
             )
+        with pytest.raises(SourceTaskConflict):
+            await service.create_context_task(
+                team_id=team_id,
+                analysis_id=analysis_ids[0],
+                agent_id=agent_id,
+                workspace_id=UUID("91000000-0000-4000-8000-000000000002"),
+                validation_profile_id=None,
+                finding_hints=(),
+            )
+
+        class ConcurrentPatchStore:
+            def __init__(self) -> None:
+                self.arrived = 0
+                self.release = asyncio.Event()
+                self.values: set[UUID] = set()
+                self.abort_calls = 0
+
+            async def write_patch(
+                self, *, team_id, analysis_id, patch, checksum, idempotency_key
+            ):
+                artifact_id = UUID("98000000-0000-4000-8000-000000000001")
+                ownership_token = None
+                if artifact_id not in self.values:
+                    self.values.add(artifact_id)
+                    ownership_token = "owner"
+                self.arrived += 1
+                if self.arrived == 2:
+                    self.release.set()
+                await self.release.wait()
+                return SourcePatchArtifactBinding(
+                    artifact_id=artifact_id,
+                    checksum=checksum,
+                    ownership_token=ownership_token,
+                )
+
+            async def abort_patch(self, *, team_id, analysis_id, binding):
+                self.abort_calls += 1
+                if binding.ownership_token == "owner":
+                    self.values.discard(binding.artifact_id)
+
+        patch_store = ConcurrentPatchStore()
+        patch_service = SourceTaskService(
+            repository=SQLAlchemySourceTaskRepository(sessions),
+            patch_writer=patch_store,
+            clock=lambda: datetime(2026, 8, 5, 8, 0, tzinfo=UTC),
+        )
+        patch_arguments = {
+            "team_id": team_id,
+            "analysis_id": patch_analysis_id,
+            "workspace_id": UUID("91000000-0000-4000-8000-000000000001"),
+            "validation_profile_id": UUID(
+                "94000000-0000-4000-8000-000000000001"
+            ),
+            "snapshot_id": UUID("95000000-0000-4000-8000-000000000001"),
+            "snapshot_hash": "a" * 64,
+            "fix_id": UUID("96000000-0000-4000-8000-000000000001"),
+            "patch": "diff --git a/a.kt b/a.kt\n",
+        }
+        patch_outcomes = await asyncio.gather(
+            patch_service.create_patch_task(
+                agent_id=secondary_agent_ids[0], **patch_arguments
+            ),
+            patch_service.create_patch_task(
+                agent_id=secondary_agent_ids[1], **patch_arguments
+            ),
+            return_exceptions=True,
+        )
+        assert sum(
+            isinstance(outcome, SourceTaskConflict) for outcome in patch_outcomes
+        ) == 1
+        assert len(patch_store.values) == 1
+        assert patch_store.abort_calls == 0
+        with migration_databases.control_engine.connect() as connection:
+            stored_patch_agent = connection.scalar(
+                text(
+                    "SELECT agent_id FROM source_tasks "
+                    "WHERE analysis_id = :analysis_id"
+                ),
+                {"analysis_id": patch_analysis_id},
+            )
+        assert stored_patch_agent in secondary_agent_ids
+
         first, second = await asyncio.gather(
             service.lease_next(agent_id=agent_id),
             service.lease_next(agent_id=agent_id),

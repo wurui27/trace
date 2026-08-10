@@ -178,6 +178,33 @@ async def test_context_task_is_unique_and_has_no_device_binding() -> None:
     assert not hasattr(repository.tasks[first.id], "device_id")
 
 
+@pytest.mark.parametrize(
+    "override",
+    (
+        {"team_id": UUID("10000000-0000-4000-8000-000000000002")},
+        {"agent_id": UUID("71000000-0000-4000-8000-000000000002")},
+        {"workspace_id": UUID("91000000-0000-4000-8000-000000000002")},
+    ),
+)
+@pytest.mark.asyncio
+async def test_context_retry_rejects_identity_rebinding(override) -> None:
+    service, repository = _service()
+    arguments = {
+        "team_id": TEAM_ID,
+        "analysis_id": ANALYSIS_ID,
+        "agent_id": AGENT_ID,
+        "workspace_id": WORKSPACE_ID,
+        "validation_profile_id": None,
+        "finding_hints": (),
+    }
+    first = await service.create_context_task(**arguments)
+
+    with pytest.raises(SourceTaskConflict):
+        await service.create_context_task(**{**arguments, **override})
+
+    assert list(repository.tasks) == [first.id]
+
+
 @pytest.mark.asyncio
 async def test_lease_returns_token_but_stores_only_digest() -> None:
     service, repository = _service()
@@ -499,6 +526,37 @@ async def test_concurrent_conflicting_patch_creation_aborts_only_loser_artifact(
     assert len(repository.tasks) == 1
     assert len(patch_store.values) == 1
     assert patch_store.abort_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_patch_retry_rejects_agent_rebinding() -> None:
+    service, repository = _service()
+    patch_store = BarrierPatchStore()
+    service._patch_writer = patch_store
+    arguments = {
+        "team_id": TEAM_ID,
+        "analysis_id": ANALYSIS_ID,
+        "workspace_id": WORKSPACE_ID,
+        "validation_profile_id": UUID("94000000-0000-4000-8000-000000000001"),
+        "snapshot_id": UUID("95000000-0000-4000-8000-000000000001"),
+        "snapshot_hash": "a" * 64,
+        "fix_id": UUID("96000000-0000-4000-8000-000000000001"),
+        "patch": "diff --git a/a.kt b/a.kt\n",
+    }
+
+    outcomes = await asyncio.gather(
+        service.create_patch_task(agent_id=AGENT_ID, **arguments),
+        service.create_patch_task(
+            agent_id=UUID("71000000-0000-4000-8000-000000000002"),
+            **arguments,
+        ),
+        return_exceptions=True,
+    )
+
+    assert sum(isinstance(outcome, SourceTaskConflict) for outcome in outcomes) == 1
+    assert len(repository.tasks) == 1
+    assert len(patch_store.values) == 1
+    assert patch_store.abort_calls == 0
 
 
 @pytest.mark.asyncio
