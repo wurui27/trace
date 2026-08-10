@@ -26,6 +26,7 @@ from perfpilot_api.security.agent_signatures import (
     decode_ed25519_public_key,
     verify_refresh_proof,
 )
+from perfpilot_api.services.source_workspaces import is_public_source_display_name
 
 AgentPlatform = Literal["macos", "windows", "linux"]
 AgentState = Literal["pending", "online", "offline", "revoked"]
@@ -915,6 +916,7 @@ def _normalize_agent_name(value: str) -> str:
         not normalized
         or len(normalized) > _AGENT_NAME_MAX_LENGTH
         or any(unicodedata.category(character) == "Cc" for character in normalized)
+        or not is_public_source_display_name(normalized)
     ):
         raise AgentInvalidRequestError
     return normalized

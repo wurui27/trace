@@ -187,6 +187,13 @@ class HeartbeatWorkspace(BaseModel):
             raise ValueError("workspace name must not be path-shaped")
         return value
 
+    @field_validator("git_branch")
+    @classmethod
+    def public_git_branch(cls, value: str | None) -> str | None:
+        if value is not None and not is_public_source_display_name(value):
+            raise ValueError("Git branch must not be path-shaped")
+        return value
+
     @field_validator("validation_profiles")
     @classmethod
     def unique_profile_ids(

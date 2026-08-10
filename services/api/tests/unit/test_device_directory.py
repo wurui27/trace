@@ -335,6 +335,11 @@ async def test_source_workspace_reads_expire_stale_agent_before_listing_or_bindi
         ("workspace", "/Users/ray/private/demo"),
         ("profile", r"C:\Users\ray\private\demo"),
         ("workspace", r"\\server\share\demo"),
+        ("branch", "/Users/ray/private/demo"),
+        ("branch", r"C:\Users\ray\private\demo"),
+        ("branch", r"\\server\share\demo"),
+        ("branch", "../private/demo"),
+        ("branch", "file:///Users/ray/private/demo"),
     ),
 )
 async def test_heartbeat_rejects_path_shaped_public_source_names_at_directory_boundary(
@@ -346,13 +351,15 @@ async def test_heartbeat_rejects_path_shaped_public_source_names_at_directory_bo
     workspace = dict(base.source_workspaces[0])  # type: ignore[index]
     if field == "workspace":
         workspace["name"] = private_name
-    else:
+    elif field == "profile":
         workspace["validation_profiles"] = [
             {
                 "profile_id": "94000000-0000-4000-8000-000000000001",
                 "name": private_name,
             }
         ]
+    else:
+        workspace["git_branch"] = private_name
 
     with pytest.raises(DeviceHeartbeatRejected) as captured:
         await harness.directory.replace_heartbeat(

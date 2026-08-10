@@ -653,7 +653,11 @@ def test_heartbeat_v11_rejects_path_shaped_public_names_before_persistence() -> 
             },
         ).json()
 
-        def heartbeat_with_names(workspace_name: str, profile_name: str) -> dict[str, object]:
+        def heartbeat_with_names(
+            workspace_name: str,
+            profile_name: str,
+            git_branch: str = "feature/source-binding",
+        ) -> dict[str, object]:
             return {
                 "schema_version": "1.1",
                 "agent_version": "1.2.3",
@@ -669,7 +673,7 @@ def test_heartbeat_v11_rejects_path_shaped_public_names_before_persistence() -> 
                         "workspace_id": "92000000-0000-4000-8000-000000000001",
                         "name": workspace_name,
                         "state": "ready",
-                        "git_branch": "feature/source-binding",
+                        "git_branch": git_branch,
                         "git_head": "1" * 40,
                         "tracked_dirty_count": 0,
                         "snapshot_policy": "tracked_worktree",
@@ -700,6 +704,20 @@ def test_heartbeat_v11_rejects_path_shaped_public_names_before_persistence() -> 
                 assert response.json()["error"]["code"] == "request_validation_failed"
                 assert private_name not in response.text
 
+        for private_name in private_names:
+            response = client.post(
+                "/v1/agent/heartbeat",
+                headers={"authorization": f"Bearer {registered['access_token']}"},
+                json=heartbeat_with_names(
+                    "Demo Android",
+                    "Android check",
+                    private_name,
+                ),
+            )
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "request_validation_failed"
+            assert private_name not in response.text
+
         target = f"/v1/teams/{TEAM_A_ID}/source-workspaces"
         empty = _browser_request(
             client,
@@ -726,6 +744,54 @@ def test_heartbeat_v11_rejects_path_shaped_public_names_before_persistence() -> 
     assert listed.json()["workspaces"][0]["name"] == "Android / Wear 中文"
     assert listed.json()["workspaces"][0]["git_branch"] == "feature/source-binding"
     assert listed.json()["workspaces"][0]["validation_profiles"][0]["name"] == "检查 / Release"
+
+
+def test_agent_create_and_rename_reject_path_shaped_names_without_leaking() -> None:
+    private_names = (
+        "/Users/ray/private/agent",
+        r"C:\Users\ray\private\agent",
+        r"\\server\share\agent",
+        "../private/agent",
+        "file:///Users/ray/private/agent",
+    )
+    with _client(source_code_analysis_enabled=True) as client:
+        registration_target = f"/v1/teams/{TEAM_A_ID}/agents/registration-codes"
+        for index, private_name in enumerate(private_names):
+            response = _browser_request(
+                client,
+                method="POST",
+                target=registration_target,
+                payload={"schema_version": "1.0", "name": private_name},
+                request_id=f"req-private-agent-create-{index}",
+            )
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "request_validation_failed"
+            assert private_name not in response.text
+
+        issued = _create_code(client, name="Build / Agent 中文")
+        rename_target = f"/v1/teams/{TEAM_A_ID}/agents/{issued['agent_id']}"
+        for index, private_name in enumerate(private_names):
+            response = _browser_request(
+                client,
+                method="PATCH",
+                target=rename_target,
+                payload={"schema_version": "1.0", "name": private_name},
+                request_id=f"req-private-agent-rename-{index}",
+            )
+            assert response.status_code == 422
+            assert response.json()["error"]["code"] == "request_validation_failed"
+            assert private_name not in response.text
+
+        renamed = _browser_request(
+            client,
+            method="PATCH",
+            target=rename_target,
+            payload={"schema_version": "1.0", "name": "Source / Agent 中文"},
+            request_id="req-valid-agent-rename",
+        )
+
+    assert renamed.status_code == 200
+    assert renamed.json()["agent"]["name"] == "Source / Agent 中文"
 
 
 def test_heartbeat_rejects_missing_agent_access_token_without_proxy_headers() -> None:

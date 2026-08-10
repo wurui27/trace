@@ -59,6 +59,7 @@ class _Repository:
 def _agent(
     *,
     team_id: UUID = TEAM_ID,
+    name: str = "Ray Mac",
     state: str = "online",
     workspace_state: str = "ready",
     capabilities: dict[str, object] | None = None,
@@ -66,7 +67,7 @@ def _agent(
     return _Agent(
         agent_id=AGENT_ID,
         team_id=team_id,
-        name="Ray Mac",
+        name=name,
         state=state,
         capabilities=(
             {"source_workspaces": [_capability(state=workspace_state)]}
@@ -164,3 +165,16 @@ async def test_binding_errors_are_distinct_and_disabled_is_stable() -> None:
             team_id=TEAM_ID,
             binding=_binding(profile_id=UUID("94000000-0000-4000-8000-000000000009")),
         )
+
+
+@pytest.mark.asyncio
+async def test_directory_filters_persisted_path_shaped_agent_name() -> None:
+    private_name = "/Users/ray/private/agent"
+    service = SourceWorkspaceService(
+        repository=_Repository(_agent(name=private_name)),
+        enabled=True,
+    )  # type: ignore[arg-type]
+
+    assert await service.list_for_team(team_id=TEAM_ID) == ()
+    with pytest.raises(SourceBindingInvalid):
+        await service.require_binding(team_id=TEAM_ID, binding=_binding())

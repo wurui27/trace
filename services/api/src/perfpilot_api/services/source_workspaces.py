@@ -129,7 +129,7 @@ class SourceWorkspaceService:
         agent = await self._repository.get_source_agent(binding.agent_id)
         if agent is None or agent.team_id != team_id:
             raise SourceBindingNotFound("source workspace was not found")
-        if agent.state != "online":
+        if agent.state != "online" or not is_public_source_display_name(agent.name):
             raise SourceBindingInvalid("source workspace is unavailable")
         workspace = next(
             (
@@ -168,6 +168,8 @@ def is_public_source_display_name(value: str) -> bool:
 def _parse_capabilities(
     agent: SourceAgentCapabilityRecord,
 ) -> tuple[SourceWorkspaceView, ...]:
+    if not isinstance(agent.name, str) or not is_public_source_display_name(agent.name):
+        return ()
     raw_workspaces = agent.capabilities.get("source_workspaces")
     if not isinstance(raw_workspaces, list) or len(raw_workspaces) > 32:
         return ()
@@ -205,7 +207,13 @@ def _parse_capabilities(
                 or (branch is not None and (not isinstance(branch, str) or not 1 <= len(branch) <= 255))
                 or (
                     isinstance(branch, str)
-                    and any(unicodedata.category(character) == "Cc" for character in branch)
+                    and (
+                        any(
+                            unicodedata.category(character) == "Cc"
+                            for character in branch
+                        )
+                        or not is_public_source_display_name(branch)
+                    )
                 )
                 or not isinstance(head, str)
                 or len(head) != 40

@@ -805,6 +805,7 @@ def _validate_source_workspaces(
                 not isinstance(branch, str)
                 or not 1 <= len(branch) <= 255
                 or any(unicodedata.category(character) == "Cc" for character in branch)
+                or not is_public_source_display_name(branch)
             ))
             or not isinstance(head, str)
             or re.fullmatch(r"[0-9a-f]{40}", head) is None
