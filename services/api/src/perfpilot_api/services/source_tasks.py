@@ -79,6 +79,7 @@ class SourceCompletionArtifact:
 class SourcePatchArtifactBinding:
     artifact_id: UUID
     checksum: str
+    ownership_token: str | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -172,18 +173,31 @@ class SourcePatchArtifactWriter(Protocol):
         idempotency_key: str,
     ) -> SourcePatchArtifactBinding: ...
 
+    async def abort_patch(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        binding: SourcePatchArtifactBinding,
+    ) -> None: ...
+
 
 class SourcePatchArtifactReader(Protocol):
     async def read_patch(
         self,
         *,
         team_id: UUID,
+        analysis_id: UUID,
         artifact_id: UUID,
+        expected_checksum: str,
     ) -> SourcePatchArtifactPayload: ...
 
 
 class SourceTaskRepository(Protocol):
     async def create_or_get(self, task: _MemorySourceTask) -> _MemorySourceTask: ...
+    async def active_patch(
+        self, *, analysis_id: UUID, fix_id: UUID
+    ) -> _MemorySourceTask | None: ...
     async def active_for_agent(self, *, agent_id: UUID, now: datetime) -> _MemorySourceTask | None: ...
     async def oldest_queued(
         self, *, agent_id: UUID
@@ -197,6 +211,16 @@ class SourceTaskRepository(Protocol):
         now: datetime,
     ) -> _MemorySourceTask | None: ...
     async def by_execution(self, execution_id: UUID) -> _MemorySourceTask | None: ...
+    async def authorize_fenced(
+        self,
+        *,
+        execution_id: UUID,
+        agent_id: UUID,
+        lease_version: int,
+        token_digest: str,
+        now: datetime,
+        allow_completed: bool,
+    ) -> _MemorySourceTask: ...
     async def expire_stale(self, *, now: datetime) -> int: ...
     async def fail_leased(
         self,
@@ -236,15 +260,40 @@ class InMemorySourceTaskRepository:
             if existing.state not in _ACTIVE_STATES or existing.task_type != task.task_type:
                 continue
             if task.task_type == "source_context" and existing.analysis_id == task.analysis_id:
-                return existing
+                if (
+                    existing.request_sha256 == task.request_sha256
+                    and existing.request_document == task.request_document
+                ):
+                    return existing
+                raise SourceTaskConflict
             if (
                 task.task_type == "patch_verification"
                 and existing.analysis_id == task.analysis_id
                 and existing.request_document.get("fix_id") == task.request_document.get("fix_id")
             ):
-                return existing
+                if (
+                    existing.request_sha256 == task.request_sha256
+                    and existing.request_document == task.request_document
+                ):
+                    return existing
+                raise SourceTaskConflict
         self.tasks[task.id] = task
         return task
+
+    async def active_patch(
+        self, *, analysis_id: UUID, fix_id: UUID
+    ) -> _MemorySourceTask | None:
+        return next(
+            (
+                task
+                for task in self.tasks.values()
+                if task.analysis_id == analysis_id
+                and task.task_type == "patch_verification"
+                and task.state in _ACTIVE_STATES
+                and task.request_document.get("fix_id") == str(fix_id)
+            ),
+            None,
+        )
 
     async def active_for_agent(self, *, agent_id: UUID, now: datetime) -> _MemorySourceTask | None:
         candidates = [
@@ -294,6 +343,37 @@ class InMemorySourceTaskRepository:
 
     async def by_execution(self, execution_id: UUID) -> _MemorySourceTask | None:
         return self.tasks.get(execution_id)
+
+    async def authorize_fenced(
+        self,
+        *,
+        execution_id: UUID,
+        agent_id: UUID,
+        lease_version: int,
+        token_digest: str,
+        now: datetime,
+        allow_completed: bool,
+    ) -> _MemorySourceTask:
+        task = self.tasks.get(execution_id)
+        if task is None or task.agent_id != agent_id:
+            raise SourceTaskNotFound
+        if (
+            task.lease_version != lease_version
+            or task.lease_token_digest is None
+            or not hmac.compare_digest(task.lease_token_digest, token_digest)
+        ):
+            raise StaleSourceTaskLease
+        if allow_completed and task.completion_sha256 is not None:
+            return task
+        if task.state not in _LEASED_STATES:
+            raise StaleSourceTaskLease
+        if task.expires_at is None or task.expires_at <= now:
+            task.state = "expired"
+            task.failure_code = "source_task_lease_expired"
+            task.completed_at = now
+            task.updated_at = now
+            raise StaleSourceTaskLease
+        return task
 
     async def expire_stale(self, *, now: datetime) -> int:
         expired = 0
@@ -352,6 +432,14 @@ class InMemorySourceTaskRepository:
             or task.lease_token_digest is None
             or not hmac.compare_digest(task.lease_token_digest, token_digest)
         ):
+            raise StaleSourceTaskLease
+        if task.state in _LEASED_STATES and (
+            task.expires_at is None or task.expires_at <= now
+        ):
+            task.state = "expired"
+            task.failure_code = "source_task_lease_expired"
+            task.completed_at = now
+            task.updated_at = now
             raise StaleSourceTaskLease
         if operation == "complete" and task.completion_sha256 is not None:
             if completion_sha256 is None or not hmac.compare_digest(
@@ -481,7 +569,29 @@ class SQLAlchemySourceTaskRepository:
                 existing = await session.scalar(statement.limit(1))
                 if existing is None:
                     raise
-                return _memory_task(existing)
+                loaded = _memory_task(existing)
+                if (
+                    loaded.request_sha256 != task.request_sha256
+                    or loaded.request_document != task.request_document
+                ):
+                    raise SourceTaskConflict
+                return loaded
+
+    async def active_patch(
+        self, *, analysis_id: UUID, fix_id: UUID
+    ) -> _MemorySourceTask | None:
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(SourceTask)
+                .where(
+                    SourceTask.analysis_id == analysis_id,
+                    SourceTask.task_type == "patch_verification",
+                    SourceTask.state.in_(_ACTIVE_STATES),
+                    SourceTask.request_document["fix_id"].astext == str(fix_id),
+                )
+                .limit(1)
+            )
+            return None if row is None else _memory_task(row)
 
     async def active_for_agent(
         self, *, agent_id: UUID, now: datetime
@@ -595,6 +705,44 @@ class SQLAlchemySourceTaskRepository:
             row = await session.get(SourceTask, execution_id)
             return None if row is None else _memory_task(row)
 
+    async def authorize_fenced(
+        self,
+        *,
+        execution_id: UUID,
+        agent_id: UUID,
+        lease_version: int,
+        token_digest: str,
+        now: datetime,
+        allow_completed: bool,
+    ) -> _MemorySourceTask:
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(SourceTask)
+                .where(SourceTask.id == execution_id)
+                .with_for_update()
+            )
+            if row is None or row.agent_id != agent_id:
+                raise SourceTaskNotFound
+            if (
+                row.lease_version != lease_version
+                or row.lease_token_digest is None
+                or not hmac.compare_digest(row.lease_token_digest, token_digest)
+            ):
+                raise StaleSourceTaskLease
+            if allow_completed and row.completion_sha256 is not None:
+                return _memory_task(row)
+            if row.state not in _LEASED_STATES:
+                raise StaleSourceTaskLease
+            if row.expires_at is None or row.expires_at <= now:
+                row.state = "expired"
+                row.failure_code = "source_task_lease_expired"
+                row.completed_at = now
+                row.updated_at = now
+                row.version += 1
+                await session.commit()
+                raise StaleSourceTaskLease
+            return _memory_task(row)
+
     async def expire_stale(self, *, now: datetime) -> int:
         async with self._sessions() as session:
             async with session.begin():
@@ -674,6 +822,17 @@ class SQLAlchemySourceTaskRepository:
                     or row.lease_token_digest is None
                     or not hmac.compare_digest(row.lease_token_digest, token_digest)
                 ):
+                    raise StaleSourceTaskLease
+                if row.state in _LEASED_STATES and (
+                    row.expires_at is None or row.expires_at <= now
+                ):
+                    row.state = "expired"
+                    row.failure_code = "source_task_lease_expired"
+                    row.completed_at = now
+                    row.updated_at = now
+                    row.version += 1
+                    await session.flush()
+                    await session.commit()
                     raise StaleSourceTaskLease
                 if operation == "complete" and row.completion_sha256 is not None:
                     if completion_sha256 is None or not hmac.compare_digest(
@@ -853,6 +1012,28 @@ class SourceTaskService:
             now=now,
         )
         patch_checksum = hashlib.sha256(patch.encode("utf-8")).hexdigest()
+        existing = await self._repository.active_patch(
+            analysis_id=analysis_id,
+            fix_id=fix_id,
+        )
+        if existing is not None:
+            expected_metadata = {
+                **public_request,
+                "patch_sha256": patch_checksum,
+            }
+            stored_metadata = {
+                key: value
+                for key, value in existing.request_document.items()
+                if key != "patch_artifact_id"
+            }
+            if (
+                existing.team_id != team_id
+                or existing.agent_id != agent_id
+                or existing.workspace_id != workspace_id
+                or stored_metadata != expected_metadata
+            ):
+                raise SourceTaskConflict
+            return self._view(existing)
         try:
             artifact = await self._patch_writer.write_patch(
                 team_id=team_id,
@@ -869,23 +1050,54 @@ class SourceTaskService:
             artifact.artifact_id.version not in range(1, 6)
             or not hmac.compare_digest(artifact.checksum, patch_checksum)
         ):
+            await self._abort_patch_artifact(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                artifact=artifact,
+            )
             raise SourceTaskInvalid
         request = {
             **public_request,
             "patch_artifact_id": str(artifact.artifact_id),
             "patch_sha256": patch_checksum,
         }
-        return await self._create(
-            team_id=team_id,
-            analysis_id=analysis_id,
-            agent_id=agent_id,
-            workspace_id=workspace_id,
-            task_type="patch_verification",
-            request=request,
-            execution_id=execution_id,
-            now=now,
-            validation_request=validation_request,
-        )
+        try:
+            return await self._create(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                agent_id=agent_id,
+                workspace_id=workspace_id,
+                task_type="patch_verification",
+                request=request,
+                execution_id=execution_id,
+                now=now,
+                validation_request=validation_request,
+            )
+        except Exception:
+            await self._abort_patch_artifact(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                artifact=artifact,
+            )
+            raise
+
+    async def _abort_patch_artifact(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        artifact: SourcePatchArtifactBinding,
+    ) -> None:
+        if artifact.ownership_token is None or self._patch_writer is None:
+            return
+        try:
+            await self._patch_writer.abort_patch(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                binding=artifact,
+            )
+        except Exception:
+            raise SourceTaskUnavailable from None
 
     async def _create(
         self,
@@ -1064,6 +1276,7 @@ class SourceTaskService:
             agent_id,
             lease_version,
             lease_token,
+            now=now,
             allow_completed=True,
         )
         if task.completion_sha256 is not None:
@@ -1118,20 +1331,17 @@ class SourceTaskService:
         lease_version: int,
         lease_token: str,
         *,
+        now: datetime,
         allow_completed: bool = False,
     ) -> _MemorySourceTask:
-        task = await self._repository.by_execution(execution_id)
-        if task is None or task.agent_id != agent_id:
-            raise SourceTaskNotFound
-        digest = hashlib.sha256(lease_token.encode("ascii")).hexdigest()
-        if (
-            task.lease_version != lease_version
-            or task.lease_token_digest is None
-            or not hmac.compare_digest(task.lease_token_digest, digest)
-            or (not allow_completed and task.state not in _LEASED_STATES)
-        ):
-            raise StaleSourceTaskLease
-        return task
+        return await self._repository.authorize_fenced(
+            execution_id=execution_id,
+            agent_id=agent_id,
+            lease_version=lease_version,
+            token_digest=self._token_digest(lease_token),
+            now=now,
+            allow_completed=allow_completed,
+        )
 
     @staticmethod
     def _token_digest(lease_token: str) -> str:
@@ -1207,7 +1417,9 @@ class SourceTaskService:
                 expected_checksum = str(request.pop("patch_sha256"))
                 payload = await self._patch_reader.read_patch(
                     team_id=task.team_id,
+                    analysis_id=task.analysis_id,
                     artifact_id=artifact_id,
+                    expected_checksum=expected_checksum,
                 )
                 actual_checksum = hashlib.sha256(payload.patch.encode("utf-8")).hexdigest()
             except (KeyError, TypeError, UnicodeError, ValueError):

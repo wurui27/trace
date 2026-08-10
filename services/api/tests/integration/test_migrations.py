@@ -548,6 +548,68 @@ async def test_source_task_sql_repository_serializes_agent_lease_and_completion(
         )
         active_source = await service.lease_next(agent_id=agent_id)
         assert active_source is not None
+
+        class BoundaryRecorder:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            async def record_completion(self, *, task, document, checksum, now):
+                self.calls += 1
+                return SourceCompletionArtifact(
+                    artifact_id=UUID("40000000-0000-4000-8000-000000000009"),
+                    checksum=checksum,
+                )
+
+        boundary_recorder = BoundaryRecorder()
+        boundary_service = SourceTaskService(
+            repository=SQLAlchemySourceTaskRepository(sessions),
+            clock=lambda: active_source.lease_expires_at,
+        )
+        boundary_completion = {
+            "schema_version": "1.0",
+            "task_type": "source_context",
+            "execution_id": str(active_source.execution_id),
+            "analysis_id": str(active_source.analysis_id),
+            "team_id": str(team_id),
+            "agent_id": str(agent_id),
+            "workspace_id": "91000000-0000-4000-8000-000000000001",
+            "lease_version": active_source.lease_version,
+            "state": "failed",
+            "result": {"failure_code": "source_unavailable", "retryable": False},
+            "signature_b64": "A" * 86 + "==",
+        }
+        expired_outcomes = await asyncio.gather(
+            boundary_service.renew(
+                execution_id=active_source.execution_id,
+                agent_id=agent_id,
+                lease_version=active_source.lease_version,
+                lease_token=active_source.lease_token,
+            ),
+            boundary_service.complete(
+                execution_id=active_source.execution_id,
+                agent_id=agent_id,
+                lease_version=active_source.lease_version,
+                lease_token=active_source.lease_token,
+                completion_document=boundary_completion,
+                recorder=boundary_recorder,
+            ),
+            return_exceptions=True,
+        )
+        from perfpilot_api.services.source_tasks import StaleSourceTaskLease
+
+        assert all(
+            isinstance(outcome, StaleSourceTaskLease)
+            for outcome in expired_outcomes
+        )
+        assert boundary_recorder.calls == 0
+        with migration_databases.control_engine.connect() as connection:
+            expired_row = connection.execute(
+                text(
+                    "SELECT state, failure_code FROM source_tasks WHERE id = :id"
+                ),
+                {"id": active_source.execution_id},
+            ).one()
+        assert expired_row == ("expired", "source_task_lease_expired")
     finally:
         await async_engine.dispose()
 
