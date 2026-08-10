@@ -9,7 +9,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import contextmanager
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 from typing import Any
 from uuid import RFC_4122, UUID, uuid4
@@ -95,6 +96,7 @@ class SourceWorkspaceRegistry:
             raise SourceRegistryError
         self._workspace_root = workspace_root.resolve(strict=False)
         self.registry_path = self._workspace_root / "source-workspaces.json"
+        self._lock_path = self._workspace_root / ".source-workspaces.lock"
         self._uuid_factory = uuid_factory
         self._replace = replace or os.replace
         self._platform_name = platform_name or _platform_name()
@@ -137,7 +139,7 @@ class SourceWorkspaceRegistry:
             raise SourceRegistryError
         return result
 
-    def _validate_workspace_path(self, value: object) -> Path:
+    def _validate_stored_workspace_path(self, value: object) -> Path:
         try:
             path = value if isinstance(value, Path) else Path(value)  # type: ignore[arg-type]
         except (TypeError, ValueError, OSError):
@@ -145,12 +147,20 @@ class SourceWorkspaceRegistry:
         if not path.is_absolute():
             raise SourceRegistryError
         try:
-            canonical = path.resolve(strict=True)
+            canonical = path.resolve(strict=False)
+        except (OSError, RuntimeError):
+            raise SourceRegistryError from None
+        if canonical == self._workspace_root or self._workspace_root in canonical.parents:
+            raise SourceRegistryError
+        return canonical
+
+    def _validate_workspace_path(self, value: object) -> Path:
+        stored = self._validate_stored_workspace_path(value)
+        try:
+            canonical = stored.resolve(strict=True)
         except (OSError, RuntimeError):
             raise SourceRegistryError from None
         if not canonical.is_dir():
-            raise SourceRegistryError
-        if canonical == self._workspace_root or self._workspace_root in canonical.parents:
             raise SourceRegistryError
         root_result = self._git(canonical, "rev-parse", "--show-toplevel")
         try:
@@ -160,10 +170,9 @@ class SourceWorkspaceRegistry:
             raise SourceRegistryError from None
         if not root_text or git_root != canonical:
             raise SourceRegistryError
-        self._git_metadata(canonical)
         return canonical
 
-    def _validate_working_directory(self, workspace: Path, value: object) -> Path:
+    def _validate_working_directory_syntax(self, value: object) -> str:
         if (
             not isinstance(value, str)
             or not 1 <= len(value) <= 512
@@ -177,19 +186,19 @@ class SourceWorkspaceRegistry:
             pure = PurePosixPath(value)
         if pure.is_absolute() or pure.drive or ".." in pure.parts:
             raise SourceRegistryError
+        return value
+
+    def _validate_working_directory(self, workspace: Path, value: object) -> Path:
+        normalized = self._validate_working_directory_syntax(value)
         try:
-            resolved = (workspace / Path(value)).resolve(strict=True)
+            resolved = (workspace / Path(normalized)).resolve(strict=True)
         except (OSError, RuntimeError):
             raise SourceRegistryError from None
         if not resolved.is_dir() or (resolved != workspace and workspace not in resolved.parents):
             raise SourceRegistryError
         return resolved
 
-    def _validate_profile(
-        self,
-        workspace: Path,
-        profile: object,
-    ) -> ValidationProfile:
+    def _validate_profile_syntax(self, profile: object) -> ValidationProfile:
         if not isinstance(profile, ValidationProfile):
             raise SourceRegistryError
         if not _valid_v4(profile.profile_id):
@@ -213,21 +222,7 @@ class SourceWorkspaceRegistry:
         expected_wrapper = "gradlew.bat" if self._platform_name == "windows" else "./gradlew"
         if argv[0] != expected_wrapper:
             raise SourceRegistryError
-        working_directory = self._validate_working_directory(
-            workspace,
-            profile.working_directory,
-        )
-        wrapper_name = "gradlew.bat" if self._platform_name == "windows" else "gradlew"
-        try:
-            wrapper = (working_directory / wrapper_name).resolve(strict=True)
-        except (OSError, RuntimeError):
-            raise SourceRegistryError from None
-        if (
-            not wrapper.is_file()
-            or (wrapper != workspace and workspace not in wrapper.parents)
-            or (self._platform_name != "windows" and not os.access(wrapper, os.X_OK))
-        ):
-            raise SourceRegistryError
+        working_directory = self._validate_working_directory_syntax(profile.working_directory)
         timeout = profile.timeout_seconds
         if not isinstance(timeout, int) or isinstance(timeout, bool) or not 1 <= timeout <= 1_200:
             raise SourceRegistryError
@@ -249,31 +244,68 @@ class SourceWorkspaceRegistry:
             profile_id=profile.profile_id,
             name=name,
             argv=argv,
-            working_directory=profile.working_directory,
+            working_directory=working_directory,
             timeout_seconds=timeout,
             allowed_exit_codes=exit_codes,
         )
 
-    def _validate_profiles(
+    def _validate_profile(
         self,
         workspace: Path,
+        profile: object,
+    ) -> ValidationProfile:
+        normalized = self._validate_profile_syntax(profile)
+        return self._validate_live_profile(workspace, normalized)
+
+    def _validate_live_profile(
+        self,
+        workspace: Path,
+        normalized: ValidationProfile,
+    ) -> ValidationProfile:
+        working_directory = self._validate_working_directory(
+            workspace,
+            normalized.working_directory,
+        )
+        wrapper_name = "gradlew.bat" if self._platform_name == "windows" else "gradlew"
+        try:
+            wrapper = (working_directory / wrapper_name).resolve(strict=True)
+        except (OSError, RuntimeError):
+            raise SourceRegistryError from None
+        if (
+            not wrapper.is_file()
+            or (wrapper != workspace and workspace not in wrapper.parents)
+            or (self._platform_name != "windows" and not os.access(wrapper, os.X_OK))
+        ):
+            raise SourceRegistryError
+        return normalized
+
+    def _validate_profiles_syntax(
+        self,
         profiles: object,
     ) -> tuple[ValidationProfile, ...]:
         if not isinstance(profiles, tuple) or len(profiles) > _MAXIMUM_PROFILES:
             raise SourceRegistryError
-        normalized = tuple(self._validate_profile(workspace, profile) for profile in profiles)
+        normalized = tuple(self._validate_profile_syntax(profile) for profile in profiles)
         if len({profile.profile_id for profile in normalized}) != len(normalized):
             raise SourceRegistryError
         if len({profile.name.casefold() for profile in normalized}) != len(normalized):
             raise SourceRegistryError
         return normalized
 
+    def _validate_profiles(
+        self,
+        workspace: Path,
+        profiles: object,
+    ) -> tuple[ValidationProfile, ...]:
+        syntactic = self._validate_profiles_syntax(profiles)
+        return tuple(self._validate_live_profile(workspace, profile) for profile in syntactic)
+
     def _validate_workspace(self, workspace: object) -> SourceWorkspace:
         if not isinstance(workspace, SourceWorkspace) or not _valid_v4(workspace.workspace_id):
             raise SourceRegistryError
         name = _validate_name(workspace.name)
-        path = self._validate_workspace_path(workspace.path)
-        profiles = self._validate_profiles(path, workspace.validation_profiles)
+        path = self._validate_stored_workspace_path(workspace.path)
+        profiles = self._validate_profiles_syntax(workspace.validation_profiles)
         return SourceWorkspace(workspace.workspace_id, name, path, profiles)
 
     def _validate_registry(
@@ -421,6 +453,65 @@ class SourceWorkspaceRegistry:
         except (ImportError, OSError, RuntimeError):
             raise SourceRegistryError from None
 
+    @contextmanager
+    def _transaction_lock(self) -> Iterator[None]:
+        descriptor: int | None = None
+        release: Callable[[], object] | None = None
+        try:
+            self._workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            descriptor = os.open(self._lock_path, flags, 0o600)
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise SourceRegistryError
+            if self._platform_name == "windows":
+                import msvcrt
+
+                self._protect_windows_file(self._lock_path)
+                if metadata.st_size == 0:
+                    os.write(descriptor, b"\0")
+                    os.fsync(descriptor)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+
+                def release() -> None:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+
+            else:
+                import fcntl
+
+                os.fchmod(descriptor, 0o600)
+                if stat.S_IMODE(os.fstat(descriptor).st_mode) != 0o600:
+                    raise SourceRegistryError
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+
+                def release() -> None:
+                    fcntl.flock(descriptor, fcntl.LOCK_UN)
+
+            yield
+        except SourceRegistryError:
+            raise
+        except (ImportError, OSError):
+            raise SourceRegistryError from None
+        finally:
+            if descriptor is not None:
+                if release is not None:
+                    try:
+                        release()
+                    except OSError:
+                        pass
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
     @staticmethod
     def _sync_directory(path: Path) -> None:
         flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
@@ -507,37 +598,43 @@ class SourceWorkspaceRegistry:
         path: Path,
         validation_profiles: tuple[ValidationProfile, ...] = (),
     ) -> SourceWorkspace:
-        workspaces = self._load()
-        normalized_name = _validate_name(name)
-        if any(workspace.name.casefold() == normalized_name.casefold() for workspace in workspaces):
-            raise SourceRegistryError
-        normalized_path = self._validate_workspace_path(path)
-        path_key = normalize_source_path(normalized_path, platform_name=self._platform_name)
-        if any(
-            normalize_source_path(workspace.path, platform_name=self._platform_name) == path_key
-            for workspace in workspaces
-        ):
-            raise SourceRegistryError
-        if len(workspaces) >= _MAXIMUM_WORKSPACES:
-            raise SourceRegistryError
-        profiles = self._validate_profiles(normalized_path, validation_profiles)
-        existing_ids = {workspace.workspace_id for workspace in workspaces}
-        workspace = SourceWorkspace(
-            workspace_id=self._new_uuid(existing_ids),
-            name=normalized_name,
-            path=normalized_path,
-            validation_profiles=profiles,
-        )
-        self._save((*workspaces, workspace))
-        return workspace
+        with self._transaction_lock():
+            workspaces = self._load()
+            normalized_name = _validate_name(name)
+            if any(
+                workspace.name.casefold() == normalized_name.casefold()
+                for workspace in workspaces
+            ):
+                raise SourceRegistryError
+            normalized_path = self._validate_workspace_path(path)
+            self._git_metadata(normalized_path)
+            path_key = normalize_source_path(normalized_path, platform_name=self._platform_name)
+            if any(
+                normalize_source_path(workspace.path, platform_name=self._platform_name) == path_key
+                for workspace in workspaces
+            ):
+                raise SourceRegistryError
+            if len(workspaces) >= _MAXIMUM_WORKSPACES:
+                raise SourceRegistryError
+            profiles = self._validate_profiles(normalized_path, validation_profiles)
+            existing_ids = {workspace.workspace_id for workspace in workspaces}
+            workspace = SourceWorkspace(
+                workspace_id=self._new_uuid(existing_ids),
+                name=normalized_name,
+                path=normalized_path,
+                validation_profiles=profiles,
+            )
+            self._save((*workspaces, workspace))
+            return workspace
 
     def list(self) -> tuple[SourceWorkspace, ...]:
         return self._load()
 
     def remove(self, workspace_id: UUID) -> None:
-        workspaces = self._load()
-        index, _workspace = self._find(workspaces, workspace_id)
-        self._save(workspaces[:index] + workspaces[index + 1 :])
+        with self._transaction_lock():
+            workspaces = self._load()
+            index, _workspace = self._find(workspaces, workspace_id)
+            self._save(workspaces[:index] + workspaces[index + 1 :])
 
     def add_validation(
         self,
@@ -549,63 +646,67 @@ class SourceWorkspaceRegistry:
         timeout_seconds: int,
         allowed_exit_codes: tuple[int, ...],
     ) -> ValidationProfile:
-        workspaces = self._load()
-        index, workspace = self._find(workspaces, workspace_id)
-        normalized_name = _validate_name(name)
-        if (
-            len(workspace.validation_profiles) >= _MAXIMUM_PROFILES
-            or any(
-                profile.name.casefold() == normalized_name.casefold()
-                for profile in workspace.validation_profiles
+        with self._transaction_lock():
+            workspaces = self._load()
+            index, workspace = self._find(workspaces, workspace_id)
+            normalized_name = _validate_name(name)
+            if (
+                len(workspace.validation_profiles) >= _MAXIMUM_PROFILES
+                or any(
+                    profile.name.casefold() == normalized_name.casefold()
+                    for profile in workspace.validation_profiles
+                )
+            ):
+                raise SourceRegistryError
+            existing_ids = {
+                profile.profile_id
+                for item in workspaces
+                for profile in item.validation_profiles
+            }
+            profile = self._validate_profile(
+                workspace.path,
+                ValidationProfile(
+                    profile_id=self._new_uuid(existing_ids),
+                    name=normalized_name,
+                    argv=argv,
+                    working_directory=working_directory,
+                    timeout_seconds=timeout_seconds,
+                    allowed_exit_codes=allowed_exit_codes,
+                ),
             )
-        ):
-            raise SourceRegistryError
-        existing_ids = {
-            profile.profile_id
-            for item in workspaces
-            for profile in item.validation_profiles
-        }
-        profile = self._validate_profile(
-            workspace.path,
-            ValidationProfile(
-                profile_id=self._new_uuid(existing_ids),
-                name=normalized_name,
-                argv=argv,
-                working_directory=working_directory,
-                timeout_seconds=timeout_seconds,
-                allowed_exit_codes=allowed_exit_codes,
-            ),
-        )
-        updated = SourceWorkspace(
-            workspace.workspace_id,
-            workspace.name,
-            workspace.path,
-            (*workspace.validation_profiles, profile),
-        )
-        self._save(workspaces[:index] + (updated,) + workspaces[index + 1 :])
-        return profile
+            updated = SourceWorkspace(
+                workspace.workspace_id,
+                workspace.name,
+                workspace.path,
+                (*workspace.validation_profiles, profile),
+            )
+            self._save(workspaces[:index] + (updated,) + workspaces[index + 1 :])
+            return profile
 
     def list_validation(self, workspace_id: UUID) -> tuple[ValidationProfile, ...]:
         _index, workspace = self._find(self._load(), workspace_id)
         return workspace.validation_profiles
 
     def remove_validation(self, workspace_id: UUID, profile_id: UUID) -> None:
-        workspaces = self._load()
-        index, workspace = self._find(workspaces, workspace_id)
-        if not _valid_v4(profile_id):
-            raise SourceRegistryError
-        profiles = tuple(
-            profile for profile in workspace.validation_profiles if profile.profile_id != profile_id
-        )
-        if len(profiles) == len(workspace.validation_profiles):
-            raise SourceRegistryError
-        updated = SourceWorkspace(
-            workspace.workspace_id,
-            workspace.name,
-            workspace.path,
-            profiles,
-        )
-        self._save(workspaces[:index] + (updated,) + workspaces[index + 1 :])
+        with self._transaction_lock():
+            workspaces = self._load()
+            index, workspace = self._find(workspaces, workspace_id)
+            if not _valid_v4(profile_id):
+                raise SourceRegistryError
+            profiles = tuple(
+                profile
+                for profile in workspace.validation_profiles
+                if profile.profile_id != profile_id
+            )
+            if len(profiles) == len(workspace.validation_profiles):
+                raise SourceRegistryError
+            updated = SourceWorkspace(
+                workspace.workspace_id,
+                workspace.name,
+                workspace.path,
+                profiles,
+            )
+            self._save(workspaces[:index] + (updated,) + workspaces[index + 1 :])
 
     def _git_metadata(self, workspace: Path) -> tuple[str | None, str, int]:
         head_result = self._git(workspace, "rev-parse", "--verify", "HEAD")
@@ -649,11 +750,18 @@ class SourceWorkspaceRegistry:
         return branch, head, dirty_count
 
     def _public_workspace(self, workspace: SourceWorkspace) -> dict[str, Any]:
-        branch, head, dirty_count = self._git_metadata(workspace.path)
+        try:
+            path = self._validate_workspace_path(workspace.path)
+            self._validate_profiles(path, workspace.validation_profiles)
+            branch, head, dirty_count = self._git_metadata(path)
+            state = "ready"
+        except SourceRegistryError:
+            branch, head, dirty_count = None, "0" * 40, 0
+            state = "invalid"
         return {
             "workspace_id": str(workspace.workspace_id),
             "name": workspace.name,
-            "state": "ready",
+            "state": state,
             "git_branch": branch,
             "git_head": head,
             "tracked_dirty_count": dirty_count,

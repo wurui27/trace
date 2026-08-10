@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import os
+import shutil
 import stat
 import subprocess
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path, PureWindowsPath
+from threading import Event
 from uuid import UUID
 
 import pytest
@@ -195,6 +199,42 @@ def test_registration_rejects_plain_directory_despite_hostile_git_environment(
     assert str(candidate) not in str(captured.value)
 
 
+def test_stale_workspace_can_be_listed_published_and_removed(
+    tmp_path: Path,
+) -> None:
+    stale_repo = _git_repo(tmp_path / "stale-repository")
+    healthy_repo = _git_repo(tmp_path / "healthy-repository")
+    identifiers = iter((WORKSPACE_ID, OTHER_WORKSPACE_ID))
+    registry = SourceWorkspaceRegistry(
+        tmp_path / "agent-state",
+        uuid_factory=lambda: next(identifiers),
+    )
+    stale = registry.add(name="Stale", path=stale_repo)
+    healthy = registry.add(name="Healthy", path=healthy_repo)
+
+    shutil.rmtree(stale_repo)
+
+    assert registry.list() == (stale, healthy)
+    public = registry.public_workspaces()
+    assert public[0] == {
+        "workspace_id": str(WORKSPACE_ID),
+        "name": "Stale",
+        "state": "invalid",
+        "git_branch": None,
+        "git_head": "0" * 40,
+        "tracked_dirty_count": 0,
+        "snapshot_policy": "tracked_worktree",
+        "validation_profiles": [],
+    }
+    assert public[1]["workspace_id"] == str(OTHER_WORKSPACE_ID)
+    assert public[1]["state"] == "ready"
+    assert str(stale_repo) not in json.dumps(public)
+
+    registry.remove(WORKSPACE_ID)
+
+    assert registry.list() == (healthy,)
+
+
 def test_registration_rejects_duplicate_names_and_non_v4_generated_ids(tmp_path: Path) -> None:
     first = _git_repo(tmp_path / "first")
     second = _git_repo(tmp_path / "second")
@@ -256,7 +296,7 @@ def test_validation_profile_rejects_shell_and_boundary_violations(
         )
 
 
-def test_deserialization_accepts_crlf_unicode_and_revalidates_ids_and_git(
+def test_deserialization_accepts_crlf_unicode_and_revalidates_ids_and_structure(
     tmp_path: Path,
 ) -> None:
     repo = _git_repo(tmp_path / "unicode-repo")
@@ -313,6 +353,50 @@ def test_atomic_replace_failure_leaves_previous_registry_intact(tmp_path: Path) 
 
     assert (root / "source-workspaces.json").read_bytes() == before
     assert SourceWorkspaceRegistry(root).list()[0].name == "First"
+
+
+def test_concurrent_adds_are_serialized_without_losing_updates(tmp_path: Path) -> None:
+    first_repo = _git_repo(tmp_path / "first")
+    second_repo = _git_repo(tmp_path / "second")
+    root = tmp_path / "agent"
+    first_replace_entered = Event()
+    release_first_replace = Event()
+    second_replace_completed = Event()
+
+    def blocking_replace(source: Path, destination: Path) -> None:
+        first_replace_entered.set()
+        if not release_first_replace.wait(timeout=5):
+            raise OSError("timed out waiting to release replacement")
+        os.replace(source, destination)
+
+    def observed_replace(source: Path, destination: Path) -> None:
+        os.replace(source, destination)
+        second_replace_completed.set()
+
+    first = SourceWorkspaceRegistry(
+        root,
+        uuid_factory=lambda: WORKSPACE_ID,
+        replace=blocking_replace,
+    )
+    second = SourceWorkspaceRegistry(
+        root,
+        uuid_factory=lambda: OTHER_WORKSPACE_ID,
+        replace=observed_replace,
+    )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        first_future = executor.submit(first.add, name="First", path=first_repo)
+        assert first_replace_entered.wait(timeout=2)
+        second_future = executor.submit(second.add, name="Second", path=second_repo)
+        try:
+            assert not second_replace_completed.wait(timeout=0.5)
+        finally:
+            release_first_replace.set()
+        first_future.result(timeout=5)
+        second_future.result(timeout=5)
+
+    assert {workspace.name for workspace in first.list()} == {"First", "Second"}
+    assert stat.S_IMODE((root / ".source-workspaces.lock").stat().st_mode) == 0o600
 
 
 def test_windows_drive_path_normalization_is_case_insensitive() -> None:
