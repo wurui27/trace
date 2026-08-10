@@ -244,6 +244,41 @@ def test_substituted_stale_workspace_can_be_listed_published_and_removed(
     assert registry.list() == (healthy,)
 
 
+@pytest.mark.parametrize("suffix", [(), ("child",)])
+def test_persisted_paths_reject_configured_agent_root_aliases(
+    tmp_path: Path,
+    suffix: tuple[str, ...],
+) -> None:
+    canonical_parent = tmp_path / "canonical"
+    canonical_parent.mkdir()
+    configured_parent = tmp_path / "configured"
+    configured_parent.symlink_to(canonical_parent, target_is_directory=True)
+    configured_root = configured_parent / "agent-state"
+    registry = SourceWorkspaceRegistry(configured_root)
+    candidate = configured_root.joinpath(*suffix)
+    document = {
+        "schema_version": "1.0",
+        "workspaces": [
+            {
+                "workspace_id": str(WORKSPACE_ID),
+                "name": "Unsafe",
+                "path": str(candidate),
+                "validation_profiles": [],
+            }
+        ],
+    }
+    registry.registry_path.parent.mkdir(parents=True)
+    registry.registry_path.write_text(json.dumps(document), encoding="utf-8")
+    registry.registry_path.chmod(0o600)
+    assert configured_root != registry.registry_path.parent
+
+    with pytest.raises(SourceRegistryError) as captured:
+        registry.list()
+
+    assert str(configured_root) not in str(captured.value)
+    assert str(candidate) not in str(captured.value)
+
+
 def test_registration_rejects_duplicate_names_and_non_v4_generated_ids(tmp_path: Path) -> None:
     first = _git_repo(tmp_path / "first")
     second = _git_repo(tmp_path / "second")

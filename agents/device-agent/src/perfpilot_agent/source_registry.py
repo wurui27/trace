@@ -97,6 +97,7 @@ class SourceWorkspaceRegistry:
     ) -> None:
         if not isinstance(workspace_root, Path) or not workspace_root.is_absolute():
             raise SourceRegistryError
+        self._configured_workspace_root = Path(os.path.normpath(os.fspath(workspace_root)))
         self._workspace_root = workspace_root.resolve(strict=False)
         self.registry_path = self._workspace_root / "source-workspaces.json"
         self._lock_path = self._workspace_root / ".source-workspaces.lock"
@@ -153,7 +154,10 @@ class SourceWorkspaceRegistry:
             lexical = Path(os.path.normpath(os.fspath(path)))
         except (TypeError, ValueError, OSError):
             raise SourceRegistryError from None
-        if lexical == self._workspace_root or self._workspace_root in lexical.parents:
+        if any(
+            lexical == root or root in lexical.parents
+            for root in (self._configured_workspace_root, self._workspace_root)
+        ):
             raise SourceRegistryError
         return lexical
 
