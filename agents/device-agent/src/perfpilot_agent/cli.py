@@ -23,8 +23,9 @@ from perfpilot_agent.executor import TaskExecutionError, TaskExecutor
 from perfpilot_agent.logging import RedactingFilter, SecretRedactor
 from perfpilot_agent.platform.base import current_platform_metadata, current_platform_name
 from perfpilot_agent.registration import RegistrationError, RegistrationService
-from perfpilot_agent.service import AgentService, SourceTaskExecutor, TaskLoop
+from perfpilot_agent.service import AgentService, TaskLoop
 from perfpilot_agent.source_registry import SourceRegistryError, SourceWorkspaceRegistry
+from perfpilot_agent.source_runner import SourceTaskRunner
 from perfpilot_agent.state import AgentRuntimeState
 
 
@@ -186,6 +187,14 @@ async def _doctor(config_path: Path | None) -> int:
 
 def _source_registry(config: AgentConfig) -> SourceWorkspaceRegistry:
     return SourceWorkspaceRegistry(config.workspace_root)
+
+
+def _source_task_runner(*, config: AgentConfig, control: ControlClient) -> SourceTaskRunner:
+    return SourceTaskRunner(
+        control=control,
+        registry=_source_registry(config),
+        cache_root=config.workspace_root / "source-cache",
+    )
 
 
 def _source(config_path: Path | None, arguments: argparse.Namespace) -> int:
@@ -366,7 +375,7 @@ async def _run(config_path: Path | None) -> int:
         tasks = TaskLoop(
             control=control,
             executor=executor,
-            source_executor=SourceTaskExecutor(control=control),
+            source_executor=_source_task_runner(config=config, control=control),
             state=state,
         )
         await AgentService(

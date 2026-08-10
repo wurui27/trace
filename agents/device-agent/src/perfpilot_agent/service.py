@@ -61,7 +61,11 @@ class SourceTaskCompletionControl(Protocol):
 
 
 class SourceTaskExecutor:
-    """Task 4 production shell; Task 5 replaces the unavailable result with a runner."""
+    """Compatibility shell for callers that have not wired a source registry yet.
+
+    The production CLI uses :class:`SourceTaskRunner`; retaining this bounded
+    shell keeps older embedded integrations from silently touching source paths.
+    """
 
     def __init__(self, *, control: SourceTaskCompletionControl) -> None:
         self._control = control
