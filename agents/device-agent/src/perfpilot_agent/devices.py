@@ -21,6 +21,7 @@ from perfpilot_agent.adb import (
     run_process,
 )
 from perfpilot_agent.control_client import (
+    ControlClientError,
     ExecutionSlot,
     HeartbeatDevice,
     HeartbeatRequest,
@@ -358,23 +359,35 @@ class HeartbeatPublisher:
         self._redactor = redactor
         self._source_registry = source_registry
 
+    def _current_credentials(self) -> AgentCredentials:
+        try:
+            current = getattr(self._control, "credentials")
+        except (AttributeError, ControlClientError):
+            return self._credentials
+        return current if isinstance(current, AgentCredentials) else self._credentials
+
     async def publish(self) -> HeartbeatResponse:
         started_at = self._clock()
         if started_at.tzinfo is None or started_at.utcoffset() is None:
             raise RuntimeStateError
         snapshot = await self._inventory.read_all()
+        credentials = self._current_credentials()
         if self._redactor is not None:
             self._redactor.replace_live_values(
                 serials={item.serial for item in snapshot},
                 secrets={
-                    self._credentials.access_token,
-                    self._credentials.refresh_token,
+                    credentials.access_token,
+                    credentials.refresh_token,
                 },
             )
         execution_id = self._state.execution_id
         schema_version = "1.0"
         workspaces: tuple[HeartbeatWorkspace, ...] | None = None
-        if self._source_registry is not None:
+        if (
+            self._source_registry is not None
+            and credentials.schema_version == "1.1"
+            and credentials.team_id is not None
+        ):
             schema_version = "1.1"
             try:
                 workspaces = tuple(
@@ -403,7 +416,7 @@ class HeartbeatPublisher:
         )
         receipt = await self._control.heartbeat(
             request,
-            access_token=self._credentials.access_token,
+            access_token=credentials.access_token,
         )
         snapshot_by_ref = {item.observation.client_ref: item for item in snapshot}
         receipt_by_ref = {item.client_ref: item for item in receipt.devices}

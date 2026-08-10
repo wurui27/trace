@@ -30,6 +30,7 @@ NOW = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
 TASK_KID = "task-key-2026-08"
 WORKSPACE_ID = UUID("92000000-0000-4000-8000-000000000001")
 PROFILE_ID = UUID("94000000-0000-4000-8000-000000000001")
+TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 
 
 class FakeInventory:
@@ -59,7 +60,7 @@ class FakeInventory:
         )
 
 
-def credentials() -> AgentCredentials:
+def credentials(*, source_capable: bool = False) -> AgentCredentials:
     key = Ed25519PrivateKey.generate()
     private_raw = key.private_bytes(
         serialization.Encoding.Raw,
@@ -71,8 +72,9 @@ def credentials() -> AgentCredentials:
         serialization.PublicFormat.Raw,
     )
     return AgentCredentials(
-        schema_version="1.0",
+        schema_version="1.1" if source_capable else "1.0",
         agent_id=AGENT_ID,
+        team_id=TEAM_ID if source_capable else None,
         private_key_b64=base64.b64encode(private_raw).decode("ascii"),
         access_token="ppat_" + "A" * 43,
         access_token_expires_at=NOW + timedelta(minutes=15),
@@ -86,9 +88,11 @@ def credentials() -> AgentCredentials:
     )
 
 
+@pytest.mark.parametrize("source_capable", [False, True], ids=["legacy-1.0", "source-1.1"])
 @pytest.mark.asyncio
 async def test_heartbeat_publishes_full_snapshot_and_keeps_digest_mapping_only_in_memory(
     tmp_path: Path,
+    source_capable: bool,
 ) -> None:
     ca_bundle = tmp_path / "ca.crt"
     ca_bundle.write_text("unused-by-mock", encoding="utf-8")
@@ -136,7 +140,7 @@ async def test_heartbeat_publishes_full_snapshot_and_keeps_digest_mapping_only_i
         ca_bundle=ca_bundle,
         workspace_root=workspace,
     )
-    stored = credentials()
+    stored = credentials(source_capable=source_capable)
     captured: dict[str, object] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -161,10 +165,15 @@ async def test_heartbeat_publishes_full_snapshot_and_keeps_digest_mapping_only_i
 
     state = AgentRuntimeState()
     async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        control = ControlClient(
+            config,
+            http_client=http_client,
+            credentials=stored,
+        )
         publisher = HeartbeatPublisher(
             inventory=FakeInventory(),
-            control=ControlClient(config, http_client=http_client),
-            credentials=stored,
+            control=control,
+            credentials=credentials(source_capable=not source_capable),
             metadata=PlatformMetadata(
                 platform="linux",
                 hostname="rivotek",
@@ -192,28 +201,31 @@ async def test_heartbeat_publishes_full_snapshot_and_keeps_digest_mapping_only_i
         ).read_text(encoding="utf-8")
     )
     Draft202012Validator(contract, format_checker=FormatChecker()).validate(payload)
-    assert payload["schema_version"] == "1.1"
+    assert payload["schema_version"] == ("1.1" if source_capable else "1.0")
     assert payload["devices"][0]["serial"] == SERIAL
     assert payload["execution_slot"] == {"state": "idle", "execution_id": None}
-    assert payload["workspaces"] == [
-        {
-            "workspace_id": str(WORKSPACE_ID),
-            "name": "Demo Android",
-            "state": "ready",
-            "git_branch": "main",
-            "git_head": subprocess.run(
-                ["git", "-C", str(source), "rev-parse", "HEAD"],
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip(),
-            "tracked_dirty_count": 0,
-            "snapshot_policy": "tracked_worktree",
-            "validation_profiles": [
-                {"profile_id": str(PROFILE_ID), "name": "Android check"}
-            ],
-        }
-    ]
+    if source_capable:
+        assert payload["workspaces"] == [
+            {
+                "workspace_id": str(WORKSPACE_ID),
+                "name": "Demo Android",
+                "state": "ready",
+                "git_branch": "main",
+                "git_head": subprocess.run(
+                    ["git", "-C", str(source), "rev-parse", "HEAD"],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                ).stdout.strip(),
+                "tracked_dirty_count": 0,
+                "snapshot_policy": "tracked_worktree",
+                "validation_profiles": [
+                    {"profile_id": str(PROFILE_ID), "name": "Android check"}
+                ],
+            }
+        ]
+    else:
+        assert "workspaces" not in payload
     serialized_payload = json.dumps(payload)
     assert str(source) not in serialized_payload
     assert "./gradlew" not in serialized_payload
