@@ -9,6 +9,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
@@ -22,6 +23,8 @@ _MAXIMUM_WORKSPACES = 32
 _MAXIMUM_PROFILES = 8
 _MAXIMUM_ARGUMENTS = 64
 _MAXIMUM_ARGUMENT_BYTES = 16 * 1024
+_TRANSACTION_LOCK_TIMEOUT_SECONDS = 120.0
+_TRANSACTION_LOCK_POLL_SECONDS = 0.05
 _SHELL_METACHARACTERS = re.compile(r"[|&;<>\r\n\x00]")
 
 
@@ -147,12 +150,12 @@ class SourceWorkspaceRegistry:
         if not path.is_absolute():
             raise SourceRegistryError
         try:
-            canonical = path.resolve(strict=False)
-        except (OSError, RuntimeError):
+            lexical = Path(os.path.normpath(os.fspath(path)))
+        except (TypeError, ValueError, OSError):
             raise SourceRegistryError from None
-        if canonical == self._workspace_root or self._workspace_root in canonical.parents:
+        if lexical == self._workspace_root or self._workspace_root in lexical.parents:
             raise SourceRegistryError
-        return canonical
+        return lexical
 
     def _validate_workspace_path(self, value: object) -> Path:
         stored = self._validate_stored_workspace_path(value)
@@ -161,6 +164,8 @@ class SourceWorkspaceRegistry:
         except (OSError, RuntimeError):
             raise SourceRegistryError from None
         if not canonical.is_dir():
+            raise SourceRegistryError
+        if canonical == self._workspace_root or self._workspace_root in canonical.parents:
             raise SourceRegistryError
         root_result = self._git(canonical, "rev-parse", "--show-toplevel")
         try:
@@ -477,8 +482,22 @@ class SourceWorkspaceRegistry:
                 if metadata.st_size == 0:
                     os.write(descriptor, b"\0")
                     os.fsync(descriptor)
-                os.lseek(descriptor, 0, os.SEEK_SET)
-                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+                deadline = time.monotonic() + _TRANSACTION_LOCK_TIMEOUT_SECONDS
+                contention_errors = {
+                    errno.EACCES,
+                    errno.EAGAIN,
+                    getattr(errno, "EDEADLK", errno.EACCES),
+                }
+                while True:
+                    os.lseek(descriptor, 0, os.SEEK_SET)
+                    try:
+                        msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError as error:
+                        remaining = deadline - time.monotonic()
+                        if error.errno not in contention_errors or remaining <= 0:
+                            raise SourceRegistryError from None
+                        time.sleep(min(_TRANSACTION_LOCK_POLL_SECONDS, remaining))
 
                 def release() -> None:
                     os.lseek(descriptor, 0, os.SEEK_SET)

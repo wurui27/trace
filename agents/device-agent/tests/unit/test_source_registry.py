@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import errno
 import json
 import os
 import shutil
 import stat
 import subprocess
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import FrozenInstanceError
 from pathlib import Path, PureWindowsPath
@@ -199,20 +201,27 @@ def test_registration_rejects_plain_directory_despite_hostile_git_environment(
     assert str(candidate) not in str(captured.value)
 
 
-def test_stale_workspace_can_be_listed_published_and_removed(
+@pytest.mark.parametrize("replacement", ["agent_root", "loop"])
+def test_substituted_stale_workspace_can_be_listed_published_and_removed(
     tmp_path: Path,
+    replacement: str,
 ) -> None:
     stale_repo = _git_repo(tmp_path / "stale-repository")
     healthy_repo = _git_repo(tmp_path / "healthy-repository")
+    agent_root = tmp_path / "agent-state"
     identifiers = iter((WORKSPACE_ID, OTHER_WORKSPACE_ID))
     registry = SourceWorkspaceRegistry(
-        tmp_path / "agent-state",
+        agent_root,
         uuid_factory=lambda: next(identifiers),
     )
     stale = registry.add(name="Stale", path=stale_repo)
     healthy = registry.add(name="Healthy", path=healthy_repo)
 
     shutil.rmtree(stale_repo)
+    if replacement == "agent_root":
+        stale_repo.symlink_to(agent_root, target_is_directory=True)
+    else:
+        stale_repo.symlink_to(stale_repo, target_is_directory=True)
 
     assert registry.list() == (stale, healthy)
     public = registry.public_workspaces()
@@ -397,6 +406,47 @@ def test_concurrent_adds_are_serialized_without_losing_updates(tmp_path: Path) -
 
     assert {workspace.name for workspace in first.list()} == {"First", "Second"}
     assert stat.S_IMODE((root / ".source-workspaces.lock").stat().st_mode) == 0o600
+
+
+def test_windows_transaction_lock_retries_contention_and_unlocks(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeMsvcrt:
+        LK_LOCK = 1
+        LK_NBLCK = 2
+        LK_UNLCK = 3
+
+        def __init__(self) -> None:
+            self.calls: list[int] = []
+            self.contentions_remaining = 3
+
+        def locking(self, _descriptor: int, mode: int, _bytes: int) -> None:
+            self.calls.append(mode)
+            if mode in {self.LK_LOCK, self.LK_NBLCK} and self.contentions_remaining:
+                self.contentions_remaining -= 1
+                raise PermissionError(errno.EACCES, "lock is held")
+
+    fake_msvcrt = FakeMsvcrt()
+    monkeypatch.setitem(sys.modules, "msvcrt", fake_msvcrt)
+    repo = _git_repo(tmp_path / "repo")
+    registry = SourceWorkspaceRegistry(
+        tmp_path / "agent-state",
+        uuid_factory=lambda: WORKSPACE_ID,
+        platform_name="windows",
+    )
+    monkeypatch.setattr(registry, "_protect_windows_file", lambda _path: None)
+
+    workspace = registry.add(name="Demo", path=repo)
+
+    assert workspace.workspace_id == WORKSPACE_ID
+    assert fake_msvcrt.calls == [
+        fake_msvcrt.LK_NBLCK,
+        fake_msvcrt.LK_NBLCK,
+        fake_msvcrt.LK_NBLCK,
+        fake_msvcrt.LK_NBLCK,
+        fake_msvcrt.LK_UNLCK,
+    ]
 
 
 def test_windows_drive_path_normalization_is_case_insensitive() -> None:
