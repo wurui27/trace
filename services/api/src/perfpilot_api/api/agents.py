@@ -29,6 +29,7 @@ from perfpilot_api.services.auth import (
     TeamAccessNotFoundError,
 )
 from perfpilot_api.services.device_directory import DeviceDirectory, DeviceView
+from perfpilot_api.services.source_workspaces import SourceWorkspaceService, SourceWorkspaceView
 
 
 class CreateRegistrationCodeRequest(BaseModel):
@@ -63,6 +64,13 @@ def get_device_directory(request: Request) -> DeviceDirectory:
     if directory is None:
         raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
     return directory
+
+
+def get_source_workspace_service(request: Request) -> SourceWorkspaceService:
+    service: SourceWorkspaceService | None = request.app.state.source_workspace_service
+    if service is None:
+        raise ApiError("service_unavailable", "服务暂时不可用", 503, True)
+    return service
 
 
 def _require_origin(request: Request) -> None:
@@ -155,6 +163,25 @@ def _device_payload(device: DeviceView) -> dict[str, object]:
     }
 
 
+def _source_workspace_payload(workspace: SourceWorkspaceView) -> dict[str, object]:
+    return {
+        "provider_kind": workspace.provider_kind,
+        "agent_id": str(workspace.agent_id),
+        "agent_name": workspace.agent_name,
+        "workspace_id": str(workspace.workspace_id),
+        "name": workspace.name,
+        "state": workspace.state,
+        "git_branch": workspace.git_branch,
+        "git_head": workspace.git_head,
+        "tracked_dirty_count": workspace.tracked_dirty_count,
+        "snapshot_policy": workspace.snapshot_policy,
+        "validation_profiles": [
+            {"profile_id": str(profile.profile_id), "name": profile.name}
+            for profile in workspace.validation_profiles
+        ],
+    }
+
+
 router = APIRouter(
     prefix="/v1/teams",
     dependencies=proxy_router_dependencies(),
@@ -240,6 +267,31 @@ async def list_devices(
     }
 
 
+@router.get("/{team_id}/source-workspaces")
+async def list_source_workspaces(
+    team_id: UUID,
+    request: Request,
+    response: Response,
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+    source_workspace_service: Annotated[
+        SourceWorkspaceService, Depends(get_source_workspace_service)
+    ],
+) -> dict[str, object]:
+    await _authorize_team(
+        request=request,
+        auth_service=auth_service,
+        team_id=team_id,
+        access="read",
+        owner_required=False,
+    )
+    workspaces = await source_workspace_service.list_for_team(team_id=team_id)
+    response.headers["cache-control"] = "no-store"
+    return {
+        "schema_version": "1.0",
+        "workspaces": [_source_workspace_payload(item) for item in workspaces],
+    }
+
+
 @router.patch("/{team_id}/agents/{agent_id}")
 async def rename_agent(
     team_id: UUID,
@@ -294,4 +346,9 @@ async def revoke_agent(
     return {"schema_version": "1.0", "agent": _agent_payload(agent)}
 
 
-__all__ = ["get_agent_service", "get_device_directory", "router"]
+__all__ = [
+    "get_agent_service",
+    "get_device_directory",
+    "get_source_workspace_service",
+    "router",
+]

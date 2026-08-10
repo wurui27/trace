@@ -652,6 +652,75 @@ def test_local_app_defaults_missing_persisted_ai_rounds_after_restart(
     ]
 
 
+def test_local_source_binding_disabled_persistence_and_old_json_compatibility(
+    tmp_path: Path,
+) -> None:
+    binding = {
+        "provider_kind": "agent_workspace",
+        "agent_id": "91000000-0000-4000-8000-000000000001",
+        "workspace_id": "92000000-0000-4000-8000-000000000001",
+        "snapshot_policy": "tracked_worktree",
+        "validation_profile_id": None,
+    }
+    body = {
+        "schema_version": "1.1",
+        "analysis_mode": "trace_upload",
+        "analysis_profile": "auto",
+        "question": None,
+        "inputs": [
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4,
+                "sha256_b64": base64.b64encode(hashlib.sha256(b"data").digest()).decode(),
+            }
+        ],
+        "source_binding": binding,
+    }
+    disabled_app = create_local_app(data_root=tmp_path / "disabled")
+    with TestClient(disabled_app) as client:
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        csrf = client.get("/v1/auth/csrf").json()["csrf_token"]
+        disabled = client.post(
+            f"/v1/teams/{team_id}/analyses",
+            json=body,
+            headers={"x-csrf-token": csrf},
+        )
+    assert disabled.status_code == 422
+    assert disabled.json()["error"]["code"] == "source_code_analysis_disabled"
+
+    enabled_app = create_local_app(
+        data_root=tmp_path / "enabled",
+        source_code_analysis_enabled=True,
+    )
+    with TestClient(enabled_app) as client:
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        csrf = client.get("/v1/auth/csrf").json()["csrf_token"]
+        created = client.post(
+            f"/v1/teams/{team_id}/analyses",
+            json=body,
+            headers={"x-csrf-token": csrf},
+        )
+    assert created.status_code == 201
+    assert created.json()["schema_version"] == "1.1"
+    assert created.json()["source_code_analysis"]["context_state"] == "waiting_for_agent"
+    analysis_id = UUID(created.json()["analysis_id"])
+    store = LocalAnalysisStore(tmp_path / "enabled")
+    state = store.load_states()[analysis_id]
+    assert state["source_binding"] == binding
+    assert "path" not in json.dumps(state)
+
+    state.pop("source_binding")
+    state.pop("source_code_analysis")
+    store.save_state(analysis_id, state)
+    restarted = create_local_app(data_root=tmp_path / "enabled")
+    with TestClient(restarted) as client:
+        restored = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}")
+    assert restored.status_code == 200
+    assert restored.json()["schema_version"] == "1.0"
+    assert "source_code_analysis" not in restored.json()
+
+
 def test_local_app_rejects_present_null_persisted_ai_rounds_after_restart(
     tmp_path: Path,
 ) -> None:

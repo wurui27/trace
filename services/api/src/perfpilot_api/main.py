@@ -108,6 +108,7 @@ from perfpilot_api.services.memory_analyses import (
     SQLAlchemyMemoryCaptureRepository,
 )
 from perfpilot_api.services.uploads import SQLAlchemyTenantBucketResolver, UploadService
+from perfpilot_api.services.source_workspaces import SourceWorkspaceService
 
 ASGIApp = Callable[[Scope, Receive, Send], Awaitable[None]]
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
@@ -216,6 +217,7 @@ def create_app(
     memory_capture_service: MemoryCaptureService | None = None,
     agent_service: AgentService | None = None,
     device_directory: DeviceDirectory | None = None,
+    source_workspace_service: SourceWorkspaceService | None = None,
     agent_task_service: AgentTaskService | None = None,
     agent_upload_service: AgentUploadService | None = None,
     android_memory_worker: AndroidMemoryWorker | None = None,
@@ -248,6 +250,7 @@ def create_app(
     resolved_memory_capture_service = memory_capture_service
     resolved_agent_service = agent_service
     resolved_device_directory = device_directory
+    resolved_source_workspace_service = source_workspace_service
     resolved_agent_task_service = agent_task_service
     resolved_agent_upload_service = agent_upload_service
     resolved_task_snapshot_signer: TaskSnapshotSigner | None = None
@@ -352,6 +355,11 @@ def create_app(
                 purpose=b"perfpilot-device-serial-v1",
                 key_reference=credential_reference,
             ),
+        )
+    if resolved_source_workspace_service is None:
+        resolved_source_workspace_service = SourceWorkspaceService(
+            repository=resolved_device_directory,
+            enabled=settings.source_code_analysis_enabled,
         )
 
     @asynccontextmanager
@@ -586,6 +594,7 @@ def create_app(
     app.state.memory_capture_service = resolved_memory_capture_service
     app.state.agent_service = resolved_agent_service
     app.state.device_directory = resolved_device_directory
+    app.state.source_workspace_service = resolved_source_workspace_service
     app.state.agent_task_service = resolved_agent_task_service
     app.state.agent_upload_service = resolved_agent_upload_service
     app.state.engine_adapter_registry = engine_adapter_registry

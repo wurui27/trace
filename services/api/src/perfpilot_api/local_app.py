@@ -27,8 +27,8 @@ from uuid import UUID, uuid4, uuid5
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from perfpilot_api.ai.local_report import (
     LocalReportSynthesizer,
@@ -90,6 +90,8 @@ from perfpilot_api.reports.projection import (
 )
 from perfpilot_api.reports.writer import AnalysisReportWriteRequest, compose_analysis_report
 from perfpilot_api.services.canonical_result_reader import LoadedCanonicalResult
+from perfpilot_api.services.source_workspaces import SourceBinding
+from perfpilot_api.errors import ApiError
 
 
 LOCAL_TEAM_ID = UUID("81000000-0000-4000-8000-000000000001")
@@ -321,12 +323,41 @@ class _InputDescriptor(_StrictModel):
         return _validated_checksum(value)
 
 
+class _SourceBindingDescriptor(_StrictModel):
+    provider_kind: Literal["agent_workspace"]
+    agent_id: UUID = Field(strict=False)
+    workspace_id: UUID = Field(strict=False)
+    snapshot_policy: Literal["tracked_worktree"]
+    validation_profile_id: UUID | None = Field(default=None, strict=False)
+
+    @field_validator(
+        "agent_id", "workspace_id", "validation_profile_id", mode="before"
+    )
+    @classmethod
+    def canonical_identifier(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("identifier must be a canonical UUID")
+        try:
+            parsed = UUID(value)
+        except ValueError:
+            raise ValueError("identifier must be a canonical UUID") from None
+        if str(parsed) != value or parsed.version not in range(1, 6):
+            raise ValueError("identifier must be a canonical UUID")
+        return value
+
+    def binding(self) -> SourceBinding:
+        return SourceBinding(**self.model_dump())
+
+
 class _CreateTraceAnalysisRequest(_StrictModel):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     analysis_mode: Literal["trace_upload"]
     analysis_profile: str
     question: str | None = Field(default=None, max_length=2000)
     inputs: list[_InputDescriptor] = Field(min_length=1, max_length=7)
+    source_binding: _SourceBindingDescriptor | None = None
 
     @field_validator("analysis_profile")
     @classmethod
@@ -343,6 +374,12 @@ class _CreateTraceAnalysisRequest(_StrictModel):
             raise ValueError("one Trace and unique input kinds are required")
         return value
 
+    @model_validator(mode="after")
+    def valid_source_version(self) -> "_CreateTraceAnalysisRequest":
+        if self.schema_version == "1.0" and self.source_binding is not None:
+            raise ValueError("source binding requires schema 1.1")
+        return self
+
 
 class _ApkDescriptor(_StrictModel):
     artifact_kind: Literal["apk"]
@@ -357,11 +394,12 @@ class _ApkDescriptor(_StrictModel):
 
 
 class _CreateDeviceAnalysisRequest(_StrictModel):
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     analysis_mode: Literal["device"]
     device_id: UUID = Field(strict=False)
     scenarios: list[Literal["cold_start", "scroll", "memory_cycle"]]
     apk: _ApkDescriptor
+    source_binding: _SourceBindingDescriptor | None = None
 
     @field_validator("scenarios")
     @classmethod
@@ -372,6 +410,12 @@ class _CreateDeviceAnalysisRequest(_StrictModel):
         if value != ["cold_start", "scroll", "memory_cycle"]:
             raise ValueError("fixed device scenarios are required")
         return value
+
+    @model_validator(mode="after")
+    def valid_source_version(self) -> "_CreateDeviceAnalysisRequest":
+        if self.schema_version == "1.0" and self.source_binding is not None:
+            raise ValueError("source binding requires schema 1.1")
+        return self
 
 
 _CreateAnalysisRequest = Annotated[
@@ -492,6 +536,52 @@ def _default_ai_rounds() -> list[_LocalAIRound]:
     return [_LocalAIRound(1, "report")]
 
 
+def _source_binding_document(binding: SourceBinding) -> dict[str, object]:
+    return {
+        "provider_kind": binding.provider_kind,
+        "agent_id": str(binding.agent_id),
+        "workspace_id": str(binding.workspace_id),
+        "snapshot_policy": binding.snapshot_policy,
+        "validation_profile_id": (
+            str(binding.validation_profile_id)
+            if binding.validation_profile_id is not None
+            else None
+        ),
+    }
+
+
+def _source_code_analysis_document(binding: SourceBinding | None) -> dict[str, object]:
+    if binding is None:
+        return {
+            "requested": False,
+            "provider_kind": None,
+            "agent_id": None,
+            "workspace_id": None,
+            "snapshot_policy": None,
+            "validation_profile_id": None,
+            "context_state": "not_requested",
+            "match_summary": "none",
+            "verification_state": "not_requested",
+            "failure_code": None,
+        }
+    return {
+        "requested": True,
+        **_source_binding_document(binding),
+        "context_state": "waiting_for_agent",
+        "match_summary": "none",
+        "verification_state": "not_requested",
+        "failure_code": None,
+    }
+
+
+def _restore_source_binding(value: object) -> SourceBinding:
+    try:
+        descriptor = _SourceBindingDescriptor.model_validate(value)
+    except Exception:
+        raise ValueError("invalid persisted local analysis") from None
+    return descriptor.binding()
+
+
 def _restore_ai_rounds(value: object) -> list[_LocalAIRound]:
     if not isinstance(value, list):
         raise ValueError("invalid persisted local analysis")
@@ -551,6 +641,10 @@ class _LocalAnalysis:
     source_run: LocalEngineRun | None = None
     source_rounds: int | None = None
     source_verification: Literal["passed", "failed", "unknown"] = "unknown"
+    source_binding: SourceBinding | None = None
+    source_code_analysis: dict[str, object] = field(
+        default_factory=lambda: _source_code_analysis_document(None)
+    )
     evidence_format_version: Literal["normalized-core-v1"] | None = None
     evidence_manifest: dict[str, str] | None = None
     ai_rounds: list[_LocalAIRound] = field(default_factory=_default_ai_rounds)
@@ -1531,6 +1625,12 @@ class _LocalRuntime:
             ),
             "source_rounds": analysis.source_rounds,
             "source_verification": analysis.source_verification,
+            "source_binding": (
+                _source_binding_document(analysis.source_binding)
+                if analysis.source_binding is not None
+                else None
+            ),
+            "source_code_analysis": dict(analysis.source_code_analysis),
             "ai_rounds": [
                 {
                     "round": item.number,
@@ -1676,11 +1776,24 @@ class _LocalRuntime:
             source_verification=(
                 str(document.get("source_verification", "unknown"))  # type: ignore[arg-type]
             ),
+            source_binding=(
+                _restore_source_binding(document["source_binding"])
+                if document.get("source_binding") is not None
+                else None
+            ),
+            source_code_analysis=(
+                dict(document["source_code_analysis"])
+                if isinstance(document.get("source_code_analysis"), Mapping)
+                else _source_code_analysis_document(None)
+            ),
             evidence_format_version=evidence_format_version,  # type: ignore[arg-type]
             evidence_manifest=evidence_manifest,
             ai_rounds=ai_rounds,
             stages={key: str(value) for key, value in stages.items()},
         )
+        expected_source = _source_code_analysis_document(analysis.source_binding)
+        if analysis.source_code_analysis != expected_source:
+            raise ValueError("invalid persisted local analysis")
         return analysis
 
     async def start(self) -> None:
@@ -1758,6 +1871,11 @@ class _LocalRuntime:
                 inputs={"apk": _LocalInput(descriptor)},
                 analysis_mode="device",
                 device_id=request.device_id,
+                source_binding=(
+                    request.source_binding.binding()
+                    if request.source_binding is not None
+                    else None
+                ),
             )
         else:
             analysis = _LocalAnalysis(
@@ -1769,7 +1887,15 @@ class _LocalRuntime:
                     else None
                 ),
                 inputs={item.kind: _LocalInput(item) for item in request.inputs},
+                source_binding=(
+                    request.source_binding.binding()
+                    if request.source_binding is not None
+                    else None
+                ),
             )
+        analysis.source_code_analysis = _source_code_analysis_document(
+            analysis.source_binding
+        )
         async with self.lock:
             if any(
                 current.state in _ACTIVE_ANALYSIS_STATES
@@ -2764,7 +2890,7 @@ class _LocalRuntime:
                 }
 
             return {
-                "schema_version": "1.0",
+                "schema_version": "1.1" if analysis.source_binding is not None else "1.0",
                 "analysis_id": str(analysis.analysis_id),
                 "team_id": str(LOCAL_TEAM_ID),
                 "analysis_mode": "device",
@@ -2802,6 +2928,11 @@ class _LocalRuntime:
                     else None
                 ),
                 "failure": analysis.failure,
+                **(
+                    {"source_code_analysis": dict(analysis.source_code_analysis)}
+                    if analysis.source_binding is not None
+                    else {}
+                ),
             }
         stage_failure = analysis.failure
         input_uploads: list[dict[str, object]] = []
@@ -2830,7 +2961,7 @@ class _LocalRuntime:
                 }
             )
         return {
-            "schema_version": "1.0",
+            "schema_version": "1.1" if analysis.source_binding is not None else "1.0",
             "analysis_id": str(analysis.analysis_id),
             "team_id": str(LOCAL_TEAM_ID),
             "analysis_mode": "trace_upload",
@@ -2866,6 +2997,11 @@ class _LocalRuntime:
                 ),
                 "run_id": analysis.source_run.run_id if analysis.source_run else None,
             },
+            **(
+                {"source_code_analysis": dict(analysis.source_code_analysis)}
+                if analysis.source_binding is not None
+                else {}
+            ),
         }
 
     def slot(self, upload: _LocalUpload, *, finalized: bool) -> dict[str, object]:
@@ -2903,6 +3039,7 @@ def create_local_app(
     data_root: Path | None = None,
     public_origin: str | None = None,
     poll_interval_seconds: float = 2.0,
+    source_code_analysis_enabled: bool = False,
 ) -> FastAPI:
     resolved_gateway = gateway or SmartPerfettoLocalGateway(
         base_url=os.getenv("PERFPILOT_LOCAL_SMARTPERFETTO_URL", "http://127.0.0.1:3001")
@@ -2961,6 +3098,22 @@ def create_local_app(
             await runtime.close()
 
     app = FastAPI(lifespan=lifespan)
+
+    async def local_api_error_handler(_request: Request, error: ApiError) -> JSONResponse:
+        return JSONResponse(
+            status_code=error.status_code,
+            content={
+                "schema_version": "1.0",
+                "error": {
+                    "code": error.code,
+                    "message": error.message,
+                    "retryable": error.retryable,
+                    "request_id": uuid4().hex,
+                },
+            },
+        )
+
+    app.add_exception_handler(ApiError, local_api_error_handler)
     app.state.local_runtime = runtime
     allowed_web_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
     configured_web_origin = os.getenv("PERFPILOT_LOCAL_WEB_ORIGIN")
@@ -3053,6 +3206,11 @@ def create_local_app(
         )
         return {"schema_version": "1.0", "devices": devices}
 
+    @app.get("/v1/teams/{team_id}/source-workspaces")
+    async def source_workspaces(team_id: UUID) -> dict[str, object]:
+        check_team(team_id)
+        return {"schema_version": "1.0", "workspaces": []}
+
     @app.post("/v1/teams/{team_id}/analyses", status_code=status.HTTP_201_CREATED)
     async def create_analysis(
         team_id: UUID,
@@ -3061,6 +3219,13 @@ def create_local_app(
     ) -> dict[str, object]:
         check_team(team_id)
         check_csrf(x_csrf_token)
+        if body.source_binding is not None and not source_code_analysis_enabled:
+            raise ApiError(
+                "source_code_analysis_disabled",
+                "源码分析功能未启用",
+                422,
+                False,
+            )
         if isinstance(body, _CreateDeviceAnalysisRequest):
             detected = await resolved_device_probe.inspect()
             if (

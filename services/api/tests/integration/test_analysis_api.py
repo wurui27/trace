@@ -29,6 +29,7 @@ from perfpilot_api.services.analyses import (
     SynthesisRunView,
 )
 from perfpilot_api.services.uploads import UploadSlot
+from perfpilot_api.services.source_workspaces import SourceBinding
 
 TEAM_ID = UUID("20000000-0000-4000-8000-000000000001")
 USER_ID = UUID("10000000-0000-4000-8000-000000000001")
@@ -75,7 +76,9 @@ class FakeAnalysisService:
         self.calls.append(("create", kwargs))
         if self.error is not None:
             raise self.error
-        return _created_view()
+        view = _created_view()
+        binding = kwargs.get("source_binding")
+        return replace(view, source_binding=binding) if binding is not None else view
 
     async def create_memory_analysis(self, **kwargs: object) -> AnalysisView:
         self.calls.append(("create_memory", kwargs))
@@ -114,10 +117,12 @@ class FakeAnalysisService:
         normalized_question = str(question).strip() if question is not None else None
         if normalized_question == "":
             normalized_question = None
-        return _trace_created_view(
+        view = _trace_created_view(
             profile=str(kwargs["analysis_profile"]),
             question=normalized_question,
         )
+        binding = kwargs.get("source_binding")
+        return replace(view, source_binding=binding) if binding is not None else view
 
     async def get_analysis(self, **kwargs: object) -> AnalysisView:
         self.calls.append(("get", kwargs))
@@ -184,6 +189,17 @@ class FakeSynthesisRunService:
         if self.error is not None:
             raise self.error
         return SynthesisRunView(analysis_id=ANALYSIS_ID, generation=2)
+
+
+class FakeSourceWorkspaceService:
+    def __init__(self) -> None:
+        self.calls: list[tuple[UUID, SourceBinding]] = []
+
+    async def require_binding(
+        self, *, team_id: UUID, binding: SourceBinding
+    ) -> SourceBinding:
+        self.calls.append((team_id, binding))
+        return binding
 
 
 def _created_view(*, include_upload_authorization: bool = True) -> AnalysisView:
@@ -382,6 +398,7 @@ def _client(
     auth_service: FakeAuthService,
     analysis_service: FakeAnalysisService,
     synthesis_run_service: FakeSynthesisRunService | None = None,
+    source_workspace_service: FakeSourceWorkspaceService | None = None,
 ) -> TestClient:
     return TestClient(
         create_app(
@@ -390,6 +407,7 @@ def _client(
             auth_service=auth_service,  # type: ignore[arg-type]
             analysis_service=analysis_service,  # type: ignore[arg-type]
             synthesis_run_service=synthesis_run_service,  # type: ignore[arg-type]
+            source_workspace_service=source_workspace_service,  # type: ignore[arg-type]
             proxy_clock=lambda: 1_700_000_000,
         )
     )
@@ -450,6 +468,16 @@ def _trace_create_body() -> bytes:
     ).encode()
 
 
+def _source_binding() -> dict[str, object]:
+    return {
+        "provider_kind": "agent_workspace",
+        "agent_id": "91000000-0000-4000-8000-000000000001",
+        "workspace_id": "92000000-0000-4000-8000-000000000001",
+        "snapshot_policy": "tracked_worktree",
+        "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+    }
+
+
 def test_create_trace_analysis_returns_direct_parent_without_device_side_effects() -> None:
     auth_service = FakeAuthService()
     analysis_service = FakeAnalysisService()
@@ -506,6 +534,130 @@ def test_create_trace_analysis_returns_direct_parent_without_device_side_effects
             },
         )
     ]
+
+
+def test_create_trace_v11_validates_and_projects_source_binding() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    source_service = FakeSourceWorkspaceService()
+    target = f"/v1/teams/{TEAM_ID}/analyses"
+    payload = json.loads(_trace_create_body())
+    payload["schema_version"] = "1.1"
+    payload["source_binding"] = _source_binding()
+    body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False).encode()
+    headers = _headers(
+        method="POST",
+        target=target,
+        body=body,
+        request_id="req-trace-source-binding",
+    )
+    headers["Idempotency-Key"] = "trace-source-1"
+
+    with _client(
+        auth_service,
+        analysis_service,
+        source_workspace_service=source_service,
+    ) as client:
+        response = client.post(target, content=body, headers=headers)
+
+    assert response.status_code == 201
+    assert response.json()["schema_version"] == "1.1"
+    assert response.json()["source_code_analysis"] == {
+        "requested": True,
+        **_source_binding(),
+        "context_state": "waiting_for_agent",
+        "match_summary": "none",
+        "verification_state": "not_requested",
+        "failure_code": None,
+    }
+    assert source_service.calls[0][0] == TEAM_ID
+    assert analysis_service.calls[0][1]["source_binding"] == source_service.calls[0][1]
+    assert analysis_service.calls[0][1]["schema_version"] == "1.1"
+
+
+def test_source_binding_is_disabled_by_default_and_private_fields_are_rejected() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    target = f"/v1/teams/{TEAM_ID}/analyses"
+    payload = json.loads(_trace_create_body())
+    payload["schema_version"] = "1.1"
+    payload["source_binding"] = _source_binding()
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    headers = _headers(method="POST", target=target, body=body, request_id="req-disabled-source")
+    headers["Idempotency-Key"] = "trace-source-disabled"
+    with _client(auth_service, analysis_service) as client:
+        disabled = client.post(target, content=body, headers=headers)
+
+    assert disabled.status_code == 422
+    assert disabled.json()["error"]["code"] == "source_code_analysis_disabled"
+
+    for key, value in (("path", "/private/repo"), ("remote", "secret"), ("argv", ["sh"])):
+        invalid_payload = json.loads(body)
+        invalid_payload["source_binding"][key] = value
+        invalid_body = json.dumps(invalid_payload, separators=(",", ":")).encode()
+        invalid_headers = _headers(
+            method="POST",
+            target=target,
+            body=invalid_body,
+            request_id=f"req-private-{key}",
+        )
+        invalid_headers["Idempotency-Key"] = f"trace-private-{key}"
+        with _client(auth_service, analysis_service) as client:
+            invalid = client.post(target, content=invalid_body, headers=invalid_headers)
+        assert invalid.status_code == 422
+        assert "/private/repo" not in invalid.text
+
+
+def test_source_binding_rejects_noncanonical_uuid() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    source_service = FakeSourceWorkspaceService()
+    target = f"/v1/teams/{TEAM_ID}/analyses"
+    payload = json.loads(_trace_create_body())
+    payload["schema_version"] = "1.1"
+    payload["source_binding"] = {
+        **_source_binding(),
+        "workspace_id": "92000000-0000-4000-8000-00000000000A",
+    }
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    headers = _headers(
+        method="POST", target=target, body=body, request_id="req-source-uuid"
+    )
+    headers["Idempotency-Key"] = "trace-source-uuid"
+
+    with _client(
+        auth_service,
+        analysis_service,
+        source_workspace_service=source_service,
+    ) as client:
+        response = client.post(target, content=body, headers=headers)
+
+    assert response.status_code == 422
+    assert source_service.calls == []
+
+
+def test_device_v11_source_agent_is_independent_from_capture_device() -> None:
+    auth_service = FakeAuthService()
+    analysis_service = FakeAnalysisService()
+    source_service = FakeSourceWorkspaceService()
+    target = f"/v1/teams/{TEAM_ID}/analyses"
+    payload = json.loads(_create_body())
+    payload["schema_version"] = "1.1"
+    payload["source_binding"] = _source_binding()
+    body = json.dumps(payload, separators=(",", ":")).encode()
+    headers = _headers(method="POST", target=target, body=body, request_id="req-device-source")
+    headers["Idempotency-Key"] = "device-source-1"
+
+    with _client(
+        auth_service,
+        analysis_service,
+        source_workspace_service=source_service,
+    ) as client:
+        response = client.post(target, content=body, headers=headers)
+
+    assert response.status_code == 201
+    assert UUID(response.json()["source_code_analysis"]["agent_id"]) != DEVICE_ID
+    assert analysis_service.calls[0][1]["device_id"] == DEVICE_ID
 
 
 def test_create_memory_analysis_returns_private_question_without_upload_or_scenarios() -> None:

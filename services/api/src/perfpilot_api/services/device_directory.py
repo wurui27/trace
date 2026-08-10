@@ -22,6 +22,7 @@ from perfpilot_api.db.control.models import (
     Device as StoredDeviceModel,
 )
 from perfpilot_api.services.agents import AgentPlatform, AgentRepository
+from perfpilot_api.services.source_workspaces import SourceAgentCapabilityRecord
 
 ConnectionType = Literal["usb", "wifi", "unknown"]
 AdbState = Literal["device", "unauthorized", "offline", "booting"]
@@ -65,6 +66,7 @@ class AgentHeartbeat:
     disk_available_bytes: int
     execution_state: ExecutionState
     execution_id: UUID | None
+    source_workspaces: tuple[dict[str, object], ...] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -155,6 +157,14 @@ class DeviceDirectoryRepository(Protocol):
         now: datetime,
     ) -> int: ...
 
+    async def list_source_agents(
+        self, team_id: UUID
+    ) -> tuple[SourceAgentCapabilityRecord, ...]: ...
+
+    async def get_source_agent(
+        self, agent_id: UUID
+    ) -> SourceAgentCapabilityRecord | None: ...
+
 
 class InMemoryDeviceDirectoryRepository:
     def __init__(
@@ -167,6 +177,7 @@ class InMemoryDeviceDirectoryRepository:
         self._uuid_factory = uuid_factory
         self._devices: dict[UUID, StoredDevice] = {}
         self._agent_heartbeats: dict[UUID, datetime] = {}
+        self._agent_capabilities: dict[UUID, dict[str, object]] = {}
         self._lock = asyncio.Lock()
 
     async def replace_snapshot(
@@ -220,7 +231,40 @@ class InMemoryDeviceDirectoryRepository:
                         state="offline",
                     )
             self._agent_heartbeats[agent_id] = now
+            capabilities = _heartbeat_capabilities(heartbeat)
+            self._agent_capabilities[agent_id] = capabilities
             return tuple(accepted)
+
+    async def list_source_agents(
+        self, team_id: UUID
+    ) -> tuple[SourceAgentCapabilityRecord, ...]:
+        agents = await self._agent_repository.list_team(team_id)
+        async with self._lock:
+            return tuple(
+                SourceAgentCapabilityRecord(
+                    agent_id=agent.id,
+                    team_id=agent.team_id,
+                    name=agent.name,
+                    state=("online" if agent.id in self._agent_heartbeats else agent.state),
+                    capabilities=dict(self._agent_capabilities.get(agent.id, {})),
+                )
+                for agent in agents
+            )
+
+    async def get_source_agent(
+        self, agent_id: UUID
+    ) -> SourceAgentCapabilityRecord | None:
+        agent = await self._agent_repository.get_refresh_candidate(agent_id)
+        if agent is None:
+            return None
+        async with self._lock:
+            return SourceAgentCapabilityRecord(
+                agent_id=agent.id,
+                team_id=agent.team_id,
+                name=agent.name,
+                state=("online" if agent.id in self._agent_heartbeats else agent.state),
+                capabilities=dict(self._agent_capabilities.get(agent.id, {})),
+            )
 
     async def list_team(self, team_id: UUID) -> tuple[StoredDevice, ...]:
         async with self._lock:
@@ -256,6 +300,8 @@ class InMemoryDeviceDirectoryRepository:
                         adb_state="offline",
                         state="offline",
                     )
+            for agent_id in stale_agent_ids:
+                self._agent_heartbeats.pop(agent_id, None)
             return len(stale_agent_ids)
 
 
@@ -378,17 +424,7 @@ class SQLAlchemyDeviceDirectoryRepository:
                 agent.hostname = heartbeat.hostname
                 agent.state = "online"
                 agent.last_heartbeat_at = now
-                agent.capabilities = {
-                    "clock_skew_ms": heartbeat.clock_skew_ms,
-                    "disk_available_bytes": heartbeat.disk_available_bytes,
-                    "execution_slot": {
-                        "execution_id": (
-                            None if heartbeat.execution_id is None else str(heartbeat.execution_id)
-                        ),
-                        "state": heartbeat.execution_state,
-                    },
-                    "observed_at": heartbeat.observed_at.astimezone(UTC).isoformat(),
-                }
+                agent.capabilities = _heartbeat_capabilities(heartbeat)
                 agent.updated_at = now
                 await session.flush()
                 return tuple(
@@ -456,6 +492,43 @@ class SQLAlchemyDeviceDirectoryRepository:
                 .values(adb_state="offline", state="offline", updated_at=now)
             )
             return len(stale_agents)
+
+    async def list_source_agents(
+        self, team_id: UUID
+    ) -> tuple[SourceAgentCapabilityRecord, ...]:
+        async with self._session_factory() as session:
+            agents = (
+                await session.scalars(
+                    select(StoredAgent)
+                    .where(StoredAgent.team_id == team_id)
+                    .order_by(StoredAgent.name, StoredAgent.id)
+                )
+            ).all()
+            return tuple(
+                SourceAgentCapabilityRecord(
+                    agent_id=agent.id,
+                    team_id=agent.team_id,
+                    name=agent.name,
+                    state=agent.state,
+                    capabilities=dict(agent.capabilities),
+                )
+                for agent in agents
+            )
+
+    async def get_source_agent(
+        self, agent_id: UUID
+    ) -> SourceAgentCapabilityRecord | None:
+        async with self._session_factory() as session:
+            agent = await session.get(StoredAgent, agent_id)
+            if agent is None:
+                return None
+            return SourceAgentCapabilityRecord(
+                agent_id=agent.id,
+                team_id=agent.team_id,
+                name=agent.name,
+                state=agent.state,
+                capabilities=dict(agent.capabilities),
+            )
 
 
 class DeviceDirectory:
@@ -626,6 +699,16 @@ class DeviceDirectory:
             now=now,
         )
 
+    async def list_source_agents(
+        self, team_id: UUID
+    ) -> tuple[SourceAgentCapabilityRecord, ...]:
+        return await self._repository.list_source_agents(team_id)
+
+    async def get_source_agent(
+        self, agent_id: UUID
+    ) -> SourceAgentCapabilityRecord | None:
+        return await self._repository.get_source_agent(agent_id)
+
 
 def _validate_optional_display(value: str | None, *, maximum: int) -> None:
     if value is not None and (
@@ -659,6 +742,107 @@ def _validate_heartbeat(heartbeat: AgentHeartbeat) -> None:
         or (heartbeat.execution_state == "busy" and heartbeat.execution_id is None)
     ):
         raise DeviceHeartbeatRejected
+    _validate_source_workspaces(heartbeat.source_workspaces)
+
+
+def _heartbeat_capabilities(heartbeat: AgentHeartbeat) -> dict[str, object]:
+    capabilities: dict[str, object] = {
+        "clock_skew_ms": heartbeat.clock_skew_ms,
+        "disk_available_bytes": heartbeat.disk_available_bytes,
+        "execution_slot": {
+            "execution_id": None if heartbeat.execution_id is None else str(heartbeat.execution_id),
+            "state": heartbeat.execution_state,
+        },
+        "observed_at": heartbeat.observed_at.astimezone(UTC).isoformat(),
+    }
+    if heartbeat.source_workspaces is not None:
+        capabilities["source_workspaces"] = [
+            dict(workspace) for workspace in heartbeat.source_workspaces
+        ]
+    return capabilities
+
+
+def _validate_source_workspaces(
+    workspaces: tuple[dict[str, object], ...] | None,
+) -> None:
+    if workspaces is None:
+        return
+    if len(workspaces) > 32:
+        raise DeviceHeartbeatRejected
+    workspace_ids: set[str] = set()
+    for workspace in workspaces:
+        if not isinstance(workspace, dict) or set(workspace) != {
+            "workspace_id",
+            "name",
+            "state",
+            "git_branch",
+            "git_head",
+            "tracked_dirty_count",
+            "snapshot_policy",
+            "validation_profiles",
+        }:
+            raise DeviceHeartbeatRejected
+        workspace_id = workspace["workspace_id"]
+        name = workspace["name"]
+        branch = workspace["git_branch"]
+        head = workspace["git_head"]
+        dirty = workspace["tracked_dirty_count"]
+        profiles = workspace["validation_profiles"]
+        if (
+            not isinstance(workspace_id, str)
+            or workspace_id in workspace_ids
+            or not isinstance(name, str)
+            or not 1 <= len(name) <= 128
+            or any(unicodedata.category(character) == "Cc" for character in name)
+            or workspace["state"] not in {"ready", "invalid"}
+            or (branch is not None and (
+                not isinstance(branch, str)
+                or not 1 <= len(branch) <= 255
+                or any(unicodedata.category(character) == "Cc" for character in branch)
+            ))
+            or not isinstance(head, str)
+            or re.fullmatch(r"[0-9a-f]{40}", head) is None
+            or type(dirty) is not int
+            or dirty < 0
+            or workspace["snapshot_policy"] != "tracked_worktree"
+            or not isinstance(profiles, list)
+            or len(profiles) > 8
+        ):
+            raise DeviceHeartbeatRejected
+        try:
+            parsed_workspace_id = UUID(workspace_id)
+        except ValueError:
+            raise DeviceHeartbeatRejected from None
+        if (
+            str(parsed_workspace_id) != workspace_id
+            or parsed_workspace_id.version not in range(1, 6)
+        ):
+            raise DeviceHeartbeatRejected
+        workspace_ids.add(workspace_id)
+        profile_ids: set[str] = set()
+        for profile in profiles:
+            if not isinstance(profile, dict) or set(profile) != {"profile_id", "name"}:
+                raise DeviceHeartbeatRejected
+            profile_id = profile["profile_id"]
+            profile_name = profile["name"]
+            if (
+                not isinstance(profile_id, str)
+                or profile_id in profile_ids
+                or not isinstance(profile_name, str)
+                or not 1 <= len(profile_name) <= 128
+                or any(unicodedata.category(character) == "Cc" for character in profile_name)
+            ):
+                raise DeviceHeartbeatRejected
+            try:
+                parsed_profile_id = UUID(profile_id)
+            except ValueError:
+                raise DeviceHeartbeatRejected from None
+            if (
+                str(parsed_profile_id) != profile_id
+                or parsed_profile_id.version not in range(1, 6)
+            ):
+                raise DeviceHeartbeatRejected
+            profile_ids.add(profile_id)
 
 
 def _state_from_observation(

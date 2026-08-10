@@ -621,6 +621,49 @@ def test_remote_agent_schema_enforces_identity_states_and_ownership(
     assert device_owner_fk["referred_columns"] == ["id", "team_id"]
 
 
+def test_source_binding_schema_is_nullable_closed_and_team_safe(
+    migration_databases: MigrationDatabases,
+) -> None:
+    _upgrade("control", migration_databases.control_url)
+    inspector = inspect(migration_databases.control_engine)
+    columns = {item["name"]: item for item in inspector.get_columns("global_jobs")}
+    source_columns = {
+        "source_provider_kind",
+        "source_agent_id",
+        "source_workspace_id",
+        "source_snapshot_policy",
+        "source_validation_profile_id",
+    }
+    assert source_columns <= set(columns)
+    assert all(columns[name]["nullable"] is True for name in source_columns)
+    assert "path" not in columns
+    checks = {
+        item["name"]: _normalize_postgresql_predicate(item["sqltext"])
+        for item in inspector.get_check_constraints("global_jobs")
+    }
+    assert {
+        "ck_global_jobs_source_binding_group",
+        "ck_global_jobs_source_provider_kind",
+        "ck_global_jobs_source_snapshot_policy",
+        "ck_global_jobs_source_profile_binding",
+    } <= set(checks)
+    assert "num_nonnulls" in checks["ck_global_jobs_source_binding_group"]
+    assert _check_string_literals(checks["ck_global_jobs_source_provider_kind"]) == {
+        "agent_workspace"
+    }
+    assert _check_string_literals(checks["ck_global_jobs_source_snapshot_policy"]) == {
+        "tracked_worktree"
+    }
+    source_agent_fk = next(
+        item
+        for item in inspector.get_foreign_keys("global_jobs")
+        if item["name"] == "fk_global_jobs_source_agent_team"
+    )
+    assert source_agent_fk["constrained_columns"] == ["source_agent_id", "team_id"]
+    assert source_agent_fk["referred_table"] == "agents"
+    assert source_agent_fk["referred_columns"] == ["id", "team_id"]
+
+
 def test_agent_multipart_schema_keeps_transport_state_in_tenant_database(
     migration_databases: MigrationDatabases,
 ) -> None:
@@ -887,7 +930,7 @@ def test_control_execution_tenant_version_migration_round_trips_empty_table(
     assert tenant_version["default"] is None
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0011_agent_execution_completion"
+            "0012_source_bindings"
         )
 
     command.downgrade(config, "0005_memory_upload_mode")
@@ -990,7 +1033,7 @@ def test_control_execution_tenant_version_downgrade_refuses_rows(
 
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0011_agent_execution_completion"
+            "0012_source_bindings"
         )
     assert "tenant_resource_version" in {
         column["name"]
@@ -2061,7 +2104,7 @@ def test_control_ai_synthesis_downgrade_refuses_audit_records(
         assert connection.scalar(text("SELECT count(*) FROM synthesis_executions")) == 1
         assert connection.scalar(text("SELECT count(*) FROM ai_invocations")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0011_agent_execution_completion"
+            "0012_source_bindings"
         )
 
 
@@ -2114,7 +2157,7 @@ def test_control_ai_synthesis_downgrade_refuses_retained_outbox_authority(
     with migration_databases.control_engine.connect() as connection:
         assert connection.scalar(text("SELECT count(*) FROM outbox_events")) == 1
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0011_agent_execution_completion"
+            "0012_source_bindings"
         )
 
 
@@ -2238,7 +2281,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
 @pytest.mark.parametrize(
     ("tree", "downgrade_revision", "head_revision"),
     [
-        ("control", "0004_external_engine_foundation", "0011_agent_execution_completion"),
+        ("control", "0004_external_engine_foundation", "0012_source_bindings"),
         ("tenant", "0003_analysis_orchestration", "0008_agent_multipart_uploads"),
     ],
 )
@@ -2294,7 +2337,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "control",
             "0004_external_engine_foundation",
-            "0011_agent_execution_completion",
+            "0012_source_bindings",
             "global_jobs",
             "ck_global_jobs_analysis_mode",
         ),

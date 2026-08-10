@@ -43,6 +43,18 @@ from perfpilot_api.services.agent_uploads import (
 )
 from perfpilot_api.storage.base import MultipartPart
 
+
+def _canonical_uuid(value: object) -> object:
+    if not isinstance(value, str):
+        raise ValueError("identifier must be a canonical UUID")
+    try:
+        parsed = UUID(value)
+    except ValueError:
+        raise ValueError("identifier must be a canonical UUID") from None
+    if str(parsed) != value or parsed.version not in range(1, 6):
+        raise ValueError("identifier must be a canonical UUID")
+    return value
+
 _PUBLIC_KEY_PATTERN = r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
 _REGISTRATION_CODE_PATTERN = r"^ppreg_[A-Za-z0-9_-]{43}$"
 _REFRESH_TOKEN_PATTERN = r"^pprt_[A-Za-z0-9_-]{43}$"
@@ -126,10 +138,54 @@ class HeartbeatDevice(BaseModel):
     )
 
 
+class HeartbeatValidationProfile(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    profile_id: UUID
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")
+
+    @field_validator("profile_id", mode="before")
+    @classmethod
+    def canonical_profile_id(cls, value: object) -> object:
+        return _canonical_uuid(value)
+
+
+class HeartbeatWorkspace(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workspace_id: UUID
+    name: str = Field(min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")
+    state: Literal["ready", "invalid"]
+    git_branch: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=255,
+        pattern=r"^[^\x00-\x1f\x7f]+$",
+    )
+    git_head: str = Field(min_length=40, max_length=40, pattern=r"^[0-9a-f]{40}$")
+    tracked_dirty_count: int = Field(strict=True, ge=0)
+    snapshot_policy: Literal["tracked_worktree"]
+    validation_profiles: tuple[HeartbeatValidationProfile, ...] = Field(max_length=8)
+
+    @field_validator("workspace_id", mode="before")
+    @classmethod
+    def canonical_workspace_id(cls, value: object) -> object:
+        return _canonical_uuid(value)
+
+    @field_validator("validation_profiles")
+    @classmethod
+    def unique_profile_ids(
+        cls, value: tuple[HeartbeatValidationProfile, ...]
+    ) -> tuple[HeartbeatValidationProfile, ...]:
+        if len({item.profile_id for item in value}) != len(value):
+            raise ValueError("validation profile identifiers must be unique")
+        return value
+
+
 class AgentHeartbeatRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     agent_version: str = Field(
         min_length=1,
         max_length=64,
@@ -146,6 +202,7 @@ class AgentHeartbeatRequest(BaseModel):
     disk_available_bytes: int = Field(strict=True, ge=0, le=2**63 - 1)
     execution_slot: ExecutionSlot
     devices: tuple[HeartbeatDevice, ...] = Field(max_length=32)
+    workspaces: tuple[HeartbeatWorkspace, ...] | None = Field(default=None, max_length=32)
 
     @field_validator("observed_at")
     @classmethod
@@ -153,6 +210,18 @@ class AgentHeartbeatRequest(BaseModel):
         if value.tzinfo is None:
             raise ValueError("observed_at must include a timezone")
         return value
+
+    @model_validator(mode="after")
+    def validate_versioned_workspaces(self) -> Self:
+        if self.schema_version == "1.0" and self.workspaces is not None:
+            raise ValueError("workspaces require heartbeat schema 1.1")
+        if self.schema_version == "1.1" and self.workspaces is None:
+            raise ValueError("workspaces are required for heartbeat schema 1.1")
+        if self.workspaces is not None and len(
+            {item.workspace_id for item in self.workspaces}
+        ) != len(self.workspaces):
+            raise ValueError("workspace identifiers must be unique")
+        return self
 
 
 class RenewAgentTaskRequest(BaseModel):
@@ -512,6 +581,14 @@ async def heartbeat(
                 disk_available_bytes=payload.disk_available_bytes,
                 execution_state=payload.execution_slot.state,
                 execution_id=payload.execution_slot.execution_id,
+                source_workspaces=(
+                    None
+                    if payload.workspaces is None
+                    else tuple(
+                        workspace.model_dump(mode="json")
+                        for workspace in payload.workspaces
+                    )
+                ),
             ),
             devices=observations,
         )

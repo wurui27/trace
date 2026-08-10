@@ -3,7 +3,7 @@ from typing import Annotated, Any, Literal
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, Header, Query, Request, Response
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from perfpilot_api.api.auth import get_auth_service, proxy_router_dependencies
 from perfpilot_api.errors import ApiError
@@ -28,6 +28,7 @@ from perfpilot_api.services.analyses import (
     StaleTaskVersionError,
     SynthesisRunService,
     SynthesisRunView,
+    source_code_analysis_view,
 )
 from perfpilot_api.services.auth import (
     AuthService,
@@ -37,6 +38,14 @@ from perfpilot_api.services.auth import (
     TeamAccessNotFoundError,
 )
 from perfpilot_api.services.uploads import UploadSlot
+from perfpilot_api.services.source_workspaces import (
+    SourceBinding,
+    SourceBindingInvalid,
+    SourceBindingNotFound,
+    SourceCodeAnalysisDisabled,
+    SourceWorkspaceService,
+)
+from perfpilot_api.api.agents import get_source_workspace_service
 
 _MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024
 _SHA256_PATTERN = r"^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$"
@@ -52,10 +61,40 @@ class ApkInput(BaseModel):
     sha256_b64: str = Field(pattern=_SHA256_PATTERN)
 
 
+class SourceBindingInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    provider_kind: Literal["agent_workspace"]
+    agent_id: UUID
+    workspace_id: UUID
+    snapshot_policy: Literal["tracked_worktree"]
+    validation_profile_id: UUID | None
+
+    @field_validator(
+        "agent_id", "workspace_id", "validation_profile_id", mode="before"
+    )
+    @classmethod
+    def canonical_identifier(cls, value: object) -> object:
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("identifier must be a canonical UUID")
+        try:
+            parsed = UUID(value)
+        except ValueError:
+            raise ValueError("identifier must be a canonical UUID") from None
+        if str(parsed) != value or parsed.version not in range(1, 6):
+            raise ValueError("identifier must be a canonical UUID")
+        return value
+
+    def binding(self) -> SourceBinding:
+        return SourceBinding(**self.model_dump())
+
+
 class CreateDeviceAnalysisRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     analysis_mode: Literal["device"]
     device_id: UUID
     scenarios: tuple[
@@ -64,6 +103,13 @@ class CreateDeviceAnalysisRequest(BaseModel):
         Literal["memory_cycle"],
     ]
     apk: ApkInput
+    source_binding: SourceBindingInput | None = None
+
+    @model_validator(mode="after")
+    def validate_source_version(self) -> "CreateDeviceAnalysisRequest":
+        if self.schema_version == "1.0" and self.source_binding is not None:
+            raise ValueError("source binding requires schema 1.1")
+        return self
 
 
 class CreateMemoryAnalysisRequest(BaseModel):
@@ -102,11 +148,18 @@ class TraceAnalysisInput(BaseModel):
 class CreateTraceAnalysisRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     analysis_mode: Literal["trace_upload"]
     analysis_profile: Literal["auto", "startup", "scroll"]
     question: str | None = None
     inputs: tuple[TraceAnalysisInput, ...] = Field(min_length=1, max_length=7)
+    source_binding: SourceBindingInput | None = None
+
+    @model_validator(mode="after")
+    def validate_source_version(self) -> "CreateTraceAnalysisRequest":
+        if self.schema_version == "1.0" and self.source_binding is not None:
+            raise ValueError("source binding requires schema 1.1")
+        return self
 
 
 CreateAnalysisRequest = Annotated[
@@ -431,6 +484,29 @@ def analysis_response(view: AnalysisView) -> dict[str, object]:
         result["question"] = view.question
         result["input_uploads"] = [_input_upload(item) for item in view.input_uploads]
         result["stages"] = [_analysis_stage(item) for item in view.stages]
+    if view.source_binding is not None:
+        source = view.source_code_analysis
+        if not source.requested:
+            source = source_code_analysis_view(view.source_binding)
+        result["schema_version"] = "1.1"
+        result["source_code_analysis"] = {
+            "requested": source.requested,
+            "provider_kind": source.provider_kind,
+            "agent_id": str(source.agent_id) if source.agent_id is not None else None,
+            "workspace_id": (
+                str(source.workspace_id) if source.workspace_id is not None else None
+            ),
+            "snapshot_policy": source.snapshot_policy,
+            "validation_profile_id": (
+                str(source.validation_profile_id)
+                if source.validation_profile_id is not None
+                else None
+            ),
+            "context_state": source.context_state,
+            "match_summary": source.match_summary,
+            "verification_state": source.verification_state,
+            "failure_code": source.failure_code,
+        }
     return result
 
 
@@ -461,6 +537,9 @@ async def create_analysis(
     ],
     auth_service: Annotated[AuthService, Depends(get_auth_service)],
     analysis_service: Annotated[AnalysisService, Depends(get_analysis_service)],
+    source_workspace_service: Annotated[
+        SourceWorkspaceService, Depends(get_source_workspace_service)
+    ],
 ) -> dict[str, object]:
     if len(request.headers.getlist("idempotency-key")) != 1:
         raise ApiError("request_validation_failed", "请求参数校验失败", 422, False)
@@ -471,6 +550,12 @@ async def create_analysis(
         access="write",
     )
     try:
+        source_binding = None
+        if getattr(payload, "source_binding", None) is not None:
+            source_binding = await source_workspace_service.require_binding(
+                team_id=team_id,
+                binding=payload.source_binding.binding(),  # type: ignore[union-attr]
+            )
         if payload.analysis_mode == "memory_upload":
             view = await analysis_service.create_memory_analysis(
                 team_id=team_id,
@@ -480,6 +565,12 @@ async def create_analysis(
                 question=payload.question,
             )
         elif payload.analysis_mode == "trace_upload":
+            trace_kwargs: dict[str, object] = {}
+            if payload.schema_version == "1.1":
+                trace_kwargs.update(
+                    schema_version="1.1",
+                    source_binding=source_binding,
+                )
             view = await analysis_service.create_trace_analysis(
                 team_id=team_id,
                 requested_by_user_id=principal.user_id,
@@ -487,8 +578,15 @@ async def create_analysis(
                 analysis_profile=payload.analysis_profile,
                 question=payload.question,
                 inputs=tuple(item.model_dump(mode="json") for item in payload.inputs),
+                **trace_kwargs,
             )
         else:
+            device_kwargs: dict[str, object] = {}
+            if payload.schema_version == "1.1":
+                device_kwargs.update(
+                    schema_version="1.1",
+                    source_binding=source_binding,
+                )
             view = await analysis_service.create_device_analysis(
                 team_id=team_id,
                 requested_by_user_id=principal.user_id,
@@ -498,7 +596,16 @@ async def create_analysis(
                 apk_mime=payload.apk.mime,
                 apk_size=payload.apk.size,
                 apk_sha256_b64=payload.apk.sha256_b64,
+                **device_kwargs,
             )
+    except SourceCodeAnalysisDisabled:
+        raise ApiError(
+            "source_code_analysis_disabled", "源码分析功能未启用", 422, False
+        ) from None
+    except SourceBindingNotFound:
+        raise ApiError("resource_not_found", "资源不存在", 404, False) from None
+    except SourceBindingInvalid:
+        raise ApiError("request_validation_failed", "请求参数校验失败", 422, False) from None
     except Exception as error:
         if not isinstance(
             error,

@@ -36,6 +36,21 @@ SCENARIOS = ("cold_start", "scroll", "memory_cycle")
 APK_MIME = "application/vnd.android.package-archive"
 CHECKSUM = base64.b64encode(b"a" * 32).decode("ascii")
 OTHER_CHECKSUM = base64.b64encode(b"b" * 32).decode("ascii")
+SOURCE_AGENT_ID = UUID("91000000-0000-4000-8000-000000000001")
+SOURCE_WORKSPACE_ID = UUID("92000000-0000-4000-8000-000000000001")
+SOURCE_PROFILE_ID = UUID("94000000-0000-4000-8000-000000000001")
+
+
+def _source_binding() -> Any:
+    from perfpilot_api.services.source_workspaces import SourceBinding
+
+    return SourceBinding(
+        provider_kind="agent_workspace",
+        agent_id=SOURCE_AGENT_ID,
+        workspace_id=SOURCE_WORKSPACE_ID,
+        snapshot_policy="tracked_worktree",
+        validation_profile_id=SOURCE_PROFILE_ID,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -601,6 +616,71 @@ async def _finalize(service: Any) -> Any:
         caller_sha256_b64=CHECKSUM,
         caller_size=4,
     )
+
+
+def test_source_binding_changes_only_v11_canonical_request_hashes() -> None:
+    from perfpilot_api.services.analyses import (
+        canonical_analysis_request_hash,
+        canonical_trace_analysis_request_hash,
+    )
+
+    device_v10 = canonical_analysis_request_hash(
+        device_id=DEVICE_ID,
+        scenarios=SCENARIOS,
+        apk_mime=APK_MIME,
+        apk_size=4,
+        apk_sha256_b64=CHECKSUM,
+    )
+    trace_v10 = canonical_trace_analysis_request_hash(
+        analysis_profile="auto",
+        question="为什么滑动卡顿？",
+        inputs=(
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4,
+                "sha256_b64": CHECKSUM,
+            },
+        ),
+    )
+    assert device_v10 == "19397c26e0fa7545f9bece91fe2ac811c7c8d5ea71c3d08b35e8b3f9edebe935"
+    assert trace_v10 == "1b08eaee1c1bc31b29b86e6ecb5c005f6156c8235f0bd99fb2a16fde84e13fe0"
+
+    device_v11 = canonical_analysis_request_hash(
+        schema_version="1.1",
+        source_binding=_source_binding(),
+        device_id=DEVICE_ID,
+        scenarios=SCENARIOS,
+        apk_mime=APK_MIME,
+        apk_size=4,
+        apk_sha256_b64=CHECKSUM,
+    )
+    trace_v11 = canonical_trace_analysis_request_hash(
+        schema_version="1.1",
+        source_binding=_source_binding(),
+        analysis_profile="auto",
+        question="为什么滑动卡顿？",
+        inputs=(
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4,
+                "sha256_b64": CHECKSUM,
+            },
+        ),
+    )
+
+    assert device_v11 != device_v10
+    assert trace_v11 != trace_v10
+    assert canonical_analysis_request_hash(
+        schema_version="1.1",
+        source_binding=_source_binding(),
+        device_id=DEVICE_ID,
+        scenarios=SCENARIOS,
+        apk_mime=APK_MIME,
+        apk_size=4,
+        apk_sha256_b64=CHECKSUM,
+    ) == device_v11
 
 
 @pytest.mark.asyncio

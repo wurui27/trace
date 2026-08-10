@@ -56,10 +56,33 @@ class GlobalJob(
             name="ck_global_jobs_counts_nonnegative",
         ),
         CheckConstraint("version > 0", name="ck_global_jobs_version_positive"),
+        CheckConstraint(
+            "num_nonnulls(source_provider_kind, source_agent_id, source_workspace_id, "
+            "source_snapshot_policy) IN (0, 4)",
+            name="ck_global_jobs_source_binding_group",
+        ),
+        CheckConstraint(
+            "source_provider_kind IS NULL OR source_provider_kind = 'agent_workspace'",
+            name="ck_global_jobs_source_provider_kind",
+        ),
+        CheckConstraint(
+            "source_snapshot_policy IS NULL OR source_snapshot_policy = 'tracked_worktree'",
+            name="ck_global_jobs_source_snapshot_policy",
+        ),
+        CheckConstraint(
+            "source_provider_kind IS NOT NULL OR source_validation_profile_id IS NULL",
+            name="ck_global_jobs_source_profile_binding",
+        ),
         ForeignKeyConstraint(
             ["selected_device_id", "team_id"],
             ["devices.id", "devices.team_id"],
             name="fk_global_jobs_selected_device_team",
+            ondelete="RESTRICT",
+        ),
+        ForeignKeyConstraint(
+            ["source_agent_id", "team_id"],
+            ["agents.id", "agents.team_id"],
+            name="fk_global_jobs_source_agent_team",
             ondelete="RESTRICT",
         ),
         Index(
@@ -68,6 +91,7 @@ class GlobalJob(
             "team_id",
         ),
         Index("ix_global_jobs_team_state_created", "team_id", "state", "created_at"),
+        Index("ix_global_jobs_source_agent_team", "source_agent_id", "team_id"),
     )
 
     team_id: Mapped[UUID] = mapped_column(
@@ -80,6 +104,13 @@ class GlobalJob(
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     input_artifact_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     selected_device_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    source_provider_kind: Mapped[str | None] = mapped_column(String(32))
+    source_agent_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    source_workspace_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    source_snapshot_policy: Mapped[str | None] = mapped_column(String(32))
+    source_validation_profile_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True)
+    )
     required_abi: Mapped[str | None] = mapped_column(String(64))
     supported_abis: Mapped[list[str]] = mapped_column(
         ARRAY(String(64)), nullable=False, default=list, server_default=text("'{}'::varchar[]")

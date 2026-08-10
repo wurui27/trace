@@ -93,11 +93,12 @@ def _services() -> tuple[AgentService, DeviceDirectory]:
     )
 
 
-def _settings() -> Settings:
+def _settings(*, source_code_analysis_enabled: bool = False) -> Settings:
     return Settings(
         app_env="test",
         proxy_secret=PROXY_SECRET.decode(),
         allowed_origins=[ORIGIN],
+        source_code_analysis_enabled=source_code_analysis_enabled,
         _env_file=None,
         _secrets_dir=None,
     )
@@ -124,12 +125,18 @@ def _proxy_headers(*, method: str, target: str, body: bytes, request_id: str) ->
     }
 
 
-def _client(*, role: str = "team_owner") -> TestClient:
+def _client(
+    *,
+    role: str = "team_owner",
+    source_code_analysis_enabled: bool = False,
+) -> TestClient:
     agent_service, device_directory = _services()
     return TestClient(
         create_app(
             testing=True,
-            settings_override=_settings(),
+            settings_override=_settings(
+                source_code_analysis_enabled=source_code_analysis_enabled
+            ),
             auth_service=FakeAuthService(role=role),  # type: ignore[arg-type]
             agent_service=agent_service,
             device_directory=device_directory,
@@ -471,6 +478,153 @@ def test_authenticated_heartbeat_publishes_only_sanitized_browser_device() -> No
     assert raw_serial not in heartbeat_response.text
     assert raw_serial not in listed.text
     assert heartbeat_response.json()["devices"][0]["device_digest"] not in listed.text
+
+
+def test_heartbeat_v11_publishes_public_ready_source_workspace_directory() -> None:
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    private_path = "/Users/ray/private/demo"
+    with _client(source_code_analysis_enabled=True) as client:
+        issued = _create_code(client)
+        registered = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.0",
+                "registration_code": issued["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "Ray Mac",
+                "os_version": "macOS 15.6",
+            },
+        ).json()
+        heartbeat_response = client.post(
+            "/v1/agent/heartbeat",
+            headers={"authorization": f"Bearer {registered['access_token']}"},
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "Ray Mac",
+                "observed_at": "2026-08-05T08:00:00Z",
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [],
+                "workspaces": [
+                    {
+                        "workspace_id": "92000000-0000-4000-8000-000000000001",
+                        "name": "Demo Android",
+                        "state": "ready",
+                        "git_branch": "main",
+                        "git_head": "1" * 40,
+                        "tracked_dirty_count": 1,
+                        "snapshot_policy": "tracked_worktree",
+                        "validation_profiles": [
+                            {
+                                "profile_id": "94000000-0000-4000-8000-000000000001",
+                                "name": "Android check",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        target = f"/v1/teams/{TEAM_A_ID}/source-workspaces"
+        listed = _browser_request(
+            client,
+            method="GET",
+            target=target,
+            payload={},
+            request_id="req-list-source-workspaces",
+        )
+        rejected_private = client.post(
+            "/v1/agent/heartbeat",
+            headers={"authorization": f"Bearer {registered['access_token']}"},
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "Ray Mac",
+                "observed_at": "2026-08-05T08:00:00Z",
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [],
+                "workspaces": [{**listed.json().get("workspaces", [{}])[0], "path": private_path}],
+            },
+        )
+
+    assert heartbeat_response.status_code == 200
+    assert listed.status_code == 200
+    assert listed.json()["workspaces"] == [
+        {
+            "provider_kind": "agent_workspace",
+            "agent_id": registered["agent_id"],
+            "agent_name": "Ray Mac",
+            "workspace_id": "92000000-0000-4000-8000-000000000001",
+            "name": "Demo Android",
+            "state": "ready",
+            "git_branch": "main",
+            "git_head": "1" * 40,
+            "tracked_dirty_count": 1,
+            "snapshot_policy": "tracked_worktree",
+            "validation_profiles": [
+                {
+                    "profile_id": "94000000-0000-4000-8000-000000000001",
+                    "name": "Android check",
+                }
+            ],
+        }
+    ]
+    assert rejected_private.status_code == 422
+    assert private_path not in rejected_private.text
+
+
+def test_heartbeat_v11_rejects_noncanonical_workspace_uuid() -> None:
+    private_key = Ed25519PrivateKey.from_private_bytes(bytes(range(32)))
+    with _client(source_code_analysis_enabled=True) as client:
+        issued = _create_code(client)
+        registered = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.0",
+                "registration_code": issued["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "Ray Mac",
+                "os_version": "macOS 15.6",
+            },
+        ).json()
+        response = client.post(
+            "/v1/agent/heartbeat",
+            headers={"authorization": f"Bearer {registered['access_token']}"},
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "Ray Mac",
+                "observed_at": "2026-08-05T08:00:00Z",
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [],
+                "workspaces": [
+                    {
+                        "workspace_id": "92000000-0000-4000-8000-00000000000A",
+                        "name": "Demo Android",
+                        "state": "ready",
+                        "git_branch": None,
+                        "git_head": "1" * 40,
+                        "tracked_dirty_count": 0,
+                        "snapshot_policy": "tracked_worktree",
+                        "validation_profiles": [],
+                    }
+                ],
+            },
+        )
+
+    assert response.status_code == 422
 
 
 def test_heartbeat_rejects_missing_agent_access_token_without_proxy_headers() -> None:

@@ -307,6 +307,14 @@ class Settings(BaseSettings):
     ai_max_response_bytes: int = Field(
         default=128 * 1024, ge=1024, le=128 * 1024, strict=True
     )
+    source_code_analysis_enabled: bool = False
+    source_context_deadline_seconds: int = Field(default=120, ge=1, le=600, strict=True)
+    source_context_max_bytes: int = Field(
+        default=98_304, ge=1024, le=98_304, strict=True
+    )
+    source_patch_max_bytes: int = Field(
+        default=65_536, ge=1024, le=65_536, strict=True
+    )
     android_memory_enabled: bool = False
     android_memory_backend: Literal["local", "oci"] = "local"
     android_memory_image_reference: str | None = None

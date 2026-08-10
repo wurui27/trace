@@ -64,6 +64,7 @@ from perfpilot_api.services.uploads import (
     UploadService,
     UploadSlot,
 )
+from perfpilot_api.services.source_workspaces import SourceBinding
 
 _IDEMPOTENCY_KEY = re.compile(r"[A-Za-z0-9._:-]{1,255}\Z")
 _APK_MIME = "application/vnd.android.package-archive"
@@ -275,6 +276,62 @@ class AnalysisStageView:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceCodeAnalysisView:
+    requested: bool
+    provider_kind: Literal["agent_workspace"] | None
+    agent_id: UUID | None
+    workspace_id: UUID | None
+    snapshot_policy: Literal["tracked_worktree"] | None
+    validation_profile_id: UUID | None
+    context_state: Literal[
+        "not_requested", "waiting_for_agent", "extracting", "available", "unavailable"
+    ]
+    match_summary: Literal["strong", "weak", "none"]
+    verification_state: Literal[
+        "not_requested",
+        "pending",
+        "validating",
+        "verified",
+        "apply_failed",
+        "validation_failed",
+        "source_changed",
+        "not_configured",
+        "timeout",
+        "canceled",
+        "unavailable",
+    ]
+    failure_code: str | None
+
+
+def source_code_analysis_view(binding: SourceBinding | None) -> SourceCodeAnalysisView:
+    if binding is None:
+        return SourceCodeAnalysisView(
+            requested=False,
+            provider_kind=None,
+            agent_id=None,
+            workspace_id=None,
+            snapshot_policy=None,
+            validation_profile_id=None,
+            context_state="not_requested",
+            match_summary="none",
+            verification_state="not_requested",
+            failure_code=None,
+        )
+    return SourceCodeAnalysisView(
+        requested=True,
+        provider_kind=binding.provider_kind,
+        agent_id=binding.agent_id,
+        workspace_id=binding.workspace_id,
+        snapshot_policy=binding.snapshot_policy,
+        validation_profile_id=binding.validation_profile_id,
+        context_state="waiting_for_agent",
+        match_summary="none",
+        verification_state="not_requested",
+        failure_code=None,
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class AnalysisView:
     analysis_id: UUID
     team_id: UUID
@@ -298,6 +355,8 @@ class AnalysisView:
     analysis_profile: Literal["auto", "startup", "scroll"] | None = None
     input_uploads: tuple[InputUploadView, ...] = ()
     stages: tuple[AnalysisStageView, ...] = ()
+    source_binding: SourceBinding | None = None
+    source_code_analysis: SourceCodeAnalysisView = source_code_analysis_view(None)
 
 
 MemoryAnalysisView = AnalysisView
@@ -360,6 +419,7 @@ class AnalysisRepository(Protocol):
         analysis_profile: Literal["auto", "startup", "scroll"],
         question: str | None,
         inputs: tuple[dict[str, object], ...],
+        source_binding: SourceBinding | None = None,
         now: datetime,
     ) -> AnalysisView: ...
 
@@ -384,6 +444,7 @@ class AnalysisRepository(Protocol):
         request_hash: str,
         candidate_analysis_id: UUID,
         selected_device_id: UUID,
+        source_binding: SourceBinding | None = None,
         now: datetime,
     ) -> CreationReservation: ...
 
@@ -599,25 +660,32 @@ def _prepared_scenarios_from_results(
 
 def canonical_analysis_request_hash(
     *,
+    schema_version: Literal["1.0", "1.1"] = "1.0",
+    source_binding: SourceBinding | None = None,
     device_id: UUID,
     scenarios: tuple[str, ...],
     apk_mime: str,
     apk_size: int,
     apk_sha256_b64: str,
 ) -> str:
-    payload = json.dumps(
-        {
-            "analysis_mode": "device",
-            "device_id": str(device_id),
-            "apk": {
-                "artifact_kind": "apk",
-                "mime": apk_mime,
-                "sha256_b64": apk_sha256_b64,
-                "size": apk_size,
-            },
-            "scenarios": list(scenarios),
-            "schema_version": "1.0",
+    if schema_version == "1.0" and source_binding is not None:
+        raise AnalysisInvalidRequestError("analysis request is invalid")
+    document: dict[str, object] = {
+        "analysis_mode": "device",
+        "device_id": str(device_id),
+        "apk": {
+            "artifact_kind": "apk",
+            "mime": apk_mime,
+            "sha256_b64": apk_sha256_b64,
+            "size": apk_size,
         },
+        "scenarios": list(scenarios),
+        "schema_version": schema_version,
+    }
+    if source_binding is not None:
+        document["source_binding"] = _source_binding_payload(source_binding)
+    payload = json.dumps(
+        document,
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
@@ -690,23 +758,89 @@ def _canonical_trace_inputs(
 
 def canonical_trace_analysis_request_hash(
     *,
+    schema_version: Literal["1.0", "1.1"] = "1.0",
+    source_binding: SourceBinding | None = None,
     analysis_profile: Literal["auto", "startup", "scroll"],
     question: str | None,
     inputs: tuple[dict[str, object], ...],
 ) -> str:
+    if schema_version == "1.0" and source_binding is not None:
+        raise AnalysisInvalidRequestError("analysis request is invalid")
+    document: dict[str, object] = {
+        "analysis_mode": "trace_upload",
+        "analysis_profile": analysis_profile,
+        "inputs": list(inputs),
+        "question": question,
+        "schema_version": schema_version,
+    }
+    if source_binding is not None:
+        document["source_binding"] = _source_binding_payload(source_binding)
     payload = json.dumps(
-        {
-            "analysis_mode": "trace_upload",
-            "analysis_profile": analysis_profile,
-            "inputs": list(inputs),
-            "question": question,
-            "schema_version": "1.0",
-        },
+        document,
         ensure_ascii=True,
         separators=(",", ":"),
         sort_keys=True,
     ).encode("ascii")
     return hashlib.sha256(payload).hexdigest()
+
+
+def _source_binding_payload(binding: SourceBinding) -> dict[str, object]:
+    return {
+        "provider_kind": binding.provider_kind,
+        "agent_id": str(binding.agent_id),
+        "workspace_id": str(binding.workspace_id),
+        "snapshot_policy": binding.snapshot_policy,
+        "validation_profile_id": (
+            None
+            if binding.validation_profile_id is None
+            else str(binding.validation_profile_id)
+        ),
+    }
+
+
+def _source_binding_columns(binding: SourceBinding | None) -> dict[str, object]:
+    if binding is None:
+        return {
+            "source_provider_kind": None,
+            "source_agent_id": None,
+            "source_workspace_id": None,
+            "source_snapshot_policy": None,
+            "source_validation_profile_id": None,
+        }
+    return {
+        "source_provider_kind": binding.provider_kind,
+        "source_agent_id": binding.agent_id,
+        "source_workspace_id": binding.workspace_id,
+        "source_snapshot_policy": binding.snapshot_policy,
+        "source_validation_profile_id": binding.validation_profile_id,
+    }
+
+
+def _stored_source_binding(job: GlobalJob) -> SourceBinding | None:
+    core = (
+        job.source_provider_kind,
+        job.source_agent_id,
+        job.source_workspace_id,
+        job.source_snapshot_policy,
+    )
+    if all(value is None for value in core):
+        if job.source_validation_profile_id is not None:
+            raise AnalysisUnavailableError("source binding state is unavailable")
+        return None
+    if (
+        job.source_provider_kind != "agent_workspace"
+        or job.source_agent_id is None
+        or job.source_workspace_id is None
+        or job.source_snapshot_policy != "tracked_worktree"
+    ):
+        raise AnalysisUnavailableError("source binding state is unavailable")
+    return SourceBinding(
+        provider_kind="agent_workspace",
+        agent_id=job.source_agent_id,
+        workspace_id=job.source_workspace_id,
+        snapshot_policy="tracked_worktree",
+        validation_profile_id=job.source_validation_profile_id,
+    )
 
 
 def _canonical_json_bytes(value: object) -> bytes:
@@ -1117,6 +1251,8 @@ class AnalysisService:
         analysis_profile: str,
         question: str | None,
         inputs: tuple[dict[str, object], ...],
+        schema_version: Literal["1.0", "1.1"] = "1.0",
+        source_binding: SourceBinding | None = None,
     ) -> AnalysisView:
         _validate_idempotency_key(idempotency_key)
         if analysis_profile not in ("auto", "startup", "scroll"):
@@ -1129,6 +1265,8 @@ class AnalysisService:
         canonical_inputs = _canonical_trace_inputs(inputs)
         typed_profile: Literal["auto", "startup", "scroll"] = analysis_profile  # type: ignore[assignment]
         request_hash = canonical_trace_analysis_request_hash(
+            schema_version=schema_version,
+            source_binding=source_binding,
             analysis_profile=typed_profile,
             question=normalized_question,
             inputs=canonical_inputs,
@@ -1143,6 +1281,7 @@ class AnalysisService:
                 analysis_profile=typed_profile,
                 question=normalized_question,
                 inputs=canonical_inputs,
+                source_binding=source_binding,
                 now=self._clock(),
             )
         )
@@ -1187,6 +1326,8 @@ class AnalysisService:
         apk_mime: str,
         apk_size: int,
         apk_sha256_b64: str,
+        schema_version: Literal["1.0", "1.1"] = "1.0",
+        source_binding: SourceBinding | None = None,
     ) -> AnalysisView:
         _validate_create_request(
             idempotency_key=idempotency_key,
@@ -1196,6 +1337,8 @@ class AnalysisService:
             apk_sha256_b64=apk_sha256_b64,
         )
         request_hash = canonical_analysis_request_hash(
+            schema_version=schema_version,
+            source_binding=source_binding,
             device_id=device_id,
             scenarios=scenarios,
             apk_mime=apk_mime,
@@ -1210,6 +1353,7 @@ class AnalysisService:
                 request_hash=request_hash,
                 candidate_analysis_id=self._uuid_source(),
                 selected_device_id=device_id,
+                source_binding=source_binding,
                 now=now,
             )
         )
@@ -2035,6 +2179,7 @@ class SQLAlchemyAnalysisRepository:
         request_hash: str,
         candidate_analysis_id: UUID,
         analysis_mode: Literal["trace_upload", "memory_upload"],
+        source_binding: SourceBinding | None = None,
         now: datetime,
     ) -> CreationReservation:
         async with self._control_session_factory() as session:
@@ -2075,6 +2220,7 @@ class SQLAlchemyAnalysisRepository:
                     max_retries=3,
                     device_migration_allowed=False,
                     version=1,
+                    **_source_binding_columns(source_binding),
                 )
                 key = IdempotencyKey(
                     team_id=team_id,
@@ -2261,6 +2407,7 @@ class SQLAlchemyAnalysisRepository:
         analysis_profile: Literal["auto", "startup", "scroll"],
         question: str | None,
         inputs: tuple[dict[str, object], ...],
+        source_binding: SourceBinding | None = None,
         now: datetime,
     ) -> AnalysisView:
         reservation = await self._reserve_direct_creation(
@@ -2269,6 +2416,7 @@ class SQLAlchemyAnalysisRepository:
             request_hash=request_hash,
             candidate_analysis_id=candidate_analysis_id,
             analysis_mode="trace_upload",
+            source_binding=source_binding,
             now=now,
         )
         manifest = [dict(item) for item in inputs]
@@ -2368,6 +2516,7 @@ class SQLAlchemyAnalysisRepository:
         request_hash: str,
         candidate_analysis_id: UUID,
         selected_device_id: UUID,
+        source_binding: SourceBinding | None = None,
         now: datetime,
     ) -> CreationReservation:
         async with self._control_session_factory() as session:
@@ -2429,6 +2578,7 @@ class SQLAlchemyAnalysisRepository:
                     max_retries=3,
                     device_migration_allowed=True,
                     version=1,
+                    **_source_binding_columns(source_binding),
                 )
                 key = IdempotencyKey(
                     team_id=team_id,
@@ -2748,6 +2898,7 @@ class SQLAlchemyAnalysisRepository:
 
         if job.analysis_mode != tenant_analysis.analysis_mode:
             raise AnalysisUnavailableError("tenant analysis state is unavailable")
+        source_binding = _stored_source_binding(job)
         if job.analysis_mode == "trace_upload":
             stored_manifest = tenant_analysis.input_manifest
             question = tenant_analysis.question
@@ -2897,6 +3048,8 @@ class SQLAlchemyAnalysisRepository:
                     synthesis=latest_synthesis,
                     report_available=report_available,
                 ),
+                source_binding=source_binding,
+                source_code_analysis=source_code_analysis_view(source_binding),
             )
 
         children_by_type = {child.scenario_type: child for child in children}
@@ -2990,6 +3143,8 @@ class SQLAlchemyAnalysisRepository:
                 failure_code=job.failure_code,
                 cancel_requested_at=job.cancel_requested_at,
                 question=tenant_analysis.question,
+                source_binding=None,
+                source_code_analysis=source_code_analysis_view(None),
             )
         if job.analysis_mode == "device" and tenant_analysis.question is not None:
             raise AnalysisUnavailableError("tenant analysis state is unavailable")
@@ -3056,6 +3211,8 @@ class SQLAlchemyAnalysisRepository:
             failure_code=job.failure_code,
             cancel_requested_at=job.cancel_requested_at,
             question=tenant_analysis.question,
+            source_binding=source_binding,
+            source_code_analysis=source_code_analysis_view(source_binding),
         )
 
     async def require_finalizable(
@@ -4425,11 +4582,13 @@ __all__ = [
     "SQLAlchemyAnalysisRepository",
     "SampleVerdictCounts",
     "ScenarioView",
+    "SourceCodeAnalysisView",
     "StaleTaskVersionError",
     "analysis_queued_event_id",
     "canonical_analysis_request_hash",
     "canonical_memory_analysis_request_hash",
     "canonical_trace_analysis_request_hash",
     "scenario_job_id",
+    "source_code_analysis_view",
     "trace_analysis_ready_event_id",
 ]
