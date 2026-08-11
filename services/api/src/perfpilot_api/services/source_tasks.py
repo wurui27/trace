@@ -104,6 +104,16 @@ class SourceTaskView:
 
 
 @dataclass(frozen=True, slots=True)
+class SourceContextTaskStatus:
+    execution_id: UUID
+    state: str
+    created_at: datetime
+    artifact_id: UUID | None
+    checksum: str | None = field(default=None, repr=False)
+    failure_code: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SourceTaskDelivery:
     execution_id: UUID
     analysis_id: UUID
@@ -211,6 +221,9 @@ class SourceTaskRepository(Protocol):
         now: datetime,
     ) -> _MemorySourceTask | None: ...
     async def by_execution(self, execution_id: UUID) -> _MemorySourceTask | None: ...
+    async def latest_context(
+        self, *, team_id: UUID, analysis_id: UUID
+    ) -> _MemorySourceTask | None: ...
     async def authorize_fenced(
         self,
         *,
@@ -352,6 +365,18 @@ class InMemorySourceTaskRepository:
 
     async def by_execution(self, execution_id: UUID) -> _MemorySourceTask | None:
         return self.tasks.get(execution_id)
+
+    async def latest_context(
+        self, *, team_id: UUID, analysis_id: UUID
+    ) -> _MemorySourceTask | None:
+        candidates = [
+            task
+            for task in self.tasks.values()
+            if task.team_id == team_id
+            and task.analysis_id == analysis_id
+            and task.task_type == "source_context"
+        ]
+        return max(candidates, key=lambda item: (item.created_at, item.id), default=None)
 
     async def authorize_fenced(
         self,
@@ -711,6 +736,22 @@ class SQLAlchemySourceTaskRepository:
             row = await session.get(SourceTask, execution_id)
             return None if row is None else _memory_task(row)
 
+    async def latest_context(
+        self, *, team_id: UUID, analysis_id: UUID
+    ) -> _MemorySourceTask | None:
+        async with self._sessions() as session:
+            row = await session.scalar(
+                select(SourceTask)
+                .where(
+                    SourceTask.team_id == team_id,
+                    SourceTask.analysis_id == analysis_id,
+                    SourceTask.task_type == "source_context",
+                )
+                .order_by(SourceTask.created_at.desc(), SourceTask.id.desc())
+                .limit(1)
+            )
+            return None if row is None else _memory_task(row)
+
     async def authorize_fenced(
         self,
         *,
@@ -977,6 +1018,27 @@ class SourceTaskService:
             workspace_id=workspace_id,
             task_type="source_context",
             request=request,
+        )
+
+    async def context_status(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+    ) -> SourceContextTaskStatus | None:
+        task = await self._repository.latest_context(
+            team_id=team_id,
+            analysis_id=analysis_id,
+        )
+        if task is None:
+            return None
+        return SourceContextTaskStatus(
+            execution_id=task.id,
+            state=task.state,
+            created_at=task.created_at,
+            artifact_id=task.completion_artifact_id,
+            checksum=task.completion_sha256,
+            failure_code=task.failure_code,
         )
 
     async def create_patch_task(
@@ -1530,6 +1592,7 @@ class SourceTaskService:
 __all__ = [
     "InMemorySourceTaskRepository",
     "SourceCompletionArtifact",
+    "SourceContextTaskStatus",
     "SourcePatchArtifactBinding",
     "SourcePatchArtifactPayload",
     "SourcePatchArtifactReader",

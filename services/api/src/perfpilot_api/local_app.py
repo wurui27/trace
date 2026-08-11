@@ -574,6 +574,19 @@ def _source_code_analysis_document(binding: SourceBinding | None) -> dict[str, o
     }
 
 
+def _source_code_analysis_unavailable_document(
+    binding: SourceBinding,
+) -> dict[str, object]:
+    return {
+        "requested": True,
+        **_source_binding_document(binding),
+        "context_state": "unavailable",
+        "match_summary": "none",
+        "verification_state": "not_requested",
+        "failure_code": "source_agent_unavailable",
+    }
+
+
 def _restore_source_binding(value: object) -> SourceBinding:
     try:
         descriptor = _SourceBindingDescriptor.model_validate(value)
@@ -2040,6 +2053,12 @@ class _LocalRuntime:
             analysis.state = "analyzing"
             analysis.failure = None
             analysis.stages["smartperfetto"] = "completed"
+            if analysis.source_binding is not None:
+                analysis.source_code_analysis = (
+                    _source_code_analysis_unavailable_document(
+                        analysis.source_binding
+                    )
+                )
             analysis.stages["perfpilot_ai"] = "running"
             analysis.stages["report"] = "pending"
             analysis.ai_rounds = _default_ai_rounds()

@@ -523,6 +523,47 @@ async def test_coordinator_deduplicates_concurrent_work_event_insert(
 
 
 @pytest.mark.asyncio
+async def test_coordinator_waits_for_source_context_before_single_synthesis(
+    database: ExecutionDatabase,
+) -> None:
+    _source_id, event_id = await _seed_source_event(database)
+    clock = Clock()
+    ready = False
+    calls: list[UUID] = []
+
+    async def source_gate(analysis_id: UUID) -> bool:
+        calls.append(analysis_id)
+        return ready
+
+    coordinator = SynthesisCoordinator(
+        session_factory=database.sessions,
+        repository=SQLAlchemySynthesisExecutionRepository(
+            database.sessions, clock=clock
+        ),
+        request_factory=lambda _source, _generation: _automatic_request(
+            checksum=_checksum(b"canonical")
+        ),
+        source_gate=source_gate,
+        clock=clock,
+        retry_backoff_seconds=5,
+    )
+
+    assert await coordinator.coordinate_next() is None
+    async with database.sessions() as session:
+        event = await session.get(OutboxEvent, event_id)
+        assert event is not None
+        assert event.published_at is None
+        assert event.ready_at == NOW + timedelta(seconds=5)
+
+    ready = True
+    clock.now = NOW + timedelta(seconds=5)
+    record = await coordinator.coordinate_next()
+
+    assert record is not None and record.generation == 1
+    assert calls == [ANALYSIS_ID, ANALYSIS_ID]
+
+
+@pytest.mark.asyncio
 async def test_coordinator_consumes_stale_attempt_before_current_source_event(
     database: ExecutionDatabase,
 ) -> None:

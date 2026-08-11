@@ -37,6 +37,11 @@ from perfpilot_api.services.synthesis_artifacts import (
 from perfpilot_api.services.synthesis_executions import (
     SQLAlchemySynthesisExecutionRepository,
 )
+from perfpilot_api.services.source_artifacts import S3SourceArtifactService
+from perfpilot_api.services.source_tasks import (
+    SQLAlchemySourceTaskRepository,
+    SourceTaskService,
+)
 from perfpilot_api.services.uploads import SQLAlchemyTenantBucketResolver
 from perfpilot_api.reports.writer import AnalysisReportWriter
 from perfpilot_api.workers.synthesis_orchestrator import (
@@ -48,6 +53,12 @@ from perfpilot_api.workers.synthesis_orchestrator import (
     SynthesisCoordinator,
     SynthesisOrchestrationWorker,
     SynthesisPipeline,
+)
+from perfpilot_api.workers.source_orchestrator import (
+    InMemorySourceAnalysisStateRepository,
+    NoopSynthesisScheduler,
+    SourceOrchestrator,
+    SQLAlchemySourceAuthorityReader,
 )
 
 
@@ -273,6 +284,19 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("ascii")
+        source_orchestrator = SourceOrchestrator(
+            authority=SQLAlchemySourceAuthorityReader(control_sessions),
+            tasks=SourceTaskService(
+                repository=SQLAlchemySourceTaskRepository(control_sessions)
+            ),
+            artifacts=S3SourceArtifactService(
+                tenant_router=artifacts.tenant_router,
+                bucket_resolver=bucket_resolver,
+                client=artifacts.s3_client,
+            ),
+            states=InMemorySourceAnalysisStateRepository(),
+            scheduler=NoopSynthesisScheduler(),
+        )
         coordinator = SynthesisCoordinator(
             session_factory=control_sessions,
             repository=repository,
@@ -286,6 +310,7 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
                 model=settings.ai_model,
                 inference_config_hash=hashlib.sha256(inference_payload).hexdigest(),
             ),
+            source_gate=source_orchestrator.prepare_for_synthesis,
         )
         pipeline = SynthesisPipeline(
             repository=repository,

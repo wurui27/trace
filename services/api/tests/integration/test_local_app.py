@@ -26,6 +26,7 @@ from perfpilot_api.local_app import (
     _prepare_local_report,
     _public_origin,
     _restore_ai_rounds,
+    _source_code_analysis_unavailable_document,
     create_local_app,
 )
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
@@ -33,6 +34,7 @@ from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapt
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
+from perfpilot_api.services.source_workspaces import SourceBinding
 
 
 class _FakeSmartPerfettoGateway:
@@ -79,6 +81,22 @@ def test_local_runtime_rejects_malformed_persisted_ai_round_state() -> None:
         _restore_ai_rounds(
             [{"round": 1, "role": "report", "state": [], "attempts": 0}]
         )
+
+
+def test_local_source_binding_degrades_when_no_source_agent_is_available() -> None:
+    document = _source_code_analysis_unavailable_document(
+        SourceBinding(
+            provider_kind="agent_workspace",
+            agent_id=UUID("91000000-0000-4000-8000-000000000001"),
+            workspace_id=UUID("92000000-0000-4000-8000-000000000001"),
+            snapshot_policy="tracked_worktree",
+            validation_profile_id=None,
+        )
+    )
+
+    assert document["context_state"] == "unavailable"
+    assert document["failure_code"] == "source_agent_unavailable"
+    assert document["match_summary"] == "none"
 
 
 def test_local_runtime_allows_configured_private_lan_web_origin(

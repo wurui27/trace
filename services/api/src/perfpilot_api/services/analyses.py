@@ -28,6 +28,7 @@ from perfpilot_api.db.control.models import (
     IdempotencyKey,
     OutboxEvent,
     ScenarioJob,
+    SourceTask,
     SynthesisExecution,
     Team,
     TenantQuota,
@@ -303,7 +304,10 @@ class SourceCodeAnalysisView:
     failure_code: str | None
 
 
-def source_code_analysis_view(binding: SourceBinding | None) -> SourceCodeAnalysisView:
+def source_code_analysis_view(
+    binding: SourceBinding | None,
+    task: SourceTask | None = None,
+) -> SourceCodeAnalysisView:
     if binding is None:
         return SourceCodeAnalysisView(
             requested=False,
@@ -317,6 +321,18 @@ def source_code_analysis_view(binding: SourceBinding | None) -> SourceCodeAnalys
             verification_state="not_requested",
             failure_code=None,
         )
+    context_state: Literal[
+        "waiting_for_agent", "extracting", "available", "unavailable"
+    ] = "waiting_for_agent"
+    failure_code = None
+    if task is not None:
+        if task.state in {"leased", "running", "cancel_requested"}:
+            context_state = "extracting"
+        elif task.state == "completed" and task.completion_artifact_id is not None:
+            context_state = "available"
+        elif task.state in {"failed", "canceled", "expired"}:
+            context_state = "unavailable"
+            failure_code = task.failure_code or "source_agent_unavailable"
     return SourceCodeAnalysisView(
         requested=True,
         provider_kind=binding.provider_kind,
@@ -324,10 +340,10 @@ def source_code_analysis_view(binding: SourceBinding | None) -> SourceCodeAnalys
         workspace_id=binding.workspace_id,
         snapshot_policy=binding.snapshot_policy,
         validation_profile_id=binding.validation_profile_id,
-        context_state="waiting_for_agent",
+        context_state=context_state,
         match_summary="none",
         verification_state="not_requested",
-        failure_code=None,
+        failure_code=failure_code,
     )
 
 
@@ -2795,6 +2811,16 @@ class SQLAlchemyAnalysisRepository:
                 if latest_smartperfetto is not None
                 else None
             )
+            latest_source_task = await session.scalar(
+                select(SourceTask)
+                .where(
+                    SourceTask.analysis_id == analysis_id,
+                    SourceTask.team_id == team_id,
+                    SourceTask.task_type == "source_context",
+                )
+                .order_by(SourceTask.created_at.desc(), SourceTask.id.desc())
+                .limit(1)
+            )
             children = list(
                 (
                     await session.scalars(
@@ -3049,7 +3075,9 @@ class SQLAlchemyAnalysisRepository:
                     report_available=report_available,
                 ),
                 source_binding=source_binding,
-                source_code_analysis=source_code_analysis_view(source_binding),
+                source_code_analysis=source_code_analysis_view(
+                    source_binding, latest_source_task
+                ),
             )
 
         children_by_type = {child.scenario_type: child for child in children}
@@ -3212,7 +3240,9 @@ class SQLAlchemyAnalysisRepository:
             cancel_requested_at=job.cancel_requested_at,
             question=tenant_analysis.question,
             source_binding=source_binding,
-            source_code_analysis=source_code_analysis_view(source_binding),
+            source_code_analysis=source_code_analysis_view(
+                source_binding, latest_source_task
+            ),
         )
 
     async def require_finalizable(

@@ -193,14 +193,29 @@ class SynthesisCoordinator:
     unavailable to this component.
     """
 
-    def __init__(self, *, session_factory: async_sessionmaker[AsyncSession], repository: SQLAlchemySynthesisExecutionRepository, request_factory: Callable[[EngineExecution, int], SynthesisRequest | Awaitable[SynthesisRequest]], clock: Callable[[], datetime] = lambda: datetime.now(UTC), retry_backoff_seconds: float = 5) -> None:
+    def __init__(
+        self,
+        *,
+        session_factory: async_sessionmaker[AsyncSession],
+        repository: SQLAlchemySynthesisExecutionRepository,
+        request_factory: Callable[
+            [EngineExecution, int], SynthesisRequest | Awaitable[SynthesisRequest]
+        ],
+        source_gate: Callable[[UUID], bool | Awaitable[bool]] | None = None,
+        clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        retry_backoff_seconds: float = 5,
+    ) -> None:
         if (
             isinstance(retry_backoff_seconds, bool)
             or not isinstance(retry_backoff_seconds, (int, float))
             or not 0 < retry_backoff_seconds <= 3600
         ):
             raise ValueError("synthesis coordinator backoff is invalid")
-        self._sessions, self._repository, self._request_factory, self._clock = session_factory, repository, request_factory, clock
+        self._sessions = session_factory
+        self._repository = repository
+        self._request_factory = request_factory
+        self._source_gate = source_gate
+        self._clock = clock
         self._retry_backoff = timedelta(seconds=retry_backoff_seconds)
 
     @staticmethod
@@ -329,6 +344,17 @@ class SynthesisCoordinator:
             # Close the control transaction before repository allocation to retain one
             # lock authority; retries reload by unique source/generation.
             team_id, analysis_id, source_id, source_event_id = source.team_id, source.analysis_id, source.id, event.id
+        if self._source_gate is not None:
+            try:
+                source_ready = self._source_gate(analysis_id)
+                if inspect.isawaitable(source_ready):
+                    source_ready = await source_ready
+            except Exception:
+                await self._reschedule_source_event(source_event_id, now)
+                return None
+            if not source_ready:
+                await self._reschedule_source_event(source_event_id, now)
+                return None
         if existing_execution_id is not None:
             try:
                 record = await self._repository.load(

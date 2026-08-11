@@ -93,6 +93,7 @@ from perfpilot_api.services.source_tasks import (
     SourceTaskCompletionRecorder,
     SourceTaskService,
 )
+from perfpilot_api.services.source_artifacts import S3SourceArtifactService
 from perfpilot_api.services.analyses import (
     AnalysisService,
     ApkInspector,
@@ -260,6 +261,7 @@ def create_app(
     resolved_source_workspace_service = source_workspace_service
     resolved_agent_task_service = agent_task_service
     resolved_source_task_service = source_task_service
+    resolved_source_task_completion_recorder = source_task_completion_recorder
     resolved_agent_upload_service = agent_upload_service
     resolved_task_snapshot_signer: TaskSnapshotSigner | None = None
     resolved_source_task_signer: SourceTaskSnapshotSigner | None = None
@@ -385,6 +387,7 @@ def create_app(
         nonlocal resolved_upload_service
         nonlocal resolved_agent_task_service
         nonlocal resolved_source_task_service
+        nonlocal resolved_source_task_completion_recorder
         nonlocal resolved_agent_upload_service
         nonlocal active_android_memory_worker
         nonlocal engine_adapter_registry
@@ -470,6 +473,17 @@ def create_app(
                     control_session_factory=control_session_factory,
                     include_local_apk_inspector=settings.app_env != "production",
                 )
+                if resolved_source_task_completion_recorder is None:
+                    resolved_source_task_completion_recorder = S3SourceArtifactService(
+                        tenant_router=owned_artifact_runtime.tenant_router,
+                        bucket_resolver=SQLAlchemyTenantBucketResolver(
+                            session_factory=control_session_factory
+                        ),
+                        client=owned_artifact_runtime.s3_client,
+                    )
+                    lifespan_app.state.source_task_completion_recorder = (
+                        resolved_source_task_completion_recorder
+                    )
                 if resolved_upload_service is None:
                     resolved_upload_service = owned_artifact_runtime.upload_service
                 lifespan_app.state.upload_service = resolved_upload_service
@@ -621,7 +635,9 @@ def create_app(
     app.state.source_workspace_service = resolved_source_workspace_service
     app.state.agent_task_service = resolved_agent_task_service
     app.state.source_task_service = resolved_source_task_service
-    app.state.source_task_completion_recorder = source_task_completion_recorder
+    app.state.source_task_completion_recorder = (
+        resolved_source_task_completion_recorder
+    )
     app.state.agent_upload_service = resolved_agent_upload_service
     app.state.engine_adapter_registry = engine_adapter_registry
     app.state.android_memory_worker = None
