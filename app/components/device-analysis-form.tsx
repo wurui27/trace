@@ -7,10 +7,12 @@ import {
   enqueueDeviceAnalysis,
   PerfPilotApiError,
   type DeviceSubmissionPhase,
+  type SourceBinding,
   type SubmitDeviceAnalysisInput,
   type SubmittedTraceAnalysis,
 } from "../lib/perfpilot-api";
 import { usePerfPilotSession } from "./perfpilot-session-provider";
+import { SourceWorkspaceField } from "./source-workspace-field";
 
 export type DeviceSubmitter = (
   submission: SubmitDeviceAnalysisInput,
@@ -59,6 +61,7 @@ export function DeviceAnalysisForm({
   const [apk, setApk] = useState<File | null>(null);
   const [phase, setPhase] = useState<DeviceSubmissionPhase | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [sourceBinding, setSourceBinding] = useState<SourceBinding | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const busy = phase !== null;
 
@@ -97,6 +100,7 @@ export function DeviceAnalysisForm({
         teamId: team.id,
         deviceId: selectedDevice.device_id,
         apk,
+        sourceBinding: sourceBinding ?? undefined,
         signal: controller.signal,
         onProgress: setPhase,
       });
@@ -162,6 +166,14 @@ export function DeviceAnalysisForm({
             Agent 会安装 APK，并按固定顺序采集三类性能证据。
           </span>
         </div>
+
+        <SourceWorkspaceField
+          client={client}
+          teamId={team?.id ?? null}
+          value={sourceBinding}
+          onChange={setSourceBinding}
+          disabled={busy}
+        />
 
         {phase ? (
           <p className="new-analysis-progress" role="status" aria-live="polite">

@@ -8,10 +8,13 @@ import {
   PerfPilotApiError,
   type SubmitTraceInput,
   type SubmittedTraceAnalysis,
+  type PerfPilotClient,
+  type SourceBinding,
   type TraceInputKind,
   type TraceProfile,
   type TraceSubmissionPhase,
 } from "../lib/perfpilot-api";
+import { SourceWorkspaceField } from "./source-workspace-field";
 
 export type TraceSubmitter = (
   submission: SubmitTraceInput,
@@ -21,6 +24,8 @@ interface TraceUploadFormProps {
   readonly submitter?: TraceSubmitter;
   readonly onCancel?: () => void;
   readonly onSubmitted?: (result: SubmittedTraceAnalysis) => void;
+  readonly client?: PerfPilotClient;
+  readonly teamId?: string | null;
 }
 
 const phaseText: Record<TraceSubmissionPhase, string> = {
@@ -56,6 +61,8 @@ export function TraceUploadForm({
   submitter = enqueueTraceAnalysis,
   onCancel,
   onSubmitted,
+  client,
+  teamId,
 }: TraceUploadFormProps) {
   const [profile, setProfile] = useState<TraceProfile>("auto");
   const [question, setQuestion] = useState("");
@@ -63,6 +70,7 @@ export function TraceUploadForm({
   const [phase, setPhase] = useState<TraceSubmissionPhase | null>(null);
   const [phaseDetail, setPhaseDetail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [sourceBinding, setSourceBinding] = useState<SourceBinding | null>(null);
   const abortRef = useRef<AbortController | null>(null);
   const busy = phase !== null && error === null;
 
@@ -106,6 +114,7 @@ export function TraceUploadForm({
         profile,
         question,
         files: selectedFiles,
+        sourceBinding: sourceBinding ?? undefined,
         signal: controller.signal,
         onProgress: (nextPhase, detail) => {
           setPhase(nextPhase);
@@ -212,18 +221,6 @@ export function TraceUploadForm({
             />
           </div>
           <div className="new-analysis-field">
-            <label htmlFor="source-archive-file">源码压缩包（可选）</label>
-            <input
-              id="source-archive-file"
-              type="file"
-              accept=".zip,.tar,.tar.gz,.tgz"
-              disabled={disabled}
-              onChange={(event) =>
-                selectFile("source_archive", event.target.files?.[0])
-              }
-            />
-          </div>
-          <div className="new-analysis-field">
             <label htmlFor="mapping-file">Mapping 文件（可选）</label>
             <input
               id="mapping-file"
@@ -256,6 +253,14 @@ export function TraceUploadForm({
             />
           </div>
         </div>
+
+        <SourceWorkspaceField
+          client={client}
+          teamId={teamId}
+          value={sourceBinding}
+          onChange={setSourceBinding}
+          disabled={disabled}
+        />
 
         {phase ? (
           <div className="trace-upload-status" role="status" aria-live="polite">

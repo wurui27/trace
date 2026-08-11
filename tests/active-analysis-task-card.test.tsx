@@ -196,6 +196,51 @@ describe("ActiveAnalysisTaskCard", () => {
     );
   });
 
+  it("shows the optional source context stage without affecting Trace-only work", () => {
+    const sourceAware: AnalysisResponse = {
+      ...activeAnalysis(),
+      schema_version: "1.1",
+      stages: [
+        { stage: "input_validation", state: "completed", failure: null },
+        { stage: "smartperfetto", state: "completed", failure: null },
+        { stage: "perfpilot_ai", state: "pending", failure: null },
+        { stage: "report", state: "pending", failure: null },
+      ],
+      source_code_analysis: {
+        requested: true,
+        provider_kind: "agent_workspace",
+        agent_id: "73000000-0000-4000-8000-000000000001",
+        workspace_id: "92000000-0000-4000-8000-000000000001",
+        snapshot_policy: "tracked_worktree",
+        validation_profile_id: null,
+        context_state: "extracting",
+        match_summary: "none",
+        verification_state: "not_requested",
+        failure_code: null,
+      },
+    };
+
+    expect(activeAnalysisStageLabel(sourceAware)).toBe("正在读取源码上下文");
+    expect(
+      activeAnalysisStageLabel({
+        ...sourceAware,
+        source_code_analysis: {
+          ...sourceAware.source_code_analysis!,
+          context_state: "available",
+          match_summary: "strong",
+          verification_state: "validating",
+        },
+      }),
+    ).toBe("正在验证源码修复");
+    expect(
+      activeAnalysisStageLabel({
+        ...sourceAware,
+        schema_version: "1.0",
+        source_code_analysis: undefined,
+      }),
+    ).toBe("等待分析资源");
+  });
+
   it("preserves the legacy running round and cancel labels", () => {
     const ai: AnalysisResponse = {
       ...activeAnalysis(),

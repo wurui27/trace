@@ -114,6 +114,53 @@ function reportPayload(): Record<string, unknown> {
 }
 
 describe("PerfPilot browser API", () => {
+  it("accepts only closed public Agent source workspace records", async () => {
+    const workspace = {
+      provider_kind: "agent_workspace",
+      agent_id: AGENT_ID,
+      agent_name: "Mac Agent",
+      workspace_id: "92000000-0000-4000-8000-000000000001",
+      name: "Demo App",
+      state: "ready",
+      git_branch: "main",
+      git_head: "a".repeat(40),
+      tracked_dirty_count: 1,
+      snapshot_policy: "tracked_worktree",
+      validation_profiles: [
+        {
+          profile_id: "94000000-0000-4000-8000-000000000001",
+          name: "Unit tests",
+        },
+      ],
+    };
+    const responses = [
+      { schema_version: "1.0", workspaces: [workspace] },
+      ...["path", "repo_url", "remote", "argv"].map((key) => ({
+        schema_version: "1.0",
+        workspaces: [{ ...workspace, [key]: "private" }],
+      })),
+      { schema_version: "1.0", workspaces: [workspace, workspace] },
+      {
+        schema_version: "1.0",
+        workspaces: [{ ...workspace, git_head: "not-a-sha" }],
+      },
+    ];
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () =>
+      Response.json(responses.shift()),
+    );
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.sourceWorkspaces(TEAM_ID)).resolves.toEqual({
+      schema_version: "1.0",
+      workspaces: [workspace],
+    });
+    for (let index = 0; index < 6; index += 1) {
+      await expect(client.sourceWorkspaces(TEAM_ID)).rejects.toMatchObject({
+        code: "invalid_api_response",
+      });
+    }
+  });
+
   it("generates an idempotency UUID when private-LAN HTTP hides crypto.randomUUID", () => {
     const source = {
       getRandomValues(target: Uint8Array): Uint8Array {
@@ -443,6 +490,25 @@ describe("PerfPilot browser API", () => {
   it("returns after upload acceptance without polling the Trace to a terminal state", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     let statusReads = 0;
+    const sourceBinding = {
+      provider_kind: "agent_workspace" as const,
+      agent_id: AGENT_ID,
+      workspace_id: "92000000-0000-4000-8000-000000000001",
+      snapshot_policy: "tracked_worktree" as const,
+      validation_profile_id: null,
+    };
+    const sourceAwareAnalysis = (state: AnalysisResponse["state"]): AnalysisResponse => ({
+      ...analysis(state),
+      schema_version: "1.1",
+      source_code_analysis: {
+        requested: true,
+        ...sourceBinding,
+        context_state: "waiting_for_agent",
+        match_summary: "none",
+        verification_state: "not_requested",
+        failure_code: null,
+      },
+    });
     const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
       const url = String(input);
       calls.push({ url, init });
@@ -459,7 +525,7 @@ describe("PerfPilot browser API", () => {
         });
       }
       if (url === `/api/v1/teams/${TEAM_ID}/analyses` && init.method === "POST") {
-        return Response.json(analysis("created"), { status: 201 });
+        return Response.json(sourceAwareAnalysis("created"), { status: 201 });
       }
       const slot = url.match(/\/analyses\/[^/]+\/uploads$/);
       if (slot) {
@@ -511,7 +577,9 @@ describe("PerfPilot browser API", () => {
       }
       if (url.endsWith(`/analyses/${ANALYSIS_ID}`)) {
         statusReads += 1;
-        return Response.json(analysis(statusReads === 1 ? "analyzing" : "completed"));
+        return Response.json(
+          sourceAwareAnalysis(statusReads === 1 ? "analyzing" : "completed"),
+        );
       }
       throw new Error(`undeclared request: ${url}`);
     });
@@ -530,6 +598,7 @@ describe("PerfPilot browser API", () => {
           { kind: "trace", file: trace },
           { kind: "mapping", file: mapping },
         ],
+        sourceBinding,
       },
       {
         client,
@@ -547,7 +616,7 @@ describe("PerfPilot browser API", () => {
       "trace-analysis-fixed",
     );
     expect(JSON.parse(String(create?.init.body))).toMatchObject({
-      schema_version: "1.0",
+      schema_version: "1.1",
       analysis_mode: "trace_upload",
       analysis_profile: "scroll",
       question: "为什么掉帧？",
@@ -555,6 +624,7 @@ describe("PerfPilot browser API", () => {
         { kind: "trace", mime: "application/octet-stream", size: 3 },
         { kind: "mapping", mime: "text/plain", size: 2 },
       ],
+      source_binding: sourceBinding,
     });
     const slots = calls.filter((call) => call.url.endsWith("/uploads"));
     expect(slots.map((call) => new Headers(call.init.headers).get("idempotency-key"))).toEqual([

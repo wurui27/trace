@@ -87,6 +87,24 @@ it("submits the selected remote device id with a device analysis", async () => {
         },
       ],
     }),
+    sourceWorkspaces: vi.fn().mockResolvedValue({
+      schema_version: "1.0",
+      workspaces: [
+        {
+          provider_kind: "agent_workspace",
+          agent_id: "73000000-0000-4000-8000-000000000002",
+          agent_name: "Windows Source Agent",
+          workspace_id: "92000000-0000-4000-8000-000000000002",
+          name: "Demo App",
+          state: "ready",
+          git_branch: "main",
+          git_head: "a".repeat(40),
+          tracked_dirty_count: 0,
+          snapshot_policy: "tracked_worktree",
+          validation_profiles: [],
+        },
+      ],
+    }),
   } as unknown as PerfPilotClient;
   const deviceSubmitter: DeviceSubmitter = vi.fn().mockResolvedValue({
     teamId: "team-1",
@@ -115,6 +133,10 @@ it("submits the selected remote device id with a device analysis", async () => {
   await user.click(screen.getByRole("button", { name: "新建分析" }));
   await user.click(screen.getByRole("button", { name: "真机自动测试" }));
   await screen.findByText("UNISOC ums9620");
+  await user.selectOptions(
+    await screen.findByLabelText("源码工作区"),
+    "92000000-0000-4000-8000-000000000002",
+  );
   const apk = new File([new Uint8Array([1, 2, 3])], "demo.apk", {
     type: "application/vnd.android.package-archive",
   });
@@ -127,6 +149,13 @@ it("submits the selected remote device id with a device analysis", async () => {
         teamId: "team-1",
         deviceId: "device-ready-1",
         apk,
+        sourceBinding: {
+          provider_kind: "agent_workspace",
+          agent_id: "73000000-0000-4000-8000-000000000002",
+          workspace_id: "92000000-0000-4000-8000-000000000002",
+          snapshot_policy: "tracked_worktree",
+          validation_profile_id: null,
+        },
       }),
     );
     expect(onSubmitted).toHaveBeenCalledOnce();

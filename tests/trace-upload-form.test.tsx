@@ -7,10 +7,74 @@ import { afterEach, expect, it, vi } from "vitest";
 import { TraceUploadForm } from "../app/components/trace-upload-form";
 import {
   PerfPilotApiError,
+  type PerfPilotClient,
   type SubmitTraceInput,
 } from "../app/lib/perfpilot-api";
 
 afterEach(cleanup);
+
+it("selects an Agent workspace without rendering or reading an Android device", async () => {
+  const user = userEvent.setup();
+  const devices = vi.fn();
+  const client = {
+    devices,
+    sourceWorkspaces: vi.fn().mockResolvedValue({
+      schema_version: "1.0",
+      workspaces: [
+        {
+          provider_kind: "agent_workspace",
+          agent_id: "73000000-0000-4000-8000-000000000001",
+          agent_name: "Mac Agent",
+          workspace_id: "92000000-0000-4000-8000-000000000001",
+          name: "Demo App",
+          state: "ready",
+          git_branch: "main",
+          git_head: "a".repeat(40),
+          tracked_dirty_count: 0,
+          snapshot_policy: "tracked_worktree",
+          validation_profiles: [],
+        },
+      ],
+    }),
+  } as unknown as PerfPilotClient;
+  const submitter = vi.fn().mockResolvedValue({
+    teamId: "team-1",
+    analysis: { analysis_id: "analysis-1" },
+  });
+  render(
+    <TraceUploadForm
+      client={client}
+      teamId="team-1"
+      submitter={submitter}
+    />,
+  );
+
+  expect(screen.queryByText(/Pixel 8/)).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/Android 设备/)).not.toBeInTheDocument();
+  expect(screen.queryByLabelText(/源码压缩包/)).not.toBeInTheDocument();
+  await user.selectOptions(
+    await screen.findByLabelText("源码工作区"),
+    "92000000-0000-4000-8000-000000000001",
+  );
+  await user.upload(
+    screen.getByLabelText("Trace 文件"),
+    new File([new Uint8Array([1])], "startup.trace"),
+  );
+  await user.click(screen.getByRole("button", { name: "开始分析" }));
+
+  expect(devices).not.toHaveBeenCalled();
+  expect(submitter).toHaveBeenCalledWith(
+    expect.objectContaining({
+      sourceBinding: {
+        provider_kind: "agent_workspace",
+        agent_id: "73000000-0000-4000-8000-000000000001",
+        workspace_id: "92000000-0000-4000-8000-000000000001",
+        snapshot_policy: "tracked_worktree",
+        validation_profile_id: null,
+      },
+    }),
+  );
+});
 
 it("hands the accepted analysis to the dashboard without keeping a result panel", async () => {
   const user = userEvent.setup();

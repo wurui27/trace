@@ -5,6 +5,9 @@ const MAX_JSON_BYTES = 10 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
+const CANONICAL_UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const HEX40 = /^[0-9a-f]{40}$/;
+const STABLE_CODE = /^[a-z][a-z0-9_]{0,95}$/;
 const ANALYSIS_STATES = new Set<AnalysisState>([
   "creating",
   "created",
@@ -86,6 +89,58 @@ export interface AnalysisSource {
   readonly verification: "passed" | "failed" | "unknown";
   readonly session_id: string | null;
   readonly run_id: string | null;
+}
+
+export interface SourceWorkspaceKey {
+  readonly provider_kind: "agent_workspace";
+  readonly agent_id: string;
+  readonly workspace_id: string;
+  readonly snapshot_policy: "tracked_worktree";
+}
+
+export interface SourceBinding extends SourceWorkspaceKey {
+  readonly validation_profile_id: string | null;
+}
+
+export interface SourceWorkspaceView extends SourceWorkspaceKey {
+  readonly agent_name: string;
+  readonly name: string;
+  readonly state: "ready" | "invalid";
+  readonly git_branch: string | null;
+  readonly git_head: string;
+  readonly tracked_dirty_count: number;
+  readonly validation_profiles: ReadonlyArray<{
+    readonly profile_id: string;
+    readonly name: string;
+  }>;
+}
+
+export interface SourceWorkspaceListResponse {
+  readonly schema_version: "1.0";
+  readonly workspaces: readonly SourceWorkspaceView[];
+}
+
+export interface SourceCodeAnalysis extends SourceBinding {
+  readonly requested: true;
+  readonly context_state:
+    | "waiting_for_agent"
+    | "extracting"
+    | "available"
+    | "unavailable";
+  readonly match_summary: "strong" | "weak" | "none";
+  readonly verification_state:
+    | "not_requested"
+    | "pending"
+    | "validating"
+    | "verified"
+    | "apply_failed"
+    | "validation_failed"
+    | "source_changed"
+    | "not_configured"
+    | "timeout"
+    | "canceled"
+    | "unavailable";
+  readonly failure_code: string | null;
 }
 
 export interface ReportMetric {
@@ -226,7 +281,7 @@ export interface TraceFileSelection {
 }
 
 export interface AnalysisResponse {
-  readonly schema_version: "1.0";
+  readonly schema_version: "1.0" | "1.1";
   readonly analysis_id: string;
   readonly team_id: string;
   readonly analysis_mode: AnalysisMode;
@@ -250,6 +305,7 @@ export interface AnalysisResponse {
   readonly failure: AnalysisFailure | null;
   readonly ai_rounds?: readonly AnalysisAiRound[];
   readonly source_analysis?: AnalysisSource;
+  readonly source_code_analysis?: SourceCodeAnalysis;
   readonly device_id?: string;
   readonly application_version_id?: string | null;
   readonly application_metadata?: ApplicationMetadata | null;
@@ -453,6 +509,10 @@ export interface PerfPilotClient {
   csrf(signal?: AbortSignal): Promise<string>;
   me(signal?: AbortSignal): Promise<MeResponse>;
   devices(teamId: string, signal?: AbortSignal): Promise<RemoteDeviceListResponse>;
+  sourceWorkspaces(
+    teamId: string,
+    signal?: AbortSignal,
+  ): Promise<SourceWorkspaceListResponse>;
   agents(teamId: string, signal?: AbortSignal): Promise<AgentListResponse>;
   createAgentRegistrationCode(
     teamId: string,
@@ -471,6 +531,7 @@ export interface PerfPilotClient {
     deviceId: string,
     apk: InputDescriptor,
     idempotencyKey: string,
+    sourceBinding?: SourceBinding,
     signal?: AbortSignal,
   ): Promise<AnalysisResponse>;
   createTrace(
@@ -479,6 +540,7 @@ export interface PerfPilotClient {
     question: string | null,
     inputs: readonly InputDescriptor[],
     idempotencyKey: string,
+    sourceBinding?: SourceBinding,
     signal?: AbortSignal,
   ): Promise<AnalysisResponse>;
   reserveInput(
@@ -704,6 +766,130 @@ export function validUploadUrl(
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   const allowedKeys = new Set(allowed);
   return Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+function validSourceWorkspace(value: unknown): value is SourceWorkspaceView {
+  if (
+    !object(value) ||
+    !exactKeys(value, [
+      "provider_kind",
+      "agent_id",
+      "agent_name",
+      "workspace_id",
+      "name",
+      "state",
+      "git_branch",
+      "git_head",
+      "tracked_dirty_count",
+      "snapshot_policy",
+      "validation_profiles",
+    ]) ||
+    value.provider_kind !== "agent_workspace" ||
+    typeof value.agent_id !== "string" ||
+    !CANONICAL_UUID.test(value.agent_id) ||
+    typeof value.workspace_id !== "string" ||
+    !CANONICAL_UUID.test(value.workspace_id) ||
+    typeof value.agent_name !== "string" ||
+    value.agent_name.length < 1 ||
+    value.agent_name.length > 128 ||
+    typeof value.name !== "string" ||
+    value.name.length < 1 ||
+    value.name.length > 128 ||
+    !["ready", "invalid"].includes(String(value.state)) ||
+    (value.git_branch !== null &&
+      (typeof value.git_branch !== "string" || value.git_branch.length > 255)) ||
+    typeof value.git_head !== "string" ||
+    !HEX40.test(value.git_head) ||
+    !Number.isSafeInteger(value.tracked_dirty_count) ||
+    Number(value.tracked_dirty_count) < 0 ||
+    value.snapshot_policy !== "tracked_worktree" ||
+    !Array.isArray(value.validation_profiles) ||
+    value.validation_profiles.length > 16
+  ) {
+    return false;
+  }
+  const profileIds = new Set<string>();
+  return value.validation_profiles.every((profile) => {
+    if (
+      !object(profile) ||
+      !exactKeys(profile, ["profile_id", "name"]) ||
+      typeof profile.profile_id !== "string" ||
+      !CANONICAL_UUID.test(profile.profile_id) ||
+      profileIds.has(profile.profile_id) ||
+      typeof profile.name !== "string" ||
+      profile.name.length < 1 ||
+      profile.name.length > 128
+    ) {
+      return false;
+    }
+    profileIds.add(profile.profile_id);
+    return true;
+  });
+}
+
+function sourceWorkspaceListResponse(value: unknown): SourceWorkspaceListResponse {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "workspaces"]) ||
+    value.schema_version !== "1.0" ||
+    !Array.isArray(value.workspaces) ||
+    value.workspaces.length > 256 ||
+    !value.workspaces.every(validSourceWorkspace)
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  const ids = value.workspaces.map((workspace) => workspace.workspace_id);
+  if (new Set(ids).size !== ids.length) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as SourceWorkspaceListResponse;
+}
+
+function validSourceCodeAnalysis(value: unknown): value is SourceCodeAnalysis {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "requested",
+      "provider_kind",
+      "agent_id",
+      "workspace_id",
+      "snapshot_policy",
+      "validation_profile_id",
+      "context_state",
+      "match_summary",
+      "verification_state",
+      "failure_code",
+    ]) &&
+    value.requested === true &&
+    value.provider_kind === "agent_workspace" &&
+    typeof value.agent_id === "string" &&
+    CANONICAL_UUID.test(value.agent_id) &&
+    typeof value.workspace_id === "string" &&
+    CANONICAL_UUID.test(value.workspace_id) &&
+    value.snapshot_policy === "tracked_worktree" &&
+    (value.validation_profile_id === null ||
+      (typeof value.validation_profile_id === "string" &&
+        CANONICAL_UUID.test(value.validation_profile_id))) &&
+    ["waiting_for_agent", "extracting", "available", "unavailable"].includes(
+      String(value.context_state),
+    ) &&
+    ["strong", "weak", "none"].includes(String(value.match_summary)) &&
+    [
+      "not_requested",
+      "pending",
+      "validating",
+      "verified",
+      "apply_failed",
+      "validation_failed",
+      "source_changed",
+      "not_configured",
+      "timeout",
+      "canceled",
+      "unavailable",
+    ].includes(String(value.verification_state)) &&
+    (value.failure_code === null ||
+      (typeof value.failure_code === "string" && STABLE_CODE.test(value.failure_code)))
+  );
 }
 
 function stringArray(value: unknown, maximum: number, minimum = 0): value is string[] {
@@ -1505,11 +1691,12 @@ function validActiveLease(value: unknown): value is ActiveAnalysisLease {
 function analysisResponse(value: unknown): AnalysisResponse {
   const hasAiRounds = object(value) && "ai_rounds" in value;
   const hasSource = object(value) && "source_analysis" in value;
+  const hasSourceCode = object(value) && "source_code_analysis" in value;
   const createdAt = object(value) ? value.created_at : undefined;
   const cancelRequestedAt = object(value) ? value.cancel_requested_at : undefined;
   if (
     !object(value) ||
-    value.schema_version !== "1.0" ||
+    !["1.0", "1.1"].includes(String(value.schema_version)) ||
     !["device", "trace_upload", "memory_upload"].includes(String(value.analysis_mode)) ||
     typeof value.analysis_id !== "string" ||
     typeof value.team_id !== "string" ||
@@ -1525,7 +1712,9 @@ function analysisResponse(value: unknown): AnalysisResponse {
       (typeof cancelRequestedAt !== "string" ||
         cancelRequestedAt.length > 64 ||
         Number.isNaN(Date.parse(cancelRequestedAt)))) ||
-    (value.failure !== null && !validFailure(value.failure))
+    (value.failure !== null && !validFailure(value.failure)) ||
+    (value.schema_version === "1.1") !== hasSourceCode ||
+    (hasSourceCode && !validSourceCodeAnalysis(value.source_code_analysis))
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
@@ -1723,6 +1912,15 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         ),
       );
     },
+    async sourceWorkspaces(teamId, signal) {
+      return sourceWorkspaceListResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/source-workspaces`,
+          {},
+          signal,
+        ),
+      );
+    },
     async agents(teamId, signal) {
       return agentListResponse(
         await requestJson(
@@ -1774,13 +1972,21 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         ),
       );
     },
-    async createTrace(teamId, profile, question, inputs, idempotencyKey, signal) {
+    async createTrace(
+      teamId,
+      profile,
+      question,
+      inputs,
+      idempotencyKey,
+      sourceBinding,
+      signal,
+    ) {
       const payload = await requestJson(
         `/api/v1/teams/${encodeURIComponent(teamId)}/analyses`,
         {
           method: "POST",
           body: JSON.stringify({
-            schema_version: "1.0",
+            schema_version: sourceBinding ? "1.1" : "1.0",
             analysis_mode: "trace_upload",
             analysis_profile: profile,
             question,
@@ -1790,6 +1996,7 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
               size: input.size,
               sha256_b64: input.sha256_b64,
             })),
+            ...(sourceBinding ? { source_binding: sourceBinding } : {}),
           }),
         },
         signal,
@@ -1797,13 +2004,20 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
       );
       return analysisResponse(payload);
     },
-    async createDeviceAnalysis(teamId, deviceId, apk, idempotencyKey, signal) {
+    async createDeviceAnalysis(
+      teamId,
+      deviceId,
+      apk,
+      idempotencyKey,
+      sourceBinding,
+      signal,
+    ) {
       const payload = await requestJson(
         `/api/v1/teams/${encodeURIComponent(teamId)}/analyses`,
         {
           method: "POST",
           body: JSON.stringify({
-            schema_version: "1.0",
+            schema_version: sourceBinding ? "1.1" : "1.0",
             analysis_mode: "device",
             device_id: deviceId,
             scenarios: ["cold_start", "scroll", "memory_cycle"],
@@ -1813,6 +2027,7 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
               size: apk.size,
               sha256_b64: apk.sha256_b64,
             },
+            ...(sourceBinding ? { source_binding: sourceBinding } : {}),
           }),
         },
         signal,
@@ -2015,6 +2230,7 @@ export interface SubmitTraceInput {
   readonly profile: TraceProfile;
   readonly question?: string;
   readonly files: readonly TraceFileSelection[];
+  readonly sourceBinding?: SourceBinding;
   readonly signal?: AbortSignal;
   readonly onProgress?: (phase: TraceSubmissionPhase, detail?: string) => void;
 }
@@ -2089,6 +2305,7 @@ export async function enqueueTraceAnalysis(
     question,
     descriptors,
     randomUUID(),
+    submission.sourceBinding,
     signal,
   );
   if (created.team_id !== teamId) {
@@ -2124,6 +2341,7 @@ export interface SubmitDeviceAnalysisInput {
   readonly teamId: string;
   readonly deviceId: string;
   readonly apk: File;
+  readonly sourceBinding?: SourceBinding;
   readonly signal?: AbortSignal;
   readonly onProgress?: (phase: DeviceSubmissionPhase) => void;
 }
@@ -2164,6 +2382,7 @@ export async function enqueueDeviceAnalysis(
     submission.deviceId,
     apk,
     randomUUID(),
+    submission.sourceBinding,
     signal,
   );
   const authorization = created.apk_upload;

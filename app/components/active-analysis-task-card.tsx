@@ -64,6 +64,13 @@ export function activeAnalysisStageLabel(analysis: AnalysisResponse): string {
   if (["creating", "created", "uploading"].includes(analysis.state)) {
     return analysis.analysis_mode === "device" ? "正在上传并校验 APK" : "正在准备分析输入";
   }
+  const source = analysis.source_code_analysis;
+  const sourceContextActive =
+    source?.requested &&
+    ["waiting_for_agent", "extracting"].includes(source.context_state);
+  const sourceVerificationActive =
+    source?.requested &&
+    ["pending", "validating"].includes(source.verification_state);
   if (analysis.analysis_mode === "device") {
     if (analysis.state === "queued") return "等待设备 Agent 接收任务";
     if (analysis.state === "scheduled") return "设备 Agent 已接收任务";
@@ -73,13 +80,19 @@ export function activeAnalysisStageLabel(analysis: AnalysisResponse): string {
         ? `设备 Agent 正在执行${scenarioNames[running.scenario_type]}`
         : "设备 Agent 正在自动采集";
     }
-    if (analysis.state === "analyzing") return "SmartPerfetto 正在解析真机 Trace";
+    if (analysis.state === "analyzing") {
+      if (sourceContextActive) return "正在读取源码上下文";
+      if (sourceVerificationActive) return "正在验证源码修复";
+      return "SmartPerfetto 正在解析真机 Trace";
+    }
     return "等待真机分析资源";
   }
   const smartPerfetto = analysis.stages.find(
     (stage) => stage.stage === "smartperfetto",
   );
   if (smartPerfetto?.state === "running") return "SmartPerfetto 正在解析 Trace";
+  if (sourceContextActive) return "正在读取源码上下文";
+  if (sourceVerificationActive) return "正在验证源码修复";
   const aiStage = analysis.stages.find((stage) => stage.stage === "perfpilot_ai");
   if (aiStage?.state === "running") {
     return runningAiProcessLabel(analysis.ai_rounds);

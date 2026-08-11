@@ -10,15 +10,18 @@ import {
 } from "react";
 import { Smartphone, Upload, X } from "lucide-react";
 
-import type { SubmittedTraceAnalysis } from "../lib/perfpilot-api";
+import type { PerfPilotClient, SubmittedTraceAnalysis } from "../lib/perfpilot-api";
 import { DeviceAnalysisForm, type DeviceSubmitter } from "./device-analysis-form";
 import { TraceUploadForm, type TraceSubmitter } from "./trace-upload-form";
+import { useOptionalPerfPilotSession } from "./perfpilot-session-provider";
 
 interface NewAnalysisDialogProps {
   readonly disabled?: boolean;
   readonly submitter?: TraceSubmitter;
   readonly deviceSubmitter?: DeviceSubmitter;
   readonly onSubmitted?: (result: SubmittedTraceAnalysis) => void;
+  readonly client?: PerfPilotClient;
+  readonly teamId?: string | null;
 }
 
 export function NewAnalysisDialog({
@@ -26,7 +29,12 @@ export function NewAnalysisDialog({
   submitter,
   deviceSubmitter,
   onSubmitted,
+  client: providedClient,
+  teamId: providedTeamId,
 }: NewAnalysisDialogProps = {}) {
+  const session = useOptionalPerfPilotSession();
+  const client = providedClient ?? session?.client;
+  const teamId = providedTeamId ?? session?.team?.id ?? null;
   const [isOpen, setIsOpen] = useState(false);
   const [mode, setMode] = useState<"device" | "trace">("trace");
   const triggerRef = useRef<HTMLButtonElement>(null);
@@ -179,6 +187,8 @@ export function NewAnalysisDialog({
             {mode === "trace" ? (
               <TraceUploadForm
                 submitter={submitter}
+                client={client}
+                teamId={teamId}
                 onCancel={closeDialog}
                 onSubmitted={handleSubmitted}
               />
