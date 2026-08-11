@@ -298,6 +298,46 @@ describe("AnalysisReportView", () => {
     expect(screen.getByText("辅助指标 4")).toBeVisible();
   });
 
+  it("does not render source paths for weak source matches", async () => {
+    const user = userEvent.setup();
+    const base = sourceAwareReport();
+    if (base.schema_version !== "1.2") throw new Error("expected report 1.2");
+    const weak = {
+      ...base,
+      source_code: {
+        ...base.source_code,
+        requested: true,
+        provider_kind: "agent_workspace" as const,
+        agent_id: "71000000-0000-4000-8000-000000000001",
+        workspace_id: "92000000-0000-4000-8000-000000000001",
+        snapshot_policy: "tracked_worktree" as const,
+        context_state: "available" as const,
+        match_summary: "weak" as const,
+        source_refs: [
+          {
+            source_ref_id: "95000000-0000-4000-8000-000000000001",
+            relative_path: "private/Startup.kt",
+            language: "kotlin" as const,
+            symbol: null,
+            start_line: 1,
+            end_line: 2,
+            content_sha256: "a".repeat(64),
+            snapshot_hash: "b".repeat(64),
+            match_grade: "weak" as const,
+            finding_ids: [],
+            evidence_ids: [],
+            rule_ids: [],
+          },
+        ],
+      },
+    };
+    render(<AnalysisReportView report={weak} onRetrySynthesis={vi.fn()} retrying={false} />);
+
+    await user.click(screen.getByRole("tab", { name: "技术附录" }));
+    expect(screen.queryByText(/private\/Startup\.kt/)).not.toBeInTheDocument();
+    expect(screen.getByText("源码匹配不足，未公开文件路径或行号。")).toBeVisible();
+  });
+
   it("renders the concise completed report in evidence-first order", () => {
     const { container } = render(
       <AnalysisReportView report={report()} onRetrySynthesis={vi.fn()} retrying={false} />,

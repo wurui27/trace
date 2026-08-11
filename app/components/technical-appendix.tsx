@@ -33,14 +33,21 @@ export function TechnicalAppendix({ report }: { readonly report: SourceAwareAnal
         ) : (
           <p>本次没有源码快照。</p>
         )}
-        {report.source_code.source_refs.map((reference) => (
-          <p key={reference.source_ref_id}>
-            {reference.relative_path} · {reference.start_line}-{reference.end_line} · {reference.match_grade}
-          </p>
-        ))}
+        {report.source_code.match_summary === "strong" ? (
+          report.source_code.source_refs.map((reference) => (
+            <p key={reference.source_ref_id}>
+              {reference.relative_path} · {reference.start_line}-{reference.end_line} · {reference.match_grade}
+            </p>
+          ))
+        ) : (
+          <p>源码匹配不足，未公开文件路径或行号。</p>
+        )}
         {report.source_code.exclusions.map((exclusion, index) => (
           <p key={`${exclusion.reason_code}:${index}`}>
-            {exclusion.relative_path ?? "未公开路径"} · {exclusion.reason_code}
+            {report.source_code.match_summary === "strong" && exclusion.relative_path
+              ? `${exclusion.relative_path} · `
+              : null}
+            {exclusion.reason_code}
           </p>
         ))}
       </section>

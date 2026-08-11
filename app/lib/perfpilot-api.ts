@@ -1552,7 +1552,23 @@ function validSourceCodeReport(value: unknown): value is SourceCodeReport {
   const exclusionsValid = value.exclusions.every((item) => object(item) && exactKeys(item, ["relative_path", "reason_code"]) &&
     (item.relative_path === null || typeof item.relative_path === "string") && typeof item.reason_code === "string");
   const limitationsValid = value.limitations.every((item) => object(item) && exactKeys(item, ["limitation_id", "summary"]) && typeof item.limitation_id === "string" && typeof item.summary === "string");
-  return snapshotValid && refsValid && exclusionsValid && limitationsValid && value.fixes.every((fix) => validSourceFix(fix, true));
+  const fixesValid = value.fixes.every((fix) => validSourceFix(fix, true));
+  if (!snapshotValid || !refsValid || !exclusionsValid || !limitationsValid || !fixesValid) {
+    return false;
+  }
+  if (value.context_state !== "available") {
+    return value.snapshot === null && value.match_summary === "none" &&
+      value.source_refs.length === 0 && value.fixes.length === 0;
+  }
+  if (value.snapshot === null) return false;
+  if (value.match_summary === "none") {
+    return value.source_refs.length === 0 && value.fixes.length === 0;
+  }
+  if (value.source_refs.length === 0 || value.source_refs.some(
+    (reference) => reference.match_grade !== value.match_summary ||
+      reference.snapshot_hash !== value.snapshot?.snapshot_hash,
+  )) return false;
+  return value.match_summary === "strong" || value.fixes.length === 0;
 }
 
 function validSynthesisProvenance(value: unknown): value is SynthesisProvenance {

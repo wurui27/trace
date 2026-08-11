@@ -1145,6 +1145,88 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("rejects source refs for none and fixes for weak source matches", async () => {
+    const sourceRef = {
+      source_ref_id: "95000000-0000-4000-8000-000000000001",
+      relative_path: "app/src/main/java/demo/Startup.kt",
+      language: "kotlin",
+      symbol: null,
+      start_line: 1,
+      end_line: 2,
+      content_sha256: "a".repeat(64),
+      snapshot_hash: "b".repeat(64),
+      match_grade: "none",
+      finding_ids: [],
+      evidence_ids: [],
+      rule_ids: [],
+    };
+    const sourceBase = {
+      requested: true,
+      provider_kind: "agent_workspace",
+      agent_id: AGENT_ID,
+      workspace_id: "92000000-0000-4000-8000-000000000001",
+      snapshot_policy: "tracked_worktree",
+      validation_profile_id: "94000000-0000-4000-8000-000000000001",
+      snapshot: {
+        snapshot_id: "93000000-0000-4000-8000-000000000001",
+        snapshot_hash: "b".repeat(64),
+        git_head: "c".repeat(40),
+      },
+      context_state: "available",
+      exclusions: [],
+      limitations: [],
+    };
+    const none = sourceAwareReportPayload();
+    none.source_code = {
+      ...sourceBase,
+      match_summary: "none",
+      source_refs: [sourceRef],
+      fixes: [],
+    };
+    const weak = sourceAwareReportPayload();
+    weak.source_code = {
+      ...sourceBase,
+      match_summary: "weak",
+      source_refs: [{ ...sourceRef, match_grade: "weak" }],
+      fixes: [{
+        fix_id: "96000000-0000-4000-8000-000000000001",
+        finding_id: "85000000-0000-4000-8000-000000000001",
+        evidence_ids: ["86000000-0000-4000-8000-000000000001"],
+        recommendation_priority: "p1",
+        source_ref_ids: [sourceRef.source_ref_id],
+        rule_id: "android.ui.blocking_wait",
+        match_grade: "strong",
+        relative_path: sourceRef.relative_path,
+        symbol: null,
+        diagnosis: "blocking wait",
+        diff: "--- a/Startup.kt\n+++ b/Startup.kt",
+        validation_profile_id: "94000000-0000-4000-8000-000000000001",
+        retest_target: "startup",
+        verification: {
+          state: "not_configured",
+          exit_code: null,
+          duration_ms: null,
+          profile_id: "94000000-0000-4000-8000-000000000001",
+          patch_sha256: "d".repeat(64),
+          log_summary: null,
+          patch_artifact: null,
+        },
+      }],
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(none))
+      .mockResolvedValueOnce(Response.json(weak));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
   it("rejects unknown or transport-private report fields", async () => {
     const unknown = { ...reportPayload(), unexpected: true };
     const privateReport = structuredClone(reportPayload());
