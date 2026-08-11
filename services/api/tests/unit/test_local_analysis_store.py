@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 from uuid import UUID
 
@@ -151,6 +153,58 @@ def test_store_replaces_existing_state_without_leaving_temporary_files(
         "version": 2,
     }
     assert sorted(path.name for path in analysis_directory.iterdir()) == ["state.json"]
+
+
+def test_store_reports_post_replace_directory_fsync_as_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalAnalysisStore(tmp_path)
+    initial = {
+        "schema_version": "1.0",
+        "team_id": str(TEAM_ID),
+        "analysis_id": str(ANALYSIS_ID),
+        "version": 1,
+    }
+    updated = {**initial, "version": 2}
+    store.save_state(TEAM_ID, ANALYSIS_ID, initial)
+    original_fsync = os.fsync
+
+    def fail_directory_fsync(descriptor: int) -> None:
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("directory fsync failed")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+    with pytest.raises(LocalAnalysisStoreError) as raised:
+        store.save_state(TEAM_ID, ANALYSIS_ID, updated)
+
+    assert getattr(raised.value, "committed", False) is True
+    assert store.load_document(TEAM_ID, ANALYSIS_ID, "state.json") == updated
+
+
+def test_store_pre_replace_failure_preserves_previous_document(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalAnalysisStore(tmp_path)
+    initial = {
+        "schema_version": "1.0",
+        "team_id": str(TEAM_ID),
+        "analysis_id": str(ANALYSIS_ID),
+        "version": 1,
+    }
+    store.save_state(TEAM_ID, ANALYSIS_ID, initial)
+
+    def fail_replace(_source: Path, _target: Path) -> None:
+        raise OSError("replace failed")
+
+    monkeypatch.setattr(os, "replace", fail_replace)
+    with pytest.raises(LocalAnalysisStoreError) as raised:
+        store.save_state(TEAM_ID, ANALYSIS_ID, {**initial, "version": 2})
+
+    assert getattr(raised.value, "committed", False) is False
+    assert store.load_document(TEAM_ID, ANALYSIS_ID, "state.json") == initial
 
 
 def test_store_isolates_same_analysis_id_between_teams(tmp_path: Path) -> None:

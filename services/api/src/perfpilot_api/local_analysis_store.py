@@ -20,7 +20,11 @@ _MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 
 
 class LocalAnalysisStoreError(RuntimeError):
-    pass
+    committed = False
+
+
+class LocalAnalysisStoreDurabilityError(LocalAnalysisStoreError):
+    committed = True
 
 
 def _reject_constant(_value: str) -> object:
@@ -218,6 +222,7 @@ class LocalAnalysisStore:
         if target.exists() and not target.is_file():
             raise LocalAnalysisStoreError("unsafe local analysis path")
         temporary = directory / f".{name}.{uuid4().hex}.tmp"
+        committed = False
         try:
             descriptor = os.open(
                 temporary,
@@ -229,14 +234,21 @@ class LocalAnalysisStore:
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, target)
+            committed = True
             directory_descriptor = os.open(directory, os.O_RDONLY)
             try:
                 os.fsync(directory_descriptor)
             finally:
                 os.close(directory_descriptor)
         except OSError:
-            temporary.unlink(missing_ok=True)
-            raise LocalAnalysisStoreError("local analysis persistence failed") from None
+            if not committed:
+                temporary.unlink(missing_ok=True)
+                raise LocalAnalysisStoreError(
+                    "local analysis persistence failed"
+                ) from None
+            raise LocalAnalysisStoreDurabilityError(
+                "local analysis durability uncertain"
+            ) from None
 
     def save_state(
         self,
@@ -327,5 +339,6 @@ class LocalAnalysisStore:
 
 __all__ = [
     "LocalAnalysisStore",
+    "LocalAnalysisStoreDurabilityError",
     "LocalAnalysisStoreError",
 ]

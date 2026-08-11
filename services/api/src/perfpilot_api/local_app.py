@@ -55,7 +55,11 @@ from perfpilot_api.engines.smartperfetto_contracts import (
 )
 from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
 from perfpilot_api.local_device import AdbDeviceProbe, LocalDevice, LocalDeviceProbe
-from perfpilot_api.local_analysis_store import LocalAnalysisStore, LocalAnalysisStoreError
+from perfpilot_api.local_analysis_store import (
+    LocalAnalysisStore,
+    LocalAnalysisStoreDurabilityError,
+    LocalAnalysisStoreError,
+)
 from perfpilot_api.local_control_store import (
     LOCAL_SESSION_TTL,
     LocalControlStore,
@@ -1781,9 +1785,33 @@ class _LocalRuntime:
         self.public_origin = _public_origin(public_origin)
         self.poll_interval_seconds = poll_interval_seconds
         self.analyses: dict[tuple[UUID, UUID], _LocalAnalysis] = {}
-        self.uploads: dict[str, _LocalUpload] = {}
+        self.uploads: dict[tuple[UUID, UUID, str], _LocalUpload] = {}
+        self.upload_authorizations: dict[str, tuple[UUID, UUID, str]] = {}
         self.lock = asyncio.Lock()
         self.tasks: set[asyncio.Task[None]] = set()
+
+    @staticmethod
+    def _upload_key(upload: _LocalUpload) -> tuple[UUID, UUID, str]:
+        return (upload.team_id, upload.analysis_id, upload.upload_id)
+
+    @staticmethod
+    def _upload_token_digest(token: str) -> str:
+        return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+    def _register_upload(self, upload: _LocalUpload) -> None:
+        key = self._upload_key(upload)
+        digest = self._upload_token_digest(upload.token)
+        if key in self.uploads or digest in self.upload_authorizations:
+            raise ValueError("invalid persisted local analysis")
+        self.uploads[key] = upload
+        self.upload_authorizations[digest] = key
+
+    def _unregister_upload(self, upload: _LocalUpload) -> None:
+        key = self._upload_key(upload)
+        self.uploads.pop(key, None)
+        digest = self._upload_token_digest(upload.token)
+        if self.upload_authorizations.get(digest) == key:
+            del self.upload_authorizations[digest]
 
     def _state_document(self, analysis: _LocalAnalysis) -> dict[str, object]:
         document: dict[str, object] = {
@@ -2046,7 +2074,7 @@ class _LocalRuntime:
                 path = self.store.upload_path(
                     analysis.team_id, analysis.analysis_id, item.upload_id
                 )
-                self.uploads[item.upload_id] = _LocalUpload(
+                upload = _LocalUpload(
                     upload_id=item.upload_id,
                     team_id=analysis.team_id,
                     analysis_id=analysis.analysis_id,
@@ -2058,6 +2086,7 @@ class _LocalRuntime:
                     path=path,
                     bytes_ready=path.is_file(),
                 )
+                self._register_upload(upload)
             self.analyses[(team_id, analysis_id)] = analysis
             restore_canceled = (
                 analysis.cancel_requested_at is not None
@@ -2130,6 +2159,22 @@ class _LocalRuntime:
         analysis.source_code_analysis = _source_code_analysis_document(
             analysis.source_binding
         )
+        upload: _LocalUpload | None = None
+        if analysis.analysis_mode == "device":
+            target = analysis.inputs["apk"]
+            upload_id = str(uuid4())
+            upload = _LocalUpload(
+                upload_id=upload_id,
+                team_id=team_id,
+                analysis_id=analysis.analysis_id,
+                kind="apk",
+                mime=target.descriptor.mime,
+                size=target.descriptor.size,
+                sha256_b64=target.descriptor.sha256_b64,
+                token=secrets.token_urlsafe(32),
+                path=self.store.upload_path(team_id, analysis.analysis_id, upload_id),
+            )
+            target.upload_id = upload_id
         async with self.lock:
             if any(
                 current.state in _ACTIVE_ANALYSIS_STATES
@@ -2141,25 +2186,19 @@ class _LocalRuntime:
                     "analysis already active",
                 )
             self.analyses[(team_id, analysis.analysis_id)] = analysis
-            if analysis.analysis_mode == "device":
-                target = analysis.inputs["apk"]
-                upload_id = str(uuid4())
-                upload = _LocalUpload(
-                    upload_id=upload_id,
-                    team_id=team_id,
-                    analysis_id=analysis.analysis_id,
-                    kind="apk",
-                    mime=target.descriptor.mime,
-                    size=target.descriptor.size,
-                    sha256_b64=target.descriptor.sha256_b64,
-                    token=secrets.token_urlsafe(32),
-                    path=self.store.upload_path(
-                        team_id, analysis.analysis_id, upload_id
-                    ),
-                )
-                self.uploads[upload_id] = upload
-                target.upload_id = upload_id
-        await self._persist(analysis)
+            if upload is not None:
+                self._register_upload(upload)
+        try:
+            await self._persist(analysis)
+        except LocalAnalysisStoreDurabilityError:
+            raise
+        except BaseException:
+            async with self.lock:
+                if self.analyses.get((team_id, analysis.analysis_id)) is analysis:
+                    del self.analyses[(team_id, analysis.analysis_id)]
+                if upload is not None:
+                    self._unregister_upload(upload)
+            raise
         return analysis
 
     async def recover(
@@ -2532,6 +2571,7 @@ class _LocalRuntime:
         analysis: _LocalAnalysis,
         request: _ReserveUploadRequest,
     ) -> _LocalUpload:
+        upload: _LocalUpload | None = None
         async with self.lock:
             target = analysis.inputs.get(request.artifact_kind)
             if target is None or (
@@ -2541,7 +2581,11 @@ class _LocalRuntime:
             ):
                 raise HTTPException(status.HTTP_409_CONFLICT, "upload metadata changed")
             if target.upload_id is not None:
-                return self.uploads[target.upload_id]
+                return self.uploads[
+                    (analysis.team_id, analysis.analysis_id, target.upload_id)
+                ]
+            previous_state = analysis.state
+            previous_version = analysis.version
             upload_id = str(uuid4())
             upload = _LocalUpload(
                 upload_id=upload_id,
@@ -2556,17 +2600,33 @@ class _LocalRuntime:
                     analysis.team_id, analysis.analysis_id, upload_id
                 ),
             )
-            self.uploads[upload_id] = upload
+            self._register_upload(upload)
             target.upload_id = upload_id
             analysis.state = "uploading"
             analysis.version += 1
-        await self._persist(analysis)
+        try:
+            await self._persist(analysis)
+        except LocalAnalysisStoreDurabilityError:
+            raise
+        except BaseException:
+            async with self.lock:
+                if target.upload_id == upload_id:
+                    target.upload_id = None
+                    analysis.state = previous_state
+                    analysis.version = previous_version
+                    self._unregister_upload(upload)
+            raise
         return upload
 
     async def put(self, upload_id: str, token: str, request: Request) -> None:
         async with self.lock:
-            upload = self.uploads.get(upload_id)
-        if upload is None or not hmac.compare_digest(upload.token, token):
+            key = self.upload_authorizations.get(self._upload_token_digest(token))
+            upload = self.uploads.get(key) if key is not None else None
+        if (
+            upload is None
+            or upload.upload_id != upload_id
+            or not hmac.compare_digest(upload.token, token)
+        ):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "upload not found")
         if request.headers.get("content-type", "").split(";", 1)[0] != upload.mime:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "content type changed")
@@ -2614,8 +2674,12 @@ class _LocalRuntime:
         analysis: _LocalAnalysis,
         request: _FinalizeUploadRequest,
     ) -> _LocalUpload:
+        start_gate: asyncio.Event | None = None
+        task: asyncio.Task[None] | None = None
         async with self.lock:
-            upload = self.uploads.get(request.upload_id)
+            upload = self.uploads.get(
+                (analysis.team_id, analysis.analysis_id, request.upload_id)
+            )
             if (
                 upload is None
                 or upload.team_id != analysis.team_id
@@ -2626,6 +2690,12 @@ class _LocalRuntime:
             ):
                 raise HTTPException(status.HTTP_409_CONFLICT, "upload is not ready")
             target = analysis.inputs[upload.kind]
+            previous_finalized = target.finalized
+            previous_artifact_id = target.artifact_id
+            previous_version = analysis.version
+            previous_state = analysis.state
+            previous_started_at = analysis.started_at
+            previous_stages = dict(analysis.stages)
             target.finalized = True
             target.artifact_id = target.artifact_id or str(uuid4())
             analysis.version += 1
@@ -2635,11 +2705,40 @@ class _LocalRuntime:
                 analysis.stages["smartperfetto"] = "running"
                 analysis.state = "analyzing"
                 analysis.started_at = analysis.started_at or datetime.now(UTC)
-                task = asyncio.create_task(self._execute(analysis))
+                start_gate = asyncio.Event()
+
+                async def execute_reserved() -> None:
+                    assert start_gate is not None
+                    await start_gate.wait()
+                    await self._execute(analysis)
+
+                task = asyncio.create_task(execute_reserved())
                 analysis.task = task
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)
-        await self._persist(analysis)
+        try:
+            await self._persist(analysis)
+        except LocalAnalysisStoreDurabilityError:
+            if start_gate is not None:
+                start_gate.set()
+            raise
+        except BaseException:
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                self.tasks.discard(task)
+            async with self.lock:
+                if analysis.task is task:
+                    analysis.task = None
+                target.finalized = previous_finalized
+                target.artifact_id = previous_artifact_id
+                analysis.version = previous_version
+                analysis.state = previous_state
+                analysis.started_at = previous_started_at
+                analysis.stages = previous_stages
+            raise
+        if start_gate is not None:
+            start_gate.set()
         return upload
 
     async def _execute(self, analysis: _LocalAnalysis) -> None:
@@ -2651,7 +2750,9 @@ class _LocalRuntime:
             trace = analysis.inputs["trace"]
             if trace.upload_id is None:
                 raise RuntimeError("Trace upload is missing")
-            trace_path = self.uploads[trace.upload_id].path
+            trace_path = self.uploads[
+                (analysis.team_id, analysis.analysis_id, trace.upload_id)
+            ].path
             run = await self.gateway.submit(
                 trace_path=trace_path,
                 profile=analysis.profile,
@@ -2688,7 +2789,9 @@ class _LocalRuntime:
         apk = analysis.inputs["apk"]
         if apk.upload_id is None:
             raise RuntimeError("APK upload is missing")
-        apk_path = self.uploads[apk.upload_id].path
+        apk_path = self.uploads[
+            (analysis.team_id, analysis.analysis_id, apk.upload_id)
+        ].path
         workspace = self.store.analysis_subdirectory(
             analysis.team_id, analysis.analysis_id, "device-captures"
         )
@@ -3096,7 +3199,9 @@ class _LocalRuntime:
             target = analysis.inputs["apk"]
             if target.upload_id is None:
                 raise RuntimeError("local APK upload is unavailable")
-            upload = self.uploads[target.upload_id]
+            upload = self.uploads[
+                (analysis.team_id, analysis.analysis_id, target.upload_id)
+            ]
             verdicts = {
                 "valid": 0,
                 "invalid": 0,

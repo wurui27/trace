@@ -29,7 +29,11 @@ from perfpilot_api.local_app import (
     _source_code_analysis_unavailable_document,
     create_local_app,
 )
-from perfpilot_api.local_analysis_store import LocalAnalysisStore
+from perfpilot_api.local_analysis_store import (
+    LocalAnalysisStore,
+    LocalAnalysisStoreDurabilityError,
+    LocalAnalysisStoreError,
+)
 from perfpilot_api.local_control_store import LocalControlStore
 from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapture
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
@@ -1094,6 +1098,33 @@ def _recovery_request() -> dict[str, object]:
     }
 
 
+def test_local_app_restores_duplicate_upload_ids_without_cross_team_aliasing(
+    tmp_path: Path,
+) -> None:
+    team_id, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    other_team_id = UUID("82000000-0000-4000-8000-000000000099")
+    upload_id = "93000000-0000-4000-8000-000000000001"
+    state["inputs"][0]["upload_id"] = upload_id
+    state["state"] = "uploading"
+    store = LocalAnalysisStore(tmp_path)
+    store.save_state(UUID(team_id), analysis_id, state)
+    other_state = copy.deepcopy(state)
+    other_state["team_id"] = str(other_team_id)
+    store.save_state(other_team_id, analysis_id, other_state)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+
+    with TestClient(app):
+        uploads = app.state.local_runtime.uploads
+        first_key = (UUID(team_id), analysis_id, upload_id)
+        second_key = (other_team_id, analysis_id, upload_id)
+        assert set(uploads) == {first_key, second_key}
+        assert uploads[first_key].path != uploads[second_key].path
+        assert uploads[first_key].token != uploads[second_key].token
+
+
 def test_local_app_defaults_missing_persisted_ai_rounds_after_restart(
     tmp_path: Path,
 ) -> None:
@@ -1784,6 +1815,186 @@ def test_local_app_lists_one_active_analysis_and_rejects_a_second(
     ]
     assert active.json()["analyses"][0]["cancel_requested_at"] is None
     assert duplicate.status_code == 409
+
+
+def test_local_app_rolls_back_create_and_reserve_when_persistence_fails(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+    with TestClient(app) as client:
+        runtime = app.state.local_runtime
+        original_save_state = runtime.store.save_state
+
+        def fail_save_state(*_args) -> None:
+            raise LocalAnalysisStoreError("local analysis persistence failed")
+
+        runtime.store.save_state = fail_save_state
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        with pytest.raises(LocalAnalysisStoreError):
+            _create_trace_analysis(client, team_id=team_id, headers=headers)
+        assert runtime.analyses == {}
+        assert runtime.uploads == {}
+
+        runtime.store.save_state = original_save_state
+        analysis_id, checksum = _create_trace_analysis(
+            client, team_id=team_id, headers=headers
+        )
+        runtime.store.save_state = fail_save_state
+        with pytest.raises(LocalAnalysisStoreError):
+            client.post(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}/uploads",
+                headers=headers,
+                json={
+                    "artifact_kind": "trace",
+                    "mime": "application/octet-stream",
+                    "size": len(b"background-local-trace"),
+                    "sha256_b64": checksum,
+                },
+            )
+        analysis = runtime.analyses[(UUID(team_id), UUID(analysis_id))]
+        assert analysis.inputs["trace"].upload_id is None
+        assert runtime.uploads == {}
+        runtime.store.save_state = original_save_state
+        retry = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/uploads",
+            headers=headers,
+            json={
+                "artifact_kind": "trace",
+                "mime": "application/octet-stream",
+                "size": len(b"background-local-trace"),
+                "sha256_b64": checksum,
+            },
+        )
+        assert retry.status_code == 201
+
+
+def test_local_app_does_not_launch_finalize_task_before_persistence(
+    tmp_path: Path,
+) -> None:
+    gateway = _FakeSmartPerfettoGateway(_smartperfetto_result())
+    app = create_local_app(gateway=gateway, data_root=tmp_path)
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client, team_id=team_id, headers=headers
+        )
+        runtime = app.state.local_runtime
+        slot = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/uploads",
+            headers=headers,
+            json={
+                "artifact_kind": "trace",
+                "mime": "application/octet-stream",
+                "size": len(b"background-local-trace"),
+                "sha256_b64": checksum,
+            },
+        ).json()["upload"]
+        put = urlsplit(slot["put_url"])
+        assert client.put(
+            f"{put.path}?{put.query}",
+            content=b"background-local-trace",
+            headers=slot["required_headers"],
+        ).status_code == 200
+        original_save_state = runtime.store.save_state
+
+        def fail_save_state(*_args) -> None:
+            raise LocalAnalysisStoreError("local analysis persistence failed")
+
+        runtime.store.save_state = fail_save_state
+        with pytest.raises(LocalAnalysisStoreError):
+            client.post(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}/finalize-upload",
+                headers=headers,
+                json={
+                    "upload_id": slot["upload_id"],
+                    "sha256_b64": checksum,
+                    "size": len(b"background-local-trace"),
+                },
+            )
+        analysis = runtime.analyses[(UUID(team_id), UUID(analysis_id))]
+        assert analysis.inputs["trace"].finalized is False
+        assert analysis.task is None
+        assert gateway.submissions == []
+        runtime.store.save_state = original_save_state
+        retry = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/finalize-upload",
+            headers=headers,
+            json={
+                "upload_id": slot["upload_id"],
+                "sha256_b64": checksum,
+                "size": len(b"background-local-trace"),
+            },
+        )
+        assert retry.status_code == 200
+        for _ in range(100):
+            if gateway.submissions:
+                break
+            time.sleep(0.01)
+        assert gateway.submissions
+
+
+def test_local_app_keeps_committed_finalize_state_when_durability_is_uncertain(
+    tmp_path: Path,
+) -> None:
+    gateway = _FakeSmartPerfettoGateway(_smartperfetto_result())
+    app = create_local_app(gateway=gateway, data_root=tmp_path)
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client, team_id=team_id, headers=headers
+        )
+        runtime = app.state.local_runtime
+        slot = client.post(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/uploads",
+            headers=headers,
+            json={
+                "artifact_kind": "trace",
+                "mime": "application/octet-stream",
+                "size": len(b"background-local-trace"),
+                "sha256_b64": checksum,
+            },
+        ).json()["upload"]
+        put = urlsplit(slot["put_url"])
+        assert client.put(
+            f"{put.path}?{put.query}",
+            content=b"background-local-trace",
+            headers=slot["required_headers"],
+        ).status_code == 200
+        original_persist = runtime._persist
+
+        async def persist_then_report_uncertain(analysis) -> None:
+            await original_persist(analysis)
+            raise LocalAnalysisStoreDurabilityError("local analysis durability uncertain")
+
+        runtime._persist = persist_then_report_uncertain
+        with pytest.raises(LocalAnalysisStoreDurabilityError):
+            client.post(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}/finalize-upload",
+                headers=headers,
+                json={
+                    "upload_id": slot["upload_id"],
+                    "sha256_b64": checksum,
+                    "size": len(b"background-local-trace"),
+                },
+            )
+        runtime._persist = original_persist
+        analysis = runtime.analyses[(UUID(team_id), UUID(analysis_id))]
+        persisted = LocalAnalysisStore(tmp_path).load_states()[
+            (UUID(team_id), UUID(analysis_id))
+        ]
+        assert analysis.inputs["trace"].finalized is True
+        assert persisted["inputs"][0]["finalized"] is True
+        for _ in range(100):
+            if gateway.submissions:
+                break
+            time.sleep(0.01)
+        assert gateway.submissions
 
 
 def test_local_app_cancel_stops_smartperfetto_and_persists_the_terminal_state(
