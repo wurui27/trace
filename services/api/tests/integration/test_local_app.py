@@ -1199,6 +1199,62 @@ def test_local_app_rejects_present_null_persisted_ai_rounds_after_restart(
             pass
 
 
+@pytest.mark.parametrize(
+    "location",
+    [
+        "top_level",
+        "input",
+        "input_descriptor",
+        "stages",
+        "source_run",
+        "source_binding",
+        "source_code_analysis",
+        "ai_round",
+    ],
+)
+def test_local_app_rejects_unknown_persisted_state_fields_after_restart(
+    tmp_path: Path,
+    location: str,
+) -> None:
+    team_id, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    if location == "top_level":
+        state["unexpected"] = True
+    elif location == "input":
+        state["inputs"][0]["unexpected"] = True
+    elif location == "input_descriptor":
+        state["inputs"][0]["descriptor"]["unexpected"] = True
+    elif location == "stages":
+        state["stages"]["unexpected"] = "pending"
+    elif location == "source_run":
+        state["source_run"] = {
+            "session_id": "session-local-1",
+            "run_id": "run-local-1",
+            "unexpected": True,
+        }
+    elif location == "source_binding":
+        state["source_binding"] = {
+            "provider_kind": "agent_workspace",
+            "agent_id": "91000000-0000-4000-8000-000000000001",
+            "workspace_id": "92000000-0000-4000-8000-000000000001",
+            "snapshot_policy": "tracked_worktree",
+            "validation_profile_id": None,
+            "unexpected": True,
+        }
+    elif location == "source_code_analysis":
+        state["source_code_analysis"]["unexpected"] = True
+    else:
+        state["ai_rounds"][0]["unexpected"] = True
+    LocalAnalysisStore(tmp_path).save_state(UUID(team_id), analysis_id, state)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+
+    with pytest.raises(ValueError, match="^invalid persisted local analysis$"):
+        with TestClient(app):
+            pass
+
+
 def test_local_app_rejects_present_null_evidence_format_after_restart(
     tmp_path: Path,
 ) -> None:

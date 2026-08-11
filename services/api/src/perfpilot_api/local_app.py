@@ -709,6 +709,137 @@ class _NormalizedLocalResult:
     source_report: dict[str, object]
 
 
+_PERSISTED_STATE_KEYS = {
+    "schema_version",
+    "team_id",
+    "analysis_id",
+    "analysis_mode",
+    "device_id",
+    "application_version_id",
+    "application_metadata",
+    "profile",
+    "question",
+    "created_at",
+    "started_at",
+    "completed_at",
+    "state",
+    "version",
+    "generation",
+    "inputs",
+    "failure",
+    "cancel_requested_at",
+    "stages",
+    "source_run",
+    "source_rounds",
+    "source_verification",
+    "source_binding",
+    "source_code_analysis",
+    "ai_rounds",
+    "report_available",
+    "evidence_format_version",
+    "evidence_manifest",
+}
+_PERSISTED_OPTIONAL_STATE_KEYS = {
+    "created_at",
+    "source_binding",
+    "source_code_analysis",
+    "ai_rounds",
+    "evidence_format_version",
+    "evidence_manifest",
+}
+_PERSISTED_STAGE_KEYS = {
+    "input_validation",
+    "smartperfetto",
+    "perfpilot_ai",
+    "report",
+}
+_PERSISTED_SOURCE_CODE_KEYS = {
+    "requested",
+    "provider_kind",
+    "agent_id",
+    "workspace_id",
+    "snapshot_policy",
+    "validation_profile_id",
+    "context_state",
+    "match_summary",
+    "verification_state",
+    "failure_code",
+}
+
+
+def _has_exact_keys(value: object, keys: set[str]) -> bool:
+    return isinstance(value, Mapping) and set(value) == keys
+
+
+def _validate_persisted_state_shape(document: Mapping[str, object]) -> None:
+    if document.get("schema_version") != "1.0":
+        raise ValueError
+    keys = set(document)
+    required = _PERSISTED_STATE_KEYS - _PERSISTED_OPTIONAL_STATE_KEYS
+    if not required <= keys or not keys <= _PERSISTED_STATE_KEYS:
+        raise ValueError
+    inputs = document.get("inputs")
+    if not isinstance(inputs, list):
+        raise ValueError
+    for item in inputs:
+        if not _has_exact_keys(
+            item, {"descriptor", "upload_id", "artifact_id", "finalized"}
+        ) or not _has_exact_keys(
+            item["descriptor"], {"kind", "mime", "size", "sha256_b64"}
+        ):
+            raise ValueError
+    if not _has_exact_keys(document.get("stages"), _PERSISTED_STAGE_KEYS):
+        raise ValueError
+    source_run = document.get("source_run")
+    if source_run is not None and not _has_exact_keys(
+        source_run, {"session_id", "run_id"}
+    ):
+        raise ValueError
+    source_binding = document.get("source_binding")
+    if source_binding is not None and not _has_exact_keys(
+        source_binding,
+        {
+            "provider_kind",
+            "agent_id",
+            "workspace_id",
+            "snapshot_policy",
+            "validation_profile_id",
+        },
+    ):
+        raise ValueError
+    if "source_code_analysis" in document and not _has_exact_keys(
+        document["source_code_analysis"], _PERSISTED_SOURCE_CODE_KEYS
+    ):
+        raise ValueError
+    if "ai_rounds" in document:
+        rounds = document["ai_rounds"]
+        if not isinstance(rounds, list) or any(
+            not _has_exact_keys(item, {"round", "role", "state", "attempts"})
+            for item in rounds
+        ):
+            raise ValueError
+    metadata = document.get("application_metadata")
+    if metadata is not None and not _has_exact_keys(
+        metadata,
+        {
+            "package_name",
+            "version_name",
+            "version_code",
+            "launch_activity",
+            "min_sdk",
+            "target_sdk",
+            "supported_abis",
+            "has_native_libraries",
+        },
+    ):
+        raise ValueError
+    failure = document.get("failure")
+    if failure is not None and not _has_exact_keys(
+        failure, {"code", "message", "retryable"}
+    ):
+        raise ValueError
+
+
 def _parse_utc_datetime(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -1743,6 +1874,15 @@ class _LocalRuntime:
         )
 
     def _restore_analysis(self, document: Mapping[str, object]) -> _LocalAnalysis:
+        try:
+            _validate_persisted_state_shape(document)
+            return self._restore_analysis_validated(document)
+        except Exception:
+            raise ValueError("invalid persisted local analysis") from None
+
+    def _restore_analysis_validated(
+        self, document: Mapping[str, object]
+    ) -> _LocalAnalysis:
         team_id = UUID(str(document["team_id"]))
         analysis_id = UUID(str(document["analysis_id"]))
         raw_created_at = document.get("created_at")
@@ -1944,6 +2084,7 @@ class _LocalRuntime:
             await self.synthesizer.aclose()
         if self.memory_analysis_gateway is not None:
             await self.memory_analysis_gateway.aclose()
+        self.store.close()
 
     async def create(
         self, team_id: UUID, request: _CreateAnalysisRequest

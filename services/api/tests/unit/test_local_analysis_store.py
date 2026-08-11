@@ -65,6 +65,41 @@ def test_store_rejects_symlinked_analysis_directory(tmp_path: Path) -> None:
         )
 
 
+def test_store_rejects_preexisting_symlinked_teams_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "teams").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(LocalAnalysisStoreError, match="unsafe local analysis path"):
+        LocalAnalysisStore(tmp_path)
+
+    assert list(outside.iterdir()) == []
+
+
+def test_store_rejects_teams_root_substitution_after_construction(
+    tmp_path: Path,
+) -> None:
+    store = LocalAnalysisStore(tmp_path)
+    original = tmp_path / "original-teams"
+    (tmp_path / "teams").rename(original)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (tmp_path / "teams").symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(LocalAnalysisStoreError, match="unsafe local analysis path"):
+        store.save_state(
+            TEAM_ID,
+            ANALYSIS_ID,
+            {
+                "schema_version": "1.0",
+                "team_id": str(TEAM_ID),
+                "analysis_id": str(ANALYSIS_ID),
+            },
+        )
+
+    assert list(outside.iterdir()) == []
+
+
 def test_store_ignores_non_uuid_directories_but_rejects_corrupt_state(
     tmp_path: Path,
 ) -> None:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 from collections.abc import Mapping
 from pathlib import Path
 from uuid import UUID, uuid4
@@ -45,9 +46,58 @@ class LocalAnalysisStore:
     def __init__(self, data_root: Path) -> None:
         if not isinstance(data_root, Path):
             raise TypeError("data_root must be a Path")
-        self._root = data_root.resolve() / "teams"
-        self._root.mkdir(parents=True, exist_ok=True)
-        self._root = self._root.resolve()
+        anchor = data_root.resolve()
+        root = anchor / "teams"
+        if root.is_symlink():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
+        try:
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if root.is_symlink() or root.resolve() != root.absolute():
+                raise ValueError
+            root.resolve().relative_to(anchor)
+            self._root = root.absolute()
+            self._root_fd = os.open(
+                self._root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            root_status = os.fstat(self._root_fd)
+            self._root_identity = (root_status.st_dev, root_status.st_ino)
+            self._verify_trusted_root()
+        except LocalAnalysisStoreError:
+            self.close()
+            raise
+        except (OSError, ValueError):
+            self.close()
+            raise LocalAnalysisStoreError("unsafe local analysis path") from None
+
+    def close(self) -> None:
+        descriptor = getattr(self, "_root_fd", -1)
+        if descriptor >= 0:
+            self._root_fd = -1
+            os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
+
+    def _verify_trusted_root(self) -> None:
+        try:
+            current = os.lstat(self._root)
+            held = os.fstat(self._root_fd)
+            if (
+                self._root_fd < 0
+                or not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != self._root_identity
+                or (held.st_dev, held.st_ino) != self._root_identity
+            ):
+                raise ValueError
+        except (OSError, ValueError):
+            raise LocalAnalysisStoreError("unsafe local analysis path") from None
 
     @staticmethod
     def _contained(path: Path, root: Path) -> None:
@@ -57,6 +107,7 @@ class LocalAnalysisStore:
             raise LocalAnalysisStoreError("unsafe local analysis path") from None
 
     def _team_directory(self, team_id: UUID, *, create: bool) -> Path:
+        self._verify_trusted_root()
         _require_uuid(team_id, "team_id")
         directory = self._root / str(team_id)
         if directory.is_symlink():
@@ -228,6 +279,7 @@ class LocalAnalysisStore:
         return document
 
     def load_states(self) -> dict[tuple[UUID, UUID], dict[str, object]]:
+        self._verify_trusted_root()
         states: dict[tuple[UUID, UUID], dict[str, object]] = {}
         try:
             teams = sorted(self._root.iterdir(), key=lambda path: path.name)
