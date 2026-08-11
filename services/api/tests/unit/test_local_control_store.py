@@ -158,6 +158,51 @@ def test_rejects_symlinked_lock_without_touching_its_target(tmp_path: Path) -> N
     assert victim.read_text(encoding="utf-8") == "do not modify"
 
 
+def test_rejects_root_symlink_substitution_after_store_construction(tmp_path: Path) -> None:
+    state_root = tmp_path / "state"
+    outside = tmp_path / "outside"
+    state_root.mkdir()
+    outside.mkdir()
+    victim = outside / "control.json"
+    victim.write_text("do not modify", encoding="utf-8")
+    store = LocalControlStore(state_root)
+    moved_state = tmp_path / "moved-state"
+    state_root.rename(moved_state)
+    state_root.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(LocalControlStoreError, match="unsafe local control path"):
+        store.ensure_user("ordinary", "valid password", False)
+
+    assert victim.read_text(encoding="utf-8") == "do not modify"
+    assert not (outside / ".control.lock").exists()
+    assert not (outside / "control.json").is_symlink()
+
+
+def test_rejects_root_swap_during_a_transaction_without_writing_outside(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    outside = tmp_path / "outside"
+    state_root.mkdir()
+    outside.mkdir()
+    victim = outside / "control.json"
+    victim.write_text("do not modify", encoding="utf-8")
+    store = LocalControlStore(state_root)
+    original_read = store._read_document
+
+    def swap_root_then_read() -> dict[str, object]:
+        state_root.rename(tmp_path / "moved-state")
+        state_root.symlink_to(outside, target_is_directory=True)
+        return original_read()
+
+    monkeypatch.setattr(store, "_read_document", swap_root_then_read)
+    with pytest.raises(LocalControlStoreError, match="unsafe local control path"):
+        store.ensure_user("ordinary", "valid password", False)
+
+    assert victim.read_text(encoding="utf-8") == "do not modify"
+
+
 def test_failed_atomic_replace_keeps_previous_control_file_readable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -165,7 +210,7 @@ def test_failed_atomic_replace_keeps_previous_control_file_readable(
     store = LocalControlStore(tmp_path)
     original = store.ensure_user("first", "safe password", False).principal
 
-    def fail_replace(_source: Path, _target: Path) -> None:
+    def fail_replace(*_args: object, **_kwargs: object) -> None:
         raise OSError("injected failure")
 
     monkeypatch.setattr("perfpilot_api.local_control_store.os.replace", fail_replace)

@@ -13,6 +13,7 @@ import hmac
 import json
 import os
 import secrets
+import stat
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -106,22 +107,43 @@ class LocalControlStore:
         except OSError:
             raise LocalControlStoreError("local control persistence failed") from None
         self._root = state_root.absolute()
-        self._control_path = self._root / _CONTROL_FILE_NAME
-        self._lock_path = self._root / _LOCK_FILE_NAME
-        if self._control_path.is_symlink() or self._lock_path.is_symlink():
-            raise LocalControlStoreError("unsafe local control path")
         try:
-            if self._control_path.exists():
-                if not self._control_path.is_file():
-                    raise LocalControlStoreError("unsafe local control path")
-                os.chmod(self._control_path, 0o600)
+            self._root_fd = os.open(
+                self._root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            root_status = os.fstat(self._root_fd)
+            self._root_identity = (root_status.st_dev, root_status.st_ino)
+            self._active_root_fd = -1
+            if self._entry_is_symlink(_CONTROL_FILE_NAME) or self._entry_is_symlink(
+                _LOCK_FILE_NAME
+            ):
+                raise LocalControlStoreError("unsafe local control path")
+            self._secure_existing_control_file()
         except LocalControlStoreError:
+            self.close()
             raise
         except OSError:
+            self.close()
             raise LocalControlStoreError("local control persistence failed") from None
         self._clock = clock
         self._uuid_factory = uuid_factory
         self._token_factory = token_factory
+
+    def close(self) -> None:
+        descriptor = getattr(self, "_root_fd", -1)
+        if descriptor >= 0:
+            self._root_fd = -1
+            os.close(descriptor)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
 
     def ensure_user(self, username: str, password: str, admin: bool) -> EnsureUserResult:
         normalized = self._validate_new_credentials(username, password)
@@ -244,19 +266,28 @@ class LocalControlStore:
 
     @contextmanager
     def _exclusive_lock(self) -> Iterator[None]:
-        if self._lock_path.is_symlink() or self._control_path.is_symlink():
-            raise LocalControlStoreError("unsafe local control path")
+        self._verify_trusted_root()
+        operation_fd = self._open_transaction_root()
+        self._active_root_fd = operation_fd
         try:
+            if self._entry_is_symlink(_LOCK_FILE_NAME) or self._entry_is_symlink(
+                _CONTROL_FILE_NAME
+            ):
+                raise LocalControlStoreError("unsafe local control path")
             descriptor = os.open(
-                self._lock_path,
+                _LOCK_FILE_NAME,
                 os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
                 0o600,
+                dir_fd=self._operation_root_fd,
             )
-            os.chmod(self._lock_path, 0o600)
             with os.fdopen(descriptor, "r+b", closefd=True) as lock_file:
+                os.fchmod(lock_file.fileno(), 0o600)
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 try:
-                    if self._lock_path.is_symlink() or self._control_path.is_symlink():
+                    self._verify_trusted_root()
+                    if self._entry_is_symlink(_LOCK_FILE_NAME) or self._entry_is_symlink(
+                        _CONTROL_FILE_NAME
+                    ):
                         raise LocalControlStoreError("unsafe local control path")
                     yield
                 finally:
@@ -265,24 +296,30 @@ class LocalControlStore:
             raise
         except OSError:
             raise LocalControlStoreError("local control persistence failed") from None
+        finally:
+            self._active_root_fd = -1
+            os.close(operation_fd)
 
     def _read_document(self) -> dict[str, Any]:
-        if self._control_path.is_symlink():
+        if self._entry_is_symlink(_CONTROL_FILE_NAME):
             raise LocalControlStoreError("unsafe local control path")
-        if not self._control_path.exists():
-            return {
-                "schema_version": _SCHEMA_VERSION,
-                "users": [],
-                "teams": [],
-                "sessions": [],
-            }
         try:
-            if not self._control_path.is_file():
-                raise ValueError
-            size = self._control_path.stat().st_size
-            if not 0 < size <= _MAX_CONTROL_BYTES:
-                raise ValueError
-            raw = self._control_path.read_bytes()
+            descriptor = os.open(
+                _CONTROL_FILE_NAME,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._operation_root_fd,
+            )
+        except FileNotFoundError:
+            return self._empty_document()
+        try:
+            with os.fdopen(descriptor, "rb", closefd=True) as stream:
+                file_status = os.fstat(stream.fileno())
+                if not stat.S_ISREG(file_status.st_mode):
+                    raise ValueError
+                size = file_status.st_size
+                if not 0 < size <= _MAX_CONTROL_BYTES:
+                    raise ValueError
+                raw = stream.read()
             document = json.loads(
                 raw.decode("utf-8", errors="strict"),
                 object_pairs_hook=_object_without_duplicates,
@@ -295,31 +332,117 @@ class LocalControlStore:
 
     def _write_document(self, document: dict[str, Any]) -> None:
         self._validate_document(document)
-        if self._control_path.is_symlink():
+        self._verify_trusted_root()
+        if self._entry_is_symlink(_CONTROL_FILE_NAME):
             raise LocalControlStoreError("unsafe local control path")
+        temporary_name = f".{_CONTROL_FILE_NAME}.{uuid4().hex}.tmp"
         try:
             payload = json.dumps(
                 document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             ).encode("utf-8")
-            temporary = self._root / f".{_CONTROL_FILE_NAME}.{uuid4().hex}.tmp"
-            descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            descriptor = os.open(
+                temporary_name,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=self._operation_root_fd,
+            )
             with os.fdopen(descriptor, "wb") as stream:
                 stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
-            os.replace(temporary, self._control_path)
-            os.chmod(self._control_path, 0o600)
-            directory_descriptor = os.open(self._root, os.O_RDONLY)
+            self._verify_trusted_root()
+            if self._entry_is_symlink(_CONTROL_FILE_NAME):
+                raise LocalControlStoreError("unsafe local control path")
+            os.replace(
+                temporary_name,
+                _CONTROL_FILE_NAME,
+                src_dir_fd=self._operation_root_fd,
+                dst_dir_fd=self._operation_root_fd,
+            )
+            os.fsync(self._operation_root_fd)
+        except LocalControlStoreError:
             try:
-                os.fsync(directory_descriptor)
-            finally:
-                os.close(directory_descriptor)
+                os.unlink(temporary_name, dir_fd=self._operation_root_fd)
+            except OSError:
+                pass
+            raise
         except OSError:
             try:
-                temporary.unlink(missing_ok=True)
+                os.unlink(temporary_name, dir_fd=self._operation_root_fd)
             except OSError:
                 pass
             raise LocalControlStoreError("local control persistence failed") from None
+
+    @staticmethod
+    def _empty_document() -> dict[str, Any]:
+        return {
+            "schema_version": _SCHEMA_VERSION,
+            "users": [],
+            "teams": [],
+            "sessions": [],
+        }
+
+    def _verify_trusted_root(self) -> None:
+        try:
+            current = os.lstat(self._root)
+            if (
+                not stat.S_ISDIR(current.st_mode)
+                or (current.st_dev, current.st_ino) != self._root_identity
+                or self._root_fd < 0
+            ):
+                raise ValueError
+            held = os.fstat(self._root_fd)
+            if (held.st_dev, held.st_ino) != self._root_identity:
+                raise ValueError
+        except (OSError, ValueError):
+            raise LocalControlStoreError("unsafe local control path") from None
+
+    def _entry_is_symlink(self, name: str) -> bool:
+        try:
+            entry = os.stat(name, dir_fd=self._operation_root_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return False
+        except OSError:
+            raise LocalControlStoreError("local control persistence failed") from None
+        return stat.S_ISLNK(entry.st_mode)
+
+    def _secure_existing_control_file(self) -> None:
+        try:
+            descriptor = os.open(
+                _CONTROL_FILE_NAME,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=self._operation_root_fd,
+            )
+        except FileNotFoundError:
+            return
+        with os.fdopen(descriptor, "rb", closefd=True) as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                raise LocalControlStoreError("unsafe local control path")
+            os.fchmod(stream.fileno(), 0o600)
+
+    @property
+    def _operation_root_fd(self) -> int:
+        active = getattr(self, "_active_root_fd", -1)
+        return active if active >= 0 else self._root_fd
+
+    def _open_transaction_root(self) -> int:
+        try:
+            descriptor = os.open(
+                self._root,
+                os.O_RDONLY
+                | os.O_DIRECTORY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+            )
+            opened = os.fstat(descriptor)
+            if (opened.st_dev, opened.st_ino) != self._root_identity:
+                os.close(descriptor)
+                raise LocalControlStoreError("unsafe local control path")
+            return descriptor
+        except LocalControlStoreError:
+            raise
+        except OSError:
+            raise LocalControlStoreError("unsafe local control path") from None
 
     @staticmethod
     def _validate_document(document: object) -> None:
