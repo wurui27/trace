@@ -191,6 +191,70 @@ def test_local_auth_changes_initial_password_and_invalidates_old_session(tmp_pat
         assert client.get("/v1/me").status_code == 401
 
 
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"username": "user01"},
+        {"username": "user01", "password": "initial user password", "extra": "no"},
+        {"username": 1, "password": "initial user password"},
+    ],
+)
+def test_local_login_rejects_malformed_bodies_as_redacted_invalid_credentials(
+    tmp_path: Path,
+    body: dict[str, object],
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    control.ensure_user("user01", "initial user password", False)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        control_store=control,
+    )
+
+    with _RawTestClient(app) as client:
+        csrf = client.get("/v1/auth/csrf").json()["csrf_token"]
+        response = client.post(
+            "/v1/auth/login",
+            headers={"Origin": "http://localhost:3000", "x-csrf-token": csrf},
+            json=body,
+        )
+
+    assert response.status_code == 401
+    assert set(response.json()) == {"schema_version", "error"}
+    assert set(response.json()["error"]) == {"code", "message", "retryable", "request_id"}
+    assert response.json()["error"]["code"] == "invalid_credentials"
+    assert "user01" not in response.text
+    assert "initial user password" not in response.text
+
+
+def test_local_device_requires_a_changed_authenticated_principal(tmp_path: Path) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user("user01", "initial user password", False).principal
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        control_store=control,
+    )
+
+    with _RawTestClient(app) as client:
+        assert client.get("/v1/device").status_code == 401
+        headers = _authenticated_client(client, "user01", "initial user password")
+        blocked = client.get("/v1/device")
+        assert blocked.status_code == 403
+        assert blocked.json()["error"]["code"] == "password_change_required"
+        changed = client.post(
+            "/v1/auth/change-password",
+            headers=headers,
+            json={
+                "current_password": "initial user password",
+                "new_password": "changed user password",
+            },
+        )
+        assert changed.status_code == 200
+        assert client.get("/v1/device").status_code == 200
+        assert control.resolve_session(client.cookies.get("perfpilot_local_session", "")).username == user.username
+
+
 def test_local_runtime_accepts_only_loopback_or_private_lan_http_origins() -> None:
     assert _public_origin("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
     assert _public_origin("http://10.166.0.125:8000") == "http://10.166.0.125:8000"

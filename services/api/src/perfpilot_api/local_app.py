@@ -26,6 +26,8 @@ from uuid import UUID, uuid4, uuid5
 
 import uvicorn
 from fastapi import FastAPI, Header, HTTPException, Query, Request, status
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
@@ -3189,7 +3191,18 @@ def create_local_app(
             },
         )
 
+    async def local_request_validation_handler(
+        request: Request, error: RequestValidationError
+    ) -> JSONResponse:
+        if request.method == "POST" and request.url.path == "/v1/auth/login":
+            return await local_api_error_handler(
+                request,
+                ApiError("invalid_credentials", "账号或密码错误", 401, False),
+            )
+        return await request_validation_exception_handler(request, error)
+
     app.add_exception_handler(ApiError, local_api_error_handler)
+    app.add_exception_handler(RequestValidationError, local_request_validation_handler)
     app.state.local_runtime = runtime
     app.state.local_control_store = resolved_control_store
     allowed_web_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
@@ -3333,7 +3346,10 @@ def create_local_app(
         }
 
     @app.get("/v1/device")
-    async def device() -> dict[str, object]:
+    async def device(request: Request) -> dict[str, object]:
+        principal = _require_principal(request)
+        if principal.must_change_password:
+            raise ApiError("password_change_required", "请先修改初始密码", 403, False)
         detected = await resolved_device_probe.inspect()
         if detected.device is None:
             return {
