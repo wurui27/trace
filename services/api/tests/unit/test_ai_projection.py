@@ -153,6 +153,15 @@ def test_recursive_scanner_rejects_cycles_and_private_keys() -> None:
         reject_private_json({"password": "hunter2"})
 
 
+def test_recursive_scanner_allows_source_code_comment_delimiters() -> None:
+    reject_private_json(
+        {
+            "kotlin": "fun onCreate() = Thread.sleep(42) // measured blocking call",
+            "java": "/* measured blocking call */ Thread.sleep(42);",
+        }
+    )
+
+
 @pytest.mark.parametrize("question", ["", " \t ", "x" * 2001])
 def test_question_must_be_nonempty_and_bounded(question: str) -> None:
     with pytest.raises(ProjectionQuestionError):

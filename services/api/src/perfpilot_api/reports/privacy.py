@@ -21,7 +21,7 @@ _PRIVATE_PATTERNS = (
     re.compile(r"\b(?:bearer|basic)\s+\S+", re.IGNORECASE),
     re.compile(r"\b(?:api[_-]?key|access[_-]?key|secret|token|password|credential)\s*[:=]", re.IGNORECASE),
     re.compile(r"-----BEGIN(?: [A-Z0-9]+)? PRIVATE KEY-----", re.IGNORECASE),
-    re.compile(r"(?:^|[\s\"'])/(?:[^\s]+)"),
+    re.compile(r"(?:^|[\s\"'])/(?![/*])(?:[^\s]+)"),
     re.compile(r"\b[A-Za-z]:[\\/]"),
     re.compile(r"(?:^|[\\/])\.\.(?:[\\/]|$)"),
 )
