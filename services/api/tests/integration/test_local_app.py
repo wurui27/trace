@@ -3188,6 +3188,101 @@ def test_local_app_removes_recovery_when_initial_persistence_fails(
     assert LocalAnalysisStore(tmp_path).load_states() == {}
 
 
+def test_local_app_retains_committed_recovery_after_durability_error(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(app) as client:
+        runtime = app.state.local_runtime
+        original_persist = runtime._persist
+        injected = False
+
+        async def persist_then_report_uncertain(analysis) -> None:
+            nonlocal injected
+            await original_persist(analysis)
+            if not injected:
+                injected = True
+                raise LocalAnalysisStoreDurabilityError(
+                    "local analysis durability uncertain"
+                )
+
+        runtime._persist = persist_then_report_uncertain
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        with pytest.raises(LocalAnalysisStoreDurabilityError):
+            client.post(
+                f"/v1/teams/{team_id}/local-recoveries",
+                headers=headers,
+                json=_recovery_request(),
+            )
+        runtime._persist = original_persist
+        assert len(runtime.analyses) == 1
+        (_, analysis_id), analysis = next(iter(runtime.analyses.items()))
+        persisted = LocalAnalysisStore(tmp_path).load_states()[
+            (UUID(team_id), analysis_id)
+        ]
+        assert analysis.generation == persisted["generation"] == 1
+        assert analysis.task is not None
+
+
+def test_local_app_retains_committed_rerun_after_durability_error(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        recovered = client.post(
+            f"/v1/teams/{team_id}/local-recoveries",
+            headers=headers,
+            json=_recovery_request(),
+        )
+        analysis_id = recovered.json()["analysis_id"]
+        for _ in range(100):
+            current = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if current["report_available"]:
+                break
+            time.sleep(0.01)
+        runtime = app.state.local_runtime
+        original_persist = runtime._persist
+        injected = False
+
+        async def persist_then_report_uncertain(analysis) -> None:
+            nonlocal injected
+            await original_persist(analysis)
+            if not injected and analysis.generation == 2:
+                injected = True
+                raise LocalAnalysisStoreDurabilityError(
+                    "local analysis durability uncertain"
+                )
+
+        runtime._persist = persist_then_report_uncertain
+        with pytest.raises(LocalAnalysisStoreDurabilityError):
+            client.post(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",
+                headers=headers,
+            )
+        runtime._persist = original_persist
+        analysis = runtime.analyses[(UUID(team_id), UUID(analysis_id))]
+        persisted = LocalAnalysisStore(tmp_path).load_states()[
+            (UUID(team_id), UUID(analysis_id))
+        ]
+        assert analysis.generation == persisted["generation"] == 2
+        assert analysis.task is not None
+
+
 def test_local_app_serializes_simultaneous_ai_rerun_reservations(
     tmp_path: Path,
 ) -> None:

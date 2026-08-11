@@ -2272,6 +2272,9 @@ class _LocalRuntime:
             self.analyses[(team_id, analysis_id)] = analysis
         try:
             await self._persist(analysis)
+        except LocalAnalysisStoreDurabilityError:
+            start_gate.set()
+            raise
         except BaseException:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -2338,6 +2341,9 @@ class _LocalRuntime:
             task.add_done_callback(self.tasks.discard)
         try:
             await self._persist(analysis)
+        except LocalAnalysisStoreDurabilityError:
+            start_gate.set()
+            raise
         except BaseException:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
