@@ -147,12 +147,42 @@ def test_sessions_store_digests_expire_at_boundary_and_password_change_revokes_t
     assert store.resolve_session("unknown") is None
     instant[0] = NOW + LOCAL_SESSION_TTL
     assert store.resolve_session(session_token) is None
-
     instant[0] = NOW
     tokens = iter(("another session", "another csrf"))
     session_token, _ = store.issue_session(user.user_id)
     store.change_password(user.user_id, "current secret", "new replacement secret")
     assert store.resolve_session(session_token) is None
+
+
+def test_preauth_sessions_verify_csrf_and_can_be_revoked(tmp_path: Path) -> None:
+    tokens = iter(("preauth plaintext", "preauth csrf"))
+    store = LocalControlStore(tmp_path, token_factory=lambda: next(tokens))
+
+    session_token, csrf_token = store.issue_preauth_session()
+
+    persisted = (tmp_path / "control.json").read_text(encoding="utf-8")
+    assert session_token not in persisted
+    assert csrf_token not in persisted
+    assert store.verify_csrf(session_token, csrf_token, purpose="preauth") is True
+    assert store.verify_csrf(session_token, csrf_token, purpose="authenticated") is False
+    store.revoke_session(session_token)
+    assert store.verify_csrf(session_token, csrf_token, purpose="preauth") is False
+
+
+def test_reopens_a_v1_authenticated_session_as_a_v2_session(tmp_path: Path) -> None:
+    store = LocalControlStore(tmp_path)
+    user = store.ensure_user("ordinary", "valid local password", False).principal
+    token, _ = store.issue_session(user.user_id)
+    document = json.loads((tmp_path / "control.json").read_text(encoding="utf-8"))
+    document["schema_version"] = 1
+    for session in document["sessions"]:
+        del session["purpose"]
+    (tmp_path / "control.json").write_text(json.dumps(document), encoding="utf-8")
+
+    reopened = LocalControlStore(tmp_path)
+
+    assert reopened.resolve_session(token) == user
+    assert json.loads((tmp_path / "control.json").read_text(encoding="utf-8"))["schema_version"] == 2
 
 
 def test_rejects_malformed_unknown_key_and_symlinked_control_paths_without_secrets(

@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import pytest
-from fastapi.testclient import TestClient
+from fastapi.testclient import TestClient as _RawTestClient
 
 from perfpilot_api.ai.local_report import LocalReportSynthesizer
 from perfpilot_api.ai.openai_compatible import SynthesisCandidate
@@ -30,11 +30,55 @@ from perfpilot_api.local_app import (
     create_local_app,
 )
 from perfpilot_api.local_analysis_store import LocalAnalysisStore
+from perfpilot_api.local_control_store import LocalControlStore
 from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapture
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
 from perfpilot_api.services.source_workspaces import SourceBinding
+
+
+_create_local_app = create_local_app
+
+
+def create_local_app(**kwargs):
+    if kwargs.get("control_store") is None:
+        data_root = kwargs.get("data_root")
+        assert isinstance(data_root, Path)
+        control = LocalControlStore(data_root / "control")
+        seeded = control.ensure_user("ray_wu", "initial local password", True)
+        if seeded.created:
+            control.change_password(
+                seeded.principal.user_id,
+                "initial local password",
+                "established local password",
+            )
+        kwargs["control_store"] = control
+    return _create_local_app(**kwargs)
+
+
+class TestClient(_RawTestClient):
+    """Legacy local-runtime tests exercise authenticated browser requests."""
+
+    def __enter__(self) -> "TestClient":
+        super().__enter__()
+        csrf = self.get("/v1/auth/csrf")
+        logged_in = self.post(
+            "/v1/auth/login",
+            headers={
+                "Origin": "http://localhost:3000",
+                "x-csrf-token": csrf.json()["csrf_token"],
+            },
+            json={"username": "ray_wu", "password": "established local password"},
+        )
+        assert logged_in.status_code == 200, logged_in.text
+        return self
+
+    def request(self, method, url, *, headers=None, **kwargs):
+        if str(method).upper() in {"POST", "PUT", "PATCH", "DELETE"}:
+            headers = dict(headers or {})
+            headers.setdefault("Origin", "http://localhost:3000")
+        return super().request(method, url, headers=headers, **kwargs)
 
 
 class _FakeSmartPerfettoGateway:
@@ -66,6 +110,85 @@ class _FakeSmartPerfettoGateway:
 
     async def aclose(self) -> None:
         return None
+
+
+def _authenticated_client(client: TestClient, username: str, password: str) -> dict[str, str]:
+    csrf = client.get("/v1/auth/csrf")
+    assert csrf.status_code == 200
+    login = client.post(
+        "/v1/auth/login",
+        headers={"Origin": "http://localhost:3000", "x-csrf-token": csrf.json()["csrf_token"]},
+        json={"username": username, "password": password},
+    )
+    assert login.status_code == 200, login.text
+    return {"Origin": "http://localhost:3000", "x-csrf-token": login.json()["csrf_token"]}
+
+
+def test_local_auth_requires_login_and_exposes_current_principal(tmp_path: Path) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    admin = control.ensure_user("ray_wu", "initial admin password", True).principal
+    ordinary = control.ensure_user("user01", "initial user password", False).principal
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        control_store=control,
+    )
+
+    with _RawTestClient(app) as client:
+        assert client.get("/v1/me").status_code == 401
+        csrf = client.get("/v1/auth/csrf")
+        assert csrf.status_code == 200
+        assert "HttpOnly" in csrf.headers["set-cookie"]
+        assert "SameSite=strict" in csrf.headers["set-cookie"]
+        assert "Secure" not in csrf.headers["set-cookie"]
+        logged_in = client.post(
+            "/v1/auth/login",
+            headers={"Origin": "http://localhost:3000", "x-csrf-token": csrf.json()["csrf_token"]},
+            json={"username": "user01", "password": "initial user password"},
+        )
+        assert logged_in.status_code == 200
+        me = client.get("/v1/me")
+        assert me.status_code == 200
+        assert me.headers["cache-control"] == "no-store"
+        assert me.json()["user"] == {
+            "id": str(ordinary.user_id),
+            "username": "user01",
+            "is_platform_admin": False,
+            "must_change_password": True,
+        }
+        assert me.json()["memberships"] == [
+            {"id": str(ordinary.team_id), "team": {"id": str(ordinary.team_id), "name": "user01 local team"}, "role": "owner"}
+        ]
+        blocked = client.get(f"/v1/teams/{ordinary.team_id}/devices")
+        assert blocked.status_code == 403
+        assert blocked.json()["error"]["code"] == "password_change_required"
+        assert client.get(f"/v1/teams/{admin.team_id}/devices").status_code == 404
+
+
+def test_local_auth_changes_initial_password_and_invalidates_old_session(tmp_path: Path) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user("user01", "initial user password", False).principal
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        control_store=control,
+    )
+
+    with _RawTestClient(app) as client:
+        headers = _authenticated_client(client, "user01", "initial user password")
+        changed = client.post(
+            "/v1/auth/change-password",
+            headers=headers,
+            json={"current_password": "initial user password", "new_password": "changed user password"},
+        )
+        assert changed.status_code == 200
+        assert set(changed.json()) == {"schema_version", "csrf_token"}
+        assert client.get("/v1/me").json()["user"]["must_change_password"] is False
+        devices = client.get(f"/v1/teams/{user.team_id}/devices")
+        assert devices.status_code == 200
+        logout = client.post("/v1/auth/logout", headers={"Origin": "http://localhost:3000", "x-csrf-token": changed.json()["csrf_token"]})
+        assert logout.status_code == 204
+        assert client.get("/v1/me").status_code == 401
 
 
 def test_local_runtime_accepts_only_loopback_or_private_lan_http_origins() -> None:

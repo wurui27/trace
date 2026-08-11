@@ -452,7 +452,14 @@ export interface AnalysisListResponse {
 
 export interface MeResponse {
   readonly schema_version: "1.0";
+  readonly user: {
+    readonly id: string;
+    readonly username: string;
+    readonly is_platform_admin: boolean;
+    readonly must_change_password: boolean;
+  };
   readonly memberships: ReadonlyArray<{
+    readonly id: string;
     readonly team: { readonly id: string; readonly name: string };
     readonly role: string;
   }>;
@@ -631,6 +638,13 @@ export interface PerfPilotClient {
   readonly fetcher: typeof globalThis.fetch;
   device(signal?: AbortSignal): Promise<LocalDeviceStatusResponse>;
   csrf(signal?: AbortSignal): Promise<string>;
+  login(username: string, password: string, signal?: AbortSignal): Promise<string>;
+  logout(signal?: AbortSignal): Promise<void>;
+  changePassword(
+    currentPassword: string,
+    newPassword: string,
+    signal?: AbortSignal,
+  ): Promise<string>;
   me(signal?: AbortSignal): Promise<MeResponse>;
   devices(teamId: string, signal?: AbortSignal): Promise<RemoteDeviceListResponse>;
   sourceWorkspaces(
@@ -2245,6 +2259,60 @@ function uploadSlot(value: unknown): UploadSlot {
   return value as unknown as UploadSlot;
 }
 
+function authCsrfResponse(value: unknown): string {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "csrf_token"]) ||
+    value.schema_version !== "1.0" ||
+    typeof value.csrf_token !== "string" ||
+    value.csrf_token.length < 1
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value.csrf_token;
+}
+
+function meResponse(value: unknown): MeResponse {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "user", "memberships"]) ||
+    value.schema_version !== "1.0" ||
+    !object(value.user) ||
+    !exactKeys(value.user, ["id", "username", "is_platform_admin", "must_change_password"]) ||
+    typeof value.user.id !== "string" ||
+    !CANONICAL_UUID.test(value.user.id) ||
+    typeof value.user.username !== "string" ||
+    value.user.username.length < 1 ||
+    value.user.username.length > 128 ||
+    typeof value.user.is_platform_admin !== "boolean" ||
+    typeof value.user.must_change_password !== "boolean" ||
+    !Array.isArray(value.memberships) ||
+    value.memberships.length !== 1
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  const membership = value.memberships[0];
+  if (
+    !object(membership) ||
+    !exactKeys(membership, ["id", "team", "role"]) ||
+    typeof membership.id !== "string" ||
+    !CANONICAL_UUID.test(membership.id) ||
+    !object(membership.team) ||
+    !exactKeys(membership.team, ["id", "name"]) ||
+    typeof membership.team.id !== "string" ||
+    !CANONICAL_UUID.test(membership.team.id) ||
+    typeof membership.team.name !== "string" ||
+    membership.team.name.length < 1 ||
+    membership.team.name.length > 128 ||
+    typeof membership.role !== "string" ||
+    membership.role.length < 1 ||
+    membership.role.length > 64
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as MeResponse;
+}
+
 export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotClient {
   const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
   let csrfToken: string | null = null;
@@ -2288,6 +2356,9 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         cause: error,
       });
     }
+    if (response.status === 204) {
+      return undefined;
+    }
     const payload = await readJson(response);
     if (!response.ok) {
       const error = object(payload) && object(payload.error) ? payload.error : null;
@@ -2308,18 +2379,37 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
     },
     async csrf(signal) {
       const payload = await requestJson("/api/v1/auth/csrf", {}, signal);
-      if (!object(payload) || payload.schema_version !== "1.0" || typeof payload.csrf_token !== "string") {
-        throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
-      }
-      csrfToken = payload.csrf_token;
+      csrfToken = authCsrfResponse(payload);
+      return csrfToken;
+    },
+    async login(username, password, signal) {
+      const payload = await requestJson(
+        "/api/v1/auth/login",
+        { method: "POST", body: JSON.stringify({ username, password }) },
+        signal,
+      );
+      csrfToken = authCsrfResponse(payload);
+      return csrfToken;
+    },
+    async logout(signal) {
+      await requestJson("/api/v1/auth/logout", { method: "POST" }, signal);
+      csrfToken = null;
+    },
+    async changePassword(currentPassword, newPassword, signal) {
+      const payload = await requestJson(
+        "/api/v1/auth/change-password",
+        {
+          method: "POST",
+          body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+        },
+        signal,
+      );
+      csrfToken = authCsrfResponse(payload);
       return csrfToken;
     },
     async me(signal) {
       const payload = await requestJson("/api/v1/me", {}, signal);
-      if (!object(payload) || payload.schema_version !== "1.0" || !Array.isArray(payload.memberships)) {
-        throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
-      }
-      return payload as unknown as MeResponse;
+      return meResponse(payload);
     },
     async devices(teamId, signal) {
       return remoteDeviceListResponse(

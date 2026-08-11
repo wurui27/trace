@@ -13,11 +13,12 @@ import {
 
 import {
   createPerfPilotClient,
+  PerfPilotApiError,
   type PerfPilotClient,
   type RemoteDeviceView,
 } from "../lib/perfpilot-api";
 
-type SessionStatus = "loading" | "ready" | "error";
+type SessionStatus = "loading" | "signed_out" | "password_change_required" | "ready" | "error";
 type DeviceDirectoryStatus = "loading" | "ready" | "error";
 
 export interface PerfPilotTeamSession {
@@ -35,6 +36,9 @@ export interface PerfPilotSessionValue {
   readonly selectedDeviceId: string | null;
   readonly selectedDevice: RemoteDeviceView | null;
   readonly error: string | null;
+  readonly login: (username: string, password: string) => Promise<void>;
+  readonly logout: () => Promise<void>;
+  readonly changePassword: (currentPassword: string, newPassword: string) => Promise<void>;
   readonly selectDevice: (deviceId: string | null) => void;
   readonly refreshDevices: () => void;
 }
@@ -82,33 +86,51 @@ export function PerfPilotSessionProvider({
   const selectionsRef = useRef(new Map<string, string | null>());
   const selectionInitializedRef = useRef(new Set<string>());
 
+  const clearSession = useCallback(() => {
+    setTeam(null);
+    setDevices([]);
+    setSelectedDeviceId(null);
+    selectionsRef.current.clear();
+    selectionInitializedRef.current.clear();
+  }, []);
+
+  const applyMe = useCallback((me: Awaited<ReturnType<PerfPilotClient["me"]>>) => {
+    const membership = me.memberships[0];
+    if (!membership) {
+      throw new Error("team_required");
+    }
+    setTeam({ id: membership.team.id, name: membership.team.name, role: membership.role });
+    setStatus(me.user?.must_change_password ? "password_change_required" : "ready");
+  }, []);
+
   useEffect(() => {
     const controller = new AbortController();
     void (async () => {
       await client.csrf(controller.signal);
       const me = await client.me(controller.signal);
-      const membership = me.memberships[0];
-      if (!membership) {
-        throw new Error("team_required");
+      if (controller.signal.aborted) return;
+      applyMe(me);
+    })().catch((caught: unknown) => {
+      if (controller.signal.aborted) return;
+      clearSession();
+      if (
+        (caught instanceof PerfPilotApiError || typeof caught === "object") &&
+        caught !== null &&
+        "code" in caught &&
+        caught.code === "authentication_required"
+      ) {
+        setStatus("signed_out");
+        setError(null);
+      } else {
+        setStatus("error");
+        setError("账号或团队信息读取失败，请刷新页面重试。");
       }
-      if (controller.signal.aborted) return;
-      setTeam({
-        id: membership.team.id,
-        name: membership.team.name,
-        role: membership.role,
-      });
-      setStatus("ready");
-    })().catch(() => {
-      if (controller.signal.aborted) return;
-      setTeam(null);
-      setStatus("error");
-      setError("账号或团队信息读取失败，请刷新页面重试。");
     });
     return () => controller.abort();
-  }, [client]);
+  }, [applyMe, clearSession, client]);
 
   useEffect(() => {
-    if (team === null) return;
+    if (team === null || status !== "ready") return;
     const controller = new AbortController();
     const teamId = team.id;
     void (async () => {
@@ -150,7 +172,31 @@ export function PerfPilotSessionProvider({
       if (!controller.signal.aborted) setDeviceStatus("error");
     });
     return () => controller.abort();
-  }, [client, pollDelay, refreshVersion, team]);
+  }, [client, pollDelay, refreshVersion, status, team]);
+
+  const login = useCallback(async (username: string, password: string) => {
+    setError(null);
+    await client.csrf();
+    await client.login(username, password);
+    const me = await client.me();
+    clearSession();
+    applyMe(me);
+  }, [applyMe, clearSession, client]);
+
+  const logout = useCallback(async () => {
+    await client.logout();
+    clearSession();
+    setError(null);
+    setStatus("signed_out");
+  }, [clearSession, client]);
+
+  const changePassword = useCallback(async (currentPassword: string, newPassword: string) => {
+    setError(null);
+    await client.changePassword(currentPassword, newPassword);
+    const me = await client.me();
+    clearSession();
+    applyMe(me);
+  }, [applyMe, clearSession, client]);
 
   const selectDevice = useCallback(
     (deviceId: string | null) => {
@@ -191,6 +237,9 @@ export function PerfPilotSessionProvider({
       selectedDeviceId,
       selectedDevice,
       error,
+      login,
+      logout,
+      changePassword,
       selectDevice,
       refreshDevices,
     }),
@@ -203,6 +252,9 @@ export function PerfPilotSessionProvider({
       selectedDeviceId,
       selectedDevice,
       error,
+      login,
+      logout,
+      changePassword,
       selectDevice,
       refreshDevices,
     ],

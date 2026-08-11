@@ -30,7 +30,7 @@ from perfpilot_api.security.passwords import (
 
 
 LOCAL_SESSION_TTL = timedelta(hours=8)
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _CONTROL_FILE_NAME = "control.json"
 _LOCK_FILE_NAME = ".control.lock"
 _MAX_CONTROL_BYTES = 2 * 1024 * 1024
@@ -206,6 +206,27 @@ class LocalControlStore:
                     "token_digest": self._digest(token),
                     "csrf_token_digest": self._digest(csrf_token),
                     "user_id": str(user_id),
+                    "purpose": "authenticated",
+                    "created_at": now.isoformat(),
+                    "expires_at": (now + LOCAL_SESSION_TTL).isoformat(),
+                }
+            )
+            self._write_document(document)
+            return token, csrf_token
+
+    def issue_preauth_session(self) -> tuple[str, str]:
+        """Issue a short-lived anonymous session used only to bind login CSRF."""
+        with self._exclusive_lock():
+            document = self._read_document()
+            token = self._new_token()
+            csrf_token = self._new_token()
+            now = self._now()
+            document["sessions"].append(
+                {
+                    "token_digest": self._digest(token),
+                    "csrf_token_digest": self._digest(csrf_token),
+                    "user_id": None,
+                    "purpose": "preauth",
                     "created_at": now.isoformat(),
                     "expires_at": (now + LOCAL_SESSION_TTL).isoformat(),
                 }
@@ -223,9 +244,77 @@ class LocalControlStore:
             for session in document["sessions"]:
                 if not hmac.compare_digest(str(session["token_digest"]), digest):
                     continue
-                if self._parse_timestamp(session["expires_at"]) <= now:
+                if (
+                    session["purpose"] != "authenticated"
+                    or self._parse_timestamp(session["expires_at"]) <= now
+                ):
                     return None
                 return self._principal_from_user_id(document, UUID(str(session["user_id"])))
+        return None
+
+    def verify_csrf(self, token: str, csrf_token: str, *, purpose: str) -> bool:
+        if purpose not in {"preauth", "authenticated"}:
+            raise ValueError("invalid session purpose")
+        if not isinstance(token, str) or not isinstance(csrf_token, str) or not token or not csrf_token:
+            return False
+        token_digest = self._digest(token)
+        csrf_digest = self._digest(csrf_token)
+        with self._exclusive_lock():
+            document = self._read_document()
+            now = self._now()
+            for session in document["sessions"]:
+                if not hmac.compare_digest(str(session["token_digest"]), token_digest):
+                    continue
+                return (
+                    session["purpose"] == purpose
+                    and self._parse_timestamp(session["expires_at"]) > now
+                    and hmac.compare_digest(str(session["csrf_token_digest"]), csrf_digest)
+                )
+        return False
+
+    def revoke_session(self, token: str) -> None:
+        if not isinstance(token, str) or not token:
+            return
+        digest = self._digest(token)
+        with self._exclusive_lock():
+            document = self._read_document()
+            remaining = [
+                session
+                for session in document["sessions"]
+                if not hmac.compare_digest(str(session["token_digest"]), digest)
+            ]
+            if len(remaining) != len(document["sessions"]):
+                document["sessions"] = remaining
+                self._write_document(document)
+
+    def rotate_session(self, token: str) -> tuple[str, str] | None:
+        """Replace an authenticated session and its CSRF secret atomically."""
+        if not isinstance(token, str) or not token:
+            return None
+        digest = self._digest(token)
+        with self._exclusive_lock():
+            document = self._read_document()
+            now = self._now()
+            for index, session in enumerate(document["sessions"]):
+                if not hmac.compare_digest(str(session["token_digest"]), digest):
+                    continue
+                if (
+                    session["purpose"] != "authenticated"
+                    or self._parse_timestamp(session["expires_at"]) <= now
+                ):
+                    return None
+                token_value = self._new_token()
+                csrf_token = self._new_token()
+                document["sessions"][index] = {
+                    "token_digest": self._digest(token_value),
+                    "csrf_token_digest": self._digest(csrf_token),
+                    "user_id": session["user_id"],
+                    "purpose": "authenticated",
+                    "created_at": now.isoformat(),
+                    "expires_at": (now + LOCAL_SESSION_TTL).isoformat(),
+                }
+                self._write_document(document)
+                return token_value, csrf_token
         return None
 
     def change_password(
@@ -323,7 +412,10 @@ class LocalControlStore:
                 object_pairs_hook=_object_without_duplicates,
                 parse_constant=_reject_constant,
             )
+            migrated = self._migrate_v1_document(document)
             self._validate_document(document)
+            if migrated:
+                self._write_document(document)
             return document
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError):
             raise LocalControlStoreError("invalid local control state") from None
@@ -379,6 +471,30 @@ class LocalControlStore:
             "teams": [],
             "sessions": [],
         }
+
+    @staticmethod
+    def _migrate_v1_document(document: object) -> bool:
+        """Upgrade only the prior authenticated-session layout in place."""
+        if (
+            not isinstance(document, dict)
+            or type(document.get("schema_version")) is not int
+            or document["schema_version"] != 1
+            or set(document) != {"schema_version", "users", "teams", "sessions"}
+            or not isinstance(document.get("sessions"), list)
+        ):
+            return False
+        for session in document["sessions"]:
+            if not isinstance(session, dict) or set(session) != {
+                "token_digest",
+                "csrf_token_digest",
+                "user_id",
+                "created_at",
+                "expires_at",
+            }:
+                return False
+            session["purpose"] = "authenticated"
+        document["schema_version"] = _SCHEMA_VERSION
+        return True
 
     def _verify_trusted_root(self) -> None:
         try:
@@ -530,6 +646,7 @@ class LocalControlStore:
                 "token_digest",
                 "csrf_token_digest",
                 "user_id",
+                "purpose",
                 "created_at",
                 "expires_at",
             }:
@@ -539,8 +656,13 @@ class LocalControlStore:
                 or len(session["token_digest"]) != 64
                 or not isinstance(session["csrf_token_digest"], str)
                 or len(session["csrf_token_digest"]) != 64
-                or str(LocalControlStore._validated_uuid(session["user_id"])) not in user_ids
+                or session["purpose"] not in {"preauth", "authenticated"}
             ):
+                raise ValueError
+            if session["purpose"] == "authenticated":
+                if str(LocalControlStore._validated_uuid(session["user_id"])) not in user_ids:
+                    raise ValueError
+            elif session["user_id"] is not None:
                 raise ValueError
             created_at = LocalControlStore._parse_timestamp(session["created_at"])
             expires_at = LocalControlStore._parse_timestamp(session["expires_at"])

@@ -54,6 +54,12 @@ from perfpilot_api.engines.smartperfetto_contracts import (
 from perfpilot_api.engines.smartperfetto_transport import SmartPerfettoTransport
 from perfpilot_api.local_device import AdbDeviceProbe, LocalDevice, LocalDeviceProbe
 from perfpilot_api.local_analysis_store import LocalAnalysisStore, LocalAnalysisStoreError
+from perfpilot_api.local_control_store import (
+    LOCAL_SESSION_TTL,
+    LocalControlStore,
+    LocalControlStoreError,
+    LocalPrincipal,
+)
 from perfpilot_api.local_device_capture import (
     LocalAndroidToolchain,
     LocalDeviceCaptureError,
@@ -302,6 +308,16 @@ def _validated_checksum(value: str) -> str:
 
 class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class _LoginRequest(_StrictModel):
+    username: str = Field(min_length=1, max_length=128)
+    password: str = Field(min_length=1, max_length=1024)
+
+
+class _ChangePasswordRequest(_StrictModel):
+    current_password: str = Field(min_length=1, max_length=1024)
+    new_password: str = Field(min_length=1, max_length=1024)
 
 
 class _InputDescriptor(_StrictModel):
@@ -3091,6 +3107,8 @@ def create_local_app(
     device_capture_gateway: LocalDeviceCaptureGateway | None = None,
     memory_analysis_gateway: LocalMemoryAnalysisGateway | None = None,
     data_root: Path | None = None,
+    control_store: LocalControlStore | None = None,
+    state_root: Path | None = None,
     public_origin: str | None = None,
     poll_interval_seconds: float = 2.0,
     source_code_analysis_enabled: bool = False,
@@ -3101,6 +3119,10 @@ def create_local_app(
     resolved_synthesizer = synthesizer or build_local_report_synthesizer()
     resolved_data_root = data_root or Path(
         os.getenv("PERFPILOT_LOCAL_DATA_DIR", ".perfpilot/local-runtime")
+    )
+    resolved_control_store = control_store or LocalControlStore(
+        state_root
+        or Path(os.getenv("PERFPILOT_LOCAL_STATE_DIR", ".perfpilot/local-control"))
     )
     resolved_device_probe = device_probe
     if resolved_device_probe is None:
@@ -3141,7 +3163,7 @@ def create_local_app(
         or os.getenv("PERFPILOT_LOCAL_API_ORIGIN", "http://localhost:8000"),
         poll_interval_seconds=poll_interval_seconds,
     )
-    csrf_token = secrets.token_urlsafe(32)
+    session_cookie_name = "perfpilot_local_session"
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -3169,6 +3191,7 @@ def create_local_app(
 
     app.add_exception_handler(ApiError, local_api_error_handler)
     app.state.local_runtime = runtime
+    app.state.local_control_store = resolved_control_store
     allowed_web_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
     configured_web_origin = os.getenv("PERFPILOT_LOCAL_WEB_ORIGIN")
     if configured_web_origin:
@@ -3176,40 +3199,134 @@ def create_local_app(
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_web_origins,
-        allow_credentials=False,
-        allow_methods=["PUT", "OPTIONS"],
-        allow_headers=["Content-Type", "x-amz-checksum-sha256"],
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_headers=["Content-Type", "x-amz-checksum-sha256", "x-csrf-token"],
     )
 
-    def check_team(team_id: UUID) -> None:
-        if team_id != LOCAL_TEAM_ID:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "team not found")
+    def _set_session_cookie(response: Response, token: str) -> None:
+        response.set_cookie(
+            session_cookie_name,
+            token,
+            max_age=int(LOCAL_SESSION_TTL.total_seconds()),
+            httponly=True,
+            secure=False,
+            samesite="strict",
+            path="/",
+        )
 
-    def check_csrf(value: str | None) -> None:
-        if value is None or not hmac.compare_digest(value, csrf_token):
-            raise HTTPException(status.HTTP_403_FORBIDDEN, "csrf token is invalid")
+    def _require_origin(request: Request) -> None:
+        if request.headers.get("origin") not in allowed_web_origins:
+            raise ApiError("origin_invalid", "请求来源无效", 403, False)
+
+    def _session_token(request: Request) -> str | None:
+        return request.cookies.get(session_cookie_name)
+
+    def _require_principal(request: Request) -> LocalPrincipal:
+        token = _session_token(request)
+        principal = resolved_control_store.resolve_session(token or "")
+        if principal is None:
+            raise ApiError("authentication_required", "请先登录", 401, False)
+        return principal
+
+    def _require_csrf(request: Request, value: str | None, *, purpose: str = "authenticated") -> None:
+        _require_origin(request)
+        if not resolved_control_store.verify_csrf(_session_token(request) or "", value or "", purpose=purpose):
+            raise ApiError("csrf_invalid", "请求校验失败", 403, False)
+
+    def authorize_team(request: Request, team_id: UUID) -> LocalPrincipal:
+        principal = _require_principal(request)
+        if principal.team_id != team_id:
+            raise ApiError("team_not_found", "团队不存在", 404, False)
+        if principal.must_change_password:
+            raise ApiError("password_change_required", "请先修改初始密码", 403, False)
+        return principal
 
     @app.get("/v1/health")
     async def health() -> dict[str, object]:
         return {"schema_version": "1.0", "status": "ready", "runtime": "local"}
 
     @app.get("/v1/auth/csrf")
-    async def csrf() -> dict[str, str]:
+    async def csrf(request: Request, response: Response) -> dict[str, str]:
+        current = _session_token(request)
+        issued = resolved_control_store.rotate_session(current or "")
+        if issued is None:
+            issued = resolved_control_store.issue_preauth_session()
+        token, csrf_token = issued
+        _set_session_cookie(response, token)
+        response.headers["cache-control"] = "no-store"
+        return {"schema_version": "1.0", "csrf_token": csrf_token}
+
+    @app.post("/v1/auth/login")
+    async def login(
+        request: Request,
+        response: Response,
+        body: _LoginRequest,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, str]:
+        _require_csrf(request, x_csrf_token, purpose="preauth")
+        principal = resolved_control_store.authenticate(body.username, body.password)
+        if principal is None:
+            raise ApiError("invalid_credentials", "账号或密码错误", 401, False)
+        old_token = _session_token(request)
+        if old_token:
+            resolved_control_store.revoke_session(old_token)
+        token, csrf_token = resolved_control_store.issue_session(principal.user_id)
+        _set_session_cookie(response, token)
+        response.headers["cache-control"] = "no-store"
+        return {"schema_version": "1.0", "csrf_token": csrf_token}
+
+    @app.post("/v1/auth/logout", status_code=status.HTTP_204_NO_CONTENT)
+    async def logout(
+        request: Request,
+        response: Response,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> Response:
+        _require_principal(request)
+        _require_csrf(request, x_csrf_token)
+        token = _session_token(request)
+        if token:
+            resolved_control_store.revoke_session(token)
+        response.delete_cookie(session_cookie_name, httponly=True, samesite="strict", path="/")
+        response.status_code = status.HTTP_204_NO_CONTENT
+        return response
+
+    @app.post("/v1/auth/change-password")
+    async def change_password(
+        request: Request,
+        response: Response,
+        body: _ChangePasswordRequest,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, str]:
+        principal = _require_principal(request)
+        _require_csrf(request, x_csrf_token)
+        try:
+            principal = resolved_control_store.change_password(
+                principal.user_id, body.current_password, body.new_password
+            )
+        except LocalControlStoreError:
+            raise ApiError("invalid_credentials", "账号或密码错误", 401, False) from None
+        token, csrf_token = resolved_control_store.issue_session(principal.user_id)
+        _set_session_cookie(response, token)
+        response.headers["cache-control"] = "no-store"
         return {"schema_version": "1.0", "csrf_token": csrf_token}
 
     @app.get("/v1/me")
-    async def me() -> dict[str, object]:
+    async def me(request: Request, response: Response) -> dict[str, object]:
+        principal = _require_principal(request)
+        response.headers["cache-control"] = "no-store"
         return {
             "schema_version": "1.0",
             "user": {
-                "id": str(LOCAL_USER_ID),
-                "username": "ray_wu",
-                "is_platform_admin": True,
+                "id": str(principal.user_id),
+                "username": principal.username,
+                "is_platform_admin": principal.is_platform_admin,
+                "must_change_password": principal.must_change_password,
             },
             "memberships": [
                 {
-                    "id": str(uuid4()),
-                    "team": {"id": str(LOCAL_TEAM_ID), "name": "本地测试"},
+                    "id": str(principal.team_id),
+                    "team": {"id": str(principal.team_id), "name": principal.team_name},
                     "role": "owner",
                 }
             ],
@@ -3250,8 +3367,8 @@ def create_local_app(
         }
 
     @app.get("/v1/teams/{team_id}/devices")
-    async def team_devices(team_id: UUID) -> dict[str, object]:
-        check_team(team_id)
+    async def team_devices(request: Request, team_id: UUID) -> dict[str, object]:
+        authorize_team(request, team_id)
         detected = await resolved_device_probe.inspect()
         devices = (
             [_team_device(detected.device)]
@@ -3261,18 +3378,19 @@ def create_local_app(
         return {"schema_version": "1.0", "devices": devices}
 
     @app.get("/v1/teams/{team_id}/source-workspaces")
-    async def source_workspaces(team_id: UUID) -> dict[str, object]:
-        check_team(team_id)
+    async def source_workspaces(request: Request, team_id: UUID) -> dict[str, object]:
+        authorize_team(request, team_id)
         return {"schema_version": "1.0", "workspaces": []}
 
     @app.post("/v1/teams/{team_id}/analyses", status_code=status.HTTP_201_CREATED)
     async def create_analysis(
+        request: Request,
         team_id: UUID,
         body: _CreateAnalysisRequest,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        check_team(team_id)
-        check_csrf(x_csrf_token)
+        authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
         if body.source_binding is not None and not source_code_analysis_enabled:
             raise ApiError(
                 "source_code_analysis_disabled",
@@ -3295,6 +3413,7 @@ def create_local_app(
 
     @app.get("/v1/teams/{team_id}/analyses")
     async def list_analyses(
+        request: Request,
         team_id: UUID,
         analysis_status: Annotated[
             Literal["active"] | None,
@@ -3303,7 +3422,7 @@ def create_local_app(
         report_available: bool | None = None,
         limit: Annotated[int, Query(ge=1, le=20)] = 1,
     ) -> dict[str, object]:
-        check_team(team_id)
+        authorize_team(request, team_id)
         if analysis_status == "active":
             if report_available is not None:
                 raise HTTPException(
@@ -3328,12 +3447,13 @@ def create_local_app(
         status_code=status.HTTP_201_CREATED,
     )
     async def recover_local_analysis(
+        request: Request,
         team_id: UUID,
         body: _LocalRecoveryRequest,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        check_team(team_id)
-        check_csrf(x_csrf_token)
+        authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
         return runtime.response(await runtime.recover(body))
 
     @app.post(
@@ -3341,13 +3461,14 @@ def create_local_app(
         status_code=status.HTTP_201_CREATED,
     )
     async def reserve_upload(
+        request: Request,
         team_id: UUID,
         analysis_id: UUID,
         body: _ReserveUploadRequest,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        check_team(team_id)
-        check_csrf(x_csrf_token)
+        authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
         analysis = await runtime.analysis(analysis_id)
         upload = await runtime.reserve(analysis, body)
         return runtime.slot(upload, finalized=False)
@@ -3363,34 +3484,37 @@ def create_local_app(
 
     @app.post("/v1/teams/{team_id}/analyses/{analysis_id}/finalize-upload")
     async def finalize_upload(
+        request: Request,
         team_id: UUID,
         analysis_id: UUID,
         body: _FinalizeUploadRequest,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        check_team(team_id)
-        check_csrf(x_csrf_token)
+        authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
         analysis = await runtime.analysis(analysis_id)
         upload = await runtime.finalize(analysis, body)
         return runtime.slot(upload, finalized=True)
 
     @app.get("/v1/teams/{team_id}/analyses/{analysis_id}")
     async def read_analysis(
+        request: Request,
         team_id: UUID,
         analysis_id: UUID,
     ) -> dict[str, object]:
-        check_team(team_id)
+        authorize_team(request, team_id)
         return runtime.response(await runtime.analysis(analysis_id))
 
     @app.post("/v1/teams/{team_id}/analyses/{analysis_id}/cancel")
     async def cancel_analysis(
+        request: Request,
         team_id: UUID,
         analysis_id: UUID,
         http_response: Response,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        check_team(team_id)
-        check_csrf(x_csrf_token)
+        authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
         analysis, accepted = await runtime.cancel(await runtime.analysis(analysis_id))
         http_response.status_code = (
             status.HTTP_202_ACCEPTED if accepted else status.HTTP_200_OK
@@ -3398,8 +3522,8 @@ def create_local_app(
         return runtime.response(analysis)
 
     @app.get("/v1/teams/{team_id}/analyses/{analysis_id}/report")
-    async def read_report(team_id: UUID, analysis_id: UUID) -> dict[str, object]:
-        check_team(team_id)
+    async def read_report(request: Request, team_id: UUID, analysis_id: UUID) -> dict[str, object]:
+        authorize_team(request, team_id)
         analysis = await runtime.analysis(analysis_id)
         if analysis.report is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "report not ready")
@@ -3410,12 +3534,13 @@ def create_local_app(
         status_code=status.HTTP_201_CREATED,
     )
     async def rerun_synthesis(
+        request: Request,
         team_id: UUID,
         analysis_id: UUID,
         x_csrf_token: Annotated[str | None, Header()] = None,
     ) -> dict[str, object]:
-        check_team(team_id)
-        check_csrf(x_csrf_token)
+        authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
         analysis = await runtime.analysis(analysis_id)
         generation = await runtime.rerun_synthesis(analysis)
         return {

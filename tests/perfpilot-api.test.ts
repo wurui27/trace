@@ -147,6 +147,46 @@ function sourceAwareReportPayload(): Record<string, unknown> {
 }
 
 describe("PerfPilot browser API", () => {
+  it("authenticates with a closed login contract and validates the current user", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", csrf_token: "preauth-csrf" }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", csrf_token: "session-csrf" }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          schema_version: "1.0",
+          user: {
+            id: "80000000-0000-4000-8000-000000000001",
+            username: "user01",
+            is_platform_admin: false,
+            must_change_password: true,
+          },
+          memberships: [
+            {
+              id: TEAM_ID,
+              team: { id: TEAM_ID, name: "user01 local team" },
+              role: "owner",
+            },
+          ],
+        }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await client.csrf();
+    await expect((client as unknown as { login: (username: string, password: string) => Promise<string> }).login("user01", "initial user password")).resolves.toBe("session-csrf");
+    await expect(client.me()).resolves.toMatchObject({
+      user: { username: "user01", must_change_password: true },
+    });
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      "/api/v1/auth/login",
+      expect.objectContaining({ method: "POST", credentials: "same-origin" }),
+    );
+  });
   it("accepts only closed public Agent source workspace records", async () => {
     const workspace = {
       provider_kind: "agent_workspace",
@@ -551,9 +591,14 @@ describe("PerfPilot browser API", () => {
       if (url === "/api/v1/me") {
         return Response.json({
           schema_version: "1.0",
-          user: { id: "user-1", username: "ray_wu", is_platform_admin: true },
+          user: {
+            id: "80000000-0000-4000-8000-000000000001",
+            username: "ray_wu",
+            is_platform_admin: true,
+            must_change_password: false,
+          },
           memberships: [
-            { id: "member-1", team: { id: TEAM_ID, name: "Ray" }, role: "owner" },
+            { id: TEAM_ID, team: { id: TEAM_ID, name: "Ray" }, role: "owner" },
           ],
         });
       }
