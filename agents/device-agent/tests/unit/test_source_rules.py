@@ -101,6 +101,7 @@ def test_context_ranks_direct_symbol_then_android_component_with_bounded_fragmen
     assert "trace_symbol" in context.fragments[0].match_signals
     assert "android.ui.blocking_wait" in context.fragments[0].rule_ids
     assert context.fragments[0].snapshot_hash == snapshot.snapshot_hash
+    assert context.fragments[0].document()["snapshot_hash"] == snapshot.snapshot_hash
     assert len({fragment.source_ref_id for fragment in context.fragments}) == len(
         context.fragments
     )

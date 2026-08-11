@@ -4,6 +4,8 @@ import hashlib
 import os
 import stat
 import subprocess
+import threading
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from uuid import UUID
@@ -104,6 +106,8 @@ def test_snapshot_captures_current_tracked_tree_without_touching_real_git(
     tmp_path: Path,
 ) -> None:
     repo = _mixed_git_repo(tmp_path / "app")
+    executable = repo / "app/src/main/java/demo/MainActivity.kt"
+    executable.chmod(0o755)
     before = _tree_digest(repo)
     git_before = _tree_digest(repo / ".git")
 
@@ -116,6 +120,12 @@ def test_snapshot_captures_current_tracked_tree_without_touching_real_git(
     assert result.read_text("app/src/main/java/demo/MainActivity.kt") == (
         "staged + unstaged\n"
     )
+    expected_mode = "100644" if os.name == "nt" else "100755"
+    assert result._file("app/src/main/java/demo/MainActivity.kt").mode == expected_mode
+    if os.name != "nt":
+        assert result.tree_path.joinpath(
+            "app/src/main/java/demo/MainActivity.kt"
+        ).stat().st_mode & stat.S_IXUSR
     assert result.read_text("app/src/main/java/demo/启动.kt") == "类 启动\r\n"
     assert "app/src/main/java/demo/deleted.kt" in result.deleted_paths
     assert "untracked.kt" not in result.paths
@@ -153,6 +163,71 @@ def test_snapshot_hash_is_deterministic_but_snapshot_ids_are_never_reused(
     assert first.git_commit == second.git_commit
     assert first.snapshot_id != second.snapshot_id
     assert first.cache_path != second.cache_path
+    executable = repo / "app/src/main/java/demo/Committed.kt"
+    executable.chmod(0o755)
+    changed_mode = snapshotter.create(repo, WORKSPACE_ID, created_at=CREATED_AT)
+    if os.name == "nt":
+        assert changed_mode.snapshot_hash == first.snapshot_hash
+    else:
+        assert changed_mode.snapshot_hash != first.snapshot_hash
+        assert changed_mode.git_commit != first.git_commit
+
+
+def test_private_commit_ignores_hostile_git_config_and_preserves_crlf_blob(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = tmp_path / "app"
+    repo.mkdir()
+    _git(repo, "init", "--quiet", "--initial-branch=main")
+    source = _write(repo, "app/src/main/java/demo/Windows.kt", b"line1\r\nline2\r\n")
+    _commit(repo)
+    hostile_home = tmp_path / "hostile-home"
+    hostile_home.mkdir()
+    attributes = tmp_path / "global-attributes"
+    attributes.write_text("*.kt text eol=lf\n", encoding="utf-8")
+    (hostile_home / ".gitconfig").write_text(
+        "[core]\n"
+        "  autocrlf = true\n"
+        f"  attributesFile = {attributes}\n"
+        "[commit]\n"
+        "  gpgsign = true\n"
+        "[gpg]\n"
+        "  program = /usr/bin/false\n",
+        encoding="utf-8",
+    )
+    snapshotter = SourceSnapshotter(cache_root=tmp_path / "cache")
+    baseline = snapshotter.create(repo, WORKSPACE_ID, created_at=CREATED_AT)
+    monkeypatch.setenv("HOME", str(hostile_home))
+
+    result = snapshotter.create(
+        repo,
+        WORKSPACE_ID,
+        created_at=CREATED_AT,
+    )
+
+    assert result.read_bytes("app/src/main/java/demo/Windows.kt") == source.read_bytes()
+    assert result.snapshot_hash == baseline.snapshot_hash
+    assert result.git_commit == baseline.git_commit
+    assert _git(
+        result.tree_path,
+        "cat-file",
+        "-p",
+        f"{result.git_commit}:app/src/main/java/demo/Windows.kt",
+    ) == b"line1\r\nline2\r\n"
+
+
+def test_snapshotter_rejects_cache_limits_above_hard_caps(tmp_path: Path) -> None:
+    with pytest.raises(SourceSnapshotError):
+        SourceSnapshotter(
+            cache_root=tmp_path / "too-large",
+            max_cache_bytes=2 * 1024 * 1024 * 1024 + 1,
+        )
+    with pytest.raises(SourceSnapshotError):
+        SourceSnapshotter(
+            cache_root=tmp_path / "too-old",
+            terminal_ttl=timedelta(hours=24, microseconds=1),
+        )
 
 
 def test_snapshot_rejects_oversized_tracked_file_before_reading_it(tmp_path: Path) -> None:
@@ -215,6 +290,64 @@ def test_cleanup_removes_only_old_terminal_snapshots(tmp_path: Path) -> None:
 
     assert not old.cache_path.exists()
     assert active.cache_path.exists()
+
+
+def test_cleaned_snapshot_id_tombstone_is_private_and_never_reused(tmp_path: Path) -> None:
+    repo = tmp_path / "app"
+    repo.mkdir()
+    _git(repo, "init", "--quiet", "--initial-branch=main")
+    _write(repo, "Main.kt", b"class Main\n")
+    _commit(repo)
+    now = CREATED_AT
+    snapshot_id = UUID("95000000-0000-4000-8000-000000000001")
+    snapshotter = SourceSnapshotter(
+        cache_root=tmp_path / "cache",
+        uuid_factory=lambda: snapshot_id,
+        clock=lambda: now,
+    )
+    first = snapshotter.create(repo, WORKSPACE_ID, created_at=now - timedelta(days=2))
+    snapshotter.mark_terminal(first.snapshot_id, terminal_at=now - timedelta(hours=25))
+    snapshotter.cleanup()
+    assert not first.cache_path.exists()
+
+    with pytest.raises(SourceSnapshotError):
+        snapshotter.create(repo, WORKSPACE_ID, created_at=now)
+
+    tombstone = snapshotter.cache_root / ".used-snapshot-ids" / str(snapshot_id)
+    assert tombstone.is_file()
+    if os.name != "nt":
+        assert stat.S_IMODE(tombstone.stat().st_mode) == 0o600
+
+
+def test_cache_cleanup_cannot_race_in_progress_snapshot_creation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    repo = tmp_path / "app"
+    repo.mkdir()
+    _git(repo, "init", "--quiet", "--initial-branch=main")
+    _write(repo, "Main.kt", b"class Main\n")
+    _commit(repo)
+    snapshotter = SourceSnapshotter(cache_root=tmp_path / "cache")
+    started = threading.Event()
+    release = threading.Event()
+    original = snapshotter._materialize
+
+    def blocking_materialize(*args, **kwargs):
+        started.set()
+        assert release.wait(timeout=5)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(snapshotter, "_materialize", blocking_materialize)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        creating = pool.submit(snapshotter.create, repo, WORKSPACE_ID, created_at=CREATED_AT)
+        assert started.wait(timeout=5)
+        cleaning = pool.submit(snapshotter.cleanup)
+        with pytest.raises(FutureTimeout):
+            cleaning.result(timeout=0.1)
+        release.set()
+        creating.result(timeout=5)
+        cleaning.result(timeout=5)
 
 
 def test_snapshot_rejects_non_repository_without_disclosing_path(tmp_path: Path) -> None:

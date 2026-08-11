@@ -93,8 +93,14 @@ class CapturingHeartbeatControl:
         )
 
 
-def _heartbeat_credentials() -> AgentCredentials:
+def _heartbeat_credentials(*, source_capable: bool = False) -> AgentCredentials:
     return AgentCredentials.model_construct(
+        schema_version="1.1" if source_capable else "1.0",
+        team_id=(
+            UUID("10000000-0000-4000-8000-000000000001")
+            if source_capable
+            else None
+        ),
         access_token="ppat_" + "A" * 43,
         refresh_token="pprt_" + "B" * 43,
     )
@@ -248,7 +254,7 @@ async def test_heartbeat_publishes_only_public_source_workspace_metadata(tmp_pat
     publisher = HeartbeatPublisher(
         inventory=EmptyInventory(),
         control=control,
-        credentials=_heartbeat_credentials(),
+        credentials=_heartbeat_credentials(source_capable=True),
         metadata=PlatformMetadata(platform="linux", hostname="test", os_version="test"),
         state=AgentRuntimeState(),
         workspace_root=tmp_path,
@@ -296,7 +302,7 @@ async def test_source_registry_failure_does_not_break_device_heartbeat_or_leak_p
     publisher = HeartbeatPublisher(
         inventory=EmptyInventory(),
         control=control,
-        credentials=_heartbeat_credentials(),
+        credentials=_heartbeat_credentials(source_capable=True),
         metadata=PlatformMetadata(platform="linux", hostname="test", os_version="test"),
         state=AgentRuntimeState(),
         workspace_root=tmp_path,
@@ -336,3 +342,34 @@ async def test_heartbeat_without_source_registry_remains_schema_1_0(tmp_path: Pa
     assert control.request.model_dump(mode="json", exclude={"workspaces"})[
         "schema_version"
     ] == "1.0"
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_missing_constructed_schema_version_falls_back_to_legacy(
+    tmp_path: Path,
+) -> None:
+    class UnexpectedRegistry:
+        def public_workspaces(self):
+            raise AssertionError("legacy credentials must not publish source workspaces")
+
+    control = CapturingHeartbeatControl()
+    publisher = HeartbeatPublisher(
+        inventory=EmptyInventory(),
+        control=control,
+        credentials=AgentCredentials.model_construct(
+            access_token="ppat_" + "A" * 43,
+            refresh_token="pprt_" + "B" * 43,
+        ),
+        metadata=PlatformMetadata(platform="linux", hostname="test", os_version="test"),
+        state=AgentRuntimeState(),
+        workspace_root=tmp_path,
+        source_registry=UnexpectedRegistry(),
+        clock=lambda: NOW,
+        disk_free=lambda _path: 1,
+    )
+
+    await publisher.publish()
+
+    assert control.request is not None
+    assert control.request.schema_version == "1.0"
+    assert "workspaces" not in control.request.model_fields_set

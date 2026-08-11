@@ -7,6 +7,7 @@ import re
 import shutil
 import stat
 import subprocess
+import tempfile
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -17,6 +18,7 @@ from uuid import UUID, uuid4
 
 MAX_SNAPSHOT_BYTES = 512 * 1024 * 1024
 MAX_CACHE_BYTES = 2 * 1024 * 1024 * 1024
+MAX_TERMINAL_TTL = timedelta(hours=24)
 _MAX_GIT_OUTPUT_BYTES = 64 * 1024 * 1024
 _ALLOWED_SUFFIXES = (".kt", ".java", ".xml", ".gradle", ".kts", ".properties")
 _SENSITIVE_NAMES = {
@@ -123,6 +125,9 @@ def _git_environment(*, controlled: dict[str, str] | None = None) -> dict[str, s
         {
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_OPTIONAL_LOCKS": "0",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_SYSTEM": os.devnull,
             "LC_ALL": "C",
         }
     )
@@ -148,7 +153,9 @@ class SourceSnapshotter:
             or max_snapshot_bytes <= 0
             or max_snapshot_bytes > MAX_SNAPSHOT_BYTES
             or max_cache_bytes <= 0
+            or max_cache_bytes > MAX_CACHE_BYTES
             or terminal_ttl.total_seconds() <= 0
+            or terminal_ttl > MAX_TERMINAL_TTL
         ):
             raise SourceSnapshotError
         self.cache_root = cache_root
@@ -158,6 +165,8 @@ class SourceSnapshotter:
         self._max_snapshot_bytes = max_snapshot_bytes
         self._max_cache_bytes = max_cache_bytes
         self._prepare_cache_root()
+        self._used_ids_root = self.cache_root / ".used-snapshot-ids"
+        self._prepare_used_ids_root()
 
     def _prepare_cache_root(self) -> None:
         try:
@@ -173,6 +182,82 @@ class SourceSnapshotter:
             raise
         except OSError:
             raise SourceSnapshotError from None
+
+    def _prepare_used_ids_root(self) -> None:
+        try:
+            with _private_umask():
+                self._used_ids_root.mkdir(mode=0o700, exist_ok=True)
+            if self._used_ids_root.is_symlink() or not self._used_ids_root.is_dir():
+                raise SourceSnapshotError
+            if os.name != "nt":
+                self._used_ids_root.chmod(0o700)
+        except SourceSnapshotError:
+            raise
+        except OSError:
+            raise SourceSnapshotError from None
+
+    def _reserve_snapshot_id(self, snapshot_id: UUID) -> None:
+        tombstone = self._used_ids_root / str(snapshot_id)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(tombstone, flags, 0o600)
+            try:
+                os.write(descriptor, b"used\n")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            if os.name != "nt":
+                tombstone.chmod(0o600)
+                directory = os.open(self._used_ids_root, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except FileExistsError:
+            raise SourceSnapshotError from None
+        except OSError:
+            raise SourceSnapshotError from None
+
+    @contextmanager
+    def _cache_lock(self) -> Iterator[None]:
+        lock_path = self.cache_root / ".source-cache.lock"
+        descriptor = -1
+        try:
+            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            if os.name == "nt":
+                import msvcrt
+
+                if os.fstat(descriptor).st_size == 0:
+                    os.write(descriptor, b"\0")
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                msvcrt.locking(descriptor, msvcrt.LK_LOCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(descriptor, fcntl.LOCK_EX)
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            yield
+        except SourceSnapshotError:
+            raise
+        except OSError:
+            raise SourceSnapshotError from None
+        finally:
+            if descriptor >= 0:
+                try:
+                    if os.name == "nt":
+                        import msvcrt
+
+                        os.lseek(descriptor, 0, os.SEEK_SET)
+                        msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(descriptor, fcntl.LOCK_UN)
+                except OSError:
+                    pass
+                os.close(descriptor)
 
     def _git(
         self,
@@ -190,6 +275,12 @@ class SourceSnapshotter:
                     str(repository),
                     "-c",
                     "core.hooksPath=/dev/null",
+                    "-c",
+                    "core.autocrlf=false",
+                    "-c",
+                    "core.attributesFile=/dev/null",
+                    "-c",
+                    "commit.gpgsign=false",
                     *arguments,
                 ],
                 stdin=subprocess.DEVNULL,
@@ -379,8 +470,11 @@ class SourceSnapshotter:
                 relative_path,
                 maximum_output_bytes=128,
             )
+            effective_mode = mode
+            if os.name != "nt":
+                effective_mode = "100755" if metadata.st_mode & 0o111 else "100644"
             digest = hashlib.sha256(content).hexdigest()
-            files.append(SnapshotFile(relative_path, mode, content, digest))
+            files.append(SnapshotFile(relative_path, effective_mode, content, digest))
             total_bytes += len(content)
         return tuple(files), tuple(sorted(deleted)), tuple(exclusions[:64])
 
@@ -446,6 +540,20 @@ class SourceSnapshotter:
         *,
         created_at: datetime | None = None,
     ) -> SourceSnapshot:
+        with self._cache_lock():
+            return self._create_locked(
+                repository,
+                workspace_id,
+                created_at=created_at,
+            )
+
+    def _create_locked(
+        self,
+        repository: Path,
+        workspace_id: UUID,
+        *,
+        created_at: datetime | None = None,
+    ) -> SourceSnapshot:
         if (
             not isinstance(repository, Path)
             or not repository.is_absolute()
@@ -459,6 +567,7 @@ class SourceSnapshotter:
         if not isinstance(snapshot_id, UUID) or snapshot_id.version != 4:
             raise SourceSnapshotError
         snapshot_path = self.cache_root / str(snapshot_id)
+        self._reserve_snapshot_id(snapshot_id)
         if snapshot_path.exists():
             raise SourceSnapshotError
         try:
@@ -502,12 +611,7 @@ class SourceSnapshotter:
                 "terminal_at": None,
                 "workspace_id": str(workspace_id),
             }
-            metadata_path = snapshot_path / "metadata.json"
-            metadata_path.write_text(
-                json.dumps(metadata, separators=(",", ":"), sort_keys=True),
-                encoding="utf-8",
-            )
-            metadata_path.chmod(0o600)
+            self._write_metadata(snapshot_path, metadata)
             result = SourceSnapshot(
                 snapshot_id=snapshot_id,
                 workspace_id=workspace_id,
@@ -522,7 +626,7 @@ class SourceSnapshotter:
                 deleted_paths=deleted,
                 exclusions=exclusions,
             )
-            self.cleanup()
+            self._cleanup_unlocked()
             if self._cache_size() > self._max_cache_bytes:
                 raise SourceSnapshotError
             return result
@@ -544,7 +648,59 @@ class SourceSnapshotter:
             return None
         return document
 
+    @staticmethod
+    def _write_metadata(path: Path, document: dict[str, object]) -> None:
+        temporary: Path | None = None
+        descriptor = -1
+        try:
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path,
+                prefix=".metadata-",
+                suffix=".tmp",
+            )
+            temporary = Path(temporary_name)
+            if os.name != "nt":
+                os.fchmod(descriptor, 0o600)
+            payload = json.dumps(document, separators=(",", ":"), sort_keys=True).encode(
+                "utf-8"
+            )
+            with os.fdopen(descriptor, "wb", closefd=True) as target:
+                descriptor = -1
+                target.write(payload)
+                target.flush()
+                os.fsync(target.fileno())
+            os.replace(temporary, path / "metadata.json")
+            temporary = None
+            if os.name != "nt":
+                directory = os.open(path, os.O_RDONLY)
+                try:
+                    os.fsync(directory)
+                finally:
+                    os.close(directory)
+        except OSError:
+            raise SourceSnapshotError from None
+        finally:
+            if descriptor >= 0:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     def mark_terminal(self, snapshot_id: UUID, *, terminal_at: datetime | None = None) -> None:
+        with self._cache_lock():
+            self._mark_terminal_locked(snapshot_id, terminal_at=terminal_at)
+
+    def _mark_terminal_locked(
+        self,
+        snapshot_id: UUID,
+        *,
+        terminal_at: datetime | None = None,
+    ) -> None:
         path = self.cache_root / str(snapshot_id)
         document = self._metadata(path)
         current = terminal_at or self._clock()
@@ -556,15 +712,7 @@ class SourceSnapshotter:
         ):
             raise SourceSnapshotError
         document["terminal_at"] = current.astimezone(UTC).isoformat()
-        metadata_path = path / "metadata.json"
-        try:
-            metadata_path.write_text(
-                json.dumps(document, separators=(",", ":"), sort_keys=True),
-                encoding="utf-8",
-            )
-            metadata_path.chmod(0o600)
-        except OSError:
-            raise SourceSnapshotError from None
+        self._write_metadata(path, document)
 
     @staticmethod
     def _directory_size(path: Path) -> int:
@@ -588,6 +736,10 @@ class SourceSnapshotter:
             raise SourceSnapshotError from None
 
     def cleanup(self) -> None:
+        with self._cache_lock():
+            self._cleanup_unlocked()
+
+    def _cleanup_unlocked(self) -> None:
         now = self._clock().astimezone(UTC)
         terminal: list[tuple[datetime, Path, int]] = []
         total = 0
@@ -619,6 +771,7 @@ class SourceSnapshotter:
 __all__ = [
     "MAX_CACHE_BYTES",
     "MAX_SNAPSHOT_BYTES",
+    "MAX_TERMINAL_TTL",
     "SnapshotFile",
     "SourceExclusion",
     "SourceSnapshot",

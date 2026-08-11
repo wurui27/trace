@@ -146,18 +146,20 @@ class SourceTaskRunner:
                     },
                 }
             )
-        await self._control.complete_source_task(
-            execution_id=task.execution_id,
-            lease_version=task.lease_version,
-            lease_token=lease_token,
-            completion=completion,
-        )
-        if snapshot is not None:
-            try:
-                self._snapshotter.mark_terminal(snapshot.snapshot_id)
-                self._snapshotter.cleanup()
-            except SourceSnapshotError:
-                pass
+        try:
+            await self._control.complete_source_task(
+                execution_id=task.execution_id,
+                lease_version=task.lease_version,
+                lease_token=lease_token,
+                completion=completion,
+            )
+        finally:
+            if snapshot is not None:
+                try:
+                    self._snapshotter.mark_terminal(snapshot.snapshot_id)
+                    self._snapshotter.cleanup()
+                except SourceSnapshotError:
+                    pass
 
     async def _execute_patch_shell(
         self,

@@ -23,6 +23,7 @@
         "end_line": 1,
         "content": "class MainActivity {}\n",
         "content_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "snapshot_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "finding_ids": ["85000000-0000-4000-8000-000000000001"],
         "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
         "rule_ids": ["startup.main_thread_binder"],

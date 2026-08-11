@@ -193,6 +193,10 @@ async def test_signed_source_context_executes_without_adb_and_emits_closed_compl
         )
     )
     Draft202012Validator(contract, format_checker=FormatChecker()).validate(wire)
+    assert all(
+        fragment["snapshot_hash"] == wire["result"]["snapshot_hash"]
+        for fragment in wire["result"]["fragments"]
+    )
     serialized = json.dumps(wire, ensure_ascii=False, sort_keys=True)
     assert str(tmp_path) not in serialized
     assert "secret.example" not in serialized

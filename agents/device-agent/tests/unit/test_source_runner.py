@@ -22,6 +22,12 @@ class RecordingControl:
         return object()
 
 
+class FailingControl(RecordingControl):
+    async def complete_source_task(self, **kwargs):
+        self.calls.append(kwargs)
+        raise OSError("network unavailable")
+
+
 def _git(repo: Path, *arguments: str) -> None:
     environment = {
         key: value for key, value in os.environ.items() if not key.upper().startswith("GIT_")
@@ -119,3 +125,22 @@ async def test_runner_returns_closed_failure_for_unknown_workspace(tmp_path: Pat
         "retryable": False,
     }
     assert str(tmp_path) not in repr(completion)
+
+
+@pytest.mark.asyncio
+async def test_runner_marks_snapshot_terminal_when_completion_upload_fails(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "agent"
+    registry = SourceWorkspaceRegistry(root)
+    workspace = registry.add(name="Demo", path=_repo(tmp_path / "private-source"))
+    control = FailingControl()
+    runner = SourceTaskRunner(control=control, registry=registry, cache_root=root / "source-cache")
+
+    with pytest.raises(OSError, match="network unavailable"):
+        await runner.run(_task(workspace.workspace_id), lease_token="opaque-token")
+
+    metadata_files = tuple((root / "source-cache").glob("*/metadata.json"))
+    assert len(metadata_files) == 1
+    metadata = metadata_files[0].read_text(encoding="utf-8")
+    assert '"terminal_at":null' not in metadata

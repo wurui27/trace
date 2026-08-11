@@ -61,6 +61,7 @@
         "end_line",
         "content",
         "content_sha256",
+        "snapshot_hash",
         "finding_ids",
         "evidence_ids",
         "rule_ids",
@@ -80,6 +81,7 @@
         "end_line": {"type": "integer", "minimum": 1},
         "content": {"type": "string", "minLength": 1, "maxLength": 98304, "$comment": "maxLength is a character bound; semantic validation also caps aggregate fragment content at 98,304 UTF-8 bytes."},
         "content_sha256": {"$ref": "#/$defs/hex64"},
+        "snapshot_hash": {"$ref": "#/$defs/hex64"},
         "finding_ids": {
           "type": "array",
           "maxItems": 3,

@@ -287,6 +287,7 @@ def test_source_completion_is_closed_bounded_and_state_discriminated() -> None:
     ) <= 98_304
 
     fragment = completion["result"]["fragments"][0]  # type: ignore[index]
+    assert fragment["snapshot_hash"] == completion["result"]["snapshot_hash"]  # type: ignore[index]
     for relative_path in (
         "/private/Main.kt",
         "C:/private/Main.kt",
@@ -298,6 +299,11 @@ def test_source_completion_is_closed_bounded_and_state_discriminated() -> None:
         invalid["result"]["fragments"][0]["relative_path"] = relative_path  # type: ignore[index]
         with pytest.raises(jsonschema.ValidationError):
             contract.validate(invalid)
+
+    mismatched = deepcopy(completion)
+    mismatched["result"]["fragments"][0]["snapshot_hash"] = "e" * 64  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        _validate_agent_contract("agents/source-task-completion.schema.json", mismatched)
 
     for mutation in (
         {**completion, "schema_version": "1.1"},

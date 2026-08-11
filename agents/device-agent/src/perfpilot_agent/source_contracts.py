@@ -57,6 +57,13 @@ def validate_source_contract_semantics(
         fragments = result.get("fragments")
         if not isinstance(fragments, list):
             return
+        snapshot_hash = result.get("snapshot_hash")
+        if not isinstance(snapshot_hash, str) or any(
+            not isinstance(fragment, dict)
+            or fragment.get("snapshot_hash") != snapshot_hash
+            for fragment in fragments
+        ):
+            raise SourceContractError
         fragment_bytes = sum(
             len(fragment["content"].encode("utf-8"))
             for fragment in fragments

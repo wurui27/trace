@@ -70,6 +70,7 @@ class SourceFragment:
             "end_line": self.end_line,
             "content": self.content,
             "content_sha256": self.content_sha256,
+            "snapshot_hash": self.snapshot_hash,
             "finding_ids": [str(item) for item in self.finding_ids],
             "evidence_ids": [str(item) for item in self.evidence_ids],
             "rule_ids": list(self.rule_ids),

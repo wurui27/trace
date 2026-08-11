@@ -385,8 +385,8 @@ class HeartbeatPublisher:
         workspaces: tuple[HeartbeatWorkspace, ...] | None = None
         if (
             self._source_registry is not None
-            and credentials.schema_version == "1.1"
-            and credentials.team_id is not None
+            and getattr(credentials, "schema_version", "1.0") == "1.1"
+            and getattr(credentials, "team_id", None) is not None
         ):
             schema_version = "1.1"
             try:
