@@ -307,6 +307,10 @@ class SourceCodeAnalysisView:
 def source_code_analysis_view(
     binding: SourceBinding | None,
     task: SourceTask | None = None,
+    *,
+    durable_context_state: str | None = None,
+    durable_match_summary: str = "none",
+    durable_failure_code: str | None = None,
 ) -> SourceCodeAnalysisView:
     if binding is None:
         return SourceCodeAnalysisView(
@@ -325,11 +329,24 @@ def source_code_analysis_view(
         "waiting_for_agent", "extracting", "available", "unavailable"
     ] = "waiting_for_agent"
     failure_code = None
-    if task is not None:
+    match_summary: Literal["strong", "weak", "none"] = "none"
+    if durable_context_state == "available" and durable_match_summary in {
+        "strong",
+        "weak",
+        "none",
+    }:
+        context_state = "available"
+        match_summary = durable_match_summary  # type: ignore[assignment]
+    elif durable_context_state == "unavailable" and durable_failure_code:
+        context_state = "unavailable"
+        failure_code = durable_failure_code
+    elif durable_context_state in {"waiting_for_agent", "extracting"}:
+        context_state = durable_context_state  # type: ignore[assignment]
+    elif task is not None:
         if task.state in {"leased", "running", "cancel_requested"}:
             context_state = "extracting"
-        elif task.state == "completed" and task.completion_artifact_id is not None:
-            context_state = "available"
+        elif task.state == "completed":
+            context_state = "extracting"
         elif task.state in {"failed", "canceled", "expired"}:
             context_state = "unavailable"
             failure_code = task.failure_code or "source_agent_unavailable"
@@ -341,7 +358,7 @@ def source_code_analysis_view(
         snapshot_policy=binding.snapshot_policy,
         validation_profile_id=binding.validation_profile_id,
         context_state=context_state,
-        match_summary="none",
+        match_summary=match_summary,
         verification_state="not_requested",
         failure_code=failure_code,
     )
@@ -3076,7 +3093,11 @@ class SQLAlchemyAnalysisRepository:
                 ),
                 source_binding=source_binding,
                 source_code_analysis=source_code_analysis_view(
-                    source_binding, latest_source_task
+                    source_binding,
+                    latest_source_task,
+                    durable_context_state=tenant_analysis.source_context_state,
+                    durable_match_summary=tenant_analysis.source_match_summary,
+                    durable_failure_code=tenant_analysis.source_failure_code,
                 ),
             )
 
@@ -3241,7 +3262,11 @@ class SQLAlchemyAnalysisRepository:
             question=tenant_analysis.question,
             source_binding=source_binding,
             source_code_analysis=source_code_analysis_view(
-                source_binding, latest_source_task
+                source_binding,
+                latest_source_task,
+                durable_context_state=tenant_analysis.source_context_state,
+                durable_match_summary=tenant_analysis.source_match_summary,
+                durable_failure_code=tenant_analysis.source_failure_code,
             ),
         )
 

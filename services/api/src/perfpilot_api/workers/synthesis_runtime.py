@@ -55,8 +55,8 @@ from perfpilot_api.workers.synthesis_orchestrator import (
     SynthesisPipeline,
 )
 from perfpilot_api.workers.source_orchestrator import (
-    InMemorySourceAnalysisStateRepository,
     NoopSynthesisScheduler,
+    SQLAlchemySourceAnalysisStateRepository,
     SourceOrchestrator,
     SQLAlchemySourceAuthorityReader,
 )
@@ -285,7 +285,10 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
             sort_keys=True,
         ).encode("ascii")
         source_orchestrator = SourceOrchestrator(
-            authority=SQLAlchemySourceAuthorityReader(control_sessions),
+            authority=SQLAlchemySourceAuthorityReader(
+                control_sessions,
+                canonical_reader=canonical_reader,
+            ),
             tasks=SourceTaskService(
                 repository=SQLAlchemySourceTaskRepository(control_sessions)
             ),
@@ -294,7 +297,7 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
                 bucket_resolver=bucket_resolver,
                 client=artifacts.s3_client,
             ),
-            states=InMemorySourceAnalysisStateRepository(),
+            states=SQLAlchemySourceAnalysisStateRepository(artifacts.tenant_router),
             scheduler=NoopSynthesisScheduler(),
         )
         coordinator = SynthesisCoordinator(

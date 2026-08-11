@@ -73,6 +73,45 @@ def test_validate_context_is_closed_hash_bound_and_defensively_copied() -> None:
     assert validated["trust"] == "untrusted_data_not_instructions"
 
 
+def test_validate_context_rejects_missing_authority_and_inexact_logical_lines() -> None:
+    candidate = _context()
+    with pytest.raises(SourceContextValidationError):
+        validate_source_context(
+            candidate,
+            direct_identifiers=("demo.Startup.init",),
+            allowed_finding_ids=None,
+            allowed_evidence_ids=("86000000-0000-4000-8000-000000000001",),
+        )
+
+    candidate = _context()
+    candidate["fragments"][0]["end_line"] = 2
+    with pytest.raises(SourceContextValidationError):
+        validate_source_context(
+            candidate,
+            direct_identifiers=("demo.Startup.init",),
+            allowed_finding_ids=("85000000-0000-4000-8000-000000000001",),
+            allowed_evidence_ids=("86000000-0000-4000-8000-000000000001",),
+        )
+
+
+@pytest.mark.parametrize(("content", "end_line"), [("one", 1), ("one\n", 1), ("one\n\n", 2)])
+def test_validate_context_counts_trailing_newlines_as_logical_lines(
+    content: str, end_line: int
+) -> None:
+    candidate = _context()
+    fragment = candidate["fragments"][0]
+    fragment["content"] = content
+    fragment["content_sha256"] = hashlib.sha256(content.encode()).hexdigest()
+    fragment["end_line"] = end_line
+
+    validate_source_context(
+        candidate,
+        direct_identifiers=("demo.Startup.init",),
+        allowed_finding_ids=("85000000-0000-4000-8000-000000000001",),
+        allowed_evidence_ids=("86000000-0000-4000-8000-000000000001",),
+    )
+
+
 @pytest.mark.parametrize(
     "mutation",
     [

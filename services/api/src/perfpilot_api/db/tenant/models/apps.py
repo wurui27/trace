@@ -180,6 +180,25 @@ class Analysis(
             "AND analysis_profile IS NULL AND input_manifest IS NULL)",
             name="ck_analyses_trace_input_metadata",
         ),
+        CheckConstraint(
+            "source_context_state IN ('not_requested', 'waiting_for_agent', "
+            "'extracting', 'available', 'unavailable')",
+            name="ck_analyses_source_context_state",
+        ),
+        CheckConstraint(
+            "source_match_summary IN ('strong', 'weak', 'none')",
+            name="ck_analyses_source_match_summary",
+        ),
+        CheckConstraint(
+            "(source_context_state = 'available' AND source_context_artifact_id IS NOT NULL "
+            "AND source_context_checksum IS NOT NULL AND source_failure_code IS NULL) OR "
+            "(source_context_state = 'unavailable' AND source_context_artifact_id IS NULL "
+            "AND source_context_checksum IS NULL AND source_failure_code IS NOT NULL) OR "
+            "(source_context_state NOT IN ('available', 'unavailable') "
+            "AND source_context_artifact_id IS NULL AND source_context_checksum IS NULL "
+            "AND source_failure_code IS NULL)",
+            name="ck_analyses_source_context_shape",
+        ),
         CheckConstraint("version > 0", name="ck_analyses_version_positive"),
         Index("ix_analyses_application_version_id", "application_version_id"),
         Index("ix_analyses_state_created", "state", "created_at"),
@@ -196,6 +215,18 @@ class Analysis(
     question: Mapped[str | None] = mapped_column(String(2000))
     analysis_profile: Mapped[str | None] = mapped_column(String(32))
     input_manifest: Mapped[list[dict[str, object]] | None] = mapped_column(JSONB)
+    source_context_state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="not_requested", server_default="not_requested"
+    )
+    source_match_summary: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="none", server_default="none"
+    )
+    source_failure_code: Mapped[str | None] = mapped_column(String(96))
+    source_context_artifact_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("artifacts.id", ondelete="SET NULL", use_alter=True),
+    )
+    source_context_checksum: Mapped[str | None] = mapped_column(String(64))
     state: Mapped[str] = mapped_column(String(32), nullable=False)
     started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))

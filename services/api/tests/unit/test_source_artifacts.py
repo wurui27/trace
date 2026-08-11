@@ -105,6 +105,18 @@ async def test_completion_is_immutable_versioned_and_tenant_private() -> None:
     assert record.size_bytes == len(service.canonical_bytes(document))
     assert "/internal/source-context/" in record.object_key
 
+    persisted = await service.persist_validated_context(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        source_artifact_id=stored.artifact_id,
+        context=loaded,
+        now=datetime.now(UTC),
+    )
+    validated_record = service.record(persisted.artifact_id)
+    assert validated_record.kind == "source_context_validated"
+    assert persisted.artifact_id != stored.artifact_id
+    assert validated_record.object_key != record.object_key
+
 
 @pytest.mark.asyncio
 async def test_cross_tenant_context_read_is_rejected_without_coordinates() -> None:

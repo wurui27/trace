@@ -373,3 +373,9 @@ async def test_production_builder_wires_automatic_synthesis_coordinator(
     assert captured["coordinator"]["session_factory"] is sessions  # type: ignore[index]
     assert captured["pipeline"]["max_projection_bytes"] == 2048  # type: ignore[index]
     assert captured["pipeline"]["memory_sources"].session_factory is sessions  # type: ignore[index,union-attr]
+    source_gate = captured["coordinator"]["source_gate"]  # type: ignore[index]
+    source_orchestrator = source_gate.__self__
+    assert type(source_orchestrator._states).__name__ == (
+        "SQLAlchemySourceAnalysisStateRepository"
+    )
+    assert source_orchestrator._authority._canonical_reader is not None

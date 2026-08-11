@@ -806,7 +806,7 @@ def test_trace_execution_state_downgrade_refuses_active_trace(
 
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_agent_multipart_uploads"
+            "0009_source_context_state"
         )
 
 
@@ -1855,7 +1855,7 @@ def test_tenant_ai_report_downgrade_refuses_new_content_or_artifact_references(
 
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_agent_multipart_uploads"
+            "0009_source_context_state"
         )
 
 
@@ -2660,7 +2660,7 @@ def test_memory_upload_mode_is_present_in_both_databases(
     ("tree", "downgrade_revision", "head_revision"),
     [
         ("control", "0004_external_engine_foundation", "0013_source_code_tasks"),
-        ("tenant", "0003_analysis_orchestration", "0008_agent_multipart_uploads"),
+        ("tenant", "0003_analysis_orchestration", "0009_source_context_state"),
     ],
 )
 def test_memory_upload_downgrade_refuses_existing_rows(
@@ -2722,7 +2722,7 @@ def test_memory_upload_downgrade_refuses_existing_rows(
         (
             "tenant",
             "0003_analysis_orchestration",
-            "0008_agent_multipart_uploads",
+            "0009_source_context_state",
             "analyses",
             "ck_analyses_mode",
         ),
@@ -3068,7 +3068,7 @@ def test_tenant_task7_downgrade_serializes_with_concurrent_metadata_writers(
     }
     with migration_databases.tenant_engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0008_agent_multipart_uploads"
+            "0009_source_context_state"
         )
 
 

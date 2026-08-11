@@ -17,16 +17,25 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 
 from perfpilot_api.db.tenant.models import Analysis, Artifact
 from perfpilot_api.db.tenant.router import TenantRouter
-from perfpilot_api.reports.source_context import validate_source_context
+from perfpilot_api.reports.source_context import (
+    validate_source_context,
+    validate_source_context_transport,
+)
 from perfpilot_api.services.source_tasks import SourceCompletionArtifact, SourceTaskView
 from perfpilot_api.services.uploads import BucketResolver, TenantBucket
 
 
-SourceArtifactKind = Literal["source_context", "source_patch", "source_validation"]
+SourceArtifactKind = Literal[
+    "source_context",
+    "source_context_validated",
+    "source_patch",
+    "source_validation",
+]
 _NAMESPACE = UUID("35b5bcad-b79d-52f1-87ec-4b004440cc7a")
 _RETENTION = timedelta(days=30)
 _DIRECTORIES = {
     "source_context": "source-context",
+    "source_context_validated": "source-context",
     "source_patch": "source-patches",
     "source_validation": "source-validation",
 }
@@ -64,6 +73,12 @@ def source_artifact_id(execution_id: UUID, checksum: str) -> UUID:
     if not isinstance(execution_id, UUID) or not _checksum(checksum):
         raise SourceArtifactConflictError
     return uuid5(_NAMESPACE, f"{execution_id}:{checksum}")
+
+
+def validated_source_artifact_id(source_artifact_id: UUID, checksum: str) -> UUID:
+    if not isinstance(source_artifact_id, UUID) or not _checksum(checksum):
+        raise SourceArtifactConflictError
+    return uuid5(_NAMESPACE, f"validated:{source_artifact_id}:{checksum}")
 
 
 def source_artifact_key(
@@ -153,7 +168,7 @@ class SourceArtifactService:
             result = document.get("result")
             if not isinstance(result, Mapping):
                 raise SourceArtifactConflictError
-            validate_source_context(result)
+            validate_source_context_transport(result)
         artifact_id = source_artifact_id(task.execution_id, checksum)
         key = source_artifact_key(task.analysis_id, artifact_id, "source_context")
         existing = self._records.get(artifact_id)
@@ -192,8 +207,8 @@ class SourceArtifactService:
         artifact_id: UUID,
         expected_checksum: str,
         direct_identifiers: tuple[str, ...] = (),
-        allowed_finding_ids: tuple[str, ...] | None = None,
-        allowed_evidence_ids: tuple[str, ...] | None = None,
+        allowed_finding_ids: tuple[str, ...] | None = (),
+        allowed_evidence_ids: tuple[str, ...] | None = (),
     ) -> dict[str, object]:
         record = self._records.get(artifact_id)
         if (
@@ -231,6 +246,45 @@ class SourceArtifactService:
             allowed_finding_ids=allowed_finding_ids,
             allowed_evidence_ids=allowed_evidence_ids,
         )
+
+    async def persist_validated_context(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        source_artifact_id: UUID,
+        context: Mapping[str, object],
+        now: datetime,
+    ) -> SourceCompletionArtifact:
+        payload = self.canonical_bytes(context)
+        checksum = hashlib.sha256(payload).hexdigest()
+        artifact_id = validated_source_artifact_id(source_artifact_id, checksum)
+        key = source_artifact_key(
+            analysis_id, artifact_id, "source_context_validated"
+        )
+        existing = self._records.get(artifact_id)
+        if existing is not None:
+            if existing.team_id != team_id or existing.analysis_id != analysis_id:
+                raise SourceArtifactConflictError
+            return SourceCompletionArtifact(artifact_id=artifact_id, checksum=checksum)
+        version_id = hashlib.sha256(
+            f"{team_id}:{key}:{checksum}".encode("ascii")
+        ).hexdigest()
+        record = SourceArtifactRecord(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            artifact_id=artifact_id,
+            kind="source_context_validated",
+            mime_type="application/json",
+            size_bytes=len(payload),
+            checksum=checksum,
+            object_key=key,
+            version_id=version_id,
+            expires_at=now.astimezone(UTC) + _RETENTION,
+        )
+        self._objects[(team_id, key, version_id)] = bytes(payload)
+        self._records[artifact_id] = record
+        return SourceCompletionArtifact(artifact_id=artifact_id, checksum=checksum)
 
 
 class S3SourceArtifactService:
@@ -387,8 +441,8 @@ class S3SourceArtifactService:
         artifact_id: UUID,
         expected_checksum: str,
         direct_identifiers: tuple[str, ...] = (),
-        allowed_finding_ids: tuple[str, ...] | None = None,
-        allowed_evidence_ids: tuple[str, ...] | None = None,
+        allowed_finding_ids: tuple[str, ...] | None = (),
+        allowed_evidence_ids: tuple[str, ...] | None = (),
     ) -> dict[str, object]:
         tenant = await self._tenant(team_id)
         try:
@@ -451,6 +505,121 @@ class S3SourceArtifactService:
             allowed_evidence_ids=allowed_evidence_ids,
         )
 
+    async def persist_validated_context(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        source_artifact_id: UUID,
+        context: Mapping[str, object],
+        now: datetime,
+    ) -> SourceCompletionArtifact:
+        temporary = SourceArtifactService.in_memory()
+        completion = await temporary.persist_validated_context(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            source_artifact_id=source_artifact_id,
+            context=context,
+            now=now,
+        )
+        record = temporary.record(completion.artifact_id)
+        payload = temporary._objects[(team_id, record.object_key, record.version_id)]
+        checksum_b64 = self._b64(payload)
+        tenant = await self._tenant(team_id)
+        expires_at = now.astimezone(UTC) + _RETENTION
+        try:
+            async with self._tenant_router.session(team_id) as session:
+                if session.info.get("tenant_resource_version") != tenant.resource_version:
+                    raise SourceArtifactUnavailableError
+                owner = await session.scalar(
+                    select(Analysis.id).where(
+                        Analysis.id == analysis_id,
+                        Analysis.tombstoned_at.is_(None),
+                        Analysis.state != "deleted",
+                    )
+                )
+                if owner is None:
+                    raise SourceArtifactConflictError
+                await session.execute(
+                    postgresql_insert(Artifact)
+                    .values(
+                        id=completion.artifact_id,
+                        analysis_id=analysis_id,
+                        upload_id=completion.artifact_id,
+                        idempotency_key=(
+                            f"internal:source_context_validated:{source_artifact_id}"
+                        ),
+                        request_hash=completion.checksum,
+                        artifact_kind="source_context_validated",
+                        mime_type="application/json",
+                        size_bytes=len(payload),
+                        sha256_b64=checksum_b64,
+                        object_key=record.object_key,
+                        version_id=None,
+                        state="pending",
+                        finalized_at=None,
+                        expires_at=expires_at,
+                        deleted_at=None,
+                        version=1,
+                    )
+                    .on_conflict_do_nothing(index_elements=(Artifact.id,))
+                )
+                row = await session.get(Artifact, completion.artifact_id)
+                if (
+                    row is None
+                    or row.analysis_id != analysis_id
+                    or row.request_hash != completion.checksum
+                    or row.artifact_kind != "source_context_validated"
+                    or row.object_key != record.object_key
+                    or row.state not in {"pending", "finalized"}
+                ):
+                    raise SourceArtifactConflictError
+                if row.state == "finalized":
+                    return completion
+                expected_version = row.version
+            receipt = await asyncio.to_thread(
+                self._client.put_object,
+                Bucket=tenant.bucket,
+                Key=record.object_key,
+                Body=payload,
+                ContentType="application/json",
+                ChecksumSHA256=checksum_b64,
+            )
+            version_id = receipt.get("VersionId") if isinstance(receipt, Mapping) else None
+            returned_checksum = (
+                receipt.get("ChecksumSHA256") if isinstance(receipt, Mapping) else None
+            )
+            if not isinstance(version_id, str) or not version_id or returned_checksum != checksum_b64:
+                raise SourceArtifactUnavailableError
+            async with self._tenant_router.session(team_id) as session:
+                finalized = await session.scalar(
+                    update(Artifact)
+                    .where(
+                        Artifact.id == completion.artifact_id,
+                        Artifact.analysis_id == analysis_id,
+                        Artifact.state == "pending",
+                        Artifact.version == expected_version,
+                    )
+                    .values(
+                        state="finalized",
+                        version_id=version_id,
+                        finalized_at=now,
+                        expires_at=expires_at,
+                        updated_at=now,
+                        version=Artifact.version + 1,
+                    )
+                    .returning(Artifact.id)
+                )
+                if finalized != completion.artifact_id:
+                    raise SourceArtifactConflictError
+        except SourceArtifactError:
+            raise
+        except BaseException as error:
+            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            raise SourceArtifactUnavailableError from None
+        return completion
+
 
 __all__ = [
     "SourceArtifactConflictError",
@@ -461,4 +630,5 @@ __all__ = [
     "S3SourceArtifactService",
     "source_artifact_id",
     "source_artifact_key",
+    "validated_source_artifact_id",
 ]

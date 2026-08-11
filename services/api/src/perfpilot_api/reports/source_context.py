@@ -131,9 +131,9 @@ def grade_source_match(
     return "weak"
 
 
-def _allowed_uuid_set(values: Iterable[str] | None) -> set[str] | None:
+def _allowed_uuid_set(values: Iterable[str] | None) -> set[str]:
     if values is None:
-        return None
+        raise SourceContextValidationError
     return {_uuid(value) for value in values}
 
 
@@ -141,8 +141,8 @@ def validate_source_context(
     document: Mapping[str, object],
     *,
     direct_identifiers: Sequence[str] = (),
-    allowed_finding_ids: Iterable[str] | None = None,
-    allowed_evidence_ids: Iterable[str] | None = None,
+    allowed_finding_ids: Iterable[str] | None = (),
+    allowed_evidence_ids: Iterable[str] | None = (),
 ) -> dict[str, object]:
     if not isinstance(document, Mapping) or set(document) != _RESULT_KEYS:
         raise SourceContextValidationError
@@ -207,6 +207,7 @@ def validate_source_context(
             or not isinstance(content, str)
             or not content
             or len(content.splitlines()) > 160
+            or end - start + 1 != len(content.splitlines())
         ):
             raise SourceContextValidationError
         encoded = content.encode("utf-8")
@@ -220,10 +221,8 @@ def validate_source_context(
         finding_ids = _unique_ids(item.get("finding_ids"), maximum=3)
         evidence_ids = _unique_ids(item.get("evidence_ids"), maximum=20)
         if (
-            allowed_findings is not None
-            and not set(finding_ids).issubset(allowed_findings)
-            or allowed_evidence is not None
-            and not set(evidence_ids).issubset(allowed_evidence)
+            not set(finding_ids).issubset(allowed_findings)
+            or not set(evidence_ids).issubset(allowed_evidence)
         ):
             raise SourceContextValidationError
         rule_ids = item.get("rule_ids")
@@ -286,8 +285,35 @@ def validate_source_context(
     }
 
 
+def validate_source_context_transport(
+    document: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate Agent transport shape before canonical report authority is available."""
+
+    fragments = document.get("fragments") if isinstance(document, Mapping) else None
+    if not isinstance(fragments, list):
+        raise SourceContextValidationError
+    finding_ids: list[str] = []
+    evidence_ids: list[str] = []
+    for fragment in fragments:
+        if not isinstance(fragment, Mapping):
+            raise SourceContextValidationError
+        raw_findings = fragment.get("finding_ids")
+        raw_evidence = fragment.get("evidence_ids")
+        if not isinstance(raw_findings, list) or not isinstance(raw_evidence, list):
+            raise SourceContextValidationError
+        finding_ids.extend(raw_findings)
+        evidence_ids.extend(raw_evidence)
+    return validate_source_context(
+        document,
+        allowed_finding_ids=finding_ids,
+        allowed_evidence_ids=evidence_ids,
+    )
+
+
 __all__ = [
     "SourceContextValidationError",
     "grade_source_match",
     "validate_source_context",
+    "validate_source_context_transport",
 ]
