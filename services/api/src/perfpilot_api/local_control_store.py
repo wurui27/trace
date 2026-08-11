@@ -99,11 +99,6 @@ class LocalControlStore:
             raise LocalControlStoreError("unsafe local control path")
         try:
             state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if state_root.is_symlink() or not state_root.is_dir():
-                raise LocalControlStoreError("unsafe local control path")
-            os.chmod(state_root, 0o700)
-        except LocalControlStoreError:
-            raise
         except OSError:
             raise LocalControlStoreError("local control persistence failed") from None
         self._root = state_root.absolute()
@@ -118,6 +113,9 @@ class LocalControlStore:
             root_status = os.fstat(self._root_fd)
             self._root_identity = (root_status.st_dev, root_status.st_ino)
             self._active_root_fd = -1
+            self._verify_trusted_root()
+            os.fchmod(self._root_fd, 0o700)
+            self._verify_trusted_root()
             if self._entry_is_symlink(_CONTROL_FILE_NAME) or self._entry_is_symlink(
                 _LOCK_FILE_NAME
             ):
@@ -128,7 +126,7 @@ class LocalControlStore:
             raise
         except OSError:
             self.close()
-            raise LocalControlStoreError("local control persistence failed") from None
+            raise LocalControlStoreError("unsafe local control path") from None
         self._clock = clock
         self._uuid_factory = uuid_factory
         self._token_factory = token_factory
@@ -306,7 +304,10 @@ class LocalControlStore:
         try:
             descriptor = os.open(
                 _CONTROL_FILE_NAME,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=self._operation_root_fd,
             )
         except FileNotFoundError:
@@ -410,7 +411,10 @@ class LocalControlStore:
         try:
             descriptor = os.open(
                 _CONTROL_FILE_NAME,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_CLOEXEC", 0),
                 dir_fd=self._operation_root_fd,
             )
         except FileNotFoundError:

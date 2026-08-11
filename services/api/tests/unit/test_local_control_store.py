@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import multiprocessing
+import os
+import queue
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID
@@ -21,6 +23,47 @@ NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
 
 def _concurrent_bootstrap(state_root: str, username: str) -> None:
     LocalControlStore(Path(state_root)).ensure_user(username, "safe local password", False)
+
+
+def _construct_store_with_fifo(state_root: str, results: multiprocessing.Queue[str]) -> None:
+    try:
+        LocalControlStore(Path(state_root))
+    except LocalControlStoreError as error:
+        results.put(str(error))
+    else:
+        results.put("unexpected success")
+
+
+def _load_fifo_after_construction(state_root: str, results: multiprocessing.Queue[str]) -> None:
+    store = LocalControlStore(Path(state_root))
+    control = Path(state_root) / "control.json"
+    os.mkfifo(control, 0o600)
+    try:
+        store.authenticate("ordinary", "valid password")
+    except LocalControlStoreError as error:
+        results.put(str(error))
+    else:
+        results.put("unexpected success")
+
+
+def _assert_child_finishes_redacted(
+    process: multiprocessing.Process,
+    results: multiprocessing.Queue[str],
+) -> None:
+    process.start()
+    process.join(timeout=3)
+    if process.is_alive():
+        process.terminate()
+        process.join(timeout=3)
+        pytest.fail("FIFO operation blocked")
+    assert process.exitcode == 0
+    try:
+        assert results.get(timeout=1) in {
+            "unsafe local control path",
+            "invalid local control state",
+        }
+    except queue.Empty:
+        pytest.fail("FIFO child did not report a redacted error")
 
 
 def test_ensure_user_is_idempotent_and_reopen_preserves_ids_and_changed_password(
@@ -156,6 +199,75 @@ def test_rejects_symlinked_lock_without_touching_its_target(tmp_path: Path) -> N
         LocalControlStore(tmp_path)
 
     assert victim.read_text(encoding="utf-8") == "do not modify"
+
+
+def test_constructor_root_swap_cannot_change_outside_permissions_or_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    outside = tmp_path / "outside"
+    state_root.mkdir()
+    outside.mkdir()
+    outside.chmod(0o755)
+    victim = outside / "victim"
+    victim.write_text("do not modify", encoding="utf-8")
+    original_chmod = os.chmod
+
+    def swap_before_path_chmod(path: Path | str, mode: int, *args: object, **kwargs: object) -> None:
+        if Path(path) == state_root:
+            state_root.rename(tmp_path / "moved-state")
+            state_root.symlink_to(outside, target_is_directory=True)
+        original_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr("perfpilot_api.local_control_store.os.chmod", swap_before_path_chmod)
+    LocalControlStore(state_root)
+
+    assert (outside.stat().st_mode & 0o777) == 0o755
+    assert victim.read_text(encoding="utf-8") == "do not modify"
+
+
+def test_constructor_detects_root_swap_after_pinned_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_root = tmp_path / "state"
+    outside = tmp_path / "outside"
+    state_root.mkdir()
+    outside.mkdir()
+    victim = outside / "victim"
+    victim.write_text("do not modify", encoding="utf-8")
+    original_open = os.open
+
+    def open_then_swap(path: Path | str, flags: int, *args: object, **kwargs: object) -> int:
+        descriptor = original_open(path, flags, *args, **kwargs)
+        if Path(path) == state_root and flags & os.O_DIRECTORY:
+            state_root.rename(tmp_path / "moved-state")
+            state_root.symlink_to(outside, target_is_directory=True)
+        return descriptor
+
+    monkeypatch.setattr("perfpilot_api.local_control_store.os.open", open_then_swap)
+    with pytest.raises(LocalControlStoreError, match="unsafe local control path"):
+        LocalControlStore(state_root)
+
+    assert victim.read_text(encoding="utf-8") == "do not modify"
+
+
+def test_fifo_control_file_rejects_without_blocking_during_construction(tmp_path: Path) -> None:
+    os.mkfifo(tmp_path / "control.json", 0o600)
+    context = multiprocessing.get_context("spawn")
+    results: multiprocessing.Queue[str] = context.Queue()
+    process = context.Process(target=_construct_store_with_fifo, args=(str(tmp_path), results))
+
+    _assert_child_finishes_redacted(process, results)
+
+
+def test_fifo_control_file_rejects_without_blocking_after_construction(tmp_path: Path) -> None:
+    context = multiprocessing.get_context("spawn")
+    results: multiprocessing.Queue[str] = context.Queue()
+    process = context.Process(target=_load_fifo_after_construction, args=(str(tmp_path), results))
+
+    _assert_child_finishes_redacted(process, results)
 
 
 def test_rejects_root_symlink_substitution_after_store_construction(tmp_path: Path) -> None:
