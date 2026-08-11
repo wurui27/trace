@@ -116,6 +116,13 @@ async def test_completion_is_immutable_versioned_and_tenant_private() -> None:
     assert validated_record.kind == "source_context_validated"
     assert persisted.artifact_id != stored.artifact_id
     assert validated_record.object_key != record.object_key
+    restored = await service.read_validated_context(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=persisted.artifact_id,
+        expected_checksum=persisted.checksum,
+    )
+    assert restored == loaded
 
 
 @pytest.mark.asyncio

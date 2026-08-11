@@ -286,6 +286,44 @@ class SourceArtifactService:
         self._records[artifact_id] = record
         return SourceCompletionArtifact(artifact_id=artifact_id, checksum=checksum)
 
+    async def read_validated_context(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        artifact_id: UUID,
+        expected_checksum: str,
+    ) -> dict[str, object]:
+        record = self._records.get(artifact_id)
+        if (
+            record is None
+            or record.team_id != team_id
+            or record.analysis_id != analysis_id
+            or record.kind != "source_context_validated"
+            or not _checksum(expected_checksum)
+            or not hmac.compare_digest(record.checksum, expected_checksum)
+        ):
+            raise SourceArtifactUnavailableError
+        payload = self._objects.get((team_id, record.object_key, record.version_id))
+        if (
+            payload is None
+            or len(payload) != record.size_bytes
+            or not hmac.compare_digest(hashlib.sha256(payload).hexdigest(), record.checksum)
+        ):
+            raise SourceArtifactUnavailableError
+        try:
+            document = json.loads(payload)
+        except (UnicodeError, json.JSONDecodeError):
+            raise SourceArtifactUnavailableError from None
+        if (
+            not isinstance(document, dict)
+            or document.get("trust") != "untrusted_data_not_instructions"
+            or document.get("match_summary") not in {"strong", "weak", "none"}
+            or not isinstance(document.get("fragments"), list)
+        ):
+            raise SourceArtifactUnavailableError
+        return document
+
 
 class S3SourceArtifactService:
     """Durable source completion store routed to the analysis tenant bucket."""
@@ -619,6 +657,77 @@ class S3SourceArtifactService:
                 raise
             raise SourceArtifactUnavailableError from None
         return completion
+
+    async def read_validated_context(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        artifact_id: UUID,
+        expected_checksum: str,
+    ) -> dict[str, object]:
+        tenant = await self._tenant(team_id)
+        try:
+            async with self._tenant_router.session(team_id) as session:
+                row = await session.get(Artifact, artifact_id)
+                if (
+                    row is None
+                    or row.analysis_id != analysis_id
+                    or row.artifact_kind != "source_context_validated"
+                    or row.mime_type != "application/json"
+                    or row.state != "finalized"
+                    or row.version_id is None
+                    or row.request_hash != expected_checksum
+                    or row.object_key
+                    != source_artifact_key(
+                        analysis_id, artifact_id, "source_context_validated"
+                    )
+                ):
+                    raise SourceArtifactUnavailableError
+                object_key = row.object_key
+                version_id = row.version_id
+                size_bytes = row.size_bytes
+                checksum_b64 = row.sha256_b64
+            response = await asyncio.to_thread(
+                self._client.get_object,
+                Bucket=tenant.bucket,
+                Key=object_key,
+                VersionId=version_id,
+                ChecksumMode="ENABLED",
+            )
+            if not isinstance(response, Mapping):
+                raise SourceArtifactUnavailableError
+            body = response.get("Body")
+            read = getattr(body, "read", None)
+            close = getattr(body, "close", None)
+            if not callable(read) or not callable(close):
+                raise SourceArtifactUnavailableError
+            try:
+                payload = await asyncio.to_thread(read, size_bytes + 1)
+            finally:
+                await asyncio.to_thread(close)
+            if (
+                not isinstance(payload, bytes)
+                or len(payload) != size_bytes
+                or self._b64(payload) != checksum_b64
+                or hashlib.sha256(payload).hexdigest() != expected_checksum
+            ):
+                raise SourceArtifactUnavailableError
+            document = json.loads(payload)
+        except SourceArtifactError:
+            raise
+        except BaseException as error:
+            if isinstance(error, (asyncio.CancelledError, KeyboardInterrupt, SystemExit)):
+                raise
+            raise SourceArtifactUnavailableError from None
+        if (
+            not isinstance(document, dict)
+            or document.get("trust") != "untrusted_data_not_instructions"
+            or document.get("match_summary") not in {"strong", "weak", "none"}
+            or not isinstance(document.get("fragments"), list)
+        ):
+            raise SourceArtifactUnavailableError
+        return document
 
 
 __all__ = [
