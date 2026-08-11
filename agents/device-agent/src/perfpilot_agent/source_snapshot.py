@@ -224,7 +224,16 @@ class SourceSnapshotter:
         lock_path = self.cache_root / ".source-cache.lock"
         descriptor = -1
         try:
-            descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+            flags = (
+                os.O_RDWR
+                | os.O_CREAT
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0)
+                | getattr(os, "O_BINARY", 0)
+            )
+            descriptor = os.open(lock_path, flags, 0o600)
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise SourceSnapshotError
             if os.name == "nt":
                 import msvcrt
 

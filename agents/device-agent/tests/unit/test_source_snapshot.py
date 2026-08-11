@@ -350,6 +350,23 @@ def test_cache_cleanup_cannot_race_in_progress_snapshot_creation(
         cleaning.result(timeout=5)
 
 
+@pytest.mark.skipif(os.name == "nt", reason="O_NOFOLLOW is a POSIX boundary")
+def test_cache_lock_rejects_symlink_without_mutating_its_target(tmp_path: Path) -> None:
+    cache_root = tmp_path / "cache"
+    snapshotter = SourceSnapshotter(cache_root=cache_root)
+    victim = tmp_path / "victim"
+    victim.write_text("unchanged\n", encoding="utf-8")
+    victim.chmod(0o644)
+    (cache_root / ".source-cache.lock").symlink_to(victim)
+
+    with pytest.raises(SourceSnapshotError) as raised:
+        snapshotter.cleanup()
+
+    assert stat.S_IMODE(victim.stat().st_mode) == 0o644
+    assert victim.read_text(encoding="utf-8") == "unchanged\n"
+    assert str(victim) not in str(raised.value)
+
+
 def test_snapshot_rejects_non_repository_without_disclosing_path(tmp_path: Path) -> None:
     repo = tmp_path / "private-source"
     repo.mkdir()
