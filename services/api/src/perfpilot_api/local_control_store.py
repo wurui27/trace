@@ -34,6 +34,10 @@ _SCHEMA_VERSION = 2
 _CONTROL_FILE_NAME = "control.json"
 _LOCK_FILE_NAME = ".control.lock"
 _MAX_CONTROL_BYTES = 2 * 1024 * 1024
+_MAX_PREAUTH_SESSIONS = 64
+_MAX_AUTHENTICATED_SESSIONS = 256
+_MAX_AUTHENTICATED_SESSIONS_PER_USER = 8
+_CSRF_CONTEXT = b"perfpilot-local-csrf-v1"
 _DUMMY_PASSWORD_HASH = hash_password("perfpilot-local-control-dummy-password")
 
 
@@ -150,9 +154,12 @@ class LocalControlStore:
         result: EnsureUserResult | None = None
         with self._exclusive_lock():
             document = self._read_document()
+            pruned = self._prune_sessions(document, self._now())
             existing = self._find_user(document, normalized)
             if existing is not None:
                 result = EnsureUserResult(self._principal_from_user(document, existing), False)
+                if pruned:
+                    self._write_document(document)
             else:
                 user_id = str(self._new_uuid())
                 team_id = str(self._new_uuid())
@@ -198,19 +205,12 @@ class LocalControlStore:
             document = self._read_document()
             if self._find_user_by_id(document, user_id) is None:
                 raise LocalControlStoreNotFoundError("local principal not found")
-            token = self._new_token()
-            csrf_token = self._new_token()
             now = self._now()
-            document["sessions"].append(
-                {
-                    "token_digest": self._digest(token),
-                    "csrf_token_digest": self._digest(csrf_token),
-                    "user_id": str(user_id),
-                    "purpose": "authenticated",
-                    "created_at": now.isoformat(),
-                    "expires_at": (now + LOCAL_SESSION_TTL).isoformat(),
-                }
-            )
+            self._prune_sessions(document, now)
+            token = self._new_token()
+            csrf_token = self._csrf_token(token)
+            self._append_session(document, token, csrf_token, str(user_id), "authenticated", now)
+            self._prune_sessions(document, now)
             self._write_document(document)
             return token, csrf_token
 
@@ -218,21 +218,37 @@ class LocalControlStore:
         """Issue a short-lived anonymous session used only to bind login CSRF."""
         with self._exclusive_lock():
             document = self._read_document()
-            token = self._new_token()
-            csrf_token = self._new_token()
             now = self._now()
-            document["sessions"].append(
-                {
-                    "token_digest": self._digest(token),
-                    "csrf_token_digest": self._digest(csrf_token),
-                    "user_id": None,
-                    "purpose": "preauth",
-                    "created_at": now.isoformat(),
-                    "expires_at": (now + LOCAL_SESSION_TTL).isoformat(),
-                }
-            )
+            self._prune_sessions(document, now)
+            token = self._new_token()
+            csrf_token = self._csrf_token(token)
+            self._append_session(document, token, csrf_token, None, "preauth", now)
+            self._prune_sessions(document, now)
             self._write_document(document)
             return token, csrf_token
+
+    def csrf_for_session(self, token: str) -> str | None:
+        """Return an idempotent CSRF token without rotating the session cookie."""
+        if not isinstance(token, str) or not token:
+            return None
+        digest = self._digest(token)
+        with self._exclusive_lock():
+            document = self._read_document()
+            now = self._now()
+            changed = self._prune_sessions(document, now)
+            for session in document["sessions"]:
+                if not hmac.compare_digest(str(session["token_digest"]), digest):
+                    continue
+                expected = self._csrf_token(token)
+                if not hmac.compare_digest(str(session["csrf_token_digest"]), self._digest(expected)):
+                    session["csrf_token_digest"] = self._digest(expected)
+                    changed = True
+                if changed:
+                    self._write_document(document)
+                return expected
+            if changed:
+                self._write_document(document)
+        return None
 
     def resolve_session(self, token: str) -> LocalPrincipal | None:
         if not isinstance(token, str) or not token:
@@ -241,6 +257,7 @@ class LocalControlStore:
         with self._exclusive_lock():
             document = self._read_document()
             now = self._now()
+            changed = self._prune_sessions(document, now)
             for session in document["sessions"]:
                 if not hmac.compare_digest(str(session["token_digest"]), digest):
                     continue
@@ -248,8 +265,15 @@ class LocalControlStore:
                     session["purpose"] != "authenticated"
                     or self._parse_timestamp(session["expires_at"]) <= now
                 ):
+                    if changed:
+                        self._write_document(document)
                     return None
-                return self._principal_from_user_id(document, UUID(str(session["user_id"])))
+                principal = self._principal_from_user_id(document, UUID(str(session["user_id"])))
+                if changed:
+                    self._write_document(document)
+                return principal
+            if changed:
+                self._write_document(document)
         return None
 
     def verify_csrf(self, token: str, csrf_token: str, *, purpose: str) -> bool:
@@ -262,14 +286,20 @@ class LocalControlStore:
         with self._exclusive_lock():
             document = self._read_document()
             now = self._now()
+            changed = self._prune_sessions(document, now)
             for session in document["sessions"]:
                 if not hmac.compare_digest(str(session["token_digest"]), token_digest):
                     continue
-                return (
+                result = (
                     session["purpose"] == purpose
                     and self._parse_timestamp(session["expires_at"]) > now
                     and hmac.compare_digest(str(session["csrf_token_digest"]), csrf_digest)
                 )
+                if changed:
+                    self._write_document(document)
+                return result
+            if changed:
+                self._write_document(document)
         return False
 
     def revoke_session(self, token: str) -> None:
@@ -278,12 +308,13 @@ class LocalControlStore:
         digest = self._digest(token)
         with self._exclusive_lock():
             document = self._read_document()
+            changed = self._prune_sessions(document, self._now())
             remaining = [
                 session
                 for session in document["sessions"]
                 if not hmac.compare_digest(str(session["token_digest"]), digest)
             ]
-            if len(remaining) != len(document["sessions"]):
+            if len(remaining) != len(document["sessions"]) or changed:
                 document["sessions"] = remaining
                 self._write_document(document)
 
@@ -295,6 +326,7 @@ class LocalControlStore:
         with self._exclusive_lock():
             document = self._read_document()
             now = self._now()
+            changed = self._prune_sessions(document, now)
             for index, session in enumerate(document["sessions"]):
                 if not hmac.compare_digest(str(session["token_digest"]), digest):
                     continue
@@ -304,7 +336,7 @@ class LocalControlStore:
                 ):
                     return None
                 token_value = self._new_token()
-                csrf_token = self._new_token()
+                csrf_token = self._csrf_token(token_value)
                 document["sessions"][index] = {
                     "token_digest": self._digest(token_value),
                     "csrf_token_digest": self._digest(csrf_token),
@@ -315,6 +347,8 @@ class LocalControlStore:
                 }
                 self._write_document(document)
                 return token_value, csrf_token
+            if changed:
+                self._write_document(document)
         return None
 
     def change_password(
@@ -340,6 +374,7 @@ class LocalControlStore:
             document["sessions"] = [
                 session for session in document["sessions"] if session["user_id"] != str(user_id)
             ]
+            self._prune_sessions(document, self._now())
             self._write_document(document)
             return self._principal_from_user(document, user)
 
@@ -425,11 +460,14 @@ class LocalControlStore:
         self._verify_trusted_root()
         if self._entry_is_symlink(_CONTROL_FILE_NAME):
             raise LocalControlStoreError("unsafe local control path")
-        temporary_name = f".{_CONTROL_FILE_NAME}.{uuid4().hex}.tmp"
+        temporary_name: str | None = None
         try:
             payload = json.dumps(
                 document, sort_keys=True, separators=(",", ":"), ensure_ascii=False
             ).encode("utf-8")
+            if len(payload) > _MAX_CONTROL_BYTES:
+                raise LocalControlStoreError("local control persistence failed")
+            temporary_name = f".{_CONTROL_FILE_NAME}.{uuid4().hex}.tmp"
             descriptor = os.open(
                 temporary_name,
                 os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
@@ -451,16 +489,18 @@ class LocalControlStore:
             )
             os.fsync(self._operation_root_fd)
         except LocalControlStoreError:
-            try:
-                os.unlink(temporary_name, dir_fd=self._operation_root_fd)
-            except OSError:
-                pass
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=self._operation_root_fd)
+                except OSError:
+                    pass
             raise
         except OSError:
-            try:
-                os.unlink(temporary_name, dir_fd=self._operation_root_fd)
-            except OSError:
-                pass
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=self._operation_root_fd)
+                except OSError:
+                    pass
             raise LocalControlStoreError("local control persistence failed") from None
 
     @staticmethod
@@ -729,6 +769,66 @@ class LocalControlStore:
         if not isinstance(token, str) or not token:
             raise LocalControlStoreError("local control persistence failed")
         return token
+
+    @staticmethod
+    def _csrf_token(token: str) -> str:
+        return hmac.new(token.encode("utf-8"), _CSRF_CONTEXT, hashlib.sha256).hexdigest()
+
+    def _append_session(
+        self,
+        document: dict[str, Any],
+        token: str,
+        csrf_token: str,
+        user_id: str | None,
+        purpose: str,
+        now: datetime,
+    ) -> None:
+        document["sessions"].append(
+            {
+                "token_digest": self._digest(token),
+                "csrf_token_digest": self._digest(csrf_token),
+                "user_id": user_id,
+                "purpose": purpose,
+                "created_at": now.isoformat(),
+                "expires_at": (now + LOCAL_SESSION_TTL).isoformat(),
+            }
+        )
+
+    @staticmethod
+    def _session_order(session: dict[str, Any]) -> tuple[datetime, str]:
+        return (
+            LocalControlStore._parse_timestamp(session["created_at"]),
+            str(session["token_digest"]),
+        )
+
+    def _prune_sessions(self, document: dict[str, Any], now: datetime) -> bool:
+        active = [
+            session
+            for session in document["sessions"]
+            if self._parse_timestamp(session["expires_at"]) > now
+        ]
+        preauth = sorted(
+            (session for session in active if session["purpose"] == "preauth"),
+            key=self._session_order,
+        )[-_MAX_PREAUTH_SESSIONS:]
+        per_user: dict[str, list[dict[str, Any]]] = {}
+        for session in active:
+            if session["purpose"] == "authenticated":
+                per_user.setdefault(str(session["user_id"]), []).append(session)
+        authenticated = [
+            session
+            for user_id in sorted(per_user)
+            for session in sorted(per_user[user_id], key=self._session_order)[
+                -_MAX_AUTHENTICATED_SESSIONS_PER_USER:
+            ]
+        ]
+        authenticated = sorted(authenticated, key=self._session_order)[
+            -_MAX_AUTHENTICATED_SESSIONS:
+        ]
+        kept = sorted([*authenticated, *preauth], key=self._session_order)
+        changed = kept != document["sessions"]
+        document["sessions"] = kept
+        return changed
 
     def _now(self) -> datetime:
         now = self._clock()

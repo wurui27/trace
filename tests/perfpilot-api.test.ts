@@ -147,6 +147,31 @@ function sourceAwareReportPayload(): Record<string, unknown> {
 }
 
 describe("PerfPilot browser API", () => {
+  it("notifies subscribers when a runtime request loses authentication", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValue(
+      Response.json(
+        {
+          schema_version: "1.0",
+          error: {
+            code: "authentication_required",
+            message: "请先登录",
+            retryable: false,
+            request_id: "request-1",
+          },
+        },
+        { status: 401 },
+      ),
+    );
+    const client = createPerfPilotClient({ fetcher });
+    const notified = vi.fn();
+    client.subscribeAuthFailures?.(notified);
+
+    await expect(client.devices(TEAM_ID)).rejects.toMatchObject({
+      code: "authentication_required",
+    });
+    expect(notified).toHaveBeenCalledTimes(1);
+  });
+
   it("authenticates with a closed login contract and validates the current user", async () => {
     const fetcher = vi
       .fn<typeof fetch>()

@@ -51,6 +51,15 @@ interface PerfPilotSessionProviderProps {
 
 const PerfPilotSessionContext = createContext<PerfPilotSessionValue | null>(null);
 
+function isAuthenticationFailure(error: unknown): boolean {
+  return (
+    (error instanceof PerfPilotApiError || typeof error === "object") &&
+    error !== null &&
+    "code" in error &&
+    (error.code === "authentication_required" || error.code === "unauthenticated")
+  );
+}
+
 function wait(milliseconds: number, signal: AbortSignal): Promise<void> {
   return new Promise((resolve, reject) => {
     if (signal.aborted) {
@@ -85,11 +94,13 @@ export function PerfPilotSessionProvider({
   const [refreshVersion, setRefreshVersion] = useState(0);
   const selectionsRef = useRef(new Map<string, string | null>());
   const selectionInitializedRef = useRef(new Set<string>());
+  const bootstrappingRef = useRef(true);
 
   const clearSession = useCallback(() => {
     setTeam(null);
     setDevices([]);
     setSelectedDeviceId(null);
+    setDeviceStatus("loading");
     selectionsRef.current.clear();
     selectionInitializedRef.current.clear();
   }, []);
@@ -103,8 +114,21 @@ export function PerfPilotSessionProvider({
     setStatus(me.user?.must_change_password ? "password_change_required" : "ready");
   }, []);
 
+  const handleAuthFailure = useCallback(() => {
+    if (bootstrappingRef.current) return;
+    clearSession();
+    setError(null);
+    setStatus("signed_out");
+  }, [clearSession]);
+
+  useEffect(
+    () => client.subscribeAuthFailures?.(handleAuthFailure),
+    [client, handleAuthFailure],
+  );
+
   useEffect(() => {
     const controller = new AbortController();
+    bootstrappingRef.current = true;
     void (async () => {
       await client.csrf(controller.signal);
       const me = await client.me(controller.signal);
@@ -113,18 +137,15 @@ export function PerfPilotSessionProvider({
     })().catch((caught: unknown) => {
       if (controller.signal.aborted) return;
       clearSession();
-      if (
-        (caught instanceof PerfPilotApiError || typeof caught === "object") &&
-        caught !== null &&
-        "code" in caught &&
-        caught.code === "authentication_required"
-      ) {
+      if (isAuthenticationFailure(caught)) {
         setStatus("signed_out");
         setError(null);
       } else {
         setStatus("error");
         setError("账号或团队信息读取失败，请刷新页面重试。");
       }
+    }).finally(() => {
+      if (!controller.signal.aborted) bootstrappingRef.current = false;
     });
     return () => controller.abort();
   }, [applyMe, clearSession, client]);
@@ -162,8 +183,12 @@ export function PerfPilotSessionProvider({
           setDevices(nextDevices);
           setSelectedDeviceId(nextSelection);
           setDeviceStatus("ready");
-        } catch {
+        } catch (caught) {
           if (controller.signal.aborted) return;
+          if (isAuthenticationFailure(caught)) {
+            handleAuthFailure();
+            return;
+          }
           setDeviceStatus("error");
         }
         await pollDelay(10_000, controller.signal);
@@ -172,7 +197,7 @@ export function PerfPilotSessionProvider({
       if (!controller.signal.aborted) setDeviceStatus("error");
     });
     return () => controller.abort();
-  }, [client, pollDelay, refreshVersion, status, team]);
+  }, [client, handleAuthFailure, pollDelay, refreshVersion, status, team]);
 
   const login = useCallback(async (username: string, password: string) => {
     setError(null);

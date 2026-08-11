@@ -255,6 +255,71 @@ def test_local_device_requires_a_changed_authenticated_principal(tmp_path: Path)
         assert control.resolve_session(client.cookies.get("perfpilot_local_session", "")).username == user.username
 
 
+def test_concurrent_authenticated_csrf_bootstraps_keep_the_same_session(tmp_path: Path) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    seeded = control.ensure_user("user01", "initial user password", False).principal
+    control.change_password(
+        seeded.user_id,
+        "initial user password",
+        "changed user password",
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        control_store=control,
+    )
+
+    with _RawTestClient(app) as client:
+        _authenticated_client(client, "user01", "changed user password")
+        session_token = client.cookies["perfpilot_local_session"]
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            responses = list(executor.map(lambda _: client.get("/v1/auth/csrf"), range(2)))
+
+    assert [response.status_code for response in responses] == [200, 200]
+    assert len({response.json()["csrf_token"] for response in responses}) == 1
+    assert all("set-cookie" not in response.headers for response in responses)
+    assert control.resolve_session(session_token) is not None
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"current_password": "initial user password"},
+        {"new_password": "changed user password"},
+        {
+            "current_password": "initial user password",
+            "new_password": "changed user password",
+            "marker": "secret-marker",
+        },
+        {"current_password": 1, "new_password": "changed user password"},
+        {"current_password": "x" * 1025, "new_password": "changed user password"},
+        {"current_password": "initial user password", "new_password": "x" * 1025},
+    ],
+)
+def test_change_password_validation_is_a_closed_redacted_422(
+    tmp_path: Path,
+    body: dict[str, object],
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    control.ensure_user("user01", "initial user password", False)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        control_store=control,
+    )
+
+    with _RawTestClient(app) as client:
+        headers = _authenticated_client(client, "user01", "initial user password")
+        response = client.post("/v1/auth/change-password", headers=headers, json=body)
+
+    assert response.status_code == 422
+    assert set(response.json()) == {"schema_version", "error"}
+    assert set(response.json()["error"]) == {"code", "message", "retryable", "request_id"}
+    assert response.json()["error"]["code"] == "credential_validation_failed"
+    assert "secret-marker" not in response.text
+    assert "initial user password" not in response.text
+
+
 def test_local_runtime_accepts_only_loopback_or_private_lan_http_origins() -> None:
     assert _public_origin("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
     assert _public_origin("http://10.166.0.125:8000") == "http://10.166.0.125:8000"

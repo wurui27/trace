@@ -10,6 +10,7 @@ from uuid import UUID
 
 import pytest
 
+import perfpilot_api.local_control_store as local_control_store_module
 from perfpilot_api.local_control_store import (
     LOCAL_SESSION_TTL,
     LocalControlStore,
@@ -167,6 +168,71 @@ def test_preauth_sessions_verify_csrf_and_can_be_revoked(tmp_path: Path) -> None
     assert store.verify_csrf(session_token, csrf_token, purpose="authenticated") is False
     store.revoke_session(session_token)
     assert store.verify_csrf(session_token, csrf_token, purpose="preauth") is False
+
+
+def test_preauth_sessions_are_pruned_and_capped(tmp_path: Path) -> None:
+    instant = [NOW]
+    store = LocalControlStore(tmp_path, clock=lambda: instant[0])
+
+    for _ in range(80):
+        store.issue_preauth_session()
+    instant[0] = NOW + LOCAL_SESSION_TTL
+    store.issue_preauth_session()
+
+    document = json.loads((tmp_path / "control.json").read_text(encoding="utf-8"))
+    assert len(document["sessions"]) <= 64
+    assert all(
+        datetime.fromisoformat(session["expires_at"]) > instant[0]
+        for session in document["sessions"]
+    )
+
+
+def test_authenticated_session_caps_are_global_and_per_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(local_control_store_module, "_MAX_AUTHENTICATED_SESSIONS", 3)
+    monkeypatch.setattr(
+        local_control_store_module,
+        "_MAX_AUTHENTICATED_SESSIONS_PER_USER",
+        2,
+    )
+    store = LocalControlStore(tmp_path)
+    first = store.ensure_user("first", "valid local password", False).principal
+    second = store.ensure_user("second", "valid local password", False).principal
+
+    for _ in range(3):
+        store.issue_session(first.user_id)
+        store.issue_session(second.user_id)
+
+    sessions = json.loads((tmp_path / "control.json").read_text(encoding="utf-8"))["sessions"]
+    assert len(sessions) == 3
+    assert sum(session["user_id"] == str(first.user_id) for session in sessions) <= 2
+    assert sum(session["user_id"] == str(second.user_id) for session in sessions) <= 2
+
+
+def test_control_write_rejects_an_encoded_document_above_the_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalControlStore(tmp_path)
+    document = store._empty_document()
+    document["sessions"].append(
+        {
+            "token_digest": "a" * 64,
+            "csrf_token_digest": "b" * 64,
+            "user_id": None,
+            "purpose": "preauth",
+            "created_at": NOW.isoformat(),
+            "expires_at": (NOW + LOCAL_SESSION_TTL).isoformat(),
+        }
+    )
+    monkeypatch.setattr(local_control_store_module, "_MAX_CONTROL_BYTES", 100)
+
+    with pytest.raises(LocalControlStoreError, match="local control persistence failed"):
+        store._write_document(document)
+
+    assert not (tmp_path / "control.json").exists()
 
 
 def test_reopens_a_v1_authenticated_session_as_a_v2_session(tmp_path: Path) -> None:

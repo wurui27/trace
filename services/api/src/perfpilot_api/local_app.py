@@ -3199,6 +3199,11 @@ def create_local_app(
                 request,
                 ApiError("invalid_credentials", "账号或密码错误", 401, False),
             )
+        if request.method == "POST" and request.url.path == "/v1/auth/change-password":
+            return await local_api_error_handler(
+                request,
+                ApiError("credential_validation_failed", "凭据格式无效", 422, False),
+            )
         return await request_validation_exception_handler(request, error)
 
     app.add_exception_handler(ApiError, local_api_error_handler)
@@ -3262,11 +3267,10 @@ def create_local_app(
     @app.get("/v1/auth/csrf")
     async def csrf(request: Request, response: Response) -> dict[str, str]:
         current = _session_token(request)
-        issued = resolved_control_store.rotate_session(current or "")
-        if issued is None:
-            issued = resolved_control_store.issue_preauth_session()
-        token, csrf_token = issued
-        _set_session_cookie(response, token)
+        csrf_token = resolved_control_store.csrf_for_session(current or "")
+        if csrf_token is None:
+            token, csrf_token = resolved_control_store.issue_preauth_session()
+            _set_session_cookie(response, token)
         response.headers["cache-control"] = "no-store"
         return {"schema_version": "1.0", "csrf_token": csrf_token}
 

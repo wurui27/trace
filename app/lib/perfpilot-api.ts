@@ -636,6 +636,7 @@ export class PerfPilotApiError extends Error {
 
 export interface PerfPilotClient {
   readonly fetcher: typeof globalThis.fetch;
+  subscribeAuthFailures?(listener: () => void): () => void;
   device(signal?: AbortSignal): Promise<LocalDeviceStatusResponse>;
   csrf(signal?: AbortSignal): Promise<string>;
   login(username: string, password: string, signal?: AbortSignal): Promise<string>;
@@ -2316,6 +2317,13 @@ function meResponse(value: unknown): MeResponse {
 export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotClient {
   const fetcher = options.fetcher ?? globalThis.fetch.bind(globalThis);
   let csrfToken: string | null = null;
+  const authFailureListeners = new Set<() => void>();
+
+  function notifyAuthFailure(): void {
+    for (const listener of authFailureListeners) {
+      listener();
+    }
+  }
 
   async function requestJson(
     path: string,
@@ -2362,18 +2370,30 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
     const payload = await readJson(response);
     if (!response.ok) {
       const error = object(payload) && object(payload.error) ? payload.error : null;
-      throw new PerfPilotApiError(
+      const apiError = new PerfPilotApiError(
         typeof error?.code === "string" ? error.code : "invalid_api_response",
         typeof error?.message === "string" ? error.message : "服务返回内容无效",
         error?.retryable === true,
         typeof error?.request_id === "string" ? error.request_id : null,
       );
+      if (
+        response.status === 401 ||
+        apiError.code === "authentication_required" ||
+        apiError.code === "unauthenticated"
+      ) {
+        notifyAuthFailure();
+      }
+      throw apiError;
     }
     return payload;
   }
 
   return {
     fetcher,
+    subscribeAuthFailures(listener) {
+      authFailureListeners.add(listener);
+      return () => authFailureListeners.delete(listener);
+    },
     async device(signal) {
       return localDeviceResponse(await requestJson("/api/v1/device", {}, signal));
     },
