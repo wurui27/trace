@@ -3425,6 +3425,37 @@ select:disabled {
   background-size: 220% 100%;
 }
 
+.source-aware-report-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 16px 18px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.source-aware-report-tabs button {
+  padding: 10px 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-weight: 720;
+  cursor: pointer;
+}
+
+.source-aware-report-tabs button[aria-selected="true"] {
+  border-bottom-color: var(--primary);
+  color: var(--text);
+}
+
+.source-fix-card pre,
+.technical-appendix pre {
+  max-width: 100%;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
 @media print {
   .final-report-topbar,
   .final-report-download,
@@ -3452,14 +3483,16 @@ select:disabled {
   .analysis-report-metric-details > :not(summary),
   .analysis-memory-evidence-details > :not(summary),
   .analysis-report-evidence details > :not(summary),
-  .analysis-report-provenance > :not(summary) {
+  .analysis-report-provenance > :not(summary),
+  .technical-appendix details > :not(summary) {
     display: block !important;
   }
 
   .analysis-report-metric-details > summary,
   .analysis-memory-evidence-details > summary,
   .analysis-report-evidence summary,
-  .analysis-report-provenance summary {
+  .analysis-report-provenance summary,
+  .technical-appendix summary {
     list-style: none;
     pointer-events: none;
   }
@@ -3467,7 +3500,8 @@ select:disabled {
   .analysis-report-metric-details > summary::-webkit-details-marker,
   .analysis-memory-evidence-details > summary::-webkit-details-marker,
   .analysis-report-evidence summary::-webkit-details-marker,
-  .analysis-report-provenance summary::-webkit-details-marker {
+  .analysis-report-provenance summary::-webkit-details-marker,
+  .technical-appendix summary::-webkit-details-marker {
     display: none;
   }
 
@@ -3483,6 +3517,14 @@ select:disabled {
   .analysis-reference-list a {
     color: inherit;
     text-decoration: none;
+  }
+
+  [data-report-printing="true"] .source-aware-report-tabs {
+    display: none !important;
+  }
+
+  [data-report-printing="true"] [data-report-layer][hidden] {
+    display: block !important;
   }
 }
 

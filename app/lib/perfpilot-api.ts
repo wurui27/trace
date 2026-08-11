@@ -223,6 +223,105 @@ export interface SynthesisOutput {
   }>;
 }
 
+export type PatchVerificationState =
+  | "not_requested"
+  | "pending"
+  | "validating"
+  | "verified"
+  | "apply_failed"
+  | "validation_failed"
+  | "source_changed"
+  | "not_configured"
+  | "timeout"
+  | "canceled"
+  | "unavailable";
+
+export interface ConciseSynthesisOutput {
+  readonly schema_version: "2.0";
+  readonly verdict: string;
+  readonly executive_summary: string;
+  readonly key_metric_ids: readonly string[];
+  readonly top_findings: SynthesisOutput["top_findings"];
+  readonly recommendations: SynthesisOutput["recommendations"];
+  readonly source_fixes: readonly Omit<SourceFix, "verification">[];
+  readonly retest_plan: SynthesisOutput["retest_plan"];
+  readonly limitations: SynthesisOutput["limitations"];
+}
+
+export interface SourceReference {
+  readonly source_ref_id: string;
+  readonly relative_path: string;
+  readonly language: "kotlin" | "java" | "xml" | "gradle" | "gradle_kts";
+  readonly symbol: string | null;
+  readonly start_line: number;
+  readonly end_line: number;
+  readonly content_sha256: string;
+  readonly snapshot_hash: string;
+  readonly match_grade: "strong" | "weak" | "none";
+  readonly finding_ids: readonly string[];
+  readonly evidence_ids: readonly string[];
+  readonly rule_ids: readonly string[];
+}
+
+export interface SourceFix {
+  readonly fix_id: string;
+  readonly finding_id: string;
+  readonly evidence_ids: readonly string[];
+  readonly recommendation_priority: "p0" | "p1" | "p2";
+  readonly source_ref_ids: readonly string[];
+  readonly rule_id: string;
+  readonly match_grade: "strong";
+  readonly relative_path: string;
+  readonly symbol: string | null;
+  readonly diagnosis: string;
+  readonly diff: string;
+  readonly validation_profile_id: string;
+  readonly retest_target: string;
+  readonly verification: {
+    readonly state: PatchVerificationState;
+    readonly exit_code: number | null;
+    readonly duration_ms: number | null;
+    readonly profile_id: string;
+    readonly patch_sha256: string;
+    readonly log_summary: string | null;
+    readonly patch_artifact: {
+      readonly artifact_id: string;
+      readonly version_id: string;
+      readonly sha256_b64: string;
+      readonly size: number;
+      readonly mime: "text/x-diff";
+    } | null;
+  };
+}
+
+export interface SourceCodeReport {
+  readonly requested: boolean;
+  readonly provider_kind: "agent_workspace" | null;
+  readonly agent_id: string | null;
+  readonly workspace_id: string | null;
+  readonly snapshot_policy: "tracked_worktree" | null;
+  readonly validation_profile_id: string | null;
+  readonly snapshot: {
+    readonly snapshot_id: string;
+    readonly snapshot_hash: string;
+    readonly git_head: string;
+  } | null;
+  readonly context_state:
+    | "not_requested"
+    | "waiting_for_agent"
+    | "extracting"
+    | "available"
+    | "unavailable";
+  readonly match_summary: "strong" | "weak" | "none";
+  readonly source_refs: readonly SourceReference[];
+  readonly exclusions: ReadonlyArray<{
+    readonly relative_path: string | null;
+    readonly reason_code: string;
+  }>;
+  readonly fixes: readonly SourceFix[];
+  readonly limitations: SynthesisOutput["limitations"];
+}
+
 export interface SynthesisProvenance {
   readonly provider_protocol: string;
   readonly provider_name: string;
@@ -236,14 +335,17 @@ export interface SynthesisProvenance {
   readonly generation: number;
 }
 
-export interface AnalysisReport {
-  readonly schema_version: "1.0" | "1.1";
+interface AnalysisReportBase {
   readonly analysis_id: string;
   readonly analysis_mode: "device" | "trace_upload";
   readonly state: "completed" | "partially_completed" | "failed" | "canceled";
   readonly report_version: number;
   readonly generated_at: string;
   readonly scenario_reports: readonly ReportScenario[];
+}
+
+export interface LegacyAnalysisReport extends AnalysisReportBase {
+  readonly schema_version: "1.0" | "1.1";
   readonly synthesis:
     | {
         readonly state: "completed";
@@ -267,6 +369,28 @@ export interface AnalysisReport {
         readonly provenance: null;
       };
 }
+
+export interface SourceAwareAnalysisReport extends AnalysisReportBase {
+  readonly schema_version: "1.2";
+  readonly source_code: SourceCodeReport;
+  readonly synthesis:
+    | {
+        readonly state: "completed";
+        readonly output: ConciseSynthesisOutput;
+        readonly synthesis_artifact_id: string;
+        readonly failure_code: null;
+        readonly provenance: SynthesisProvenance;
+      }
+    | {
+        readonly state: "failed";
+        readonly output: null;
+        readonly synthesis_artifact_id: null;
+        readonly failure_code: string;
+        readonly provenance: null;
+      };
+}
+
+export type AnalysisReport = LegacyAnalysisReport | SourceAwareAnalysisReport;
 
 export interface SynthesisRunResponse {
   readonly schema_version: "1.0";
@@ -990,7 +1114,10 @@ const PRIVATE_TRANSPORT_KEYS = new Set([
   "version_id",
 ]);
 
-function containsPrivateTransportData(value: unknown): boolean {
+function containsPrivateTransportData(
+  value: unknown,
+  allowPatchArtifactVersion = false,
+): boolean {
   const pending: unknown[] = [value];
   while (pending.length > 0) {
     const current = pending.pop();
@@ -1003,8 +1130,16 @@ function containsPrivateTransportData(value: unknown): boolean {
       continue;
     }
     if (!object(current)) continue;
+    const publicPatchArtifact =
+      allowPatchArtifactVersion &&
+      exactKeys(current, ["artifact_id", "version_id", "sha256_b64", "size", "mime"]) &&
+      current.mime === "text/x-diff";
     for (const [key, nested] of Object.entries(current)) {
-      if (PRIVATE_TRANSPORT_KEYS.has(key.toLowerCase())) return true;
+      const normalizedKey = key.toLowerCase();
+      if (
+        PRIVATE_TRANSPORT_KEYS.has(normalizedKey) &&
+        !(normalizedKey === "version_id" && publicPatchArtifact)
+      ) return true;
       pending.push(nested);
     }
   }
@@ -1213,6 +1348,213 @@ function validSynthesisOutput(value: unknown): value is SynthesisOutput {
   return findingsValid && recommendationsValid && retestsValid && limitationsValid;
 }
 
+function validSynthesisItems(value: Record<string, unknown>, maximum = 3): boolean {
+  const findingsValid =
+    Array.isArray(value.top_findings) &&
+    value.top_findings.length <= maximum &&
+    value.top_findings.every(
+      (item) =>
+        object(item) &&
+        exactKeys(item, ["finding_id", "evidence_ids", "user_impact"]) &&
+        typeof item.finding_id === "string" &&
+        stringArray(item.evidence_ids, 20, 1) &&
+        typeof item.user_impact === "string",
+    );
+  const recommendationsValid =
+    Array.isArray(value.recommendations) &&
+    value.recommendations.length <= maximum &&
+    value.recommendations.every(
+      (item) =>
+        object(item) &&
+        exactKeys(item, [
+          "priority",
+          "title",
+          "action",
+          "expected_effect",
+          "finding_ids",
+          "evidence_ids",
+        ]) &&
+        ["p0", "p1", "p2"].includes(String(item.priority)) &&
+        typeof item.title === "string" &&
+        typeof item.action === "string" &&
+        typeof item.expected_effect === "string" &&
+        stringArray(item.finding_ids, 20, 1) &&
+        stringArray(item.evidence_ids, 20, 1),
+    );
+  const retestsValid =
+    Array.isArray(value.retest_plan) &&
+    value.retest_plan.length <= maximum &&
+    value.retest_plan.every(
+      (item) =>
+        object(item) &&
+        exactKeys(item, [
+          "mode",
+          "scenario_type",
+          "metric_ids",
+          "limitation_ids",
+          "steps",
+          "success_condition",
+          "failure_condition",
+        ]) &&
+        ["verify_metric", "collect_evidence"].includes(String(item.mode)) &&
+        ["startup", "scroll", "memory_cycle"].includes(String(item.scenario_type)) &&
+        stringArray(item.metric_ids, 20) &&
+        stringArray(item.limitation_ids, 20) &&
+        typeof item.steps === "string",
+    );
+  const limitationsValid =
+    Array.isArray(value.limitations) &&
+    value.limitations.length <= 20 &&
+    value.limitations.every(
+      (item) =>
+        object(item) &&
+        exactKeys(item, ["limitation_id", "summary"]) &&
+        typeof item.limitation_id === "string" &&
+        typeof item.summary === "string",
+    );
+  return findingsValid && recommendationsValid && retestsValid && limitationsValid;
+}
+
+const SOURCE_FIX_KEYS = [
+  "fix_id",
+  "finding_id",
+  "evidence_ids",
+  "recommendation_priority",
+  "source_ref_ids",
+  "rule_id",
+  "match_grade",
+  "relative_path",
+  "symbol",
+  "diagnosis",
+  "diff",
+  "validation_profile_id",
+  "retest_target",
+] as const;
+
+function validSourceFix(value: unknown, verification: boolean): boolean {
+  if (
+    !object(value) ||
+    !exactKeys(value, verification ? [...SOURCE_FIX_KEYS, "verification"] : SOURCE_FIX_KEYS) ||
+    !CANONICAL_UUID.test(String(value.fix_id)) ||
+    !CANONICAL_UUID.test(String(value.finding_id)) ||
+    !stringArray(value.evidence_ids, 20, 1) ||
+    !["p0", "p1", "p2"].includes(String(value.recommendation_priority)) ||
+    !stringArray(value.source_ref_ids, 12, 1) ||
+    typeof value.rule_id !== "string" ||
+    value.match_grade !== "strong" ||
+    typeof value.relative_path !== "string" ||
+    value.relative_path.startsWith("/") ||
+    (value.symbol !== null && typeof value.symbol !== "string") ||
+    typeof value.diagnosis !== "string" ||
+    typeof value.diff !== "string" ||
+    !CANONICAL_UUID.test(String(value.validation_profile_id)) ||
+    typeof value.retest_target !== "string"
+  ) {
+    return false;
+  }
+  if (!verification) return true;
+  const result = value.verification;
+  if (
+    !object(result) ||
+    !exactKeys(result, [
+      "state",
+      "exit_code",
+      "duration_ms",
+      "profile_id",
+      "patch_sha256",
+      "log_summary",
+      "patch_artifact",
+    ]) ||
+    ![
+      "not_requested", "pending", "validating", "verified", "apply_failed",
+      "validation_failed", "source_changed", "not_configured", "timeout",
+      "canceled", "unavailable",
+    ].includes(String(result.state)) ||
+    (result.exit_code !== null && !Number.isSafeInteger(result.exit_code)) ||
+    (result.duration_ms !== null && !Number.isSafeInteger(result.duration_ms)) ||
+    !CANONICAL_UUID.test(String(result.profile_id)) ||
+    typeof result.patch_sha256 !== "string" ||
+    !/^[0-9a-f]{64}$/.test(result.patch_sha256) ||
+    (result.log_summary !== null && typeof result.log_summary !== "string")
+  ) {
+    return false;
+  }
+  return (
+    result.patch_artifact === null ||
+    (object(result.patch_artifact) &&
+      exactKeys(result.patch_artifact, ["artifact_id", "version_id", "sha256_b64", "size", "mime"]) &&
+      CANONICAL_UUID.test(String(result.patch_artifact.artifact_id)) &&
+      typeof result.patch_artifact.version_id === "string" &&
+      typeof result.patch_artifact.sha256_b64 === "string" &&
+      Number.isSafeInteger(result.patch_artifact.size) &&
+      result.patch_artifact.mime === "text/x-diff")
+  );
+}
+
+function validConciseSynthesisOutput(value: unknown): value is ConciseSynthesisOutput {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "schema_version", "verdict", "executive_summary", "key_metric_ids",
+      "top_findings", "recommendations", "source_fixes", "retest_plan", "limitations",
+    ]) &&
+    value.schema_version === "2.0" &&
+    typeof value.verdict === "string" &&
+    typeof value.executive_summary === "string" &&
+    stringArray(value.key_metric_ids, 3) &&
+    Array.isArray(value.source_fixes) &&
+    value.source_fixes.length <= 3 &&
+    value.source_fixes.every((fix) => validSourceFix(fix, false)) &&
+    validSynthesisItems(value)
+  );
+}
+
+function validSourceCodeReport(value: unknown): value is SourceCodeReport {
+  if (
+    !object(value) ||
+    !exactKeys(value, [
+      "requested", "provider_kind", "agent_id", "workspace_id", "snapshot_policy",
+      "validation_profile_id", "snapshot", "context_state", "match_summary",
+      "source_refs", "exclusions", "fixes", "limitations",
+    ]) ||
+    typeof value.requested !== "boolean" ||
+    !["not_requested", "waiting_for_agent", "extracting", "available", "unavailable"].includes(String(value.context_state)) ||
+    !["strong", "weak", "none"].includes(String(value.match_summary)) ||
+    !Array.isArray(value.source_refs) || value.source_refs.length > 12 ||
+    !Array.isArray(value.exclusions) || value.exclusions.length > 64 ||
+    !Array.isArray(value.fixes) || value.fixes.length > 3 ||
+    !Array.isArray(value.limitations) || value.limitations.length > 20
+  ) return false;
+  if (!value.requested) {
+    return value.provider_kind === null && value.agent_id === null && value.workspace_id === null &&
+      value.snapshot_policy === null && value.validation_profile_id === null && value.snapshot === null &&
+      value.context_state === "not_requested" && value.match_summary === "none" &&
+      value.source_refs.length === 0 && value.exclusions.length === 0 && value.fixes.length === 0 && value.limitations.length === 0;
+  }
+  if (
+    value.provider_kind !== "agent_workspace" ||
+    !CANONICAL_UUID.test(String(value.agent_id)) ||
+    !CANONICAL_UUID.test(String(value.workspace_id)) ||
+    value.snapshot_policy !== "tracked_worktree" ||
+    (value.validation_profile_id !== null && !CANONICAL_UUID.test(String(value.validation_profile_id)))
+  ) return false;
+  const snapshotValid = value.snapshot === null || (
+    object(value.snapshot) && exactKeys(value.snapshot, ["snapshot_id", "snapshot_hash", "git_head"]) &&
+    CANONICAL_UUID.test(String(value.snapshot.snapshot_id)) && /^[0-9a-f]{64}$/.test(String(value.snapshot.snapshot_hash)) && HEX40.test(String(value.snapshot.git_head))
+  );
+  const refsValid = value.source_refs.every((ref) =>
+    object(ref) && exactKeys(ref, ["source_ref_id", "relative_path", "language", "symbol", "start_line", "end_line", "content_sha256", "snapshot_hash", "match_grade", "finding_ids", "evidence_ids", "rule_ids"]) &&
+    CANONICAL_UUID.test(String(ref.source_ref_id)) && typeof ref.relative_path === "string" && !ref.relative_path.startsWith("/") &&
+    ["kotlin", "java", "xml", "gradle", "gradle_kts"].includes(String(ref.language)) && (ref.symbol === null || typeof ref.symbol === "string") &&
+    Number.isSafeInteger(ref.start_line) && Number.isSafeInteger(ref.end_line) && /^[0-9a-f]{64}$/.test(String(ref.content_sha256)) &&
+    /^[0-9a-f]{64}$/.test(String(ref.snapshot_hash)) && ["strong", "weak", "none"].includes(String(ref.match_grade)) &&
+    stringArray(ref.finding_ids, 3) && stringArray(ref.evidence_ids, 20) && stringArray(ref.rule_ids, 8));
+  const exclusionsValid = value.exclusions.every((item) => object(item) && exactKeys(item, ["relative_path", "reason_code"]) &&
+    (item.relative_path === null || typeof item.relative_path === "string") && typeof item.reason_code === "string");
+  const limitationsValid = value.limitations.every((item) => object(item) && exactKeys(item, ["limitation_id", "summary"]) && typeof item.limitation_id === "string" && typeof item.summary === "string");
+  return snapshotValid && refsValid && exclusionsValid && limitationsValid && value.fixes.every((fix) => validSourceFix(fix, true));
+}
+
 function validSynthesisProvenance(value: unknown): value is SynthesisProvenance {
   return (
     object(value) &&
@@ -1246,9 +1588,10 @@ function validSynthesisProvenance(value: unknown): value is SynthesisProvenance 
 }
 
 function analysisReportResponse(value: unknown): AnalysisReport {
+  const sourceAware = object(value) && value.schema_version === "1.2";
   if (
     !object(value) ||
-    containsPrivateTransportData(value) ||
+    containsPrivateTransportData(value, sourceAware) ||
     !exactKeys(value, [
       "schema_version",
       "analysis_id",
@@ -1258,8 +1601,9 @@ function analysisReportResponse(value: unknown): AnalysisReport {
       "generated_at",
       "scenario_reports",
       "synthesis",
+      ...(sourceAware ? ["source_code"] : []),
     ]) ||
-    !["1.0", "1.1"].includes(String(value.schema_version)) ||
+    !["1.0", "1.1", "1.2"].includes(String(value.schema_version)) ||
     !["device", "trace_upload"].includes(String(value.analysis_mode)) ||
     typeof value.analysis_id !== "string" ||
     !["completed", "partially_completed", "failed", "canceled"].includes(
@@ -1274,6 +1618,33 @@ function analysisReportResponse(value: unknown): AnalysisReport {
     !value.scenario_reports.every(validScenarioReport)
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  if (value.schema_version === "1.2") {
+    if (
+      !validSourceCodeReport(value.source_code) ||
+      !object(value.synthesis) ||
+      !exactKeys(value.synthesis, [
+        "state", "output", "synthesis_artifact_id", "failure_code", "provenance",
+      ])
+    ) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    const completed =
+      value.synthesis.state === "completed" &&
+      validConciseSynthesisOutput(value.synthesis.output) &&
+      typeof value.synthesis.synthesis_artifact_id === "string" &&
+      value.synthesis.failure_code === null &&
+      validSynthesisProvenance(value.synthesis.provenance);
+    const failed =
+      value.synthesis.state === "failed" &&
+      value.synthesis.output === null &&
+      value.synthesis.synthesis_artifact_id === null &&
+      typeof value.synthesis.failure_code === "string" &&
+      value.synthesis.provenance === null;
+    if (!completed && !failed) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    return value as unknown as SourceAwareAnalysisReport;
   }
   if (value.schema_version === "1.0") {
     if (value.synthesis !== undefined) {
@@ -1694,8 +2065,39 @@ function analysisResponse(value: unknown): AnalysisResponse {
   const hasSourceCode = object(value) && "source_code_analysis" in value;
   const createdAt = object(value) ? value.created_at : undefined;
   const cancelRequestedAt = object(value) ? value.cancel_requested_at : undefined;
+  const commonKeys = [
+    "schema_version",
+    "analysis_id",
+    "team_id",
+    "analysis_mode",
+    "state",
+    "version",
+    "created_at",
+    "cancel_requested_at",
+    "report_available",
+    "failure",
+    "source_code_analysis",
+  ] as const;
+  const modeKeys = object(value)
+    ? value.analysis_mode === "trace_upload"
+      ? ["analysis_profile", "question", "input_uploads", "stages", "ai_rounds", "source_analysis"]
+      : value.analysis_mode === "device"
+        ? [
+            "device_id",
+            "application_version_id",
+            "application_metadata",
+            "apk_upload",
+            "scenarios",
+            "sample_verdict_counts",
+            "active_lease",
+            "started_at",
+            "completed_at",
+          ]
+        : ["application_version_id", "application_metadata", "question"]
+    : [];
   if (
     !object(value) ||
+    !exactKeys(value, [...commonKeys, ...modeKeys]) ||
     !["1.0", "1.1"].includes(String(value.schema_version)) ||
     !["device", "trace_upload", "memory_upload"].includes(String(value.analysis_mode)) ||
     typeof value.analysis_id !== "string" ||

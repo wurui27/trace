@@ -113,6 +113,39 @@ function reportPayload(): Record<string, unknown> {
   };
 }
 
+function sourceAwareReportPayload(): Record<string, unknown> {
+  const report = structuredClone(reportPayload());
+  report.schema_version = "1.2";
+  report.source_code = {
+    requested: false,
+    provider_kind: null,
+    agent_id: null,
+    workspace_id: null,
+    snapshot_policy: null,
+    validation_profile_id: null,
+    snapshot: null,
+    context_state: "not_requested",
+    match_summary: "none",
+    source_refs: [],
+    exclusions: [],
+    fixes: [],
+    limitations: [],
+  };
+  const synthesis = report.synthesis as Record<string, unknown>;
+  synthesis.output = {
+    schema_version: "2.0",
+    verdict: "启动存在主线程等待",
+    executive_summary: "先缩短主线程阻塞，再按相同场景复测。",
+    key_metric_ids: [],
+    top_findings: [],
+    recommendations: [],
+    source_fixes: [],
+    retest_plan: [],
+    limitations: [],
+  };
+  return report;
+}
+
 describe("PerfPilot browser API", () => {
   it("accepts only closed public Agent source workspace records", async () => {
     const workspace = {
@@ -771,6 +804,101 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("rejects private top-level fields for every analysis mode and schema", async () => {
+    const sourceCodeAnalysis = {
+      requested: true,
+      provider_kind: "agent_workspace",
+      agent_id: AGENT_ID,
+      workspace_id: "92000000-0000-4000-8000-000000000001",
+      snapshot_policy: "tracked_worktree",
+      validation_profile_id: null,
+      context_state: "waiting_for_agent",
+      match_summary: "none",
+      verification_state: "not_requested",
+      failure_code: null,
+    };
+    const metadata = {
+      package_name: "com.example.app",
+      version_name: "1.0",
+      version_code: 1,
+      launch_activity: null,
+      min_sdk: 26,
+      target_sdk: 35,
+      supported_abis: [],
+      has_native_libraries: false,
+    };
+    const counts = { valid: 0, invalid: 0, pending: 0, validation_error: 0, total: 0 };
+    const device = {
+      schema_version: "1.0",
+      analysis_id: ANALYSIS_ID,
+      team_id: TEAM_ID,
+      analysis_mode: "device",
+      device_id: DEVICE_ID,
+      state: "created",
+      version: 1,
+      application_version_id: null,
+      application_metadata: metadata,
+      apk_upload: {
+        state: "pending",
+        upload_id: "85000000-0000-4000-8000-000000000001",
+        artifact_kind: "apk",
+        mime: "application/vnd.android.package-archive",
+        size: 3,
+        sha256_b64: "c".repeat(44),
+        expires_at: "2026-08-11T08:15:00Z",
+      },
+      scenarios: ["cold_start", "scroll", "memory_cycle"].map((scenario_type) => ({
+        scenario_job_id: null,
+        scenario_type,
+        state: "awaiting_input",
+        version: null,
+        device_group_id: null,
+        sample_verdict_counts: counts,
+        started_at: null,
+        completed_at: null,
+        failure: null,
+      })),
+      sample_verdict_counts: counts,
+      active_lease: null,
+      report_available: false,
+      started_at: null,
+      completed_at: null,
+      failure: null,
+    };
+    const memory = {
+      schema_version: "1.0",
+      analysis_id: ANALYSIS_ID,
+      team_id: TEAM_ID,
+      analysis_mode: "memory_upload",
+      application_version_id: null,
+      application_metadata: metadata,
+      question: null,
+      state: "created",
+      version: 1,
+      report_available: false,
+      failure: null,
+    };
+    const variants = [analysis("completed"), device, memory].flatMap((payload) => [
+      { ...payload, private_path: "/private/repo" },
+      {
+        ...payload,
+        schema_version: "1.1",
+        source_code_analysis: sourceCodeAnalysis,
+        argv: ["git", "status"],
+      },
+    ]);
+    const fetcher = vi.fn<typeof fetch>().mockImplementation(async () =>
+      Response.json(variants.shift()),
+    );
+    const client = createPerfPilotClient({ fetcher });
+
+    for (let index = 0; index < 6; index += 1) {
+      await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+        code: "invalid_api_response",
+      });
+    }
+  });
+
   it("accepts the exact single-pass and legacy AI round layouts", async () => {
     const valid = analysis("completed");
     const sourceAnalysis = {
@@ -989,6 +1117,31 @@ describe("PerfPilot browser API", () => {
       state: "partially_completed",
       synthesis: { state: "completed" },
       scenario_reports: [{ scenario_type: "startup" }],
+    });
+  });
+
+  it("accepts only the closed public AnalysisReport 1.2 document", async () => {
+    const valid = sourceAwareReportPayload();
+    const privateRoot = { ...sourceAwareReportPayload(), repo_url: "ssh://private/repo" };
+    const privateSource = sourceAwareReportPayload();
+    (privateSource.source_code as Record<string, unknown>).private_path = "/private/repo";
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(valid))
+      .mockResolvedValueOnce(Response.json(privateRoot))
+      .mockResolvedValueOnce(Response.json(privateSource));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      schema_version: "1.2",
+      synthesis: { state: "completed", output: { schema_version: "2.0" } },
+      source_code: { requested: false, context_state: "not_requested" },
+    });
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
     });
   });
 

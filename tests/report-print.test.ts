@@ -4,15 +4,20 @@ import { printAnalysisReport, supportsReportPrint } from "../app/lib/report-prin
 
 describe("report printing", () => {
   it("prints with a report-specific title and restores the document title", () => {
-    const target = { document: { title: "PerfPilot" }, print: vi.fn() };
+    const target = {
+      document: { title: "PerfPilot", documentElement: { dataset: {} as Record<string, string> } },
+      print: vi.fn(),
+    };
 
     target.print.mockImplementation(() => {
       expect(target.document.title).toBe("PerfPilot-analysis-42");
+      expect(target.document.documentElement.dataset.reportPrinting).toBe("true");
     });
 
     expect(printAnalysisReport("analysis/42", target)).toBe(true);
     expect(target.print).toHaveBeenCalledOnce();
     expect(target.document.title).toBe("PerfPilot");
+    expect(target.document.documentElement.dataset.reportPrinting).toBeUndefined();
   });
 
   it("returns false and restores the title when printing throws", () => {

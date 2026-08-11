@@ -1,16 +1,26 @@
 "use client";
 
+import { useState } from "react";
+
 import type {
   AnalysisReport,
+  LegacyAnalysisReport,
   ReportEvidence,
   ReportFinding,
   ReportMetric,
 } from "../lib/perfpilot-api";
+import { ConciseReportSummary } from "./concise-report-summary";
+import { SourceFixesPanel } from "./source-fixes-panel";
+import { TechnicalAppendix } from "./technical-appendix";
 
 interface AnalysisReportViewProps {
   readonly report: AnalysisReport;
   readonly onRetrySynthesis: () => void | Promise<void>;
   readonly retrying: boolean;
+}
+
+interface LegacyAnalysisReportViewProps extends Omit<AnalysisReportViewProps, "report"> {
+  readonly report: LegacyAnalysisReport;
 }
 
 const priorityOrder = { p0: 0, p1: 1, p2: 2, p3: 3 } as const;
@@ -142,11 +152,57 @@ function memoryMetricRank(metric: ReportMetric): number {
   return row * 10 + field;
 }
 
-export function AnalysisReportView({
+export function AnalysisReportView(props: AnalysisReportViewProps) {
+  if (props.report.schema_version === "1.2") {
+    return <SourceAwareAnalysisReportView report={props.report} />;
+  }
+  return <LegacyAnalysisReportView {...props} report={props.report} />;
+}
+
+function SourceAwareAnalysisReportView({
+  report,
+}: {
+  readonly report: Extract<AnalysisReport, { readonly schema_version: "1.2" }>;
+}) {
+  const [tab, setTab] = useState<"conclusion" | "source" | "appendix">("conclusion");
+  return (
+    <article className="analysis-report-card source-aware-report" aria-label="PerfPilot 分析报告">
+      <div className="source-aware-report-tabs" role="tablist" aria-label="报告内容">
+        {([
+          ["conclusion", "结论"],
+          ["source", "源码修复"],
+          ["appendix", "技术附录"],
+        ] as const).map(([id, label]) => (
+          <button
+            key={id}
+            type="button"
+            role="tab"
+            aria-selected={tab === id}
+            aria-controls={`report-panel-${id}`}
+            onClick={() => setTab(id)}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      <div id="report-panel-conclusion" role="tabpanel" hidden={tab !== "conclusion"} data-report-layer="conclusion">
+        <ConciseReportSummary report={report} />
+      </div>
+      <div id="report-panel-source" role="tabpanel" hidden={tab !== "source"} data-report-layer="source">
+        <SourceFixesPanel report={report} />
+      </div>
+      <div id="report-panel-appendix" role="tabpanel" hidden={tab !== "appendix"} data-report-layer="appendix">
+        <TechnicalAppendix report={report} />
+      </div>
+    </article>
+  );
+}
+
+function LegacyAnalysisReportView({
   report,
   onRetrySynthesis,
   retrying,
-}: AnalysisReportViewProps) {
+}: LegacyAnalysisReportViewProps) {
   const bundles = report.scenario_reports.flatMap((scenario) =>
     scenario.bundle === null ? [] : [{ scenario: scenario.scenario_type, bundle: scenario.bundle }],
   );

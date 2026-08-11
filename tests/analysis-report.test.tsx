@@ -232,7 +232,72 @@ function deviceMemoryReport(): AnalysisReport {
   };
 }
 
+function sourceAwareReport(): AnalysisReport {
+  const legacy = report();
+  const output = legacy.synthesis.state === "completed" ? legacy.synthesis.output : null;
+  if (output === null) throw new Error("fixture requires synthesis");
+  return {
+    ...legacy,
+    schema_version: "1.2",
+    synthesis: {
+      ...legacy.synthesis,
+      output: {
+        ...output,
+        schema_version: "2.0",
+        verdict: "启动关键路径被主线程同步等待阻塞。",
+        key_metric_ids: METRIC_IDS.slice(0, 3),
+        top_findings: output.top_findings.slice(0, 3),
+        recommendations: output.recommendations.slice(0, 3),
+        source_fixes: [],
+      },
+    },
+    source_code: {
+      requested: false,
+      provider_kind: null,
+      agent_id: null,
+      workspace_id: null,
+      snapshot_policy: null,
+      validation_profile_id: null,
+      snapshot: null,
+      context_state: "not_requested",
+      match_summary: "none",
+      source_refs: [],
+      exclusions: [],
+      fixes: [],
+      limitations: [],
+    },
+  } as unknown as AnalysisReport;
+}
+
 describe("AnalysisReportView", () => {
+  it("dispatches report 1.2 into conclusion, source fixes and appendix tabs", async () => {
+    const user = userEvent.setup();
+    render(
+      <AnalysisReportView
+        report={sourceAwareReport()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "结论" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+    expect(screen.getByRole("tab", { name: "源码修复" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "技术附录" })).toBeInTheDocument();
+    expect(screen.getAllByTestId("key-metric")).toHaveLength(3);
+    expect(screen.getAllByTestId("top-finding")).toHaveLength(3);
+    expect(screen.getAllByTestId("priority-action")).toHaveLength(3);
+    expect(screen.getByText("辅助指标 4")).not.toBeVisible();
+
+    await user.click(screen.getByRole("tab", { name: "源码修复" }));
+    expect(screen.getByText("本次分析未关联源码")).toBeInTheDocument();
+    await user.click(screen.getByRole("tab", { name: "技术附录" }));
+    await user.click(screen.getByText("startup"));
+    expect(screen.getByText("辅助指标 4")).toBeVisible();
+  });
+
   it("renders the concise completed report in evidence-first order", () => {
     const { container } = render(
       <AnalysisReportView report={report()} onRetrySynthesis={vi.fn()} retrying={false} />,
