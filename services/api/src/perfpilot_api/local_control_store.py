@@ -33,6 +33,7 @@ _SCHEMA_VERSION = 1
 _CONTROL_FILE_NAME = "control.json"
 _LOCK_FILE_NAME = ".control.lock"
 _MAX_CONTROL_BYTES = 2 * 1024 * 1024
+_DUMMY_PASSWORD_HASH = hash_password("perfpilot-local-control-dummy-password")
 
 
 class LocalControlStoreError(RuntimeError):
@@ -123,7 +124,7 @@ class LocalControlStore:
         self._token_factory = token_factory
 
     def ensure_user(self, username: str, password: str, admin: bool) -> EnsureUserResult:
-        normalized = self._validate_credentials(username, password)
+        normalized = self._validate_new_credentials(username, password)
         if not isinstance(admin, bool):
             raise LocalControlStoreError("invalid local credentials")
         result: EnsureUserResult | None = None
@@ -131,30 +132,44 @@ class LocalControlStore:
             document = self._read_document()
             existing = self._find_user(document, normalized)
             if existing is not None:
-                result = EnsureUserResult(self._principal_from_user(existing), False)
+                result = EnsureUserResult(self._principal_from_user(document, existing), False)
             else:
+                user_id = str(self._new_uuid())
+                team_id = str(self._new_uuid())
+                team = {
+                    "team_id": team_id,
+                    "name": f"{normalized} local team",
+                }
                 user = {
-                    "user_id": str(self._new_uuid()),
+                    "user_id": user_id,
                     "username": normalized,
-                    "team_id": str(self._new_uuid()),
-                    "team_name": f"{normalized} local team",
+                    "team_id": team["team_id"],
                     "password_hash": self._password_hash(password),
                     "is_platform_admin": admin,
                     "must_change_password": True,
                 }
+                document["teams"].append(team)
                 document["users"].append(user)
                 self._write_document(document)
-                result = EnsureUserResult(self._principal_from_user(user), True)
+                result = EnsureUserResult(self._principal_from_user(document, user), True)
         assert result is not None
         return result
 
     def authenticate(self, username: str, password: str) -> LocalPrincipal | None:
-        normalized = self._validate_credentials(username, password)
+        if not isinstance(username, str) or not isinstance(password, str):
+            return None
+        normalized = normalize_username(username)
+        if not normalized or len(normalized) > 128:
+            verify_password(_DUMMY_PASSWORD_HASH, password)
+            return None
         with self._exclusive_lock():
-            user = self._find_user(self._read_document(), normalized)
-            if user is None or not verify_password(str(user["password_hash"]), password):
+            document = self._read_document()
+            user = self._find_user(document, normalized)
+            password_hash = str(user["password_hash"]) if user is not None else _DUMMY_PASSWORD_HASH
+            verified = verify_password(password_hash, password)
+            if user is None or not verified:
                 return None
-            return self._principal_from_user(user)
+            return self._principal_from_user(document, user)
 
     def issue_session(self, user_id: UUID) -> tuple[str, str]:
         if not isinstance(user_id, UUID):
@@ -201,7 +216,8 @@ class LocalControlStore:
     ) -> LocalPrincipal:
         if not isinstance(user_id, UUID):
             raise TypeError("user_id must be a UUID")
-        self._validate_password(current_password)
+        if not isinstance(current_password, str):
+            raise LocalControlStoreError("invalid local credentials")
         with self._exclusive_lock():
             document = self._read_document()
             user = self._find_user_by_id(document, user_id)
@@ -216,7 +232,7 @@ class LocalControlStore:
                 session for session in document["sessions"] if session["user_id"] != str(user_id)
             ]
             self._write_document(document)
-            return self._principal_from_user(user)
+            return self._principal_from_user(document, user)
 
     def require_team(self, token: str, team_id: UUID) -> LocalPrincipal:
         if not isinstance(team_id, UUID):
@@ -254,7 +270,12 @@ class LocalControlStore:
         if self._control_path.is_symlink():
             raise LocalControlStoreError("unsafe local control path")
         if not self._control_path.exists():
-            return {"schema_version": _SCHEMA_VERSION, "users": [], "sessions": []}
+            return {
+                "schema_version": _SCHEMA_VERSION,
+                "users": [],
+                "teams": [],
+                "sessions": [],
+            }
         try:
             if not self._control_path.is_file():
                 raise ValueError
@@ -305,24 +326,37 @@ class LocalControlStore:
         if not isinstance(document, dict) or set(document) != {
             "schema_version",
             "users",
+            "teams",
             "sessions",
         }:
             raise ValueError
-        if document["schema_version"] != _SCHEMA_VERSION:
+        if type(document["schema_version"]) is not int or document["schema_version"] != _SCHEMA_VERSION:
             raise ValueError
         users = document["users"]
+        teams = document["teams"]
         sessions = document["sessions"]
-        if not isinstance(users, list) or not isinstance(sessions, list):
+        if not isinstance(users, list) or not isinstance(teams, list) or not isinstance(sessions, list):
             raise ValueError
+        team_ids: set[str] = set()
+        for team in teams:
+            if not isinstance(team, dict) or set(team) != {"team_id", "name"}:
+                raise ValueError
+            team_id = LocalControlStore._validated_uuid(team["team_id"])
+            if (
+                not isinstance(team["name"], str)
+                or not team["name"]
+                or str(team_id) in team_ids
+            ):
+                raise ValueError
+            team_ids.add(str(team_id))
         usernames: set[str] = set()
         user_ids: set[str] = set()
-        team_ids: set[str] = set()
+        referenced_team_ids: set[str] = set()
         for user in users:
             if not isinstance(user, dict) or set(user) != {
                 "user_id",
                 "username",
                 "team_id",
-                "team_name",
                 "password_hash",
                 "is_platform_admin",
                 "must_change_password",
@@ -336,20 +370,21 @@ class LocalControlStore:
                 or normalize_username(username) != username
                 or not username
                 or len(username) > 128
-                or not isinstance(user["team_name"], str)
-                or not user["team_name"]
                 or not isinstance(user["password_hash"], str)
                 or not user["password_hash"]
                 or not isinstance(user["is_platform_admin"], bool)
                 or not isinstance(user["must_change_password"], bool)
                 or username in usernames
                 or str(user_id) in user_ids
-                or str(team_id) in team_ids
+                or str(team_id) not in team_ids
+                or str(team_id) in referenced_team_ids
             ):
                 raise ValueError
             usernames.add(username)
             user_ids.add(str(user_id))
-            team_ids.add(str(team_id))
+            referenced_team_ids.add(str(team_id))
+        if referenced_team_ids != team_ids:
+            raise ValueError
         for session in sessions:
             if not isinstance(session, dict) or set(session) != {
                 "token_digest",
@@ -403,15 +438,20 @@ class LocalControlStore:
         self, document: dict[str, Any], user_id: UUID
     ) -> LocalPrincipal | None:
         user = self._find_user_by_id(document, user_id)
-        return self._principal_from_user(user) if user is not None else None
+        return self._principal_from_user(document, user) if user is not None else None
 
     @staticmethod
-    def _principal_from_user(user: dict[str, Any]) -> LocalPrincipal:
+    def _principal_from_user(document: dict[str, Any], user: dict[str, Any]) -> LocalPrincipal:
+        team = next(
+            (team for team in document["teams"] if team["team_id"] == user["team_id"]), None
+        )
+        if team is None:
+            raise LocalControlStoreError("invalid local control state")
         return LocalPrincipal(
             user_id=UUID(str(user["user_id"])),
             username=str(user["username"]),
             team_id=UUID(str(user["team_id"])),
-            team_name=str(user["team_name"]),
+            team_name=str(team["name"]),
             is_platform_admin=bool(user["is_platform_admin"]),
             must_change_password=bool(user["must_change_password"]),
         )
@@ -435,7 +475,7 @@ class LocalControlStore:
         return now.astimezone(UTC)
 
     @staticmethod
-    def _validate_credentials(username: str, password: str) -> str:
+    def _validate_new_credentials(username: str, password: str) -> str:
         if not isinstance(username, str):
             raise LocalControlStoreError("invalid local credentials")
         normalized = normalize_username(username)

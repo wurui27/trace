@@ -53,10 +53,35 @@ def test_control_file_contains_only_password_hash_and_has_private_permissions(tm
     payload = (tmp_path / "control.json").read_text(encoding="utf-8")
     document = json.loads(payload)
     assert secret not in payload
+    assert set(document) == {"schema_version", "users", "teams", "sessions"}
     assert "password" not in document["users"][0]
     assert document["users"][0]["password_hash"].startswith("$argon2")
+    assert document["users"][0]["team_id"] == document["teams"][0]["team_id"]
+    assert document["teams"][0]["name"] == "ordinary local team"
     assert (tmp_path.stat().st_mode & 0o777) == 0o700
     assert ((tmp_path / "control.json").stat().st_mode & 0o777) == 0o600
+
+
+def test_reopens_user_and_separate_team_records_with_stable_factory_ids(
+    tmp_path: Path,
+) -> None:
+    expected_user_id = UUID("80000000-0000-4000-8000-000000000001")
+    expected_team_id = UUID("81000000-0000-4000-8000-000000000001")
+    identifiers = iter((expected_user_id, expected_team_id))
+    created = LocalControlStore(
+        tmp_path,
+        uuid_factory=lambda: next(identifiers),
+    ).ensure_user("ordinary", "valid password", False)
+    reopened = LocalControlStore(tmp_path).ensure_user("ordinary", "other valid password", True)
+    document = json.loads((tmp_path / "control.json").read_text(encoding="utf-8"))
+
+    assert created.principal.user_id == expected_user_id
+    assert created.principal.team_id == expected_team_id
+    assert reopened.principal == created.principal
+    assert document["users"][0]["team_id"] == str(expected_team_id)
+    assert document["teams"] == [
+        {"team_id": str(expected_team_id), "name": "ordinary local team"}
+    ]
 
 
 def test_sessions_store_digests_expire_at_boundary_and_password_change_revokes_them(
@@ -109,6 +134,30 @@ def test_rejects_malformed_unknown_key_and_symlinked_control_paths_without_secre
         LocalControlStore(linked_state)
 
 
+def test_rejects_syntactically_invalid_and_duplicate_key_control_json(tmp_path: Path) -> None:
+    (tmp_path / "control.json").write_text("{not json", encoding="utf-8")
+    with pytest.raises(LocalControlStoreError, match="invalid local control state"):
+        LocalControlStore(tmp_path).authenticate("person", "valid password")
+
+    (tmp_path / "control.json").write_text(
+        '{"schema_version":1,"schema_version":1,"users":[],"sessions":[]}',
+        encoding="utf-8",
+    )
+    with pytest.raises(LocalControlStoreError, match="invalid local control state"):
+        LocalControlStore(tmp_path).authenticate("person", "valid password")
+
+
+def test_rejects_symlinked_lock_without_touching_its_target(tmp_path: Path) -> None:
+    victim = tmp_path / "victim"
+    victim.write_text("do not modify", encoding="utf-8")
+    (tmp_path / ".control.lock").symlink_to(victim)
+
+    with pytest.raises(LocalControlStoreError, match="unsafe local control path"):
+        LocalControlStore(tmp_path)
+
+    assert victim.read_text(encoding="utf-8") == "do not modify"
+
+
 def test_failed_atomic_replace_keeps_previous_control_file_readable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -155,5 +204,47 @@ def test_normalization_collision_password_validation_and_team_requirement(tmp_pa
         store.ensure_user("   ", "valid password", False)
     with pytest.raises(LocalControlStoreError, match="invalid local credentials"):
         store.ensure_user("person", "", False)
+    with pytest.raises(LocalControlStoreError, match="invalid local credentials"):
+        store.ensure_user("person", "elevenchars", False)
+    with pytest.raises(LocalControlStoreError, match="invalid local credentials"):
+        store.ensure_user("equalpassword", "EQUALPASSWORD", False)
+    equal_user = store.ensure_user("equalpassword", "different valid password", False)
+    with pytest.raises(LocalControlStoreError, match="invalid local credentials"):
+        store.change_password(
+            equal_user.principal.user_id,
+            "different valid password",
+            "EQUALPASSWORD",
+        )
     with pytest.raises(LocalControlStoreNotFoundError, match="local principal not found"):
         store.require_team(token, UUID("ffffffff-ffff-4fff-8fff-ffffffffffff"))
+
+
+@pytest.mark.parametrize(
+    ("username", "password"),
+    [
+        ("missing", "valid password"),
+        ("ordinary", "wrong password"),
+        ("ordinary", "short"),
+        ("ordinary", ""),
+    ],
+)
+def test_authenticate_always_returns_none_for_invalid_supplied_credentials(
+    tmp_path: Path,
+    username: str,
+    password: str,
+) -> None:
+    store = LocalControlStore(tmp_path)
+    store.ensure_user("ordinary", "valid password", False)
+
+    assert store.authenticate(username, password) is None
+
+
+def test_rejects_boolean_schema_version_even_though_bool_equals_one(tmp_path: Path) -> None:
+    store = LocalControlStore(tmp_path)
+    store.ensure_user("ordinary", "valid password", False)
+    document = json.loads((tmp_path / "control.json").read_text(encoding="utf-8"))
+    document["schema_version"] = True
+    (tmp_path / "control.json").write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(LocalControlStoreError, match="invalid local control state"):
+        LocalControlStore(tmp_path).authenticate("ordinary", "valid password")
