@@ -2,9 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add an authorized, separately downloadable SmartPerfetto original AI document to the final report and guarantee Simplified Chinese for PerfPilot narrative fields with one bounded retry.
+**Goal:** Add an authorized, separately downloadable SmartPerfetto original AI document while keeping PerfPilot as a distinct Chinese, source-aware optimization report that maps strong Trace evidence to direct code changes and retest steps.
 
 **Architecture:** Treat the existing `smartperfetto-report.json` as an immutable private artifact bound to team, analysis, size, SHA-256, and version; do not call a model to regenerate it. Keep AnalysisReport 1.2 compact, expose the original document through a tenant-authorized lazy endpoint, and validate Chinese only at the AI narrative boundary while excluding technical identifiers, paths, metrics, code, and Unified Diff.
+
+**Product boundary:** The two reports are intentionally not normalized into the same wording or structure. The SmartPerfetto tab renders the original kernel document faithfully; the PerfPilot tabs consume validated Trace plus source context and prioritize concrete file/class/method fixes, strong-only Unified Diff, expected impact, and retest instructions. Without strong source evidence, PerfPilot emits recommendation-only content and never invents code locations.
 
 **Tech Stack:** Python 3.12, FastAPI streaming responses, Pydantic/JSON Schema contracts, pytest, Next.js 16, React 19, TypeScript, Vitest, CSS print media, OpenAI-compatible synthesis provider.
 
@@ -135,6 +137,8 @@ it("loads the original report only after its fourth tab is selected", async () =
 ```
 
 Add tests for loading/error/retry, summary/findings/verification sections, full JSON disclosure, legacy 1.0/1.1 retaining three tabs, and print mode including the original summary but not the full JSON.
+
+Add a regression asserting the SmartPerfetto tab renders its own original summary even when it differs from `report.executive_summary`, while the conclusion/source tabs continue to render PerfPilot's separate source-aware recommendation and strong-only Diff.
 
 - [ ] **Step 2: Run UI/client RED**
 
@@ -353,6 +357,7 @@ Verify over authenticated HTTP/browser sessions:
 4. The dashboard is empty after restart; all six accounts can still authenticate.
 5. A user-generated Agent registration code can register the Mac Agent; `source add` uses a path selected by that user; only that user's selector shows the workspace.
 6. A completed trace shows four report tabs, PerfPilot narrative is Chinese, and the SmartPerfetto original JSON downloads as `smartperfetto-{analysis_id}.json`.
+7. Deliberately different SmartPerfetto and PerfPilot fixture conclusions remain different in the UI; the PerfPilot view contains a concrete source file/class/method action, expected impact, and retest step, while the original tab remains byte-faithful to SmartPerfetto.
 
 - [ ] **Step 7: Record deployment evidence**
 

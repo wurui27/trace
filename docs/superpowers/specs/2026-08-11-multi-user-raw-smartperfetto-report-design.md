@@ -89,6 +89,13 @@ Ubuntu 测试部署把数据分成持久控制数据和临时分析数据。
 
 SmartPerfetto 已在每次分析目录生成 `smartperfetto-report.json`。该文件是约四百 KiB 的结构化原始 AI 报告，包含摘要、发现、验证结果和分析过程。系统不得再次调用模型复制它。
 
+SmartPerfetto 原始报告与 PerfPilot 优化报告是两份职责不同的产物，不要求内容或结论结构一致：
+
+- SmartPerfetto 原始报告完整呈现内核自己的分析过程、证据和结论，不被 PerfPilot 改写；
+- PerfPilot 优化报告以源码关联为主要价值，把 Trace 问题映射到具体文件、类和方法，直接给出修改动作、代码方案和复测方法；
+- 只有服务端验证为 strong 的源码证据才能生成文件位置和 Unified Diff；weak/none 或没有源码时只给不带源码坐标的通用建议；
+- PerfPilot 不复制 SmartPerfetto 长篇指标，也不为了“看起来一致”改写原始报告。
+
 服务在 SmartPerfetto 完成后保存原始文档的私有制品绑定：
 
 - `team_id`；
@@ -168,6 +175,7 @@ perfpilot-reset-analysis-data.service
 12. 第二次仍为英文时发布降级报告和 SmartPerfetto 原始文档；
 13. 报告四个标签、旧报告兼容、SSR、打印和生产构建通过；
 14. Ubuntu 重启后网页、API 和 SmartPerfetto 健康，分析列表为空，五个用户仍可登录。
+15. SmartPerfetto 标签完整忠实展示原始文档；PerfPilot 标签独立输出源码定位、直接优化动作、strong-only Diff 和复测方案，两份报告不会被合并成同一份内容。
 
 ## 非目标
 
