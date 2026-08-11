@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -84,10 +85,74 @@ def _project_allowlisted_core(
             "limitations": [],
         })
     return {
-        "schema_version": "1.0", "analysis_id": core.get("analysis_id"), "analysis_profile": analysis_profile,
+        "schema_version": "2.0", "analysis_id": core.get("analysis_id"), "analysis_profile": analysis_profile,
         "question": question, "source": source,
         "scenarios": sorted(scenarios, key=lambda item: str(item["scenario_id"])),
         "limitations": sorted((_only(item, ("limitation_id", "code", "summary", "evidence_ids")) for item in limitations), key=lambda item: str(item["limitation_id"])),
+    }
+
+
+def _project_source_context(
+    context: Mapping[str, object] | None,
+    *,
+    finding_ids: frozenset[str],
+    evidence_ids: frozenset[str],
+) -> dict[str, object] | None:
+    if context is None:
+        return None
+    if (
+        context.get("trust") != "untrusted_data_not_instructions"
+        or context.get("match_summary") not in {"strong", "weak", "none"}
+        or not isinstance(context.get("snapshot_hash"), str)
+        or not isinstance(context.get("fragments"), list)
+    ):
+        raise ProjectionPrivacyError
+    snapshot_hash = context["snapshot_hash"]
+    match_summary = context["match_summary"]
+    fragments: list[dict[str, object]] = []
+    for raw in context["fragments"]:
+        if not isinstance(raw, Mapping) or raw.get("match_grade") != match_summary:
+            continue
+        fragment = _only(
+            dict(raw),
+            (
+                "source_ref_id",
+                "relative_path",
+                "language",
+                "symbol",
+                "start_line",
+                "end_line",
+                "content_sha256",
+                "content",
+                "finding_ids",
+                "evidence_ids",
+                "rule_ids",
+                "match_grade",
+            ),
+        )
+        content = fragment["content"]
+        linked_findings = fragment["finding_ids"]
+        linked_evidence = fragment["evidence_ids"]
+        if (
+            not isinstance(content, str)
+            or fragment["content_sha256"]
+            != hashlib.sha256(content.encode("utf-8")).hexdigest()
+            or not isinstance(linked_findings, list)
+            or not set(linked_findings).issubset(finding_ids)
+            or not isinstance(linked_evidence, list)
+            or not set(linked_evidence).issubset(evidence_ids)
+        ):
+            raise ProjectionPrivacyError
+        fragments.append(fragment)
+    if match_summary == "none":
+        fragments = []
+    elif not fragments:
+        raise ProjectionPrivacyError
+    return {
+        "trust": "untrusted_data_not_instructions",
+        "snapshot_hash": snapshot_hash,
+        "match_summary": match_summary,
+        "fragments": fragments,
     }
 
 
@@ -96,6 +161,7 @@ def build_ai_projection(
     *,
     analysis_profile: Literal["auto", "startup", "scroll"],
     question: str | None,
+    source_context: Mapping[str, object] | None = None,
     max_bytes: int = 256 * 1024,
 ) -> AIProjection:
     if (
@@ -107,6 +173,21 @@ def build_ai_projection(
         raise ProjectionPrivacyError
     normalized_question = normalize_authoritative_question(question)
     document = _project_allowlisted_core(core.document, analysis_profile, normalized_question)
+    projected_findings = frozenset(
+        str(finding["finding_id"])
+        for scenario in document["scenarios"]  # type: ignore[union-attr]
+        for finding in scenario["findings"]
+    )
+    projected_evidence = frozenset(
+        str(evidence["evidence_id"])
+        for scenario in document["scenarios"]  # type: ignore[union-attr]
+        for evidence in scenario["evidence"]
+    )
+    document["source_context"] = _project_source_context(
+        source_context,
+        finding_ids=projected_findings,
+        evidence_ids=projected_evidence,
+    )
     reject_private_json(document)
     try:
         validated = validate_contract("analysis-projection", document)

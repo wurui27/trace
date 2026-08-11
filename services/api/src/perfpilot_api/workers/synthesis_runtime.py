@@ -49,6 +49,7 @@ from perfpilot_api.workers.synthesis_orchestrator import (
     SQLAlchemySynthesisAnalysisContextRepository,
     SQLAlchemySynthesisMemorySourceRepository,
     SQLAlchemySynthesisParentProjector,
+    SQLAlchemySynthesisSourceContextRepository,
     SQLAlchemySynthesisWorkQueue,
     SynthesisCoordinator,
     SynthesisOrchestrationWorker,
@@ -284,6 +285,11 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
             separators=(",", ":"),
             sort_keys=True,
         ).encode("ascii")
+        source_artifacts = S3SourceArtifactService(
+            tenant_router=artifacts.tenant_router,
+            bucket_resolver=bucket_resolver,
+            client=artifacts.s3_client,
+        )
         source_orchestrator = SourceOrchestrator(
             authority=SQLAlchemySourceAuthorityReader(
                 control_sessions,
@@ -292,11 +298,7 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
             tasks=SourceTaskService(
                 repository=SQLAlchemySourceTaskRepository(control_sessions)
             ),
-            artifacts=S3SourceArtifactService(
-                tenant_router=artifacts.tenant_router,
-                bucket_resolver=bucket_resolver,
-                client=artifacts.s3_client,
-            ),
+            artifacts=source_artifacts,
             states=SQLAlchemySourceAnalysisStateRepository(artifacts.tenant_router),
             scheduler=NoopSynthesisScheduler(),
         )
@@ -328,6 +330,11 @@ async def build_production_synthesis_worker() -> SynthesisWorkerRuntime:
             ),
             memory_sources=SQLAlchemySynthesisMemorySourceRepository(
                 session_factory=control_sessions
+            ),
+            source_contexts=SQLAlchemySynthesisSourceContextRepository(
+                control_session_factory=control_sessions,
+                tenant_router=artifacts.tenant_router,
+                artifacts=source_artifacts,
             ),
             parent_projector=SQLAlchemySynthesisParentProjector(
                 control_session_factory=control_sessions,

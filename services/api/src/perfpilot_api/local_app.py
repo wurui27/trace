@@ -735,7 +735,7 @@ def _blocked_ai_projection(
     document = validate_contract(
         "analysis-projection",
         {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
             "analysis_id": str(analysis_id),
             "analysis_profile": analysis_profile,
             "question": None,
@@ -747,6 +747,7 @@ def _blocked_ai_projection(
             },
             "scenarios": [],
             "limitations": [],
+            "source_context": None,
         },
     )
     payload = canonical_json_bytes(document)
@@ -1246,7 +1247,7 @@ def _compose_local_report(
     prompt_version = (
         synthesizer.prompt_version
         if synthesizer is not None
-        else "perfpilot-local-report-v2"
+        else "perfpilot-report-v3"
     )
     prompt_checksum = synthesizer.prompt_sha256_b64 if synthesizer is not None else ""
     try:
@@ -1286,10 +1287,44 @@ def _compose_local_report(
             completion_tokens=completion_tokens if synthesis is not None else None,
             total_tokens=(prompt_tokens + completion_tokens) if synthesis is not None else None,
             latency_ms=latency_ms if synthesis is not None else None,
+            source_code_document=_local_source_code_document(analysis),
         ),
         report_version=generation,
     )
     return composed.document
+
+
+def _local_source_code_document(analysis: _LocalAnalysis) -> dict[str, object]:
+    binding = analysis.source_binding
+    if binding is None:
+        return {
+            "requested": False,
+            "provider_kind": None,
+            "agent_id": None,
+            "workspace_id": None,
+            "snapshot_policy": None,
+            "validation_profile_id": None,
+            "snapshot": None,
+            "context_state": "not_requested",
+            "match_summary": "none",
+            "source_refs": [],
+            "exclusions": [],
+            "fixes": [],
+            "limitations": [],
+        }
+    return {
+        "requested": True,
+        **_source_binding_document(binding),
+        "snapshot": None,
+        "context_state": analysis.source_code_analysis.get(
+            "context_state", "unavailable"
+        ),
+        "match_summary": "none",
+        "source_refs": [],
+        "exclusions": [],
+        "fixes": [],
+        "limitations": [],
+    }
 
 
 def _source_metadata(

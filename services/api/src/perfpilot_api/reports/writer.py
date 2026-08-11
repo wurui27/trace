@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -64,6 +65,7 @@ class AnalysisReportWriteRequest:
     completion_tokens: int | None
     total_tokens: int | None
     latency_ms: int | None
+    source_code_document: Mapping[str, object] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -125,6 +127,75 @@ def _not_applicable(reason: str) -> dict[str, object]:
         "sha256_b64": None,
         "reason": reason,
     }
+
+
+def _no_source_code() -> dict[str, object]:
+    return {
+        "requested": False,
+        "provider_kind": None,
+        "agent_id": None,
+        "workspace_id": None,
+        "snapshot_policy": None,
+        "validation_profile_id": None,
+        "snapshot": None,
+        "context_state": "not_requested",
+        "match_summary": "none",
+        "source_refs": [],
+        "exclusions": [],
+        "fixes": [],
+        "limitations": [],
+    }
+
+
+def _source_code_v12(
+    source: Mapping[str, object] | None,
+    synthesis_output: Mapping[str, object] | None,
+) -> dict[str, object]:
+    try:
+        document = json.loads(canonical_json_bytes(source or _no_source_code()))
+    except Exception:
+        raise ReportSourceError("report source is invalid") from None
+    if not isinstance(document, dict):
+        raise ReportSourceError("report source is invalid")
+    synthesis_fixes = (
+        synthesis_output.get("source_fixes")
+        if isinstance(synthesis_output, Mapping)
+        else []
+    )
+    existing_fixes = document.get("fixes")
+    if not isinstance(synthesis_fixes, list) or not isinstance(existing_fixes, list):
+        raise ReportSourceError("report source is invalid")
+    existing_by_id = {
+        item.get("fix_id"): item for item in existing_fixes if isinstance(item, dict)
+    }
+    public_fixes: list[dict[str, object]] = []
+    for raw in synthesis_fixes:
+        if not isinstance(raw, dict):
+            raise ReportSourceError("report source is invalid")
+        existing = existing_by_id.get(raw.get("fix_id"))
+        if isinstance(existing, dict):
+            public_fixes.append(existing)
+            continue
+        profile_id = raw.get("validation_profile_id")
+        diff = raw.get("diff")
+        if not isinstance(profile_id, str) or not isinstance(diff, str):
+            raise ReportSourceError("report source is invalid")
+        public_fixes.append(
+            {
+                **raw,
+                "verification": {
+                    "state": "not_requested",
+                    "exit_code": None,
+                    "duration_ms": None,
+                    "profile_id": profile_id,
+                    "patch_sha256": hashlib.sha256(diff.encode("utf-8")).hexdigest(),
+                    "log_summary": None,
+                    "patch_artifact": None,
+                },
+            }
+        )
+    document["fixes"] = public_fixes
+    return document
 
 
 def _bundle(
@@ -311,6 +382,7 @@ def compose_analysis_report(
         )
 
     public_ids: dict[str, list[str]] = {"recommendations": [], "retest_plan": []}
+    synthesis_output: Mapping[str, object] | None = None
     if request.synthesis_document is None:
         if (
             request.synthesis_artifact_id is not None
@@ -336,6 +408,7 @@ def compose_analysis_report(
             raise ReportSourceError("report source is invalid")
         _checksum(request.synthesis_sha256_b64)
         output = validate_contract("synthesis-output", request.synthesis_document)
+        synthesis_output = output
         usage = (request.prompt_tokens, request.completion_tokens, request.total_tokens)
         if (
             any(type(value) is not int or value < 0 for value in usage)
@@ -375,19 +448,43 @@ def compose_analysis_report(
             },
         }
         synthesis_failed = False
-    state = "partially_completed" if partial_core or synthesis_failed else "completed"
+    report_v12 = (
+        request.source_code_document is not None
+        or synthesis_output is not None
+        and synthesis_output.get("schema_version") == "2.0"
+    )
+    if request.source_code_document is not None and not report_v12:
+        raise ReportSourceError("report source is invalid")
+    source_code = (
+        _source_code_v12(request.source_code_document, synthesis_output)
+        if report_v12
+        else None
+    )
+    source_partial = bool(
+        source_code is not None
+        and source_code.get("requested") is True
+        and source_code.get("context_state") != "available"
+    )
+    state = (
+        "partially_completed"
+        if partial_core or synthesis_failed or source_partial
+        else "completed"
+    )
+    report_document = {
+        "schema_version": "1.2" if report_v12 else "1.1",
+        "analysis_id": str(request.analysis_id),
+        "analysis_mode": analysis_mode,
+        "state": state,
+        "report_version": report_version,
+        "generated_at": generated_at,
+        "scenario_reports": scenario_reports,
+        "synthesis": synthesis,
+    }
+    if source_code is not None:
+        report_document["source_code"] = source_code
     document = validate_contract(
         "analysis-report",
-        {
-            "schema_version": "1.1",
-            "analysis_id": str(request.analysis_id),
-            "analysis_mode": analysis_mode,
-            "state": state,
-            "report_version": report_version,
-            "generated_at": generated_at,
-            "scenario_reports": scenario_reports,
-            "synthesis": synthesis,
-        },
+        report_document,
     )
     payload = canonical_json_bytes(document)
     digest = base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")

@@ -108,6 +108,60 @@ def test_composer_builds_valid_ordered_v11_report_and_exact_provenance() -> None
     ).decode("ascii")
 
 
+def test_composer_builds_v12_single_document_without_source_context() -> None:
+    synthesis = _load("synthesis-output-v2.valid.json")
+    synthesis["source_fixes"] = []
+    source_code = {
+        "requested": False,
+        "provider_kind": None,
+        "agent_id": None,
+        "workspace_id": None,
+        "snapshot_policy": None,
+        "validation_profile_id": None,
+        "snapshot": None,
+        "context_state": "not_requested",
+        "match_summary": "none",
+        "source_refs": [],
+        "exclusions": [],
+        "fixes": [],
+        "limitations": [],
+    }
+
+    result = compose_analysis_report(
+        replace(
+            _request(),
+            synthesis_document=synthesis,
+            source_code_document=source_code,
+        ),
+        report_version=4,
+    )
+
+    assert result.document["schema_version"] == "1.2"
+    assert result.document["synthesis"]["output"]["schema_version"] == "2.0"
+    assert result.document["source_code"] == source_code
+
+
+def test_composer_enriches_strong_source_fix_in_the_same_v12_document() -> None:
+    source_report = _load("analysis-report-v1.2.valid.json")
+    source_code = source_report["source_code"]
+    source_code["fixes"] = []
+
+    result = compose_analysis_report(
+        replace(
+            _request(),
+            synthesis_document=_load("synthesis-output-v2.valid.json"),
+            source_code_document=source_code,
+        ),
+        report_version=4,
+    )
+
+    public_fix = result.document["source_code"]["fixes"][0]
+    assert public_fix["fix_id"] == result.document["synthesis"]["output"][
+        "source_fixes"
+    ][0]["fix_id"]
+    assert public_fix["verification"]["state"] == "not_requested"
+
+
 def test_composer_preserves_device_mode_in_v11_report() -> None:
     core = _load("normalized-trace-report.valid.json")
     core["analysis_mode"] = "device"

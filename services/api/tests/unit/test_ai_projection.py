@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 
@@ -12,6 +13,7 @@ from perfpilot_api.reports.projection import (
     ProjectionQuestionError,
     build_ai_projection,
 )
+from perfpilot_api.reports.source_context import validate_source_context
 
 
 def _core() -> NormalizedTraceReport:
@@ -45,6 +47,60 @@ def test_projection_is_allowlisted_and_uses_only_authoritative_question() -> Non
     assert set(projection.document["scenarios"][0]) == {
         "scenario_id", "scenario_type", "core_state", "metrics", "findings", "evidence", "limitations"
     }
+
+
+def test_v2_projection_is_default_even_without_source_context() -> None:
+    projection = build_ai_projection(
+        _core(), analysis_profile="auto", question=None
+    )
+
+    assert projection.document["schema_version"] == "2.0"
+    assert projection.document["source_context"] is None
+
+
+def test_v2_projection_copies_only_server_validated_source_refs() -> None:
+    content = "class Startup { fun init() = Unit }\n"
+    context = validate_source_context(
+        {
+            "snapshot_id": "95000000-0000-4000-8000-000000000001",
+            "snapshot_hash": "a" * 64,
+            "git_head": "b" * 40,
+            "tracked_dirty_count": 0,
+            "fragments": [
+                {
+                    "source_ref_id": "97000000-0000-4000-8000-000000000001",
+                    "relative_path": "app/src/main/java/demo/Startup.kt",
+                    "language": "kotlin",
+                    "symbol": "demo.Startup.init",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "content": content,
+                    "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                    "snapshot_hash": "a" * 64,
+                    "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+                    "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+                    "rule_ids": ["android.ui.blocking_wait"],
+                    "match_signals": ["trace_symbol"],
+                }
+            ],
+            "exclusions": [],
+            "truncated": False,
+        },
+        direct_identifiers=("demo.Startup.init",),
+        allowed_finding_ids=("85000000-0000-4000-8000-000000000001",),
+        allowed_evidence_ids=("86000000-0000-4000-8000-000000000001",),
+    )
+
+    document = build_ai_projection(
+        _core(),
+        analysis_profile="auto",
+        question=None,
+        source_context=context,
+    ).document
+
+    assert document["source_context"]["match_summary"] == "strong"
+    assert document["source_context"]["fragments"][0]["match_grade"] == "strong"
+    assert "git_head" not in json.dumps(document)
 
 
 @pytest.mark.parametrize(

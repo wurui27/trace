@@ -86,6 +86,7 @@ from perfpilot_api.services.synthesis_executions import (
     SynthesisRequest,
     SynthesisSourceRecord,
 )
+from perfpilot_api.services.source_artifacts import SourceArtifactUnavailableError
 
 
 _WORKER = re.compile(r"[A-Za-z0-9._:-]{1,128}\Z")
@@ -598,6 +599,181 @@ class SynthesisMemorySourceContext:
     execution: SynthesisSourceRecord | None
 
 
+@dataclass(frozen=True, slots=True)
+class SynthesisSourceContext:
+    projection_context: Mapping[str, object] | None
+    report_document: Mapping[str, object]
+
+
+class _ValidatedSourceArtifacts(Protocol):
+    async def read_validated_context(self, **kwargs: object) -> dict[str, object]: ...
+
+
+def _source_not_requested() -> SynthesisSourceContext:
+    return SynthesisSourceContext(
+        projection_context=None,
+        report_document={
+            "requested": False,
+            "provider_kind": None,
+            "agent_id": None,
+            "workspace_id": None,
+            "snapshot_policy": None,
+            "validation_profile_id": None,
+            "snapshot": None,
+            "context_state": "not_requested",
+            "match_summary": "none",
+            "source_refs": [],
+            "exclusions": [],
+            "fixes": [],
+            "limitations": [],
+        },
+    )
+
+
+class _NoSourceContexts:
+    async def load(self, **_: object) -> SynthesisSourceContext:
+        return _source_not_requested()
+
+
+class SQLAlchemySynthesisSourceContextRepository:
+    """Read the tenant-bound, server-validated source context for synthesis."""
+
+    def __init__(
+        self,
+        *,
+        control_session_factory: async_sessionmaker[AsyncSession],
+        tenant_router: TenantRouter,
+        artifacts: _ValidatedSourceArtifacts,
+    ) -> None:
+        self._control_sessions = control_session_factory
+        self._tenant_router = tenant_router
+        self._artifacts = artifacts
+
+    async def load(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        tenant_resource_version: int,
+    ) -> SynthesisSourceContext:
+        async with self._control_sessions() as session:
+            job = await session.scalar(
+                select(GlobalJob).where(
+                    GlobalJob.id == analysis_id,
+                    GlobalJob.team_id == team_id,
+                )
+            )
+        if job is None:
+            raise SynthesisArtifactUnavailableError
+        binding = (
+            job.source_provider_kind,
+            job.source_agent_id,
+            job.source_workspace_id,
+            job.source_snapshot_policy,
+        )
+        if all(value is None for value in binding):
+            return _source_not_requested()
+        if (
+            job.source_provider_kind != "agent_workspace"
+            or job.source_agent_id is None
+            or job.source_workspace_id is None
+            or job.source_snapshot_policy != "tracked_worktree"
+        ):
+            raise SynthesisArtifactConflictError
+        async with self._tenant_router.session(team_id) as session:
+            if session.info.get("tenant_resource_version") != tenant_resource_version:
+                raise SynthesisArtifactUnavailableError
+            analysis = await session.get(Analysis, analysis_id)
+            if analysis is None or analysis.tombstoned_at is not None:
+                raise SynthesisArtifactConflictError
+            state = analysis.source_context_state
+            match_summary = analysis.source_match_summary
+            artifact_id = analysis.source_context_artifact_id
+            checksum = analysis.source_context_checksum
+        common: dict[str, object] = {
+            "requested": True,
+            "provider_kind": "agent_workspace",
+            "agent_id": str(job.source_agent_id),
+            "workspace_id": str(job.source_workspace_id),
+            "snapshot_policy": "tracked_worktree",
+            "validation_profile_id": (
+                None
+                if job.source_validation_profile_id is None
+                else str(job.source_validation_profile_id)
+            ),
+        }
+        if state != "available":
+            if state not in {"waiting_for_agent", "extracting", "unavailable"}:
+                raise SynthesisArtifactConflictError
+            return SynthesisSourceContext(
+                projection_context=None,
+                report_document=common
+                | {
+                    "snapshot": None,
+                    "context_state": state,
+                    "match_summary": match_summary,
+                    "source_refs": [],
+                    "exclusions": [],
+                    "fixes": [],
+                    "limitations": [],
+                },
+            )
+        if artifact_id is None or checksum is None:
+            raise SynthesisArtifactConflictError
+        context = await self._artifacts.read_validated_context(
+            team_id=team_id,
+            analysis_id=analysis_id,
+            artifact_id=artifact_id,
+            expected_checksum=checksum,
+        )
+        if context.get("match_summary") != match_summary:
+            raise SynthesisArtifactConflictError
+        snapshot_hash = context.get("snapshot_hash")
+        fragments = context.get("fragments")
+        exclusions = context.get("exclusions")
+        if (
+            not isinstance(snapshot_hash, str)
+            or not isinstance(fragments, list)
+            or not isinstance(exclusions, list)
+        ):
+            raise SynthesisArtifactConflictError
+        refs: list[dict[str, object]] = []
+        for fragment in fragments:
+            if not isinstance(fragment, Mapping):
+                raise SynthesisArtifactConflictError
+            refs.append(
+                {
+                    key: value
+                    for key, value in fragment.items()
+                    if key != "content"
+                }
+                | {"snapshot_hash": snapshot_hash}
+            )
+        projection_context = {
+            "trust": context.get("trust"),
+            "snapshot_hash": snapshot_hash,
+            "match_summary": match_summary,
+            "fragments": [dict(fragment) for fragment in fragments],
+        }
+        return SynthesisSourceContext(
+            projection_context=projection_context,
+            report_document=common
+            | {
+                "snapshot": {
+                    "snapshot_id": context.get("snapshot_id"),
+                    "snapshot_hash": snapshot_hash,
+                    "git_head": context.get("git_head"),
+                },
+                "context_state": "available",
+                "match_summary": match_summary,
+                "source_refs": refs,
+                "exclusions": [dict(item) for item in exclusions],
+                "fixes": [],
+                "limitations": [],
+            },
+        )
+
+
 class SQLAlchemySynthesisMemorySourceRepository:
     """Resolve the latest Android Memory execution from control authority."""
 
@@ -989,6 +1165,10 @@ class _MemorySources(Protocol):
     async def load(self, **kwargs: object) -> SynthesisMemorySourceContext: ...
 
 
+class _SourceContexts(Protocol):
+    async def load(self, **kwargs: object) -> SynthesisSourceContext: ...
+
+
 class _ParentProjector(Protocol):
     async def project(self, **kwargs: object) -> str: ...
 
@@ -1010,6 +1190,7 @@ class SynthesisPipeline:
         analysis_contexts: _AnalysisContexts,
         memory_sources: _MemorySources,
         parent_projector: _ParentProjector,
+        source_contexts: _SourceContexts | None = None,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         checkpoint: Checkpoint | None = None,
         normalizer: Callable[..., NormalizedTraceReport] = normalize_smartperfetto_result,
@@ -1035,6 +1216,7 @@ class SynthesisPipeline:
         self._analysis_contexts = analysis_contexts
         self._memory_sources = memory_sources
         self._parent_projector = parent_projector
+        self._source_contexts = source_contexts or _NoSourceContexts()
         self._clock = clock
         self._checkpoint_callback = checkpoint
         self._normalizer = normalizer
@@ -1128,10 +1310,16 @@ class SynthesisPipeline:
             source,
             analysis_mode=context.analysis_mode,
         )
+        source_context = await self._source_contexts.load(
+            team_id=execution.team_id,
+            analysis_id=execution.analysis_id,
+            tenant_resource_version=execution.tenant_resource_version,
+        )
         projection = self._projection_builder(
             core,
             analysis_profile=context.analysis_profile,
             question=context.question,
+            source_context=source_context.projection_context,
             max_bytes=self._max_projection_bytes,
         )
         return loaded, core, projection
@@ -1159,7 +1347,11 @@ class SynthesisPipeline:
             return await self._advance(claim)
         except SynthesisLeaseLostError:
             raise SynthesisClaimLostError("synthesis claim was lost") from None
-        except (CanonicalResultUnavailableError, SynthesisArtifactUnavailableError):
+        except (
+            CanonicalResultUnavailableError,
+            SourceArtifactUnavailableError,
+            SynthesisArtifactUnavailableError,
+        ):
             return SynthesisStepResult("pending", 5)
         except (
             CanonicalResultIntegrityError,
@@ -1395,6 +1587,11 @@ class SynthesisPipeline:
             source,
             analysis_mode=context.analysis_mode,
         )
+        source_context = await self._source_contexts.load(
+            team_id=record.team_id,
+            analysis_id=record.analysis_id,
+            tenant_resource_version=record.tenant_resource_version,
+        )
         synthesis_document: Mapping[str, object] | None = None
         if record.candidate_artifact_id is not None:
             artifact = await self._artifact_store.read(
@@ -1436,6 +1633,7 @@ class SynthesisPipeline:
             completion_tokens=record.completion_tokens,
             total_tokens=record.total_tokens,
             latency_ms=record.latency_ms,
+            source_code_document=source_context.report_document,
         )
         published = await self._report_writer.publish(request)
         await self._checkpoint("tenant_report_insert")

@@ -244,7 +244,7 @@ class _FakeLocalMemoryAnalysisGateway:
 class _ProjectionReportProvider:
     provider_name = "test-provider"
     model = "test-model"
-    prompt_version = "perfpilot-local-report-v2-test"
+    prompt_version = "perfpilot-report-v3-test"
     prompt_sha256_b64 = base64.b64encode(hashlib.sha256(b"test-prompt").digest()).decode(
         "ascii"
     )
@@ -254,6 +254,7 @@ class _ProjectionReportProvider:
         findings = []
         recommendations = []
         retest_plan = []
+        key_metric_ids = []
         for scenario in projected["scenarios"]:
             for finding in scenario["findings"]:
                 evidence_ids = list(finding["evidence_ids"])
@@ -265,9 +266,12 @@ class _ProjectionReportProvider:
                     }
                 )
                 if finding["status"] in {"confirmed", "suspected"} and evidence_ids:
+                    priority = ("p0", "p1", "p2")[
+                        min(len(recommendations), 2)
+                    ]
                     recommendations.append(
                         {
-                            "priority": "p1",
+                            "priority": priority,
                             "title": finding["title"],
                             "action": "修复该性能问题，并使用相同场景复测。",
                             "expected_effect": "降低该问题对用户体验的影响。",
@@ -281,6 +285,7 @@ class _ProjectionReportProvider:
                 if metric["status"] == "available"
             ]
             if metric_ids:
+                key_metric_ids.extend(metric_ids)
                 retest_plan.append(
                     {
                         "mode": "verify_metric",
@@ -293,11 +298,14 @@ class _ProjectionReportProvider:
                     }
                 )
         document = {
-            "schema_version": "1.0",
+            "schema_version": "2.0",
+            "verdict": "存在证据支持的应用性能瓶颈。",
             "executive_summary": "单次测试 AI 已完成证据复核。",
-            "top_findings": findings[:5],
-            "recommendations": recommendations[:10],
-            "retest_plan": retest_plan[:5],
+            "key_metric_ids": key_metric_ids[:3],
+            "top_findings": findings[:3],
+            "recommendations": recommendations[:3],
+            "source_fixes": [],
+            "retest_plan": retest_plan[:3],
             "limitations": [
                 {
                     "limitation_id": item["limitation_id"],
@@ -324,7 +332,7 @@ def _test_synthesizer() -> LocalReportSynthesizer:
 class _InvalidReportProvider:
     provider_name = "invalid-test-provider"
     model = "invalid-test-model"
-    prompt_version = "perfpilot-local-report-v2-test"
+    prompt_version = "perfpilot-report-v3-test"
     prompt_sha256_b64 = base64.b64encode(
         hashlib.sha256(b"invalid-test-prompt").digest()
     ).decode("ascii")
@@ -1488,8 +1496,12 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
         assert validated["synthesis"]["state"] == "completed"
         assert (
             validated["synthesis"]["provenance"]["prompt_template_version"]
-            == "perfpilot-local-report-v2-test"
+            == "perfpilot-report-v3-test"
         )
+        assert validated["schema_version"] == "1.2"
+        assert len(validated["synthesis"]["output"]["key_metric_ids"]) <= 3
+        assert len(validated["synthesis"]["output"]["top_findings"]) <= 3
+        assert len(validated["synthesis"]["output"]["recommendations"]) <= 3
         assert validated["synthesis"]["output"]["recommendations"]
         analysis_directory = tmp_path / "analyses" / analysis_id
         assert (analysis_directory / "round-1.json").is_file()

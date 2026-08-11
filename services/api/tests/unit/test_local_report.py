@@ -40,6 +40,12 @@ def _load(name: str) -> dict[str, object]:
     )
 
 
+def _v2_candidate() -> dict[str, object]:
+    document = _load("synthesis-output-v2.valid.json")
+    document["source_fixes"] = []
+    return document
+
+
 def _projection() -> AIProjection:
     core_bytes = canonical_json_bytes(_load("normalized-trace-report.valid.json"))
     core = NormalizedTraceReport(
@@ -90,7 +96,7 @@ def _unchecked_projection(case: str) -> AIProjection:
 class FakeReportProvider:
     provider_name = "test-provider"
     model = "test-model"
-    prompt_version = "perfpilot-local-report-v2"
+    prompt_version = "perfpilot-report-v3"
     prompt_sha256_b64 = base64.b64encode(hashlib.sha256(b"prompt").digest()).decode()
 
     def __init__(self, candidates: list[bytes]) -> None:
@@ -196,7 +202,7 @@ class RetryAwareReportProvider(FakeReportProvider):
 
 @pytest.mark.asyncio
 async def test_report_synthesizer_uses_one_provider_request() -> None:
-    candidate = canonical_json_bytes(_load("synthesis-output.valid.json"))
+    candidate = canonical_json_bytes(_v2_candidate())
     provider = FakeReportProvider([candidate])
     observed: list[tuple[int, str, str, int]] = []
 
@@ -213,7 +219,7 @@ async def test_report_synthesizer_uses_one_provider_request() -> None:
         (1, "report", "running", 0),
         (1, "report", "completed", 1),
     ]
-    assert result.output.document == _load("synthesis-output.valid.json")
+    assert result.output.document == _v2_candidate()
     assert result.rounds == (
         LocalReportUsage(1, "report", 1, 10, 20, 30),
     )
@@ -221,7 +227,7 @@ async def test_report_synthesizer_uses_one_provider_request() -> None:
 
 @pytest.mark.asyncio
 async def test_report_synthesizer_retries_invalid_output_once() -> None:
-    valid_document = _load("synthesis-output.valid.json")
+    valid_document = _v2_candidate()
     invalid_document = dict(valid_document)
     invalid_document["executive_summary"] = (
         "Startup remains blocked by 101 unsupported delay units."
@@ -244,7 +250,7 @@ async def test_report_synthesizer_retries_invalid_output_once() -> None:
 @pytest.mark.asyncio
 async def test_report_synthesizer_retries_an_invalid_legacy_provider_without_kwargs(
 ) -> None:
-    valid = canonical_json_bytes(_load("synthesis-output.valid.json"))
+    valid = canonical_json_bytes(_v2_candidate())
     provider = FakeReportProvider([b"{}", valid])
 
     result = await LocalReportSynthesizer(provider=provider).synthesize(_projection())
@@ -261,7 +267,7 @@ async def test_report_synthesizer_accumulates_usage_from_invalid_candidate() -> 
         [
             SynthesisCandidate(b"{}", 3, 5, 7),
             SynthesisCandidate(
-                canonical_json_bytes(_load("synthesis-output.valid.json")),
+                canonical_json_bytes(_v2_candidate()),
                 11,
                 13,
                 17,
@@ -286,7 +292,7 @@ async def test_report_synthesizer_retries_retryable_provider_error() -> None:
                 detail_code="transport_timeout",
             ),
             SynthesisCandidate(
-                canonical_json_bytes(_load("synthesis-output.valid.json")),
+                canonical_json_bytes(_v2_candidate()),
                 10,
                 20,
                 30,
@@ -448,7 +454,7 @@ def test_local_provider_factory_exposes_non_secret_report_metadata() -> None:
     try:
         assert synthesizer.provider_name == "local-deepseek"
         assert synthesizer.model == "model-a"
-        assert synthesizer.prompt_version == "perfpilot-local-report-v2"
+        assert synthesizer.prompt_version == "perfpilot-report-v3"
         assert "not-a-real-token" not in repr(synthesizer)
         assert "not-a-real-token" not in repr(synthesizer._provider)
     finally:

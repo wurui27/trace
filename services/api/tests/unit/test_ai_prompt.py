@@ -9,7 +9,7 @@ def test_synthesis_prompt_is_versioned_hashed_and_constrains_untrusted_input() -
 
     prompt = load_synthesis_prompt()
 
-    assert prompt.version == "perfpilot-synthesis-v1"
+    assert prompt.version == "perfpilot-report-v3"
     assert prompt.sha256_b64 == base64.b64encode(
         hashlib.sha256(prompt.raw_bytes).digest()
     ).decode("ascii")
@@ -25,3 +25,6 @@ def test_synthesis_prompt_is_versioned_hashed_and_constrains_untrusted_input() -
     assert "tools" in instruction
     assert "only" in instruction
     assert "synthesis" in instruction
+    assert "three" in instruction
+    assert "strong" in instruction
+    assert "diff" in instruction

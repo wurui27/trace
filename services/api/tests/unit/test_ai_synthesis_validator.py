@@ -19,7 +19,9 @@ def _json_fixture(name: str) -> dict[str, object]:
 
 
 def _projection_document() -> dict[str, object]:
-    return _json_fixture("analysis-projection.valid.json")
+    document = _json_fixture("analysis-projection-v2.valid.json")
+    document["source_context"] = None
+    return document
 
 
 def _projection() -> AIProjection:
@@ -28,7 +30,30 @@ def _projection() -> AIProjection:
 
 
 def _candidate() -> dict[str, object]:
-    return _json_fixture("synthesis-output.valid.json")
+    document = _json_fixture("synthesis-output-v2.valid.json")
+    document["source_fixes"] = []
+    return document
+
+
+def test_v2_rejects_unknown_key_metric_reference() -> None:
+    candidate = _candidate()
+    candidate["key_metric_ids"] = [UNKNOWN_ID]
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate)
+
+
+def test_v2_source_fix_must_match_server_validated_ref() -> None:
+    projection_document = _json_fixture("analysis-projection-v2.valid.json")
+    projection = AIProjection(
+        canonical_bytes=canonical_json_bytes(projection_document),
+        sha256_b64="Y2hlY2tzdW0=",
+    )
+    candidate = _json_fixture("synthesis-output-v2.valid.json")
+    candidate["source_fixes"][0]["source_ref_ids"] = [UNKNOWN_ID]
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
 
 
 def _validator() -> object:

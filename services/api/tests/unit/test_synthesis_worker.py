@@ -38,6 +38,7 @@ from perfpilot_api.workers.synthesis_orchestrator import (
     SynthesisAnalysisContext,
     SynthesisMemorySourceContext,
     SynthesisPipeline,
+    SynthesisSourceContext,
     SynthesisWorkClaim,
 )
 
@@ -67,6 +68,12 @@ def _provider_fixture(name: str) -> dict[str, object]:
             / name
         ).read_text(encoding="utf-8")
     )
+
+
+def _synthesis_v2_no_source() -> dict[str, object]:
+    document = _load("synthesis-output-v2.valid.json")
+    document["source_fixes"] = []
+    return document
 
 
 def _core(analysis_mode: str = "trace_upload") -> NormalizedTraceReport:
@@ -279,7 +286,7 @@ class FakeArtifactStore:
 
 class FakeProvider:
     def __init__(self, outcomes: list[object] | None = None) -> None:
-        self.outcomes = outcomes or [_load("synthesis-output.valid.json")]
+        self.outcomes = outcomes or [_synthesis_v2_no_source()]
         self.retry_codes: list[str | None] = []
 
     async def synthesize(self, _projection, *, retry_code: str | None = None):
@@ -332,6 +339,14 @@ class FakeMemorySources:
         return self.context
 
 
+class FakeSourceContexts:
+    def __init__(self, context: SynthesisSourceContext) -> None:
+        self.context = context
+
+    async def load(self, **_: object) -> SynthesisSourceContext:
+        return self.context
+
+
 class FakeProjector:
     def __init__(self) -> None:
         self.calls: list[dict[str, object]] = []
@@ -368,6 +383,7 @@ def _pipeline(
     canonical_reader: FakeCanonicalReader | None = None,
     memory_result_joiner=None,
     memory_unavailable_joiner=None,
+    source_context: SynthesisSourceContext | None = None,
 ) -> SynthesisPipeline:
     kwargs = {}
     if projection_builder is not None:
@@ -391,12 +407,45 @@ def _pipeline(
             )
         ),
         parent_projector=projector,
+        source_contexts=(
+            FakeSourceContexts(source_context) if source_context is not None else None
+        ),
         clock=lambda: NOW,
         checkpoint=checkpoint,
         normalizer=lambda _loaded, *, analysis_mode="trace_upload": _core(analysis_mode),
         max_projection_bytes=max_projection_bytes,
         **kwargs,
     )
+
+
+@pytest.mark.asyncio
+async def test_pipeline_projects_source_context_and_publishes_one_source_aware_report() -> None:
+    source_document = _load("analysis-report-v1.2.valid.json")["source_code"]
+    projection_context = _load("analysis-projection-v2.valid.json")["source_context"]
+    fragment = projection_context["fragments"][0]
+    content_sha256 = hashlib.sha256(fragment["content"].encode("utf-8")).hexdigest()
+    fragment["content_sha256"] = content_sha256
+    source_document["source_refs"][0]["content_sha256"] = content_sha256
+    source_context = SynthesisSourceContext(
+        projection_context=projection_context,
+        report_document=source_document,
+    )
+    provider = FakeProvider([_load("synthesis-output-v2.valid.json")])
+    writer = FakeWriter()
+    pipeline = _pipeline(
+        FakeRepository(),
+        provider,
+        FakeArtifactStore(),
+        writer,
+        FakeProjector(),
+        source_context=source_context,
+    )
+
+    result = await _finish(pipeline)
+
+    assert result.state == "succeeded"
+    assert provider.retry_codes == [None]
+    assert writer.requests[-1].source_code_document == source_document
 
 
 @pytest.mark.asyncio
@@ -641,7 +690,7 @@ async def test_projection_preflight_failure_publishes_core_without_calling_provi
 @pytest.mark.asyncio
 async def test_invalid_candidate_retries_once_with_only_stable_retry_code() -> None:
     repository = FakeRepository()
-    provider = FakeProvider([b"{}", _load("synthesis-output.valid.json")])
+    provider = FakeProvider([b"{}", _synthesis_v2_no_source()])
     pipeline = _pipeline(
         repository,
         provider,
@@ -662,7 +711,7 @@ async def test_rate_limit_then_success_uses_two_fake_provider_calls() -> None:
     calls = 0
     success = _provider_fixture("synthesis-success.json")
     success["choices"][0]["message"]["content"] = json.dumps(  # type: ignore[index]
-        _load("synthesis-output.valid.json"),
+        _synthesis_v2_no_source(),
         ensure_ascii=False,
         allow_nan=False,
         separators=(",", ":"),

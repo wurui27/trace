@@ -72,7 +72,7 @@ class RetryAwareLocalReportProvider(Protocol):
     ) -> SynthesisCandidate: ...
 
 
-_PROMPT_RESOURCE = "perfpilot-local-report-v2.txt"
+_PROMPT_RESOURCE = "perfpilot-report-v3.txt"
 _MAX_PROJECTION_BYTES = 256 * 1024
 
 
@@ -152,7 +152,7 @@ def build_local_report_projection(projection: AIProjection) -> AIProjection:
 
 
 class LocalOpenAICompatibleReportProvider:
-    prompt_version = "perfpilot-local-report-v2"
+    prompt_version = "perfpilot-report-v3"
 
     def __init__(
         self,
@@ -270,7 +270,7 @@ class LocalReportSynthesizer:
             getattr(
                 self._provider,
                 "prompt_version",
-                "perfpilot-local-report-v2",
+                "perfpilot-report-v3",
             )
         )
 

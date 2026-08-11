@@ -39,12 +39,16 @@ class AISynthesisOutput:
 
 @dataclass(frozen=True, slots=True)
 class _ProjectionIndex:
+    schema_version: str
     evidence_ids: frozenset[str]
     finding_evidence: Mapping[str, frozenset[str]]
     finding_status: Mapping[str, str]
     scenario_metrics: Mapping[str, frozenset[str]]
     limitation_ids: frozenset[str]
+    metric_ids: frozenset[str]
     numeric_spellings: frozenset[str]
+    source_match: str
+    source_refs: Mapping[str, Mapping[str, object]]
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -102,6 +106,7 @@ def _projection_index(projection: AIProjection) -> _ProjectionIndex:
         finding_status: dict[str, str] = {}
         scenario_metrics: dict[str, set[str]] = {}
         numeric_spellings: set[str] = set()
+        metric_ids: set[str] = set()
 
         for scenario in scenarios:
             if not isinstance(scenario, dict):
@@ -125,6 +130,7 @@ def _projection_index(projection: AIProjection) -> _ProjectionIndex:
                 if metric_id in scenario_metric_ids:
                     raise SynthesisValidationError
                 scenario_metric_ids.add(metric_id)
+                metric_ids.add(metric_id)
                 numeric_value = metric.get("numeric_value")
                 if numeric_value is not None:
                     numeric_spellings.add(_number_spelling(numeric_value))
@@ -176,12 +182,28 @@ def _projection_index(projection: AIProjection) -> _ProjectionIndex:
                 if limitation_id in limitation_ids:
                     raise SynthesisValidationError
                 limitation_ids.add(limitation_id)
+        source_context = document.get("source_context")
+        source_match = "none"
+        source_refs: dict[str, Mapping[str, object]] = {}
+        if isinstance(source_context, dict):
+            source_match = str(source_context.get("match_summary"))
+            fragments = source_context.get("fragments")
+            if not isinstance(fragments, list):
+                raise SynthesisValidationError
+            for fragment in fragments:
+                if not isinstance(fragment, dict):
+                    raise SynthesisValidationError
+                source_ref_id = fragment.get("source_ref_id")
+                if not isinstance(source_ref_id, str) or source_ref_id in source_refs:
+                    raise SynthesisValidationError
+                source_refs[source_ref_id] = MappingProxyType(dict(fragment))
     except SynthesisValidationError:
         raise
     except Exception:
         raise SynthesisValidationError from None
 
     return _ProjectionIndex(
+        schema_version=str(document["schema_version"]),
         evidence_ids=frozenset(evidence_ids),
         finding_evidence=MappingProxyType(finding_evidence),
         finding_status=MappingProxyType(finding_status),
@@ -189,7 +211,10 @@ def _projection_index(projection: AIProjection) -> _ProjectionIndex:
             {scenario_type: frozenset(metric_ids) for scenario_type, metric_ids in scenario_metrics.items()}
         ),
         limitation_ids=frozenset(limitation_ids),
+        metric_ids=frozenset(metric_ids),
         numeric_spellings=frozenset(numeric_spellings),
+        source_match=source_match,
+        source_refs=MappingProxyType(source_refs),
     )
 
 
@@ -211,6 +236,12 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
     limitations = document["limitations"]
     if not all(isinstance(section, list) for section in (top_findings, recommendations, retest_plan, limitations)):
         raise SynthesisValidationError
+    if index.schema_version == "2.0":
+        if document.get("schema_version") != "2.0" or not _known_ids(
+            document.get("key_metric_ids"), index.metric_ids
+        ):
+            raise SynthesisValidationError
+        _validate_source_fixes(document, index)
 
     for finding in top_findings:
         if not isinstance(finding, dict):
@@ -278,8 +309,69 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
             raise SynthesisValidationError
 
 
+def _validate_source_fixes(
+    document: dict[str, object], index: _ProjectionIndex
+) -> None:
+    source_fixes = document.get("source_fixes")
+    recommendations = document.get("recommendations")
+    if not isinstance(source_fixes, list) or not isinstance(recommendations, list):
+        raise SynthesisValidationError
+    if index.source_match != "strong" and source_fixes:
+        raise SynthesisValidationError
+    recommendation_by_priority = {
+        item.get("priority"): item for item in recommendations if isinstance(item, dict)
+    }
+    fix_ids: set[str] = set()
+    for fix in source_fixes:
+        if not isinstance(fix, dict):
+            raise SynthesisValidationError
+        fix_id = fix.get("fix_id")
+        finding_id = fix.get("finding_id")
+        evidence_ids = fix.get("evidence_ids")
+        source_ref_ids = fix.get("source_ref_ids")
+        rule_id = fix.get("rule_id")
+        priority = fix.get("recommendation_priority")
+        if (
+            not isinstance(fix_id, str)
+            or fix_id in fix_ids
+            or not isinstance(finding_id, str)
+            or finding_id not in index.finding_evidence
+            or not _known_ids(evidence_ids, index.evidence_ids)
+            or not isinstance(evidence_ids, list)
+            or not isinstance(source_ref_ids, list)
+            or not source_ref_ids
+            or not all(ref_id in index.source_refs for ref_id in source_ref_ids)
+            or not isinstance(rule_id, str)
+            or priority not in recommendation_by_priority
+        ):
+            raise SynthesisValidationError
+        fix_ids.add(fix_id)
+        recommendation = recommendation_by_priority[priority]
+        if (
+            not isinstance(recommendation, dict)
+            or finding_id not in recommendation.get("finding_ids", [])
+            or not set(evidence_ids).issubset(recommendation.get("evidence_ids", []))
+        ):
+            raise SynthesisValidationError
+        for ref_id in source_ref_ids:
+            source_ref = index.source_refs[ref_id]
+            if (
+                source_ref.get("match_grade") != "strong"
+                or source_ref.get("relative_path") != fix.get("relative_path")
+                or source_ref.get("symbol") != fix.get("symbol")
+                or finding_id not in source_ref.get("finding_ids", [])
+                or not set(evidence_ids).issubset(source_ref.get("evidence_ids", []))
+                or rule_id not in source_ref.get("rule_ids", [])
+            ):
+                raise SynthesisValidationError
+
+
 def _narrative_fields(document: dict[str, object]) -> tuple[str, ...]:
     fields = [document["executive_summary"]]
+    if document.get("schema_version") == "2.0":
+        fields.append(document["verdict"])
+        for fix in document["source_fixes"]:
+            fields.extend((fix["diagnosis"], fix["retest_target"]))
     for finding in document["top_findings"]:
         fields.append(finding["user_impact"])
     for recommendation in document["recommendations"]:

@@ -8,8 +8,8 @@ from dataclasses import dataclass, field
 from importlib.resources import files
 
 
-_PROMPT_RESOURCE = "perfpilot-synthesis-v1.txt"
-_PROMPT_VERSION = "perfpilot-synthesis-v1"
+_PROMPT_RESOURCE = "perfpilot-report-v3.txt"
+_PROMPT_VERSION = "perfpilot-report-v3"
 _MAX_PROMPT_BYTES = 32 * 1024
 
 
