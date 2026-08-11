@@ -124,6 +124,189 @@ def _authenticated_client(client: TestClient, username: str, password: str) -> d
     return {"Origin": "http://localhost:3000", "x-csrf-token": login.json()["csrf_token"]}
 
 
+def test_local_analyses_are_isolated_between_logged_in_user_teams(
+    tmp_path: Path,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    first = control.ensure_user("user01", "initial user password", False).principal
+    second = control.ensure_user("user02", "initial user password", False).principal
+    control.change_password(
+        first.user_id, "initial user password", "established user password"
+    )
+    control.change_password(
+        second.user_id, "initial user password", "established user password"
+    )
+    data_root = tmp_path / "data"
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=data_root,
+        control_store=control,
+    )
+
+    with _RawTestClient(app) as first_client, _RawTestClient(app) as second_client:
+        first_headers = _authenticated_client(
+            first_client, "user01", "established user password"
+        )
+        second_headers = _authenticated_client(
+            second_client, "user02", "established user password"
+        )
+        analysis_id, checksum = _create_trace_analysis(
+            first_client,
+            team_id=str(first.team_id),
+            headers=first_headers,
+        )
+        created = first_client.get(f"/v1/teams/{first.team_id}/analyses/{analysis_id}")
+        assert created.json()["team_id"] == str(first.team_id)
+
+        first_slot = first_client.post(
+            f"/v1/teams/{first.team_id}/analyses/{analysis_id}/uploads",
+            headers=first_headers,
+            json={
+                "artifact_kind": "trace",
+                "mime": "application/octet-stream",
+                "size": len(b"background-local-trace"),
+                "sha256_b64": checksum,
+            },
+        ).json()["upload"]
+
+        cross_paths = (
+            ("GET", f"/v1/teams/{second.team_id}/analyses/{analysis_id}", None),
+            (
+                "POST",
+                f"/v1/teams/{second.team_id}/analyses/{analysis_id}/uploads",
+                {
+                    "artifact_kind": "trace",
+                    "mime": "application/octet-stream",
+                    "size": len(b"background-local-trace"),
+                    "sha256_b64": checksum,
+                },
+            ),
+            ("POST", f"/v1/teams/{second.team_id}/analyses/{analysis_id}/cancel", None),
+            (
+                "POST",
+                f"/v1/teams/{second.team_id}/analyses/{analysis_id}/finalize-upload",
+                {
+                    "upload_id": first_slot["upload_id"],
+                    "size": len(b"background-local-trace"),
+                    "sha256_b64": checksum,
+                },
+            ),
+            ("GET", f"/v1/teams/{second.team_id}/analyses/{analysis_id}/report", None),
+            (
+                "POST",
+                f"/v1/teams/{second.team_id}/analyses/{analysis_id}/synthesis-runs",
+                None,
+            ),
+        )
+        for method, path, body in cross_paths:
+            response = second_client.request(
+                method,
+                path,
+                headers=second_headers,
+                json=body,
+            )
+            assert response.status_code == 404
+            assert analysis_id not in response.text
+            assert str(first.team_id) not in response.text
+
+        active_first = first_client.get(
+            f"/v1/teams/{first.team_id}/analyses?status=active"
+        )
+        active_second = second_client.get(
+            f"/v1/teams/{second.team_id}/analyses?status=active"
+        )
+        assert [item["analysis_id"] for item in active_first.json()["analyses"]] == [
+            analysis_id
+        ]
+        assert active_second.json()["analyses"] == []
+
+        put = urlsplit(first_slot["put_url"])
+        assert (
+            first_client.put(
+                f"{put.path}?{put.query}",
+                content=b"background-local-trace",
+                headers=first_slot["required_headers"],
+            ).status_code
+            == 200
+        )
+        assert (
+            first_client.post(
+                f"/v1/teams/{first.team_id}/analyses/{analysis_id}/finalize-upload",
+                headers=first_headers,
+                json={
+                    "upload_id": first_slot["upload_id"],
+                    "size": len(b"background-local-trace"),
+                    "sha256_b64": checksum,
+                },
+            ).status_code
+            == 200
+        )
+        for _ in range(100):
+            completed = first_client.get(
+                f"/v1/teams/{first.team_id}/analyses/{analysis_id}"
+            ).json()
+            if completed["report_available"]:
+                break
+            time.sleep(0.01)
+        assert completed["report_available"] is True
+        assert (
+            first_client.get(
+                f"/v1/teams/{first.team_id}/analyses/{analysis_id}/report"
+            ).status_code
+            == 200
+        )
+        first_list = first_client.get(f"/v1/teams/{first.team_id}/analyses")
+        second_list = second_client.get(f"/v1/teams/{second.team_id}/analyses")
+        assert [item["analysis_id"] for item in first_list.json()["analyses"]] == [
+            analysis_id
+        ]
+        assert second_list.json()["analyses"] == []
+
+        first_recovery = first_client.post(
+            f"/v1/teams/{first.team_id}/local-recoveries",
+            headers=first_headers,
+            json=_recovery_request(),
+        )
+        second_recovery = second_client.post(
+            f"/v1/teams/{second.team_id}/local-recoveries",
+            headers=second_headers,
+            json=_recovery_request(),
+        )
+        assert first_recovery.status_code == 201
+        assert second_recovery.status_code == 201
+        assert (
+            first_recovery.json()["analysis_id"]
+            != second_recovery.json()["analysis_id"]
+        )
+        assert first_recovery.json()["team_id"] == str(first.team_id)
+        assert second_recovery.json()["team_id"] == str(second.team_id)
+        for client, owner, recovery in (
+            (first_client, first, first_recovery),
+            (second_client, second, second_recovery),
+        ):
+            for _ in range(100):
+                recovered_state = client.get(
+                    f"/v1/teams/{owner.team_id}/analyses/{recovery.json()['analysis_id']}"
+                ).json()
+                if recovered_state["report_available"]:
+                    break
+                time.sleep(0.01)
+            assert recovered_state["report_available"] is True
+
+    assert (
+        data_root
+        / "teams"
+        / str(first.team_id)
+        / "analyses"
+        / analysis_id
+        / "state.json"
+    ).is_file()
+    assert not (data_root / "analyses" / analysis_id).exists()
+
+
+
+
+
 def test_local_auth_requires_login_and_exposes_current_principal(tmp_path: Path) -> None:
     control = LocalControlStore(tmp_path / "control")
     admin = control.ensure_user("ray_wu", "initial admin password", True).principal
@@ -834,6 +1017,7 @@ def _create_trace_analysis(
         },
     )
     assert response.status_code == 201
+    assert response.json()["team_id"] == team_id
     return response.json()["analysis_id"], checksum
 
 
@@ -891,7 +1075,7 @@ def _persist_created_trace_analysis(
             headers=headers,
         )
     parsed_analysis_id = UUID(analysis_id)
-    state = LocalAnalysisStore(tmp_path).load_states()[parsed_analysis_id]
+    state = LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), parsed_analysis_id)]
     return team_id, parsed_analysis_id, state
 
 
@@ -915,7 +1099,7 @@ def test_local_app_defaults_missing_persisted_ai_rounds_after_restart(
 ) -> None:
     team_id, analysis_id, state = _persist_created_trace_analysis(tmp_path)
     state.pop("ai_rounds")
-    LocalAnalysisStore(tmp_path).save_state(analysis_id, state)
+    LocalAnalysisStore(tmp_path).save_state(UUID(team_id), analysis_id, state)
     app = create_local_app(
         gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
         data_root=tmp_path,
@@ -984,13 +1168,13 @@ def test_local_source_binding_disabled_persistence_and_old_json_compatibility(
     assert created.json()["source_code_analysis"]["context_state"] == "waiting_for_agent"
     analysis_id = UUID(created.json()["analysis_id"])
     store = LocalAnalysisStore(tmp_path / "enabled")
-    state = store.load_states()[analysis_id]
+    state = store.load_states()[(UUID(team_id), analysis_id)]
     assert state["source_binding"] == binding
     assert "path" not in json.dumps(state)
 
     state.pop("source_binding")
     state.pop("source_code_analysis")
-    store.save_state(analysis_id, state)
+    store.save_state(UUID(team_id), analysis_id, state)
     restarted = create_local_app(data_root=tmp_path / "enabled")
     with TestClient(restarted) as client:
         restored = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}")
@@ -1002,9 +1186,9 @@ def test_local_source_binding_disabled_persistence_and_old_json_compatibility(
 def test_local_app_rejects_present_null_persisted_ai_rounds_after_restart(
     tmp_path: Path,
 ) -> None:
-    _, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    team_id, analysis_id, state = _persist_created_trace_analysis(tmp_path)
     state["ai_rounds"] = None
-    LocalAnalysisStore(tmp_path).save_state(analysis_id, state)
+    LocalAnalysisStore(tmp_path).save_state(UUID(team_id), analysis_id, state)
     app = create_local_app(
         gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
         data_root=tmp_path,
@@ -1018,9 +1202,9 @@ def test_local_app_rejects_present_null_persisted_ai_rounds_after_restart(
 def test_local_app_rejects_present_null_evidence_format_after_restart(
     tmp_path: Path,
 ) -> None:
-    _, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    team_id, analysis_id, state = _persist_created_trace_analysis(tmp_path)
     state["evidence_format_version"] = None
-    LocalAnalysisStore(tmp_path).save_state(analysis_id, state)
+    LocalAnalysisStore(tmp_path).save_state(UUID(team_id), analysis_id, state)
     app = create_local_app(
         gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
         data_root=tmp_path,
@@ -1036,7 +1220,7 @@ def test_local_app_requires_a_strict_evidence_marker_manifest_pair_after_restart
     tmp_path: Path,
     mutation: str,
 ) -> None:
-    _, analysis_id, state = _persist_created_trace_analysis(tmp_path)
+    team_id, analysis_id, state = _persist_created_trace_analysis(tmp_path)
     checksum = base64.b64encode(hashlib.sha256(b"manifest").digest()).decode(
         "ascii"
     )
@@ -1052,7 +1236,7 @@ def test_local_app_requires_a_strict_evidence_marker_manifest_pair_after_restart
         state["evidence_manifest"] = manifest
     if mutation == "malformed":
         manifest["unexpected"] = True
-    LocalAnalysisStore(tmp_path).save_state(analysis_id, state)
+    LocalAnalysisStore(tmp_path).save_state(UUID(team_id), analysis_id, state)
     app = create_local_app(
         gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
         data_root=tmp_path,
@@ -1372,7 +1556,9 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
     captured_apk, captured_serial, workspace = capture_gateway.calls[0]
     assert captured_apk == apk
     assert captured_serial == serial
-    assert workspace.parent.name == "device-captures"
+    assert workspace.name == "device-captures"
+    assert workspace.parent.name == analysis_id
+    assert workspace.parents[2].name == team_id
     assert smartperfetto.submissions == [
         (b"captured-startup-trace", "startup", None),
         (b"captured-scroll-trace", "scroll", None),
@@ -1442,11 +1628,11 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
 
     store = LocalAnalysisStore(tmp_path)
     parsed_analysis_id = UUID(analysis_id)
-    legacy_state = store.load_states()[parsed_analysis_id]
+    legacy_state = store.load_states()[(UUID(team_id), parsed_analysis_id)]
     legacy_state.pop("evidence_format_version", None)
     legacy_state.pop("evidence_manifest", None)
-    store.save_state(parsed_analysis_id, legacy_state)
-    analysis_directory = tmp_path / "analyses" / analysis_id
+    store.save_state(UUID(team_id), parsed_analysis_id, legacy_state)
+    analysis_directory = tmp_path / "teams" / team_id / "analyses" / analysis_id
     (analysis_directory / "normalized-core.json").unlink()
     old_report_bytes = (analysis_directory / "report.json").read_bytes()
     old_report = rerun_report.json()
@@ -1490,7 +1676,7 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
     assert legacy_gateway.submissions == []
     assert legacy_gateway.status_calls == 0
     assert legacy_gateway.fetch_calls == 0
-    assert store.load_states()[parsed_analysis_id]["ai_rounds"] == [
+    assert store.load_states()[(UUID(team_id), parsed_analysis_id)]["ai_rounds"] == [
         {"round": 1, "role": "report", "state": "failed", "attempts": 0}
     ]
 
@@ -1755,7 +1941,7 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
         assert len(validated["synthesis"]["output"]["top_findings"]) <= 3
         assert len(validated["synthesis"]["output"]["recommendations"]) <= 3
         assert validated["synthesis"]["output"]["recommendations"]
-        analysis_directory = tmp_path / "analyses" / analysis_id
+        analysis_directory = tmp_path / "teams" / team_id / "analyses" / analysis_id
         assert (analysis_directory / "round-1.json").is_file()
         assert not (analysis_directory / "round-2.json").exists()
         assert not (analysis_directory / "round-3.json").exists()
@@ -1836,6 +2022,7 @@ def test_local_app_publishes_core_report_when_ai_projection_is_privacy_blocked(
     assert bundle is not None
     assert bundle["findings"][0]["title"] == "JIT 编译活跃"
     projection = LocalAnalysisStore(tmp_path).load_document(
+        UUID(team_id),
         UUID(analysis_id),
         "projection.json",
     )
@@ -1897,7 +2084,7 @@ def test_local_app_persists_bounded_single_pass_failure(tmp_path: Path) -> None:
     expected_failed_rounds = [
         {"round": 1, "role": "report", "state": "failed", "attempts": 2}
     ]
-    persisted = LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)]
+    persisted = LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), UUID(analysis_id))]
     assert persisted["ai_rounds"] == expected_failed_rounds
 
     restarted_app = create_local_app(
@@ -2028,7 +2215,8 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     store = LocalAnalysisStore(tmp_path)
     states = store.load_states()
     original_id = UUID(analysis_id)
-    original_state = states[original_id]
+    parsed_team_id = UUID(team_id)
+    original_state = states[(parsed_team_id, original_id)]
     assert isinstance(original_state.get("created_at"), str)
     assert original_state["ai_rounds"] == [
         {"round": 1, "role": "report", "state": "completed", "attempts": 1}
@@ -2048,11 +2236,12 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     legacy_report = copy.deepcopy(expected_report)
     legacy_report["analysis_id"] = str(legacy_id)
     assert legacy_report["report_version"] == 1
-    store.save_state(legacy_id, legacy_state)
-    store.save_document(legacy_id, "report.json", legacy_report)
-    legacy_projection = store.load_document(original_id, "projection.json")
-    legacy_core = store.load_document(original_id, "normalized-core.json")
+    store.save_state(parsed_team_id, legacy_id, legacy_state)
+    store.save_document(parsed_team_id, legacy_id, "report.json", legacy_report)
+    legacy_projection = store.load_document(parsed_team_id, original_id, "projection.json")
+    legacy_core = store.load_document(parsed_team_id, original_id, "normalized-core.json")
     legacy_source_report = store.load_document(
+        parsed_team_id,
         original_id,
         "smartperfetto-report.json",
     )
@@ -2061,9 +2250,10 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     assert legacy_source_report is not None
     legacy_projection["analysis_id"] = str(legacy_id)
     legacy_core["analysis_id"] = str(legacy_id)
-    store.save_document(legacy_id, "projection.json", legacy_projection)
-    store.save_document(legacy_id, "normalized-core.json", legacy_core)
+    store.save_document(parsed_team_id, legacy_id, "projection.json", legacy_projection)
+    store.save_document(parsed_team_id, legacy_id, "normalized-core.json", legacy_core)
     store.save_document(
+        parsed_team_id,
         legacy_id,
         "smartperfetto-report.json",
         legacy_source_report,
@@ -2074,12 +2264,12 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         source=legacy_source_report,
         projection=legacy_projection,
     )
-    store.save_state(legacy_id, legacy_state)
+    store.save_state(parsed_team_id, legacy_id, legacy_state)
     legacy_round_2 = {"sentinel": "legacy-round-2"}
     legacy_round_3 = {"sentinel": "legacy-round-3"}
-    store.save_document(legacy_id, "round-2.json", legacy_round_2)
-    store.save_document(legacy_id, "round-3.json", legacy_round_3)
-    legacy_directory = tmp_path / "analyses" / str(legacy_id)
+    store.save_document(parsed_team_id, legacy_id, "round-2.json", legacy_round_2)
+    store.save_document(parsed_team_id, legacy_id, "round-3.json", legacy_round_3)
+    legacy_directory = tmp_path / "teams" / team_id / "analyses" / str(legacy_id)
     legacy_round_2_bytes = (legacy_directory / "round-2.json").read_bytes()
     legacy_round_3_bytes = (legacy_directory / "round-3.json").read_bytes()
 
@@ -2089,19 +2279,19 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
     newer_state["created_at"] = "2099-01-01T00:00:00+00:00"
     newer_report = copy.deepcopy(expected_report)
     newer_report["analysis_id"] = str(newer_id)
-    store.save_state(newer_id, newer_state)
-    store.save_document(newer_id, "report.json", newer_report)
+    store.save_state(parsed_team_id, newer_id, newer_state)
+    store.save_document(parsed_team_id, newer_id, "report.json", newer_report)
 
     pending_id = UUID("92000000-0000-4000-8000-000000000003")
     pending_state = copy.deepcopy(original_state)
     pending_state["analysis_id"] = str(pending_id)
     pending_state["created_at"] = "2100-01-01T00:00:00+00:00"
     pending_state["report_available"] = False
-    store.save_state(pending_id, pending_state)
+    store.save_state(parsed_team_id, pending_id, pending_state)
 
     migrated_state = copy.deepcopy(original_state)
     migrated_state.pop("created_at")
-    store.save_state(original_id, migrated_state)
+    store.save_state(parsed_team_id, original_id, migrated_state)
 
     restored_gateway = _FakeSmartPerfettoGateway(_smartperfetto_result())
     second_app = create_local_app(
@@ -2136,8 +2326,8 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         legacy = client.get(f"/v1/teams/{team_id}/analyses/{legacy_id}")
         assert legacy.status_code == 200
         assert legacy.json()["ai_rounds"] == expected_legacy_rounds
-        assert store.load_document(legacy_id, "round-2.json") == legacy_round_2
-        assert store.load_document(legacy_id, "round-3.json") == legacy_round_3
+        assert store.load_document(parsed_team_id, legacy_id, "round-2.json") == legacy_round_2
+        assert store.load_document(parsed_team_id, legacy_id, "round-3.json") == legacy_round_3
         assert (legacy_directory / "round-2.json").read_bytes() == legacy_round_2_bytes
         assert (legacy_directory / "round-3.json").read_bytes() == legacy_round_3_bytes
 
@@ -2171,9 +2361,9 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         )
         assert rerun_report.status_code == 200
         assert rerun_report.json()["report_version"] == 2
-        assert store.load_document(legacy_id, "round-1.json") is not None
-        assert store.load_document(legacy_id, "round-2.json") == legacy_round_2
-        assert store.load_document(legacy_id, "round-3.json") == legacy_round_3
+        assert store.load_document(parsed_team_id, legacy_id, "round-1.json") is not None
+        assert store.load_document(parsed_team_id, legacy_id, "round-2.json") == legacy_round_2
+        assert store.load_document(parsed_team_id, legacy_id, "round-3.json") == legacy_round_3
         assert (legacy_directory / "round-2.json").read_bytes() == legacy_round_2_bytes
         assert (legacy_directory / "round-3.json").read_bytes() == legacy_round_3_bytes
 
@@ -2214,13 +2404,13 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
             time.sleep(0.01)
         assert first_state["state"] == "completed"
 
-    legacy_directory = tmp_path / "analyses" / analysis_id
+    legacy_directory = tmp_path / "teams" / team_id / "analyses" / analysis_id
     (legacy_directory / "normalized-core.json").unlink(missing_ok=True)
     legacy_store = LocalAnalysisStore(tmp_path)
-    legacy_state = legacy_store.load_states()[UUID(analysis_id)]
+    legacy_state = legacy_store.load_states()[(UUID(team_id), UUID(analysis_id))]
     legacy_state.pop("evidence_format_version", None)
     legacy_state.pop("evidence_manifest", None)
-    legacy_store.save_state(UUID(analysis_id), legacy_state)
+    legacy_store.save_state(UUID(team_id), UUID(analysis_id), legacy_state)
     assert {
         "projection.json",
         "report.json",
@@ -2264,6 +2454,7 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
     assert restarted_gateway.status_calls == 0
     assert restarted_gateway.fetch_calls == 0
     migrated_core = LocalAnalysisStore(tmp_path).load_document(
+        UUID(team_id),
         UUID(analysis_id),
         "normalized-core.json",
     )
@@ -2271,18 +2462,20 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
     assert validate_contract("normalized-trace-report", migrated_core)[
         "analysis_id"
     ] == analysis_id
-    assert LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)][
+    assert LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), UUID(analysis_id))][
         "evidence_format_version"
     ] == "normalized-core-v1"
 
     store = LocalAnalysisStore(tmp_path)
     parsed_analysis_id = UUID(analysis_id)
-    legacy_state = store.load_states()[parsed_analysis_id]
+    parsed_team_id = UUID(team_id)
+    legacy_state = store.load_states()[(parsed_team_id, parsed_analysis_id)]
     legacy_state.pop("evidence_format_version", None)
     legacy_state.pop("evidence_manifest", None)
-    store.save_state(parsed_analysis_id, legacy_state)
+    store.save_state(parsed_team_id, parsed_analysis_id, legacy_state)
     (legacy_directory / "normalized-core.json").unlink()
     tampered_source = store.load_document(
+        parsed_team_id,
         parsed_analysis_id,
         "smartperfetto-report.json",
     )
@@ -2290,7 +2483,7 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
     startup_envelope = tampered_source["dataEnvelopes"][0]
     startup_envelope["evidence"][0]["fields"]["duration_ms"] = 123.4
     startup_envelope["columns"][0]["value"] = 123.4
-    analysis = second_app.state.local_runtime.analyses[parsed_analysis_id]
+    analysis = second_app.state.local_runtime.analyses[(parsed_team_id, parsed_analysis_id)]
     tampered = _prepare_local_report(
         analysis,
         EngineResult(
@@ -2303,11 +2496,13 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
         ),
     )
     store.save_document(
+        parsed_team_id,
         parsed_analysis_id,
         "smartperfetto-report.json",
         tampered.source_report,
     )
     store.save_document(
+        parsed_team_id,
         parsed_analysis_id,
         "projection.json",
         tampered.projection.document,
@@ -2406,17 +2601,19 @@ def test_local_app_rejects_invalid_versioned_core_and_keeps_the_old_report(
         ).json()
 
     store = LocalAnalysisStore(tmp_path)
+    parsed_team_id = UUID(team_id)
     parsed_analysis_id = UUID(analysis_id)
-    state = store.load_states()[parsed_analysis_id]
+    state = store.load_states()[(parsed_team_id, parsed_analysis_id)]
     assert state["evidence_format_version"] == "normalized-core-v1"
-    original_core = store.load_document(parsed_analysis_id, "normalized-core.json")
+    original_core = store.load_document(parsed_team_id, parsed_analysis_id, "normalized-core.json")
     assert original_core is not None
-    analysis_directory = tmp_path / "analyses" / analysis_id
+    analysis_directory = tmp_path / "teams" / team_id / "analyses" / analysis_id
     old_report_bytes = (analysis_directory / "report.json").read_bytes()
     if core_mutation == "missing":
         (analysis_directory / "normalized-core.json").unlink()
     elif core_mutation == "corrupt":
         store.save_document(
+            parsed_team_id,
             parsed_analysis_id,
             "normalized-core.json",
             {"schema_version": "invalid"},
@@ -2437,11 +2634,13 @@ def test_local_app_rejects_invalid_versioned_core_and_keeps_the_old_report(
             question=state["question"],
         )
         store.save_document(
+            parsed_team_id,
             parsed_analysis_id,
             "normalized-core.json",
             original_core,
         )
         store.save_document(
+            parsed_team_id,
             parsed_analysis_id,
             "projection.json",
             tampered_projection.document,
@@ -2534,12 +2733,13 @@ def test_local_app_does_not_publish_a_manifest_for_partial_evidence_writes(
         ).json()
 
     store = LocalAnalysisStore(tmp_path)
+    parsed_team_id = UUID(team_id)
     parsed_analysis_id = UUID(analysis_id)
-    legacy_state = store.load_states()[parsed_analysis_id]
+    legacy_state = store.load_states()[(parsed_team_id, parsed_analysis_id)]
     legacy_state.pop("evidence_format_version", None)
     legacy_state.pop("evidence_manifest", None)
-    store.save_state(parsed_analysis_id, legacy_state)
-    analysis_directory = tmp_path / "analyses" / analysis_id
+    store.save_state(parsed_team_id, parsed_analysis_id, legacy_state)
+    analysis_directory = tmp_path / "teams" / team_id / "analyses" / analysis_id
     (analysis_directory / "normalized-core.json").unlink()
     old_report_bytes = (analysis_directory / "report.json").read_bytes()
     provider = _InvalidReportProvider()
@@ -2556,13 +2756,14 @@ def test_local_app_does_not_publish_a_manifest_for_partial_evidence_writes(
         original_save_document = runtime.store.save_document
 
         def fail_selected_document(
+            stored_team_id: UUID,
             stored_analysis_id: UUID,
             name: str,
             value: dict[str, object],
         ) -> None:
             if name == failed_document:
                 raise RuntimeError("evidence document write failed")
-            original_save_document(stored_analysis_id, name, value)
+            original_save_document(stored_team_id, stored_analysis_id, name, value)
 
         runtime.store.save_document = fail_selected_document
         headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
@@ -2586,7 +2787,7 @@ def test_local_app_does_not_publish_a_manifest_for_partial_evidence_writes(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
         )
 
-    persisted = store.load_states()[parsed_analysis_id]
+    persisted = store.load_states()[(parsed_team_id, parsed_analysis_id)]
     assert "evidence_format_version" not in persisted
     assert "evidence_manifest" not in persisted
     assert preserved_report.json() == old_report
@@ -2682,7 +2883,7 @@ def test_local_app_installs_recovery_task_before_persisting_initial_state(
     assert provider.calls == 1
     assert report.status_code == 200
     assert report.json()["report_version"] == 1
-    persisted = LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)]
+    persisted = LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), UUID(analysis_id))]
     assert persisted["generation"] == 1
     assert gateway.submissions == []
 
@@ -2768,7 +2969,7 @@ def test_local_app_serializes_simultaneous_ai_rerun_reservations(
         runtime = app.state.local_runtime
         parsed_analysis_id = UUID(analysis_id)
         for _ in range(100):
-            initial_task = runtime.analyses[parsed_analysis_id].task
+            initial_task = runtime.analyses[(UUID(team_id), parsed_analysis_id)].task
             if initial_task is not None and initial_task.done():
                 break
             time.sleep(0.01)
@@ -2885,7 +3086,7 @@ def test_local_app_serializes_simultaneous_ai_rerun_reservations(
     assert provider.rerun_calls == 1
     assert final_report.status_code == 200
     assert final_report.json()["report_version"] == 2
-    persisted = LocalAnalysisStore(tmp_path).load_states()[UUID(analysis_id)]
+    persisted = LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), UUID(analysis_id))]
     assert persisted["generation"] == 2
     assert persisted["ai_rounds"] == terminal["ai_rounds"]
     assert gateway.submissions == []
@@ -2925,12 +3126,12 @@ def test_local_app_rolls_back_a_failed_rerun_persistence_reservation(
             time.sleep(0.01)
         runtime = app.state.local_runtime
         for _ in range(100):
-            initial_task = runtime.analyses[parsed_analysis_id].task
+            initial_task = runtime.analyses[(UUID(team_id), parsed_analysis_id)].task
             if initial_task is not None and initial_task.done():
                 break
             time.sleep(0.01)
         persisted_before = copy.deepcopy(
-            LocalAnalysisStore(tmp_path).load_states()[parsed_analysis_id]
+            LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), parsed_analysis_id)]
         )
         original_persist = runtime._persist
         fail_reservation = True
@@ -2952,7 +3153,7 @@ def test_local_app_rolls_back_a_failed_rerun_persistence_reservation(
         with pytest.raises(RuntimeError, match="^rerun persistence failed$"):
             client.post(rerun_path, headers=headers)
 
-        current = runtime.analyses[parsed_analysis_id]
+        current = runtime.analyses[(UUID(team_id), parsed_analysis_id)]
         assert current.task is None
         assert current.generation == persisted_before["generation"]
         assert current.state == persisted_before["state"]
@@ -2968,7 +3169,7 @@ def test_local_app_rolls_back_a_failed_rerun_persistence_reservation(
         assert restored["version"] == before["version"]
         assert restored["stages"] == before["stages"]
         assert restored["ai_rounds"] == before["ai_rounds"]
-        assert LocalAnalysisStore(tmp_path).load_states()[parsed_analysis_id] == (
+        assert LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), parsed_analysis_id)] == (
             persisted_before
         )
 

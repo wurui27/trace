@@ -1,4 +1,4 @@
-"""Atomic, bounded persistence for the loopback-only analysis runtime."""
+"""Atomic, tenant-scoped persistence for the loopback-only analysis runtime."""
 
 from __future__ import annotations
 
@@ -35,29 +35,68 @@ def _object_without_duplicates(pairs: list[tuple[str, object]]) -> dict[str, obj
     return result
 
 
+def _require_uuid(value: UUID, name: str) -> UUID:
+    if not isinstance(value, UUID):
+        raise TypeError(f"{name} must be a UUID")
+    return value
+
+
 class LocalAnalysisStore:
     def __init__(self, data_root: Path) -> None:
         if not isinstance(data_root, Path):
             raise TypeError("data_root must be a Path")
-        resolved_root = data_root.resolve()
-        self._root = resolved_root / "analyses"
+        self._root = data_root.resolve() / "teams"
         self._root.mkdir(parents=True, exist_ok=True)
         self._root = self._root.resolve()
 
-    def _analysis_directory(self, analysis_id: UUID, *, create: bool) -> Path:
-        if not isinstance(analysis_id, UUID):
-            raise TypeError("analysis_id must be a UUID")
-        directory = self._root / str(analysis_id)
+    @staticmethod
+    def _contained(path: Path, root: Path) -> None:
+        try:
+            path.relative_to(root)
+        except ValueError:
+            raise LocalAnalysisStoreError("unsafe local analysis path") from None
+
+    def _team_directory(self, team_id: UUID, *, create: bool) -> Path:
+        _require_uuid(team_id, "team_id")
+        directory = self._root / str(team_id)
         if directory.is_symlink():
             raise LocalAnalysisStoreError("unsafe local analysis path")
         if create:
             directory.mkdir(mode=0o700, parents=False, exist_ok=True)
         if not directory.exists() or not directory.is_dir():
             raise LocalAnalysisStoreError("unsafe local analysis path")
-        try:
-            directory.relative_to(self._root)
-        except ValueError:
-            raise LocalAnalysisStoreError("unsafe local analysis path") from None
+        self._contained(directory, self._root)
+        return directory
+
+    def _analyses_directory(self, team_id: UUID, *, create: bool) -> Path:
+        team = self._team_directory(team_id, create=create)
+        directory = team / "analyses"
+        if directory.is_symlink():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
+        if create:
+            directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+        if not directory.exists() or not directory.is_dir():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
+        self._contained(directory, team)
+        return directory
+
+    def _analysis_directory(
+        self,
+        team_id: UUID,
+        analysis_id: UUID,
+        *,
+        create: bool,
+    ) -> Path:
+        _require_uuid(analysis_id, "analysis_id")
+        analyses = self._analyses_directory(team_id, create=create)
+        directory = analyses / str(analysis_id)
+        if directory.is_symlink():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
+        if create:
+            directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+        if not directory.exists() or not directory.is_dir():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
+        self._contained(directory, analyses)
         return directory
 
     @staticmethod
@@ -69,8 +108,48 @@ class LocalAnalysisStore:
             raise LocalAnalysisStoreError("unsafe local analysis path")
         return target
 
+    def analysis_subdirectory(
+        self,
+        team_id: UUID,
+        analysis_id: UUID,
+        name: str,
+    ) -> Path:
+        if name not in {"uploads", "device-captures"}:
+            raise LocalAnalysisStoreError("invalid local analysis directory name")
+        analysis = self._analysis_directory(team_id, analysis_id, create=True)
+        directory = analysis / name
+        if directory.is_symlink():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
+        directory.mkdir(mode=0o700, parents=False, exist_ok=True)
+        if not directory.is_dir():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
+        self._contained(directory, analysis)
+        return directory
+
+    def upload_path(
+        self,
+        team_id: UUID,
+        analysis_id: UUID,
+        upload_id: str,
+    ) -> Path:
+        if not isinstance(upload_id, str):
+            raise TypeError("upload_id must be a string")
+        try:
+            parsed = UUID(upload_id)
+        except ValueError:
+            raise LocalAnalysisStoreError("invalid local upload identifier") from None
+        if str(parsed) != upload_id:
+            raise LocalAnalysisStoreError("invalid local upload identifier")
+        directory = self.analysis_subdirectory(team_id, analysis_id, "uploads")
+        target = directory / f"{upload_id}.bin"
+        if target.is_symlink():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
+        self._contained(target, directory)
+        return target
+
     def save_document(
         self,
+        team_id: UUID,
         analysis_id: UUID,
         name: str,
         value: Mapping[str, object],
@@ -83,8 +162,10 @@ class LocalAnalysisStore:
             raise LocalAnalysisStoreError("invalid local analysis document") from None
         if not payload or len(payload) > _MAX_DOCUMENT_BYTES:
             raise LocalAnalysisStoreError("invalid local analysis document")
-        directory = self._analysis_directory(analysis_id, create=True)
+        directory = self._analysis_directory(team_id, analysis_id, create=True)
         target = self._document_path(directory, name)
+        if target.exists() and not target.is_file():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
         temporary = directory / f".{name}.{uuid4().hex}.tmp"
         try:
             descriptor = os.open(
@@ -106,14 +187,30 @@ class LocalAnalysisStore:
             temporary.unlink(missing_ok=True)
             raise LocalAnalysisStoreError("local analysis persistence failed") from None
 
-    def save_state(self, analysis_id: UUID, value: Mapping[str, object]) -> None:
-        self.save_document(analysis_id, "state.json", value)
+    def save_state(
+        self,
+        team_id: UUID,
+        analysis_id: UUID,
+        value: Mapping[str, object],
+    ) -> None:
+        if value.get("team_id") != str(team_id) or value.get("analysis_id") != str(
+            analysis_id
+        ):
+            raise LocalAnalysisStoreError("invalid local analysis document")
+        self.save_document(team_id, analysis_id, "state.json", value)
 
-    def load_document(self, analysis_id: UUID, name: str) -> dict[str, object] | None:
-        directory = self._analysis_directory(analysis_id, create=False)
+    def load_document(
+        self,
+        team_id: UUID,
+        analysis_id: UUID,
+        name: str,
+    ) -> dict[str, object] | None:
+        directory = self._analysis_directory(team_id, analysis_id, create=False)
         target = self._document_path(directory, name)
         if not target.exists():
             return None
+        if not target.is_file():
+            raise LocalAnalysisStoreError("unsafe local analysis path")
         try:
             size = target.stat().st_size
             if not 0 < size <= _MAX_DOCUMENT_BYTES:
@@ -130,24 +227,49 @@ class LocalAnalysisStore:
             raise LocalAnalysisStoreError("invalid local analysis document")
         return document
 
-    def load_states(self) -> dict[UUID, dict[str, object]]:
-        states: dict[UUID, dict[str, object]] = {}
+    def load_states(self) -> dict[tuple[UUID, UUID], dict[str, object]]:
+        states: dict[tuple[UUID, UUID], dict[str, object]] = {}
         try:
-            candidates = sorted(self._root.iterdir(), key=lambda path: path.name)
+            teams = sorted(self._root.iterdir(), key=lambda path: path.name)
         except OSError:
             raise LocalAnalysisStoreError("local analysis persistence failed") from None
-        for candidate in candidates:
+        for team_candidate in teams:
             try:
-                analysis_id = UUID(candidate.name)
+                team_id = UUID(team_candidate.name)
             except ValueError:
                 continue
-            if candidate.is_symlink():
-                raise LocalAnalysisStoreError("unsafe local analysis path")
-            if not candidate.is_dir():
+            if str(team_id) != team_candidate.name:
                 continue
-            state = self.load_document(analysis_id, "state.json")
-            if state is not None:
-                states[analysis_id] = state
+            if team_candidate.is_symlink():
+                raise LocalAnalysisStoreError("unsafe local analysis path")
+            if not team_candidate.is_dir():
+                continue
+            analyses = team_candidate / "analyses"
+            if analyses.is_symlink():
+                raise LocalAnalysisStoreError("unsafe local analysis path")
+            if not analyses.exists():
+                continue
+            if not analyses.is_dir():
+                raise LocalAnalysisStoreError("unsafe local analysis path")
+            for candidate in sorted(analyses.iterdir(), key=lambda path: path.name):
+                try:
+                    analysis_id = UUID(candidate.name)
+                except ValueError:
+                    continue
+                if str(analysis_id) != candidate.name:
+                    continue
+                if candidate.is_symlink():
+                    raise LocalAnalysisStoreError("unsafe local analysis path")
+                if not candidate.is_dir():
+                    continue
+                state = self.load_document(team_id, analysis_id, "state.json")
+                if state is None:
+                    continue
+                if state.get("team_id") != str(team_id) or state.get(
+                    "analysis_id"
+                ) != str(analysis_id):
+                    raise LocalAnalysisStoreError("invalid local analysis document")
+                states[(team_id, analysis_id)] = state
         return states
 
 

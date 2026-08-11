@@ -102,7 +102,6 @@ from perfpilot_api.services.source_workspaces import SourceBinding
 from perfpilot_api.errors import ApiError
 
 
-LOCAL_TEAM_ID = UUID("81000000-0000-4000-8000-000000000001")
 LOCAL_USER_ID = UUID("80000000-0000-4000-8000-000000000001")
 LOCAL_AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
 _SMARTPERFETTO_COMMIT = "1508f99788bfcf18cc861e4bf4f8b472e84240c3"
@@ -505,6 +504,7 @@ class _LocalInput:
 @dataclass(slots=True)
 class _LocalUpload:
     upload_id: str
+    team_id: UUID
     analysis_id: UUID
     kind: str
     mime: str
@@ -651,6 +651,7 @@ def _restore_ai_rounds(value: object) -> list[_LocalAIRound]:
 
 @dataclass(slots=True)
 class _LocalAnalysis:
+    team_id: UUID
     analysis_id: UUID
     profile: str
     question: str | None
@@ -949,7 +950,7 @@ def _normalize_local_smartperfetto_result(
     ].descriptor
     canonical = canonicalize_engine_result(
         EngineResultWrite(
-            team_id=LOCAL_TEAM_ID,
+            team_id=analysis.team_id,
             analysis_id=analysis.analysis_id,
             execution_id=execution_id,
             expected_execution_version=1,
@@ -970,7 +971,7 @@ def _normalize_local_smartperfetto_result(
         )
     )
     loaded = LoadedCanonicalResult(
-        team_id=LOCAL_TEAM_ID,
+        team_id=analysis.team_id,
         analysis_id=analysis.analysis_id,
         execution_id=execution_id,
         artifact_id=artifact_id,
@@ -1000,10 +1001,20 @@ def _normalize_local_smartperfetto_result(
     )
 
 
-def _missing_scroll_scenario(analysis_id: UUID) -> tuple[dict[str, object], dict[str, object]]:
-    scenario_id = str(uuid5(_LOCAL_RECOVERY_NAMESPACE, f"{analysis_id}:scroll-unavailable"))
+def _missing_scroll_scenario(
+    team_id: UUID, analysis_id: UUID
+) -> tuple[dict[str, object], dict[str, object]]:
+    scenario_id = str(
+        uuid5(
+            _LOCAL_RECOVERY_NAMESPACE,
+            f"{team_id}:{analysis_id}:scroll-unavailable",
+        )
+    )
     limitation_id = str(
-        uuid5(_LOCAL_RECOVERY_NAMESPACE, f"{analysis_id}:scroll-result-unavailable")
+        uuid5(
+            _LOCAL_RECOVERY_NAMESPACE,
+            f"{team_id}:{analysis_id}:scroll-result-unavailable",
+        )
     )
     return (
         {
@@ -1059,6 +1070,7 @@ def _missing_scroll_scenario(analysis_id: UUID) -> tuple[dict[str, object], dict
 
 
 def _merge_local_smartperfetto_reports(
+    team_id: UUID,
     primary: NormalizedTraceReport,
     secondary: NormalizedTraceReport,
 ) -> NormalizedTraceReport:
@@ -1089,6 +1101,7 @@ def _merge_local_smartperfetto_reports(
             limitations[str(raw["limitation_id"])] = dict(raw)
     if "scroll" not in selected:
         scenario, limitation = _missing_scroll_scenario(
+            team_id,
             UUID(str(primary_document["analysis_id"]))
         )
         selected["scroll"] = scenario
@@ -1127,7 +1140,7 @@ def _canonical_local_memory_result(
     apk = analysis.inputs["apk"].descriptor
     canonical = canonicalize_engine_result(
         EngineResultWrite(
-            team_id=LOCAL_TEAM_ID,
+            team_id=analysis.team_id,
             analysis_id=analysis.analysis_id,
             execution_id=execution_id,
             expected_execution_version=1,
@@ -1146,7 +1159,7 @@ def _canonical_local_memory_result(
         )
     )
     return LoadedCanonicalResult(
-        team_id=LOCAL_TEAM_ID,
+        team_id=analysis.team_id,
         analysis_id=analysis.analysis_id,
         execution_id=execution_id,
         artifact_id=artifact_id,
@@ -1178,9 +1191,13 @@ def _prepare_local_report(
                 scroll_result,
                 profile="scroll",
             )
-            normalized = _merge_local_smartperfetto_reports(normalized, scroll.report)
+            normalized = _merge_local_smartperfetto_reports(
+                analysis.team_id, normalized, scroll.report
+            )
         else:
-            normalized = _merge_local_smartperfetto_reports(normalized, normalized)
+            normalized = _merge_local_smartperfetto_reports(
+                analysis.team_id, normalized, normalized
+            )
         if memory_result is not None and memory_engine_commit_sha is not None:
             try:
                 normalized = join_android_memory_result(
@@ -1277,7 +1294,7 @@ def _compose_local_report(
     latency_ms = sum(item.latency_ms for item in rounds)
     composed = compose_analysis_report(
         AnalysisReportWriteRequest(
-            team_id=LOCAL_TEAM_ID,
+            team_id=analysis.team_id,
             analysis_id=analysis.analysis_id,
             synthesis_execution_id=synthesis_execution_id,
             tenant_resource_version=1,
@@ -1632,9 +1649,7 @@ class _LocalRuntime:
         self.store = LocalAnalysisStore(self.data_root)
         self.public_origin = _public_origin(public_origin)
         self.poll_interval_seconds = poll_interval_seconds
-        self.upload_root = self.data_root / "uploads"
-        self.upload_root.mkdir(parents=True, exist_ok=True)
-        self.analyses: dict[UUID, _LocalAnalysis] = {}
+        self.analyses: dict[tuple[UUID, UUID], _LocalAnalysis] = {}
         self.uploads: dict[str, _LocalUpload] = {}
         self.lock = asyncio.Lock()
         self.tasks: set[asyncio.Task[None]] = set()
@@ -1642,6 +1657,7 @@ class _LocalRuntime:
     def _state_document(self, analysis: _LocalAnalysis) -> dict[str, object]:
         document: dict[str, object] = {
             "schema_version": "1.0",
+            "team_id": str(analysis.team_id),
             "analysis_id": str(analysis.analysis_id),
             "analysis_mode": analysis.analysis_mode,
             "device_id": str(analysis.device_id) if analysis.device_id is not None else None,
@@ -1721,11 +1737,13 @@ class _LocalRuntime:
         document = self._state_document(analysis)
         await asyncio.to_thread(
             self.store.save_state,
+            analysis.team_id,
             analysis.analysis_id,
             document,
         )
 
     def _restore_analysis(self, document: Mapping[str, object]) -> _LocalAnalysis:
+        team_id = UUID(str(document["team_id"]))
         analysis_id = UUID(str(document["analysis_id"]))
         raw_created_at = document.get("created_at")
         created_at = _parse_utc_datetime(raw_created_at)
@@ -1797,6 +1815,7 @@ class _LocalRuntime:
                 document["evidence_manifest"]
             )
         analysis = _LocalAnalysis(
+            team_id=team_id,
             analysis_id=analysis_id,
             profile=str(document["profile"]),
             question=(
@@ -1864,14 +1883,15 @@ class _LocalRuntime:
 
     async def start(self) -> None:
         persisted = await asyncio.to_thread(self.store.load_states)
-        for analysis_id, document in persisted.items():
+        for (team_id, analysis_id), document in persisted.items():
             analysis = self._restore_analysis(document)
             migrate_created_at = document.get("created_at") is None
-            if analysis.analysis_id != analysis_id:
+            if analysis.team_id != team_id or analysis.analysis_id != analysis_id:
                 raise ValueError("persisted local analysis identity changed")
             if document.get("report_available") is True:
                 analysis.report = await asyncio.to_thread(
                     self.store.load_document,
+                    analysis.team_id,
                     analysis.analysis_id,
                     "report.json",
                 )
@@ -1883,9 +1903,12 @@ class _LocalRuntime:
             for item in analysis.inputs.values():
                 if item.upload_id is None:
                     continue
-                path = self.upload_root / f"{item.upload_id}.bin"
+                path = self.store.upload_path(
+                    analysis.team_id, analysis.analysis_id, item.upload_id
+                )
                 self.uploads[item.upload_id] = _LocalUpload(
                     upload_id=item.upload_id,
+                    team_id=analysis.team_id,
                     analysis_id=analysis.analysis_id,
                     kind=item.descriptor.kind,
                     mime=item.descriptor.mime,
@@ -1895,7 +1918,7 @@ class _LocalRuntime:
                     path=path,
                     bytes_ready=path.is_file(),
                 )
-            self.analyses[analysis_id] = analysis
+            self.analyses[(team_id, analysis_id)] = analysis
             restore_canceled = (
                 analysis.cancel_requested_at is not None
                 and analysis.state in _ACTIVE_ANALYSIS_STATES
@@ -1922,7 +1945,9 @@ class _LocalRuntime:
         if self.memory_analysis_gateway is not None:
             await self.memory_analysis_gateway.aclose()
 
-    async def create(self, request: _CreateAnalysisRequest) -> _LocalAnalysis:
+    async def create(
+        self, team_id: UUID, request: _CreateAnalysisRequest
+    ) -> _LocalAnalysis:
         if isinstance(request, _CreateDeviceAnalysisRequest):
             descriptor = _InputDescriptor(
                 kind="apk",
@@ -1931,6 +1956,7 @@ class _LocalRuntime:
                 sha256_b64=request.apk.sha256_b64,
             )
             analysis = _LocalAnalysis(
+                team_id=team_id,
                 analysis_id=uuid4(),
                 profile="startup",
                 question=None,
@@ -1945,6 +1971,7 @@ class _LocalRuntime:
             )
         else:
             analysis = _LocalAnalysis(
+                team_id=team_id,
                 analysis_id=uuid4(),
                 profile=request.analysis_profile,
                 question=(
@@ -1965,38 +1992,44 @@ class _LocalRuntime:
         async with self.lock:
             if any(
                 current.state in _ACTIVE_ANALYSIS_STATES
-                for current in self.analyses.values()
+                for (current_team_id, _), current in self.analyses.items()
+                if current_team_id == team_id
             ):
                 raise HTTPException(
                     status.HTTP_409_CONFLICT,
                     "analysis already active",
                 )
-            self.analyses[analysis.analysis_id] = analysis
+            self.analyses[(team_id, analysis.analysis_id)] = analysis
             if analysis.analysis_mode == "device":
                 target = analysis.inputs["apk"]
                 upload_id = str(uuid4())
                 upload = _LocalUpload(
                     upload_id=upload_id,
+                    team_id=team_id,
                     analysis_id=analysis.analysis_id,
                     kind="apk",
                     mime=target.descriptor.mime,
                     size=target.descriptor.size,
                     sha256_b64=target.descriptor.sha256_b64,
                     token=secrets.token_urlsafe(32),
-                    path=self.upload_root / f"{upload_id}.bin",
+                    path=self.store.upload_path(
+                        team_id, analysis.analysis_id, upload_id
+                    ),
                 )
                 self.uploads[upload_id] = upload
                 target.upload_id = upload_id
         await self._persist(analysis)
         return analysis
 
-    async def recover(self, request: _LocalRecoveryRequest) -> _LocalAnalysis:
+    async def recover(
+        self, team_id: UUID, request: _LocalRecoveryRequest
+    ) -> _LocalAnalysis:
         analysis_id = uuid5(
             _LOCAL_RECOVERY_NAMESPACE,
-            f"default-workspace\0{request.session_id}",
+            f"{team_id}\0default-workspace\0{request.session_id}",
         )
         async with self.lock:
-            existing = self.analyses.get(analysis_id)
+            existing = self.analyses.get((team_id, analysis_id))
         if existing is not None:
             return existing
         run = LocalEngineRun(session_id=request.session_id, run_id=request.run_id)
@@ -2013,6 +2046,7 @@ class _LocalRuntime:
             sha256_b64=request.trace_sha256_b64,
         )
         analysis = _LocalAnalysis(
+            team_id=team_id,
             analysis_id=analysis_id,
             profile=request.analysis_profile,
             question=(
@@ -2048,14 +2082,14 @@ class _LocalRuntime:
             )
 
         async with self.lock:
-            raced = self.analyses.get(analysis_id)
+            raced = self.analyses.get((team_id, analysis_id))
             if raced is not None:
                 return raced
             task = asyncio.create_task(execute_recovered())
             analysis.task = task
             self.tasks.add(task)
             task.add_done_callback(self.tasks.discard)
-            self.analyses[analysis_id] = analysis
+            self.analyses[(team_id, analysis_id)] = analysis
         try:
             await self._persist(analysis)
         except BaseException:
@@ -2063,11 +2097,11 @@ class _LocalRuntime:
             await asyncio.gather(task, return_exceptions=True)
             async with self.lock:
                 if (
-                    self.analyses.get(analysis_id) is analysis
+                    self.analyses.get((team_id, analysis_id)) is analysis
                     and analysis.task is task
                 ):
                     analysis.task = None
-                    del self.analyses[analysis_id]
+                    del self.analyses[(team_id, analysis_id)]
             self.tasks.discard(task)
             raise
         start_gate.set()
@@ -2151,14 +2185,17 @@ class _LocalRuntime:
     ) -> _PreparedLocalReport:
         try:
             source_value = self.store.load_document(
+                analysis.team_id,
                 analysis.analysis_id,
                 "smartperfetto-report.json",
             )
             projection_value = self.store.load_document(
+                analysis.team_id,
                 analysis.analysis_id,
                 "projection.json",
             )
             core_value = self.store.load_document(
+                analysis.team_id,
                 analysis.analysis_id,
                 "normalized-core.json",
             )
@@ -2187,6 +2224,7 @@ class _LocalRuntime:
             else:
                 core_value = None
                 report_value = self.store.load_document(
+                    analysis.team_id,
                     analysis.analysis_id,
                     "report.json",
                 )
@@ -2249,19 +2287,23 @@ class _LocalRuntime:
                 failure_code="ai_report_rerun_failed",
             )
 
-    async def analysis(self, analysis_id: UUID) -> _LocalAnalysis:
+    async def analysis(self, team_id: UUID, analysis_id: UUID) -> _LocalAnalysis:
         async with self.lock:
-            analysis = self.analyses.get(analysis_id)
+            analysis = self.analyses.get((team_id, analysis_id))
         if analysis is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "analysis not found")
         return analysis
 
-    async def report_analyses(self, *, limit: int) -> tuple[_LocalAnalysis, ...]:
+    async def report_analyses(
+        self, team_id: UUID, *, limit: int
+    ) -> tuple[_LocalAnalysis, ...]:
         if type(limit) is not int or not 1 <= limit <= 20:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid list limit")
         async with self.lock:
             available = tuple(
-                analysis for analysis in self.analyses.values() if analysis.report is not None
+                analysis
+                for (current_team_id, _), analysis in self.analyses.items()
+                if current_team_id == team_id and analysis.report is not None
             )
         return tuple(
             sorted(
@@ -2271,14 +2313,17 @@ class _LocalRuntime:
             )[:limit]
         )
 
-    async def active_analyses(self, *, limit: int) -> tuple[_LocalAnalysis, ...]:
+    async def active_analyses(
+        self, team_id: UUID, *, limit: int
+    ) -> tuple[_LocalAnalysis, ...]:
         if type(limit) is not int or not 1 <= limit <= 20:
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, "invalid list limit")
         async with self.lock:
             active = tuple(
                 analysis
-                for analysis in self.analyses.values()
-                if analysis.state in _ACTIVE_ANALYSIS_STATES
+                for (current_team_id, _), analysis in self.analyses.items()
+                if current_team_id == team_id
+                and analysis.state in _ACTIVE_ANALYSIS_STATES
             )
         return tuple(
             sorted(
@@ -2359,13 +2404,16 @@ class _LocalRuntime:
             upload_id = str(uuid4())
             upload = _LocalUpload(
                 upload_id=upload_id,
+                team_id=analysis.team_id,
                 analysis_id=analysis.analysis_id,
                 kind=request.artifact_kind,
                 mime=request.mime,
                 size=request.size,
                 sha256_b64=request.sha256_b64,
                 token=secrets.token_urlsafe(32),
-                path=self.upload_root / f"{upload_id}.bin",
+                path=self.store.upload_path(
+                    analysis.team_id, analysis.analysis_id, upload_id
+                ),
             )
             self.uploads[upload_id] = upload
             target.upload_id = upload_id
@@ -2385,11 +2433,23 @@ class _LocalRuntime:
             request.headers.get("x-amz-checksum-sha256", ""), upload.sha256_b64
         ):
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "checksum header changed")
-        temporary = upload.path.with_suffix(".uploading")
+        expected_path = self.store.upload_path(
+            upload.team_id, upload.analysis_id, upload.upload_id
+        )
+        if expected_path != upload.path or (
+            upload.path.exists() and not upload.path.is_file()
+        ):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "upload not found")
+        temporary = upload.path.parent / f".{upload.upload_id}.{uuid4().hex}.uploading"
         digest = hashlib.sha256()
         size = 0
         try:
-            with temporary.open("wb") as stream:
+            descriptor = os.open(
+                temporary,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            with os.fdopen(descriptor, "wb") as stream:
                 async for chunk in request.stream():
                     size += len(chunk)
                     if size > upload.size:
@@ -2417,6 +2477,7 @@ class _LocalRuntime:
             upload = self.uploads.get(request.upload_id)
             if (
                 upload is None
+                or upload.team_id != analysis.team_id
                 or upload.analysis_id != analysis.analysis_id
                 or upload.size != request.size
                 or upload.sha256_b64 != request.sha256_b64
@@ -2487,8 +2548,9 @@ class _LocalRuntime:
         if apk.upload_id is None:
             raise RuntimeError("APK upload is missing")
         apk_path = self.uploads[apk.upload_id].path
-        workspace = self.data_root / "device-captures" / str(analysis.analysis_id)
-        workspace.mkdir(parents=True, exist_ok=True)
+        workspace = self.store.analysis_subdirectory(
+            analysis.team_id, analysis.analysis_id, "device-captures"
+        )
         capture = await self.device_capture_gateway.capture(
             apk_path=apk_path,
             serial=detected.device.serial,
@@ -2523,7 +2585,8 @@ class _LocalRuntime:
             analysis.application_version_id = uuid5(
                 _LOCAL_APPLICATION_NAMESPACE,
                 (
-                    f"{metadata.package_name}\0{metadata.version_code}\0"
+                    f"{analysis.team_id}\0{metadata.package_name}\0"
+                    f"{metadata.version_code}\0"
                     f"{apk.descriptor.sha256_b64}"
                 ),
             )
@@ -2565,6 +2628,7 @@ class _LocalRuntime:
         if memory_result is not None:
             await asyncio.to_thread(
                 self.store.save_document,
+                analysis.team_id,
                 analysis.analysis_id,
                 "android-memory-result.json",
                 memory_result.payload,
@@ -2679,18 +2743,21 @@ class _LocalRuntime:
             )
         await asyncio.to_thread(
             self.store.save_document,
+            analysis.team_id,
             analysis.analysis_id,
             "normalized-core.json",
             prepared.core_document,
         )
         await asyncio.to_thread(
             self.store.save_document,
+            analysis.team_id,
             analysis.analysis_id,
             "smartperfetto-report.json",
             prepared.source_report,
         )
         await asyncio.to_thread(
             self.store.save_document,
+            analysis.team_id,
             analysis.analysis_id,
             "projection.json",
             projection_document,
@@ -2753,6 +2820,7 @@ class _LocalRuntime:
                 if output is not None:
                     await asyncio.to_thread(
                         self.store.save_document,
+                        analysis.team_id,
                         analysis.analysis_id,
                         "round-1.json",
                         output.document,
@@ -2803,6 +2871,7 @@ class _LocalRuntime:
         )
         await asyncio.to_thread(
             self.store.save_document,
+            analysis.team_id,
             analysis.analysis_id,
             "report.json",
             report,
@@ -2964,7 +3033,7 @@ class _LocalRuntime:
             return {
                 "schema_version": "1.1" if analysis.source_binding is not None else "1.0",
                 "analysis_id": str(analysis.analysis_id),
-                "team_id": str(LOCAL_TEAM_ID),
+                "team_id": str(analysis.team_id),
                 "analysis_mode": "device",
                 "device_id": str(analysis.device_id),
                 "state": analysis.state,
@@ -3035,7 +3104,7 @@ class _LocalRuntime:
         return {
             "schema_version": "1.1" if analysis.source_binding is not None else "1.0",
             "analysis_id": str(analysis.analysis_id),
-            "team_id": str(LOCAL_TEAM_ID),
+            "team_id": str(analysis.team_id),
             "analysis_mode": "trace_upload",
             "analysis_profile": analysis.profile,
             "question": analysis.question,
@@ -3077,7 +3146,7 @@ class _LocalRuntime:
         }
 
     def slot(self, upload: _LocalUpload, *, finalized: bool) -> dict[str, object]:
-        target = self.analyses[upload.analysis_id].inputs[upload.kind]
+        target = self.analyses[(upload.team_id, upload.analysis_id)].inputs[upload.kind]
         result: dict[str, object] = {
             "state": "finalized" if finalized else "pending",
             "upload_id": upload.upload_id,
@@ -3429,7 +3498,7 @@ def create_local_app(
                     status.HTTP_409_CONFLICT,
                     "selected Android device is unavailable",
                 )
-        return runtime.response(await runtime.create(body))
+        return runtime.response(await runtime.create(team_id, body))
 
     @app.get("/v1/teams/{team_id}/analyses")
     async def list_analyses(
@@ -3449,14 +3518,14 @@ def create_local_app(
                     status.HTTP_422_UNPROCESSABLE_ENTITY,
                     "status and report_available cannot be combined",
                 )
-            analyses = await runtime.active_analyses(limit=limit)
+            analyses = await runtime.active_analyses(team_id, limit=limit)
         elif report_available is not None and not report_available:
             raise HTTPException(
                 status.HTTP_422_UNPROCESSABLE_ENTITY,
                 "report_available must be true",
             )
         else:
-            analyses = await runtime.report_analyses(limit=limit)
+            analyses = await runtime.report_analyses(team_id, limit=limit)
         return {
             "schema_version": "1.0",
             "analyses": [runtime.response(analysis) for analysis in analyses],
@@ -3474,7 +3543,7 @@ def create_local_app(
     ) -> dict[str, object]:
         authorize_team(request, team_id)
         _require_csrf(request, x_csrf_token)
-        return runtime.response(await runtime.recover(body))
+        return runtime.response(await runtime.recover(team_id, body))
 
     @app.post(
         "/v1/teams/{team_id}/analyses/{analysis_id}/uploads",
@@ -3489,7 +3558,7 @@ def create_local_app(
     ) -> dict[str, object]:
         authorize_team(request, team_id)
         _require_csrf(request, x_csrf_token)
-        analysis = await runtime.analysis(analysis_id)
+        analysis = await runtime.analysis(team_id, analysis_id)
         upload = await runtime.reserve(analysis, body)
         return runtime.slot(upload, finalized=False)
 
@@ -3512,7 +3581,7 @@ def create_local_app(
     ) -> dict[str, object]:
         authorize_team(request, team_id)
         _require_csrf(request, x_csrf_token)
-        analysis = await runtime.analysis(analysis_id)
+        analysis = await runtime.analysis(team_id, analysis_id)
         upload = await runtime.finalize(analysis, body)
         return runtime.slot(upload, finalized=True)
 
@@ -3523,7 +3592,7 @@ def create_local_app(
         analysis_id: UUID,
     ) -> dict[str, object]:
         authorize_team(request, team_id)
-        return runtime.response(await runtime.analysis(analysis_id))
+        return runtime.response(await runtime.analysis(team_id, analysis_id))
 
     @app.post("/v1/teams/{team_id}/analyses/{analysis_id}/cancel")
     async def cancel_analysis(
@@ -3535,7 +3604,9 @@ def create_local_app(
     ) -> dict[str, object]:
         authorize_team(request, team_id)
         _require_csrf(request, x_csrf_token)
-        analysis, accepted = await runtime.cancel(await runtime.analysis(analysis_id))
+        analysis, accepted = await runtime.cancel(
+            await runtime.analysis(team_id, analysis_id)
+        )
         http_response.status_code = (
             status.HTTP_202_ACCEPTED if accepted else status.HTTP_200_OK
         )
@@ -3544,7 +3615,7 @@ def create_local_app(
     @app.get("/v1/teams/{team_id}/analyses/{analysis_id}/report")
     async def read_report(request: Request, team_id: UUID, analysis_id: UUID) -> dict[str, object]:
         authorize_team(request, team_id)
-        analysis = await runtime.analysis(analysis_id)
+        analysis = await runtime.analysis(team_id, analysis_id)
         if analysis.report is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "report not ready")
         return analysis.report
@@ -3561,7 +3632,7 @@ def create_local_app(
     ) -> dict[str, object]:
         authorize_team(request, team_id)
         _require_csrf(request, x_csrf_token)
-        analysis = await runtime.analysis(analysis_id)
+        analysis = await runtime.analysis(team_id, analysis_id)
         generation = await runtime.rerun_synthesis(analysis)
         return {
             "schema_version": "1.0",
