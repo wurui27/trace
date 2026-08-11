@@ -349,6 +349,40 @@ def test_two_processes_serialise_updates_without_losing_users(tmp_path: Path) ->
     assert reopened.authenticate("second", "safe local password") is not None
 
 
+def test_first_lock_creation_handles_a_concurrent_creator_atomically(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = LocalControlStore(tmp_path)
+    original_open = os.open
+    injected_collision = False
+
+    def create_competitor_then_report_exists(
+        path: Path | str,
+        flags: int,
+        *args: object,
+        **kwargs: object,
+    ) -> int:
+        nonlocal injected_collision
+        if path == ".control.lock" and flags & os.O_CREAT:
+            assert flags & os.O_EXCL
+            if not injected_collision:
+                injected_collision = True
+                descriptor = original_open(path, flags, *args, **kwargs)
+                os.close(descriptor)
+                raise FileExistsError
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(
+        "perfpilot_api.local_control_store.os.open",
+        create_competitor_then_report_exists,
+    )
+    created = store.ensure_user("ordinary", "valid password", False)
+
+    assert injected_collision is True
+    assert created.created is True
+
+
 def test_normalization_collision_password_validation_and_team_requirement(tmp_path: Path) -> None:
     store = LocalControlStore(tmp_path)
     created = store.ensure_user("  Stra\u00dfe ", "valid password", False)

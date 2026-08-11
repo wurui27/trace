@@ -272,13 +272,10 @@ class LocalControlStore:
                 _CONTROL_FILE_NAME
             ):
                 raise LocalControlStoreError("unsafe local control path")
-            descriptor = os.open(
-                _LOCK_FILE_NAME,
-                os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
-                0o600,
-                dir_fd=self._operation_root_fd,
-            )
+            descriptor = self._open_lock_file()
             with os.fdopen(descriptor, "r+b", closefd=True) as lock_file:
+                if not stat.S_ISREG(os.fstat(lock_file.fileno()).st_mode):
+                    raise LocalControlStoreError("unsafe local control path")
                 os.fchmod(lock_file.fileno(), 0o600)
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
                 try:
@@ -423,6 +420,22 @@ class LocalControlStore:
             if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                 raise LocalControlStoreError("unsafe local control path")
             os.fchmod(stream.fileno(), 0o600)
+
+    def _open_lock_file(self) -> int:
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            return os.open(
+                _LOCK_FILE_NAME,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=self._operation_root_fd,
+            )
+        except FileExistsError:
+            return os.open(
+                _LOCK_FILE_NAME,
+                flags,
+                dir_fd=self._operation_root_fd,
+            )
 
     @property
     def _operation_root_fd(self) -> int:
