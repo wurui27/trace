@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import importlib.util
 import json
 import os
 import stat
@@ -17,10 +18,17 @@ from perfpilot_agent.source_rules import select_source_context
 from perfpilot_agent.source_snapshot import SourceSnapshotter
 from perfpilot_api.ai.local_report import LocalReportSynthesizer
 from perfpilot_api.ai.openai_compatible import SynthesisCandidate
+from perfpilot_api.local_agent_store import LocalAgentStore
+from perfpilot_api.local_control_store import LocalControlStore
 from perfpilot_api.reports.contracts import canonical_json_bytes
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
 from perfpilot_api.reports.source_context import validate_source_context
+from perfpilot_api.reports.smartperfetto_original import (
+    SmartPerfettoOriginalNotFound,
+    persist_smartperfetto_original,
+    read_smartperfetto_original,
+)
 from perfpilot_api.reports.writer import AnalysisReportWriteRequest, compose_analysis_report
 from perfpilot_api.services.source_tasks import SourceTaskError
 from perfpilot_api.workers.source_orchestrator import (
@@ -43,9 +51,7 @@ CHECKSUM = base64.b64encode(b"c" * 32).decode("ascii")
 
 
 def _load(name: str) -> dict[str, object]:
-    return json.loads(
-        (ROOT / "contracts/v1/examples" / name).read_text(encoding="utf-8")
-    )
+    return json.loads((ROOT / "contracts/v1/examples" / name).read_text(encoding="utf-8"))
 
 
 def _core() -> NormalizedTraceReport:
@@ -68,7 +74,49 @@ class OnePassProvider:
     async def complete(self, *, projection) -> SynthesisCandidate:
         self.calls += 1
         candidate = _load("synthesis-output-v2.valid.json")
+        candidate["verdict"] = "启动关键路径被同步初始化阻塞。"
+        candidate["executive_summary"] = "将同步查询移到首帧之后，再重复相同的冷启动场景。"
+        for finding in candidate["top_findings"]:
+            finding["user_impact"] = "首屏显示时间晚于现有目标。"
+        for index, recommendation in enumerate(candidate["recommendations"]):
+            recommendation["title"] = "延后同步查询" if index == 0 else "重复启动采集"
+            recommendation["action"] = (
+                "将查询移到首帧之后。" if index == 0 else "修改后采集相同的冷启动流程。"
+            )
+            recommendation["expected_effect"] = (
+                "移除启动关键路径中的同步等待。" if index == 0 else "依据现有阈值确认启动指标。"
+            )
+        for item in candidate["retest_plan"]:
+            item["steps"] = "使用相同流程采集五次冷启动。"
         candidate["source_fixes"] = []
+        source_context = projection.document.get("source_context")
+        if isinstance(source_context, dict) and source_context.get("match_summary") == "strong":
+            source_ref = source_context["fragments"][0]
+            relative_path = source_ref["relative_path"]
+            candidate["source_fixes"] = [
+                {
+                    "fix_id": "96000000-0000-4000-8000-000000000001",
+                    "finding_id": source_ref["finding_ids"][0],
+                    "evidence_ids": source_ref["evidence_ids"],
+                    "recommendation_priority": "p0",
+                    "source_ref_ids": [source_ref["source_ref_id"]],
+                    "rule_id": source_ref["rule_ids"][0],
+                    "match_grade": "strong",
+                    "relative_path": relative_path,
+                    "symbol": source_ref["symbol"],
+                    "diagnosis": "启动路径在主线程执行了同步等待。",
+                    "diff": (
+                        f"diff --git a/{relative_path} b/{relative_path}\n"
+                        f"--- a/{relative_path}\n"
+                        f"+++ b/{relative_path}\n"
+                        "@@ -1 +1 @@\n"
+                        "-fun onCreate() = Thread.sleep(42)\n"
+                        "+fun onCreate() = launchAfterFirstFrame()\n"
+                    ),
+                    "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+                    "retest_target": "重复冷启动并对比首帧耗时。",
+                }
+            ]
         return SynthesisCandidate(canonical_json_bytes(candidate), 10, 20, 30)
 
     async def aclose(self) -> None:
@@ -175,7 +223,7 @@ def _source_document(context: dict[str, object]) -> dict[str, object]:
         "agent_id": str(AGENT_ID),
         "workspace_id": str(WORKSPACE_ID),
         "snapshot_policy": "tracked_worktree",
-        "validation_profile_id": None,
+        "validation_profile_id": "94000000-0000-4000-8000-000000000001",
         "snapshot": {
             "snapshot_id": context["snapshot_id"],
             "snapshot_hash": context["snapshot_hash"],
@@ -275,6 +323,10 @@ async def test_current_dirty_source_reaches_strong_v12_refs_without_mutating_git
     assert "DIRTY_SENTINEL" in projection["source_context"]["fragments"][0]["content"]
     assert report["schema_version"] == "1.2"
     assert report["source_code"]["source_refs"]
+    assert report["source_code"]["fixes"][0]["relative_path"] == (
+        "app/src/main/java/demo/Startup.kt"
+    )
+    assert report["source_code"]["fixes"][0]["diff"].startswith("diff --git a/app/")
     assert _repository_digest(repository) == tree_before
     assert _repository_digest(repository, git_only=True) == git_before
 
@@ -343,3 +395,71 @@ async def test_offline_agent_degrades_to_trace_only_ai_report() -> None:
     assert report["synthesis"]["state"] == "completed"
     assert report["source_code"]["context_state"] == "unavailable"
     assert report["state"] == "partially_completed"
+
+
+@pytest.mark.asyncio
+async def test_team_artifacts_reset_without_changing_persistent_users_or_agents(
+    tmp_path: Path,
+) -> None:
+    state_root = tmp_path / "state"
+    analysis_root = tmp_path / "analysis"
+    control = LocalControlStore(state_root / "control")
+    user_a = control.ensure_user("user01", "initial user password", False).principal
+    user_b = control.ensure_user("user02", "initial user password", False).principal
+    agents = LocalAgentStore(state_root / "agents", uuid_factory=lambda: AGENT_ID)
+    await agents.create_pending(
+        team_id=user_a.team_id,
+        owner_user_id=user_a.user_id,
+        name="Source Mac",
+        registration_code_digest="a" * 64,
+        registration_code_expires_at=NOW.replace(year=2027),
+        now=NOW,
+    )
+    original_bytes = b'{ "summary": "SmartPerfetto original", "findings": [] }\n'
+    binding = persist_smartperfetto_original(
+        root=analysis_root,
+        team_id=user_a.team_id,
+        analysis_id=ANALYSIS_ID,
+        payload=original_bytes,
+    )
+    (analysis_root / "teams" / str(user_b.team_id) / "analyses").mkdir(parents=True)
+    report, _provider, _projection = await _report(
+        source_context=None,
+        source_document=_source_not_requested(),
+    )
+    assert canonical_json_bytes(report) != original_bytes
+    assert (
+        read_smartperfetto_original(
+            root=analysis_root,
+            binding=binding,
+            team_id=user_a.team_id,
+            analysis_id=ANALYSIS_ID,
+        )
+        == original_bytes
+    )
+    with pytest.raises(SmartPerfettoOriginalNotFound):
+        read_smartperfetto_original(
+            root=analysis_root,
+            binding=binding,
+            team_id=user_b.team_id,
+            analysis_id=ANALYSIS_ID,
+        )
+
+    control_bytes = (state_root / "control" / "control.json").read_bytes()
+    agent_bytes = (state_root / "agents" / "agents.json").read_bytes()
+    reset_script = ROOT / "scripts" / "reset-ubuntu-analysis-data.py"
+    spec = importlib.util.spec_from_file_location("acceptance_reset", reset_script)
+    assert spec is not None and spec.loader is not None
+    reset = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(reset)
+    reset.reset_analysis_root(str(analysis_root), str(analysis_root), str(state_root))
+
+    assert list(analysis_root.iterdir()) == []
+    assert not any(".reset-" in path.name for path in tmp_path.iterdir())
+    assert (state_root / "control" / "control.json").read_bytes() == control_bytes
+    assert (state_root / "agents" / "agents.json").read_bytes() == agent_bytes
+    reopened_control = LocalControlStore(state_root / "control")
+    reopened_agents = LocalAgentStore(state_root / "agents")
+    assert reopened_control.find_user("user01") == user_a
+    assert reopened_control.find_user("user02") == user_b
+    assert [agent.id for agent in await reopened_agents.list_team(user_a.team_id)] == [AGENT_ID]
