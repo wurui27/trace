@@ -1556,7 +1556,7 @@ def _local_source_code_document(analysis: _LocalAnalysis) -> dict[str, object]:
         else str(analysis.source_code_analysis.get("match_summary", "none"))
     )
     source_refs: list[dict[str, object]] = []
-    if available and match_summary in {"strong", "weak"}:
+    if available and match_summary == "strong":
         fragments = context.get("fragments")
         if isinstance(fragments, list):
             source_refs = [
@@ -1570,7 +1570,7 @@ def _local_source_code_document(analysis: _LocalAnalysis) -> dict[str, object]:
                 }
                 for fragment in fragments
                 if isinstance(fragment, Mapping)
-                and fragment.get("match_grade") in {"strong", "weak"}
+                and fragment.get("match_grade") == "strong"
             ]
     snapshot = (
         {
@@ -2166,6 +2166,7 @@ class _LocalRuntime:
             analysis = self._restore_analysis(document)
             migrate_created_at = document.get("created_at") is None
             source_degraded = False
+            resume_gate: asyncio.Event | None = None
             if analysis.team_id != team_id or analysis.analysis_id != analysis_id:
                 raise ValueError("persisted local analysis identity changed")
             if document.get("report_available") is True:
@@ -2237,8 +2238,47 @@ class _LocalRuntime:
                     if stage_state not in {"completed", "failed", "not_requested"}:
                         analysis.stages[stage_name] = "canceled"
                 analysis.version += 1
+            resume_from_prepared = (
+                source_degraded
+                and not restore_canceled
+                and analysis.state in _ACTIVE_ANALYSIS_STATES
+                and analysis.stages.get("smartperfetto") == "completed"
+                and analysis.evidence_manifest is not None
+                and analysis.task is None
+            )
+            if resume_from_prepared:
+                resume_gate = asyncio.Event()
+                generation = analysis.generation
+
+                async def resume_persisted_synthesis(
+                    current: _LocalAnalysis = analysis,
+                    current_generation: int = generation,
+                    gate: asyncio.Event = resume_gate,
+                ) -> None:
+                    await gate.wait()
+                    await self._execute_persisted_synthesis(
+                        current,
+                        generation=current_generation,
+                    )
+
+                task = asyncio.create_task(resume_persisted_synthesis())
+                analysis.task = task
+                self.tasks.add(task)
+                task.add_done_callback(self.tasks.discard)
+                analysis.stages["perfpilot_ai"] = "running"
+                analysis.version += 1
             if migrate_created_at or restore_canceled or source_degraded:
-                await self._persist(analysis)
+                try:
+                    await self._persist(analysis)
+                except BaseException:
+                    if resume_gate is not None and analysis.task is not None:
+                        analysis.task.cancel()
+                        await asyncio.gather(analysis.task, return_exceptions=True)
+                        self.tasks.discard(analysis.task)
+                        analysis.task = None
+                    raise
+            if resume_gate is not None:
+                resume_gate.set()
 
     async def close(self) -> None:
         tasks = tuple(self.tasks)

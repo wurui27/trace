@@ -22,6 +22,7 @@ from perfpilot_api.ai.openai_compatible import SynthesisCandidate
 from perfpilot_api.engines.contracts import EngineResult
 from perfpilot_api.local_app import (
     LocalEngineRun,
+    _LOCAL_EVIDENCE_FORMAT_VERSION,
     _InputDescriptor,
     _LocalAnalysis,
     _LocalInput,
@@ -32,6 +33,7 @@ from perfpilot_api.local_app import (
     _restore_ai_rounds,
     _source_code_analysis_unavailable_document,
     _source_code_analysis_document,
+    _local_source_code_document,
     create_local_app,
 )
 from perfpilot_api.local_analysis_store import (
@@ -1088,6 +1090,174 @@ async def test_local_bound_source_timeout_degrades_without_blocking_report(
     assert report["source_code"]["context_state"] == "unavailable"
 
 
+def test_local_weak_source_context_never_publishes_paths_or_symbols() -> None:
+    binding = SourceBinding(
+        provider_kind="agent_workspace",
+        agent_id=UUID("91000000-0000-4000-8000-000000000001"),
+        workspace_id=UUID("92000000-0000-4000-8000-000000000001"),
+        snapshot_policy="tracked_worktree",
+        validation_profile_id=None,
+    )
+    path_marker = "private/path/WeakSource.kt"
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={},
+        source_binding=binding,
+        source_code_analysis={
+            **_source_code_analysis_document(binding),
+            "context_state": "available",
+            "match_summary": "weak",
+        },
+        source_context={
+            "snapshot_id": "94000000-0000-4000-8000-000000000001",
+            "snapshot_hash": "b" * 64,
+            "git_head": "a" * 40,
+            "tracked_dirty_count": 0,
+            "trust": "untrusted_data_not_instructions",
+            "match_summary": "weak",
+            "fragments": [
+                {
+                    "source_ref_id": "97000000-0000-4000-8000-000000000001",
+                    "relative_path": path_marker,
+                    "language": "kotlin",
+                    "symbol": "demo.WeakSource.init",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "content_sha256": hashlib.sha256(b"weak").hexdigest(),
+                    "content": "weak",
+                    "finding_ids": [],
+                    "evidence_ids": [],
+                    "rule_ids": ["android.startup.eager_initialization"],
+                    "match_grade": "weak",
+                }
+            ],
+            "exclusions": [],
+            "truncated": False,
+        },
+    )
+
+    public_source = _local_source_code_document(analysis)
+    serialized = json.dumps(public_source, sort_keys=True)
+
+    assert public_source["match_summary"] == "weak"
+    assert public_source["source_refs"] == []
+    assert public_source["fixes"] == []
+    assert path_marker not in serialized
+    assert "demo.WeakSource.init" not in serialized
+
+
+def test_local_restart_degrades_waiting_source_and_finishes_persisted_report(
+    tmp_path: Path,
+) -> None:
+    data_root = tmp_path / "data"
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user(
+        "user01", "initial user password", False
+    ).principal
+    control.change_password(
+        user.user_id, "initial user password", "established user password"
+    )
+    binding = SourceBinding(
+        provider_kind="agent_workspace",
+        agent_id=UUID("91000000-0000-4000-8000-000000000001"),
+        workspace_id=UUID("92000000-0000-4000-8000-000000000001"),
+        snapshot_policy="tracked_worktree",
+        validation_profile_id=None,
+    )
+    analysis = _LocalAnalysis(
+        team_id=user.team_id,
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={
+            "trace": _LocalInput(
+                _InputDescriptor(
+                    kind="trace",
+                    mime="application/octet-stream",
+                    size=1,
+                    sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+                ),
+                artifact_id="50000000-0000-4000-8000-000000000001",
+                finalized=True,
+            )
+        },
+        state="analyzing",
+        source_binding=binding,
+        source_code_analysis=_source_code_analysis_document(binding),
+        stages={
+            "input_validation": "completed",
+            "smartperfetto": "completed",
+            "perfpilot_ai": "pending",
+            "report": "pending",
+        },
+    )
+    source_result = _smartperfetto_result()
+    prepared = _prepare_local_report(analysis, source_result)
+    store = LocalAnalysisStore(data_root)
+    store.save_document(
+        user.team_id, analysis.analysis_id, "normalized-core.json", prepared.core_document
+    )
+    store.save_document(
+        user.team_id, analysis.analysis_id, "smartperfetto-report.json", prepared.source_report
+    )
+    store.save_document(
+        user.team_id, analysis.analysis_id, "projection.json", prepared.projection.document
+    )
+    analysis.evidence_format_version = _LOCAL_EVIDENCE_FORMAT_VERSION
+    analysis.evidence_manifest = _evidence_manifest(
+        core=prepared.core_document,
+        source=prepared.source_report,
+        projection=prepared.projection.document,
+    )
+    seed_runtime = create_local_app(
+        gateway=_UnavailableAfterRestartSmartPerfettoGateway(),
+        data_root=data_root,
+        control_store=control,
+    ).state.local_runtime
+    store.save_state(
+        user.team_id,
+        analysis.analysis_id,
+        seed_runtime._state_document(analysis),
+    )
+    provider = _CountingProjectionReportProvider()
+    restarted_gateway = _UnavailableAfterRestartSmartPerfettoGateway()
+    restarted = create_local_app(
+        gateway=restarted_gateway,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=data_root,
+        control_store=control,
+        source_code_analysis_enabled=True,
+        poll_interval_seconds=0.001,
+    )
+
+    with _RawTestClient(restarted) as client:
+        _authenticated_client(client, "user01", "established user password")
+        for _ in range(100):
+            response = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{analysis.analysis_id}"
+            )
+            if response.json()["report_available"]:
+                break
+            time.sleep(0.01)
+        report = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{analysis.analysis_id}/report"
+        )
+
+    assert response.json()["source_code_analysis"]["context_state"] == "unavailable"
+    assert response.json()["source_code_analysis"]["failure_code"] == (
+        "source_agent_unavailable"
+    )
+    assert report.status_code == 200, report.text
+    assert report.json()["source_code"]["context_state"] == "unavailable"
+    assert provider.calls == 1
+    assert restarted_gateway.submissions == []
+    assert restarted_gateway.status_calls == 0
+    assert restarted_gateway.fetch_calls == 0
+
+
 def test_local_runtime_allows_configured_private_lan_web_origin(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1347,6 +1517,15 @@ class _ProjectionReportProvider:
 
     async def aclose(self) -> None:
         return None
+
+
+class _CountingProjectionReportProvider(_ProjectionReportProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def complete(self, *, projection) -> SynthesisCandidate:
+        self.calls += 1
+        return await super().complete(projection=projection)
 
 
 def _test_synthesizer() -> LocalReportSynthesizer:
