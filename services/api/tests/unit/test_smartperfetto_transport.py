@@ -76,6 +76,7 @@ async def test_transport_sends_only_server_owned_auth_and_workspace_headers() ->
     assert response == SmartPerfettoJsonResponse(
         status_code=200,
         payload={"success": True},
+        raw_body=b'{"success":true}',
     )
     assert len(requests) == 1
     assert requests[0].headers["Authorization"] == "Bearer service-api-key-secret-marker"

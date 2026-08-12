@@ -3,10 +3,12 @@
 import { ArrowLeft, CheckCircle2, Download } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 import { completedAiProcessCopy } from "../lib/analysis-ai-status";
 import { createRandomUuid } from "../lib/perfpilot-api";
 import { createPerfPilotClient, type PerfPilotClient } from "../lib/perfpilot-api";
+import type { SmartPerfettoOriginal } from "../lib/perfpilot-api";
 import { printAnalysisReport, supportsReportPrint } from "../lib/report-print";
 import {
   createAnalysisLoader,
@@ -48,6 +50,8 @@ export function FullAnalysisReport({
   const [snapshot, setSnapshot] = useState<ReportSnapshot | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [printSupported, setPrintSupported] = useState<boolean | null>(null);
+  const [originalForPrint, setOriginalForPrint] = useState<SmartPerfettoOriginal | null>(null);
+  const [originalPrintFailed, setOriginalPrintFailed] = useState(false);
   const retryController = useRef<AbortController | null>(null);
   const requestKey = `${analysisId}:${attempt}`;
 
@@ -157,6 +161,26 @@ export function FullAnalysisReport({
     }
   };
 
+  const printReport = async (): Promise<void> => {
+    if (report.schema_version === "1.2" && originalForPrint === null && !originalPrintFailed) {
+      const controller = new AbortController();
+      const timer = window.setTimeout(() => controller.abort(), 3_000);
+      try {
+        const original = await client.smartPerfettoOriginal(
+          teamId,
+          analysisId,
+          controller.signal,
+        );
+        flushSync(() => setOriginalForPrint(original));
+      } catch {
+        flushSync(() => setOriginalPrintFailed(true));
+      } finally {
+        window.clearTimeout(timer);
+      }
+    }
+    printer(analysisId);
+  };
+
   return (
     <div className="final-report-page">
       <header className="final-report-topbar">
@@ -179,7 +203,7 @@ export function FullAnalysisReport({
             aria-describedby={printSupported === false ? "report-print-unavailable" : undefined}
             className="final-report-download"
             disabled={printSupported !== true}
-            onClick={() => printer(analysisId)}
+            onClick={() => void printReport()}
             type="button"
           >
             <Download aria-hidden="true" />
@@ -277,6 +301,8 @@ export function FullAnalysisReport({
           report={report}
           teamId={analysis.team_id}
           client={client}
+          originalForPrint={originalForPrint}
+          originalPrintFailed={originalPrintFailed}
           onRetrySynthesis={retrySynthesis}
           retrying={retrying}
         />

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, Protocol
 from uuid import UUID
@@ -122,6 +122,7 @@ class EngineResult:
     contract: str
     state: EngineTerminalStateValue
     payload: dict[str, object]
+    original_report_bytes: bytes | None = field(default=None, repr=False)
 
 
 class EngineAdapter(Protocol):

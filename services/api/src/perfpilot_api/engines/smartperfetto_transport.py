@@ -24,6 +24,7 @@ _EXTERNAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
 class SmartPerfettoJsonResponse:
     status_code: int
     payload: dict[str, Any]
+    raw_body: bytes
 
 
 def _error(
@@ -138,7 +139,7 @@ class SmartPerfettoTransport:
         headers["Authorization"] = f"Bearer {token}"
         return headers
 
-    async def _bounded_json(self, response: httpx.Response) -> dict[str, Any]:
+    async def _bounded_json(self, response: httpx.Response) -> tuple[dict[str, Any], bytes]:
         chunks: list[bytes] = []
         size = 0
         async for chunk in response.aiter_bytes():
@@ -147,12 +148,13 @@ class SmartPerfettoTransport:
                 raise _error("engine_contract_invalid", retryable=False)
             chunks.append(chunk)
         try:
-            payload = json.loads(b"".join(chunks))
+            raw_body = b"".join(chunks)
+            payload = json.loads(raw_body)
         except (TypeError, ValueError, json.JSONDecodeError, UnicodeDecodeError):
             raise _error("engine_contract_invalid", retryable=False) from None
         if not isinstance(payload, dict):
             raise _error("engine_contract_invalid", retryable=False)
-        return payload
+        return payload, raw_body
 
     @staticmethod
     def _check_status(response: httpx.Response) -> None:
@@ -191,10 +193,11 @@ class SmartPerfettoTransport:
                 follow_redirects=False,
             )
             self._check_status(response)
-            payload = await self._bounded_json(response)
+            payload, raw_body = await self._bounded_json(response)
             return SmartPerfettoJsonResponse(
                 status_code=response.status_code,
                 payload=payload,
+                raw_body=raw_body,
             )
         except EngineAdapterError:
             raise
@@ -237,8 +240,8 @@ class SmartPerfettoTransport:
                 follow_redirects=False,
             )
             self._check_status(response)
-            payload = await self._bounded_json(response)
-            return SmartPerfettoJsonResponse(response.status_code, payload)
+            payload, raw_body = await self._bounded_json(response)
+            return SmartPerfettoJsonResponse(response.status_code, payload, raw_body)
         except EngineAdapterError:
             raise
         except httpx.TimeoutException:

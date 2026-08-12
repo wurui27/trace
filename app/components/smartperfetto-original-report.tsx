@@ -24,18 +24,22 @@ export function SmartPerfettoOriginalReport({
   analysisId,
   teamId,
   client,
+  preloadedDocument = null,
+  preloadFailed = false,
 }: {
   readonly active: boolean;
   readonly analysisId: string;
   readonly teamId?: string;
   readonly client: PerfPilotClient;
+  readonly preloadedDocument?: SmartPerfettoOriginal | null;
+  readonly preloadFailed?: boolean;
 }) {
   const [attempt, setAttempt] = useState(0);
   const [document, setDocument] = useState<SmartPerfettoOriginal | null>(null);
   const [failed, setFailed] = useState(false);
 
   useEffect(() => {
-    if (!active || !teamId || document !== null) return;
+    if (!active || !teamId || document !== null || preloadedDocument !== null) return;
     const controller = new AbortController();
     void client.smartPerfettoOriginal(teamId, analysisId, controller.signal).then(
       (value) => setDocument(value),
@@ -44,19 +48,20 @@ export function SmartPerfettoOriginalReport({
       },
     );
     return () => controller.abort();
-  }, [active, analysisId, attempt, client, document, teamId]);
+  }, [active, analysisId, attempt, client, document, preloadedDocument, teamId]);
 
-  const summary = useMemo(() => text(document?.summary), [document]);
-  const findings = useMemo(() => array(document?.findings), [document]);
+  const visibleDocument = preloadedDocument ?? document;
+  const summary = useMemo(() => text(visibleDocument?.summary), [visibleDocument]);
+  const findings = useMemo(() => array(visibleDocument?.findings), [visibleDocument]);
   const verification = useMemo(
-    () => text(document?.claimVerificationResult ?? document?.claimSupport ?? document?.verification),
-    [document],
+    () => text(visibleDocument?.claimVerificationResult ?? visibleDocument?.claimSupport ?? visibleDocument?.verification),
+    [visibleDocument],
   );
 
   if (!teamId) {
     return <p role="status">当前页面缺少团队上下文，无法读取原始报告。</p>;
   }
-  if (failed) {
+  if (failed || preloadFailed) {
     return (
       <div role="alert">
         <p>SmartPerfetto 原始报告暂时无法读取。</p>
@@ -64,7 +69,7 @@ export function SmartPerfettoOriginalReport({
       </div>
     );
   }
-  if (document === null) return <p role="status">正在读取 SmartPerfetto 原始报告…</p>;
+  if (visibleDocument === null) return <p role="status">正在读取 SmartPerfetto 原始报告…</p>;
 
   return (
     <section className="smartperfetto-original-report" aria-label="SmartPerfetto 原始报告内容">
@@ -90,7 +95,7 @@ export function SmartPerfettoOriginalReport({
       </section>
       <details className="smartperfetto-full-json">
         <summary>查看完整 JSON</summary>
-        <pre>{JSON.stringify(document, null, 2)}</pre>
+        <pre>{JSON.stringify(visibleDocument, null, 2)}</pre>
       </details>
     </section>
   );

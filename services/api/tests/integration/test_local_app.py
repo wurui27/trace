@@ -100,8 +100,9 @@ class TestClient(_RawTestClient):
 
 
 class _FakeSmartPerfettoGateway:
-    def __init__(self, result: EngineResult) -> None:
+    def __init__(self, result: EngineResult, *, original_report_bytes: bytes | None = None) -> None:
         self.result = result
+        self.original_report_bytes = original_report_bytes
         self.submissions: list[tuple[bytes, str, str | None]] = []
         self.cancel_calls: list[LocalEngineRun] = []
 
@@ -121,7 +122,14 @@ class _FakeSmartPerfettoGateway:
 
     async def fetch_result(self, run: LocalEngineRun) -> EngineResult:
         assert run.run_id == "run-local-1"
-        return self.result
+        if self.original_report_bytes is None:
+            return self.result
+        return EngineResult(
+            contract=self.result.contract,
+            state=self.result.state,
+            payload=self.result.payload,
+            original_report_bytes=self.original_report_bytes,
+        )
 
     async def cancel(self, run: LocalEngineRun) -> None:
         self.cancel_calls.append(run)
@@ -2932,6 +2940,62 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
                 "startup.startup_analysis_get_startups.dur_ms",
                 "startup.startup_analysis_get_startups.ttid_ms",
             }
+
+
+def test_local_app_downloads_exact_upstream_smartperfetto_report_bytes(
+    tmp_path: Path,
+) -> None:
+    result = _smartperfetto_result()
+    source = result.payload["report"]
+    assert isinstance(source, dict)
+    reordered = {key: source[key] for key in reversed(source)}
+    reordered["analysisNotes"] = ["原始结论"]
+    raw = json.dumps(reordered, ensure_ascii=True, indent=2).encode("utf-8") + b"\n"
+    parsed = json.loads(raw)
+    result = EngineResult(
+        contract=result.contract,
+        state=result.state,
+        payload={"reportId": parsed["reportId"], "report": parsed},
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(result, original_report_bytes=raw),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client, team_id=team_id, headers=headers
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+        )
+        for _ in range(200):
+            state = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()["state"]
+            if state in {"completed", "partially_completed", "failed"}:
+                break
+            time.sleep(0.01)
+        downloaded = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/smartperfetto-original?download=true"
+        )
+        report = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        ).json()
+
+    assert downloaded.status_code == 200
+    assert downloaded.content == raw
+    assert report["smartperfetto_original"]["size"] == len(raw)
+    assert report["smartperfetto_original"]["sha256"] == hashlib.sha256(raw).hexdigest()
 
 
 def test_local_app_publishes_core_report_when_ai_projection_is_privacy_blocked(

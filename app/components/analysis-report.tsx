@@ -24,6 +24,8 @@ interface AnalysisReportViewProps {
   readonly retrying: boolean;
   readonly teamId?: string;
   readonly client?: PerfPilotClient;
+  readonly originalForPrint?: import("../lib/perfpilot-api").SmartPerfettoOriginal | null;
+  readonly originalPrintFailed?: boolean;
 }
 
 interface LegacyAnalysisReportViewProps extends Omit<AnalysisReportViewProps, "report"> {
@@ -161,7 +163,7 @@ function memoryMetricRank(metric: ReportMetric): number {
 
 export function AnalysisReportView(props: AnalysisReportViewProps) {
   if (props.report.schema_version === "1.2") {
-    return <SourceAwareAnalysisReportView report={props.report} teamId={props.teamId} client={props.client ?? defaultClient} />;
+    return <SourceAwareAnalysisReportView report={props.report} teamId={props.teamId} client={props.client ?? defaultClient} originalForPrint={props.originalForPrint} originalPrintFailed={props.originalPrintFailed} />;
   }
   return <LegacyAnalysisReportView {...props} report={props.report} />;
 }
@@ -170,10 +172,14 @@ function SourceAwareAnalysisReportView({
   report,
   teamId,
   client,
+  originalForPrint,
+  originalPrintFailed,
 }: {
   readonly report: Extract<AnalysisReport, { readonly schema_version: "1.2" }>;
   readonly teamId?: string;
   readonly client: PerfPilotClient;
+  readonly originalForPrint?: import("../lib/perfpilot-api").SmartPerfettoOriginal | null;
+  readonly originalPrintFailed?: boolean;
 }) {
   const [tab, setTab] = useState<"conclusion" | "source" | "appendix" | "original">("conclusion");
   return (
@@ -212,6 +218,8 @@ function SourceAwareAnalysisReportView({
           analysisId={report.analysis_id}
           teamId={teamId}
           client={client}
+          preloadedDocument={originalForPrint}
+          preloadFailed={originalPrintFailed}
         />
       </div>
     </article>

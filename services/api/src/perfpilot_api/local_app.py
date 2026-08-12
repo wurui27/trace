@@ -12,6 +12,7 @@ import base64
 import hashlib
 import hmac
 import ipaddress
+import json
 import logging
 import os
 import secrets
@@ -339,6 +340,10 @@ class SmartPerfettoLocalGateway:
         if not 200 <= response.status_code <= 299:
             raise RuntimeError("SmartPerfetto report is unavailable")
         parsed = SmartPerfettoReportResponse.model_validate(response.payload)
+        original_report_bytes = _top_level_json_value_bytes(
+            response.raw_body,
+            "report",
+        )
         report = parsed.sanitized_report
         usable = bool(
             isinstance(report.get("summary"), Mapping)
@@ -348,6 +353,7 @@ class SmartPerfettoLocalGateway:
             contract="workspace-agent-v1",
             state="completed" if usable else "insufficient_data",
             payload={"reportId": parsed.report_id, "report": report},
+            original_report_bytes=original_report_bytes,
         )
 
     async def cancel(self, run: LocalEngineRun) -> None:
@@ -376,6 +382,48 @@ def _validated_checksum(value: str) -> str:
     if base64.b64encode(decoded).decode("ascii") != value:
         raise ValueError("invalid checksum")
     return value
+
+
+def _top_level_json_value_bytes(payload: bytes, key: str) -> bytes:
+    """Return one top-level JSON value without reserializing it."""
+
+    try:
+        text = payload.decode("utf-8", errors="strict")
+        decoder = json.JSONDecoder()
+        index = 0
+
+        def whitespace(position: int) -> int:
+            while position < len(text) and text[position] in " \t\r\n":
+                position += 1
+            return position
+
+        index = whitespace(index)
+        if index >= len(text) or text[index] != "{":
+            raise ValueError
+        index += 1
+        while True:
+            index = whitespace(index)
+            if index >= len(text) or text[index] == "}":
+                raise ValueError
+            name, index = decoder.raw_decode(text, index)
+            if not isinstance(name, str):
+                raise ValueError
+            index = whitespace(index)
+            if index >= len(text) or text[index] != ":":
+                raise ValueError
+            value_start = whitespace(index + 1)
+            _value, value_end = decoder.raw_decode(text, value_start)
+            if name == key:
+                extracted = text[value_start:value_end].encode("utf-8")
+                if not 0 < len(extracted) <= 2 * 1024 * 1024:
+                    raise ValueError
+                return extracted
+            index = whitespace(value_end)
+            if index >= len(text) or text[index] != ",":
+                raise ValueError
+            index += 1
+    except (UnicodeError, ValueError):
+        raise RuntimeError("SmartPerfetto report is unavailable") from None
 
 
 class _StrictModel(BaseModel):
@@ -772,6 +820,7 @@ class _PreparedLocalReport:
     canonical_sha256_b64: str
     normalizer_version: str
     source_report: dict[str, object]
+    original_report_bytes: bytes | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -780,6 +829,7 @@ class _NormalizedLocalResult:
     artifact_id: UUID
     canonical_sha256_b64: str
     source_report: dict[str, object]
+    original_report_bytes: bytes | None = field(default=None, repr=False)
 
 
 _PERSISTED_STATE_KEYS = {
@@ -1208,6 +1258,7 @@ def _normalize_local_smartperfetto_result(
         artifact_id=artifact_id,
         canonical_sha256_b64=canonical.checksum_sha256_b64,
         source_report=dict(report_payload),
+        original_report_bytes=result.original_report_bytes,
     )
 
 
@@ -1472,6 +1523,7 @@ def _prepare_local_report(
         canonical_sha256_b64=primary.canonical_sha256_b64,
         normalizer_version=normalizer_version,
         source_report=primary.source_report,
+        original_report_bytes=primary.original_report_bytes,
     )
 
 
@@ -3342,13 +3394,20 @@ class _LocalRuntime:
             "smartperfetto-report.json",
             prepared.source_report,
         )
-        original_binding = await asyncio.to_thread(
-            persist_smartperfetto_original,
-            root=self.data_root,
-            team_id=analysis.team_id,
-            analysis_id=analysis.analysis_id,
-            document=prepared.source_report,
-        )
+        if analysis.smartperfetto_original is not None:
+            original_binding = analysis.smartperfetto_original
+        else:
+            original_binding = await asyncio.to_thread(
+                persist_smartperfetto_original,
+                root=self.data_root,
+                team_id=analysis.team_id,
+                analysis_id=analysis.analysis_id,
+                **(
+                    {"payload": prepared.original_report_bytes}
+                    if prepared.original_report_bytes is not None
+                    else {"document": prepared.source_report}
+                ),
+            )
         await asyncio.to_thread(
             self.store.save_document,
             analysis.team_id,

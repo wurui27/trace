@@ -114,3 +114,25 @@ def test_original_report_rejects_oversized_file(tmp_path: Path) -> None:
             analysis_id=analysis_id,
             maximum_bytes=32,
         )
+
+
+def test_original_report_preserves_valid_noncanonical_json_bytes(tmp_path: Path) -> None:
+    team_id = uuid4()
+    analysis_id = uuid4()
+    payload = b'{ "findings": [ ], "summary": "\\u539f\\u59cb" }\n'
+
+    binding = persist_smartperfetto_original(
+        root=tmp_path,
+        team_id=team_id,
+        analysis_id=analysis_id,
+        payload=payload,
+    )
+
+    assert binding.size == len(payload)
+    assert binding.sha256 == hashlib.sha256(payload).hexdigest()
+    assert read_smartperfetto_original(
+        root=tmp_path,
+        binding=binding,
+        team_id=team_id,
+        analysis_id=analysis_id,
+    ) == payload

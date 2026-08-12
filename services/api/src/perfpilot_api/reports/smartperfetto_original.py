@@ -142,13 +142,25 @@ def persist_smartperfetto_original(
     root: Path,
     team_id: UUID,
     analysis_id: UUID,
-    document: object,
+    document: object | None = None,
+    payload: bytes | None = None,
 ) -> SmartPerfettoOriginalBinding:
-    try:
-        payload = canonical_json_bytes(document)
-    except Exception:
-        raise SmartPerfettoOriginalInvalid from None
+    if (document is None) == (payload is None):
+        raise SmartPerfettoOriginalInvalid
+    if payload is None:
+        try:
+            payload = canonical_json_bytes(document)
+        except Exception:
+            raise SmartPerfettoOriginalInvalid from None
+    elif type(payload) is not bytes:
+        raise SmartPerfettoOriginalInvalid
     if not 0 < len(payload) <= MAX_SMARTPERFETTO_ORIGINAL_BYTES:
+        raise SmartPerfettoOriginalInvalid
+    try:
+        parsed = json.loads(payload.decode("utf-8"))
+    except (UnicodeError, ValueError, json.JSONDecodeError):
+        raise SmartPerfettoOriginalInvalid from None
+    if not isinstance(parsed, dict):
         raise SmartPerfettoOriginalInvalid
     directory = _safe_analysis_directory(root, team_id, analysis_id)
     target = _artifact_path(root.resolve(), team_id, analysis_id, _VERSION)
@@ -248,7 +260,7 @@ def read_smartperfetto_original(
         if hashlib.sha256(payload).hexdigest() != binding.sha256:
             raise ValueError
         parsed = json.loads(payload.decode("utf-8"))
-        if not isinstance(parsed, dict) or canonical_json_bytes(parsed) != payload:
+        if not isinstance(parsed, dict):
             raise ValueError
         return payload
     except FileNotFoundError:
