@@ -5,8 +5,8 @@ export function ConciseReportSummary({ report }: { readonly report: SourceAwareA
   if (output === null) {
     return (
       <section className="analysis-report-section" aria-label="结论">
-        <h2>AI 最终结论未生成</h2>
-        <p>内核证据和技术附录仍可查看。</p>
+        <h2>PerfPilot AI 中文总结生成失败</h2>
+        <p>PerfPilot AI 中文总结生成失败；SmartPerfetto 原始报告和核心 Trace 结论仍可查看。</p>
       </section>
     );
   }

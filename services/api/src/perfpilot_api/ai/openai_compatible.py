@@ -273,7 +273,11 @@ class OpenAICompatibleSynthesisProvider:
     ) -> SynthesisCandidate:
         if not isinstance(projection, AIProjection):
             raise TypeError("projection must be an AIProjection")
-        if retry_code not in {None, "ai_output_invalid"}:
+        if retry_code not in {
+            None,
+            "ai_output_invalid",
+            "ai_narrative_language_invalid",
+        }:
             raise ValueError("AI retry context is invalid")
         try:
             projection_text = projection.canonical_bytes.decode("utf-8")
@@ -293,11 +297,15 @@ class OpenAICompatibleSynthesisProvider:
                 {
                     "role": "user",
                     "content": (
-                        "The previous output failed validation. Generate a complete "
-                        "new JSON object from the authoritative projection. Strictly "
-                        "check the schema and every referenced identifier. Narrative "
-                        "fields must contain no ASCII digits; measurements belong only "
-                        "in report metric sections."
+                        "上一候选的面向用户叙述不是简体中文；只修正叙述语言，保持证据、ID、数值、代码和 Diff 不变。"
+                        if retry_code == "ai_narrative_language_invalid"
+                        else (
+                            "The previous output failed validation. Generate a complete "
+                            "new JSON object from the authoritative projection. Strictly "
+                            "check the schema and every referenced identifier. Narrative "
+                            "fields must contain no ASCII digits; measurements belong only "
+                            "in report metric sections."
+                        )
                     ),
                 }
             )

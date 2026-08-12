@@ -6,6 +6,7 @@ import { useEffect, useRef, useState } from "react";
 
 import { completedAiProcessCopy } from "../lib/analysis-ai-status";
 import { createRandomUuid } from "../lib/perfpilot-api";
+import { createPerfPilotClient, type PerfPilotClient } from "../lib/perfpilot-api";
 import { printAnalysisReport, supportsReportPrint } from "../lib/report-print";
 import {
   createAnalysisLoader,
@@ -18,6 +19,7 @@ import { AnalysisReportView } from "./analysis-report";
 
 const defaultLoader = createAnalysisLoader();
 const defaultRerunner = createSynthesisRerunner();
+const defaultClient = createPerfPilotClient();
 
 interface FullAnalysisReportProps {
   readonly analysisId: string;
@@ -25,6 +27,7 @@ interface FullAnalysisReportProps {
   readonly rerunner?: SynthesisRerunner;
   readonly randomUUID?: () => string;
   readonly printer?: (analysisId: string) => boolean;
+  readonly client?: PerfPilotClient;
 }
 
 interface ReportSnapshot {
@@ -39,6 +42,7 @@ export function FullAnalysisReport({
   rerunner = defaultRerunner,
   randomUUID = createRandomUuid,
   printer = printAnalysisReport,
+  client = defaultClient,
 }: FullAnalysisReportProps) {
   const [attempt, setAttempt] = useState(0);
   const [snapshot, setSnapshot] = useState<ReportSnapshot | null>(null);
@@ -271,6 +275,8 @@ export function FullAnalysisReport({
 
         <AnalysisReportView
           report={report}
+          teamId={analysis.team_id}
+          client={client}
           onRetrySynthesis={retrySynthesis}
           retrying={retrying}
         />

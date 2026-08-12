@@ -3526,6 +3526,10 @@ select:disabled {
   [data-report-printing="true"] [data-report-layer][hidden] {
     display: block !important;
   }
+
+  .smartperfetto-full-json {
+    display: none !important;
+  }
 }
 
 /* Honest route placeholders */

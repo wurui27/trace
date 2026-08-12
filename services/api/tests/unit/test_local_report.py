@@ -43,6 +43,16 @@ def _load(name: str) -> dict[str, object]:
 def _v2_candidate() -> dict[str, object]:
     document = _load("synthesis-output-v2.valid.json")
     document["source_fixes"] = []
+    document["verdict"] = "启动关键路径被同步初始化阻塞。"
+    document["executive_summary"] = "将同步查询移到首帧之后，再重复相同的冷启动场景。"
+    for item in document["top_findings"]:
+        item["user_impact"] = "首屏显示时间晚于现有目标。"
+    for index, item in enumerate(document["recommendations"]):
+        item["title"] = "延后同步查询" if index == 0 else "重复启动采集"
+        item["action"] = "将查询移到首帧之后。" if index == 0 else "修改后采集相同的冷启动流程。"
+        item["expected_effect"] = "移除启动关键路径中的同步等待。" if index == 0 else "依据现有阈值确认启动指标。"
+    for item in document["retest_plan"]:
+        item["steps"] = "使用相同流程采集五次冷启动。"
     return document
 
 
@@ -223,6 +233,19 @@ async def test_report_synthesizer_uses_one_provider_request() -> None:
     assert result.rounds == (
         LocalReportUsage(1, "report", 1, 10, 20, 30),
     )
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_retries_english_narrative_once_then_rejects() -> None:
+    english = _load("synthesis-output-v2.valid.json")
+    english["source_fixes"] = []
+    candidate = canonical_json_bytes(english)
+    provider = FakeReportProvider([candidate, candidate])
+
+    with pytest.raises(LocalSynthesisError, match="^ai_narrative_language_invalid$"):
+        await LocalReportSynthesizer(provider=provider).synthesize(_projection())
+
+    assert provider.calls == 2
 
 
 @pytest.mark.asyncio

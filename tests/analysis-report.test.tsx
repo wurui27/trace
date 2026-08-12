@@ -286,6 +286,7 @@ describe("AnalysisReportView", () => {
     );
     expect(screen.getByRole("tab", { name: "源码修复" })).toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "技术附录" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "SmartPerfetto 原始报告" })).toBeInTheDocument();
     expect(screen.getAllByTestId("key-metric")).toHaveLength(3);
     expect(screen.getAllByTestId("top-finding")).toHaveLength(3);
     expect(screen.getAllByTestId("priority-action")).toHaveLength(3);

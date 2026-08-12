@@ -63,7 +63,8 @@
         "provenance": {}
       }
     },
-    "source_code": {"$ref": "#/$defs/sourceCode"}
+    "source_code": {"$ref": "#/$defs/sourceCode"},
+    "smartperfetto_original": {"$ref": "#/$defs/smartperfettoOriginal"}
   },
   "allOf": [
     {
@@ -71,7 +72,7 @@
         "properties": {"schema_version": {"enum": ["1.0", "1.1"]}},
         "required": ["schema_version"]
       },
-      "then": {"properties": {"source_code": false}}
+      "then": {"properties": {"source_code": false, "smartperfetto_original": false}}
     },
     {
       "if": {
@@ -193,6 +194,7 @@
           "state": {"enum": ["completed", "partially_completed"]},
           "synthesis": {"$ref": "#/$defs/synthesisV2"},
           "source_code": {"$ref": "#/$defs/sourceCode"},
+          "smartperfetto_original": {"$ref": "#/$defs/smartperfettoOriginal"},
           "scenario_reports": {
             "oneOf": [
               {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}], "items": false},
@@ -1626,6 +1628,19 @@
           }
         }
       ]
+    },
+    "smartperfettoOriginal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["available", "artifact_id", "version", "mime", "size", "sha256"],
+      "properties": {
+        "available": {"const": true},
+        "artifact_id": {"$ref": "#/$defs/sourceUuid"},
+        "version": {"const": 1},
+        "mime": {"const": "application/json"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 2097152},
+        "sha256": {"$ref": "#/$defs/hex64"}
+      }
     },
     "sourceSnapshot": {
       "type": "object",

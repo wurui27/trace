@@ -1215,6 +1215,20 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("loads a bounded SmartPerfetto original document and builds its same-origin download URL", async () => {
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(
+      Response.json({ summary: { conclusion: "原始结论" }, findings: [] }),
+    );
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.smartPerfettoOriginal(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      summary: { conclusion: "原始结论" },
+    });
+    expect(client.smartPerfettoOriginalDownloadUrl(TEAM_ID, ANALYSIS_ID)).toBe(
+      `/api/v1/teams/${TEAM_ID}/analyses/${ANALYSIS_ID}/smartperfetto-original?download=true`,
+    );
+  });
+
   it("rejects source refs for none and fixes for weak source matches", async () => {
     const sourceRef = {
       source_ref_id: "95000000-0000-4000-8000-000000000001",

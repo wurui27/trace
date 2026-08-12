@@ -94,6 +94,13 @@ from perfpilot_api.reports.normalizer import (
 from perfpilot_api.reports.smartperfetto_live_normalizer import (
     normalize_live_smartperfetto_result,
 )
+from perfpilot_api.reports.smartperfetto_original import (
+    SmartPerfettoOriginalBinding,
+    SmartPerfettoOriginalInvalid,
+    SmartPerfettoOriginalNotFound,
+    persist_smartperfetto_original,
+    read_smartperfetto_original,
+)
 from perfpilot_api.reports.projection import (
     AIProjection,
     ProjectionPrivacyError,
@@ -744,6 +751,7 @@ class _LocalAnalysis:
     source_context: dict[str, object] | None = field(default=None, repr=False)
     evidence_format_version: Literal["normalized-core-v1"] | None = None
     evidence_manifest: dict[str, str] | None = None
+    smartperfetto_original: SmartPerfettoOriginalBinding | None = None
     ai_rounds: list[_LocalAIRound] = field(default_factory=_default_ai_rounds)
     stages: dict[str, str] = field(
         default_factory=lambda: {
@@ -803,6 +811,7 @@ _PERSISTED_STATE_KEYS = {
     "report_available",
     "evidence_format_version",
     "evidence_manifest",
+    "smartperfetto_original",
 }
 _PERSISTED_OPTIONAL_STATE_KEYS = {
     "created_at",
@@ -811,6 +820,7 @@ _PERSISTED_OPTIONAL_STATE_KEYS = {
     "ai_rounds",
     "evidence_format_version",
     "evidence_manifest",
+    "smartperfetto_original",
 }
 _PERSISTED_STAGE_KEYS = {
     "input_validation",
@@ -903,6 +913,10 @@ def _validate_persisted_state_shape(document: Mapping[str, object]) -> None:
         failure, {"code", "message", "retryable"}
     ):
         raise ValueError
+    if "smartperfetto_original" in document:
+        SmartPerfettoOriginalBinding.from_private_document(
+            document["smartperfetto_original"]
+        )
 
 
 def _parse_utc_datetime(value: object) -> datetime | None:
@@ -1470,6 +1484,7 @@ def _compose_local_report(
     synthesis_failure_code: str | None,
     rounds: tuple[LocalReportUsage, ...],
     synthesizer: LocalReportSynthesizer | None,
+    smartperfetto_original: SmartPerfettoOriginalBinding | None = None,
 ) -> dict[str, object]:
     synthesis_document = synthesis.document if synthesis is not None else None
     synthesis_bytes = synthesis.canonical_bytes if synthesis is not None else None
@@ -1524,7 +1539,11 @@ def _compose_local_report(
         ),
         report_version=generation,
     )
-    return composed.document
+    document = dict(composed.document)
+    if document.get("schema_version") == "1.2" and smartperfetto_original is not None:
+        document["smartperfetto_original"] = smartperfetto_original.public_document()
+        document = validate_contract("analysis-report", document)
+    return document
 
 
 def _local_source_code_document(analysis: _LocalAnalysis) -> dict[str, object]:
@@ -2004,6 +2023,10 @@ class _LocalRuntime:
         if analysis.evidence_format_version is not None:
             document["evidence_format_version"] = analysis.evidence_format_version
             document["evidence_manifest"] = dict(analysis.evidence_manifest or {})
+        if analysis.smartperfetto_original is not None:
+            document["smartperfetto_original"] = (
+                analysis.smartperfetto_original.private_document()
+            )
         return document
 
     async def _persist(self, analysis: _LocalAnalysis) -> None:
@@ -2155,6 +2178,13 @@ class _LocalRuntime:
             ),
             evidence_format_version=evidence_format_version,  # type: ignore[arg-type]
             evidence_manifest=evidence_manifest,
+            smartperfetto_original=(
+                SmartPerfettoOriginalBinding.from_private_document(
+                    document["smartperfetto_original"]
+                )
+                if document.get("smartperfetto_original") is not None
+                else None
+            ),
             ai_rounds=ai_rounds,
             stages={key: str(value) for key, value in stages.items()},
         )
@@ -3312,6 +3342,13 @@ class _LocalRuntime:
             "smartperfetto-report.json",
             prepared.source_report,
         )
+        original_binding = await asyncio.to_thread(
+            persist_smartperfetto_original,
+            root=self.data_root,
+            team_id=analysis.team_id,
+            analysis_id=analysis.analysis_id,
+            document=prepared.source_report,
+        )
         await asyncio.to_thread(
             self.store.save_document,
             analysis.team_id,
@@ -3334,6 +3371,10 @@ class _LocalRuntime:
             ):
                 analysis.evidence_format_version = _LOCAL_EVIDENCE_FORMAT_VERSION
                 analysis.evidence_manifest = manifest
+                analysis.version += 1
+                manifest_changed = True
+            if analysis.smartperfetto_original != original_binding:
+                analysis.smartperfetto_original = original_binding
                 analysis.version += 1
                 manifest_changed = True
         if manifest_changed:
@@ -3425,6 +3466,7 @@ class _LocalRuntime:
             synthesis_failure_code=synthesis_failure_code,
             rounds=rounds,
             synthesizer=self.synthesizer,
+            smartperfetto_original=analysis.smartperfetto_original,
         )
         await asyncio.to_thread(
             self.store.save_document,
@@ -4448,6 +4490,57 @@ def create_local_app(
         if analysis.report is None:
             raise HTTPException(status.HTTP_404_NOT_FOUND, "report not ready")
         return analysis.report
+
+    @app.get(
+        "/v1/teams/{team_id}/analyses/{analysis_id}/smartperfetto-original"
+    )
+    async def read_smartperfetto_original_report(
+        request: Request,
+        team_id: UUID,
+        analysis_id: UUID,
+        download: Annotated[Literal["true"] | None, Query()] = None,
+    ) -> Response:
+        authorize_team(request, team_id)
+        analysis = await runtime.analysis(team_id, analysis_id)
+        binding = analysis.smartperfetto_original
+        if binding is None:
+            raise ApiError(
+                "smartperfetto_original_not_found",
+                "SmartPerfetto 原始报告不存在",
+                404,
+                False,
+            )
+        try:
+            payload = await asyncio.to_thread(
+                read_smartperfetto_original,
+                root=runtime.data_root,
+                binding=binding,
+                team_id=team_id,
+                analysis_id=analysis_id,
+            )
+        except SmartPerfettoOriginalNotFound:
+            raise ApiError(
+                "smartperfetto_original_not_found",
+                "SmartPerfetto 原始报告不存在",
+                404,
+                False,
+            ) from None
+        except SmartPerfettoOriginalInvalid:
+            raise ApiError(
+                "smartperfetto_original_invalid",
+                "SmartPerfetto 原始报告校验失败",
+                409,
+                False,
+            ) from None
+        headers = {
+            "cache-control": "private, no-store",
+            "x-content-type-options": "nosniff",
+        }
+        if download == "true":
+            headers["content-disposition"] = (
+                f'attachment; filename="smartperfetto-{analysis_id}.json"'
+            )
+        return Response(payload, media_type="application/json", headers=headers)
 
     @app.post(
         "/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",

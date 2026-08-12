@@ -2,6 +2,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 
 const API_PREFIX = "/api/v1/";
 const MAX_JSON_BYTES = 10 * 1024 * 1024;
+const MAX_SMARTPERFETTO_ORIGINAL_BYTES = 2 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
@@ -373,6 +374,14 @@ export interface LegacyAnalysisReport extends AnalysisReportBase {
 export interface SourceAwareAnalysisReport extends AnalysisReportBase {
   readonly schema_version: "1.2";
   readonly source_code: SourceCodeReport;
+  readonly smartperfetto_original?: Readonly<{
+    readonly available: true;
+    readonly artifact_id: string;
+    readonly version: 1;
+    readonly mime: "application/json";
+    readonly size: number;
+    readonly sha256: string;
+  }>;
   readonly synthesis:
     | {
         readonly state: "completed";
@@ -391,6 +400,8 @@ export interface SourceAwareAnalysisReport extends AnalysisReportBase {
 }
 
 export type AnalysisReport = LegacyAnalysisReport | SourceAwareAnalysisReport;
+
+export type SmartPerfettoOriginal = Readonly<Record<string, unknown>>;
 
 export interface SynthesisRunResponse {
   readonly schema_version: "1.0";
@@ -709,6 +720,12 @@ export interface PerfPilotClient {
     signal?: AbortSignal,
   ): Promise<AnalysisResponse>;
   report(teamId: string, analysisId: string, signal?: AbortSignal): Promise<AnalysisReport>;
+  smartPerfettoOriginal(
+    teamId: string,
+    analysisId: string,
+    signal?: AbortSignal,
+  ): Promise<SmartPerfettoOriginal>;
+  smartPerfettoOriginalDownloadUrl(teamId: string, analysisId: string): string;
   createSynthesisRun(
     teamId: string,
     analysisId: string,
@@ -805,9 +822,12 @@ function inputMime(selection: TraceFileSelection): string {
     : fallbackMime(selection.kind, selection.file.name);
 }
 
-async function readJson(response: Response): Promise<unknown> {
+async function readJson(
+  response: Response,
+  maximumBytes: number = MAX_JSON_BYTES,
+): Promise<unknown> {
   const declared = response.headers.get("content-length");
-  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > MAX_JSON_BYTES)) {
+  if (declared !== null && (!/^\d+$/.test(declared) || Number(declared) > maximumBytes)) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
   if (response.body === null) {
@@ -821,7 +841,7 @@ async function readJson(response: Response): Promise<unknown> {
       const { done, value } = await reader.read();
       if (done) break;
       size += value.byteLength;
-      if (size > MAX_JSON_BYTES) {
+      if (size > maximumBytes) {
         await reader.cancel();
         throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
       }
@@ -851,6 +871,20 @@ async function readJson(response: Response): Promise<unknown> {
 
 function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
+}
+
+function safeJsonTree(value: unknown, depth = 0): boolean {
+  if (depth > 64) return false;
+  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (Array.isArray(value)) {
+    return value.length <= 100_000 && value.every((item) => safeJsonTree(item, depth + 1));
+  }
+  if (!object(value)) return false;
+  const keys = Object.keys(value);
+  return keys.length <= 100_000 && keys.every(
+    (key) => !["__proto__", "prototype", "constructor"].includes(key) && safeJsonTree(value[key], depth + 1),
+  );
 }
 
 function privateLanHostname(value: string): boolean {
@@ -1633,6 +1667,7 @@ function analysisReportResponse(value: unknown): AnalysisReport {
       "scenario_reports",
       "synthesis",
       ...(sourceAware ? ["source_code"] : []),
+      ...(sourceAware && "smartperfetto_original" in value ? ["smartperfetto_original"] : []),
     ]) ||
     !["1.0", "1.1", "1.2"].includes(String(value.schema_version)) ||
     !["device", "trace_upload"].includes(String(value.analysis_mode)) ||
@@ -1657,6 +1692,24 @@ function analysisReportResponse(value: unknown): AnalysisReport {
       !exactKeys(value.synthesis, [
         "state", "output", "synthesis_artifact_id", "failure_code", "provenance",
       ])
+    ) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    if (
+      value.smartperfetto_original !== undefined &&
+      (!object(value.smartperfetto_original) ||
+        !exactKeys(value.smartperfetto_original, [
+          "available", "artifact_id", "version", "mime", "size", "sha256",
+        ]) ||
+        value.smartperfetto_original.available !== true ||
+        typeof value.smartperfetto_original.artifact_id !== "string" ||
+        value.smartperfetto_original.version !== 1 ||
+        value.smartperfetto_original.mime !== "application/json" ||
+        !Number.isSafeInteger(value.smartperfetto_original.size) ||
+        Number(value.smartperfetto_original.size) < 1 ||
+        Number(value.smartperfetto_original.size) > MAX_SMARTPERFETTO_ORIGINAL_BYTES ||
+        typeof value.smartperfetto_original.sha256 !== "string" ||
+        !/^[0-9a-f]{64}$/.test(value.smartperfetto_original.sha256))
     ) {
       throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
     }
@@ -2712,6 +2765,30 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
       }
       return report;
+    },
+    async smartPerfettoOriginal(teamId, analysisId, signal) {
+      const path = `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/smartperfetto-original`;
+      aborted(signal);
+      let response: Response;
+      try {
+        response = await fetcher(path, {
+          headers: { accept: "application/json" },
+          credentials: "same-origin",
+          redirect: "error",
+          signal,
+        });
+      } catch (error) {
+        aborted(signal);
+        throw new PerfPilotApiError("network_unavailable", "网络连接不可用", true, null, { cause: error });
+      }
+      const payload = await readJson(response, MAX_SMARTPERFETTO_ORIGINAL_BYTES);
+      if (!response.ok || !object(payload) || !safeJsonTree(payload)) {
+        throw new PerfPilotApiError("invalid_api_response", "SmartPerfetto 原始报告无效", false, null);
+      }
+      return payload;
+    },
+    smartPerfettoOriginalDownloadUrl(teamId, analysisId) {
+      return `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/smartperfetto-original?download=true`;
     },
     async createSynthesisRun(teamId, analysisId, idempotencyKey, signal) {
       const run = synthesisRunResponse(

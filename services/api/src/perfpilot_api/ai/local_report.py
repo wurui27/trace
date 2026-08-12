@@ -20,6 +20,10 @@ from perfpilot_api.ai.openai_compatible import (
     OpenAICompatibleSynthesisProvider,
     SynthesisCandidate,
 )
+from perfpilot_api.ai.chinese_narrative import (
+    ChineseNarrativeError,
+    validate_simplified_chinese_narrative,
+)
 from perfpilot_api.ai.prompt import SynthesisPrompt
 from perfpilot_api.ai.synthesis import (
     AISynthesisOutput,
@@ -33,7 +37,7 @@ from perfpilot_api.reports.projection import AIProjection
 
 ReportRole = Literal["report"]
 ReportState = Literal["running", "completed", "failed"]
-OutputRetryCode = Literal["ai_output_invalid"]
+OutputRetryCode = Literal["ai_output_invalid", "ai_narrative_language_invalid"]
 ReportObserver = Callable[
     [int, ReportRole, ReportState, int, AISynthesisOutput | None],
     Awaitable[None],
@@ -320,6 +324,7 @@ class LocalReportSynthesizer:
                     projection=projection,
                     candidate=candidate.candidate_json,
                 )
+                validate_simplified_chinese_narrative(output.document)
                 usage = LocalReportUsage(
                     number=1,
                     role="report",
@@ -336,6 +341,11 @@ class LocalReportSynthesizer:
                 retryable = True
                 detail_code = "semantic_validation"
                 retry_code = "ai_output_invalid"
+            except ChineseNarrativeError:
+                failure_code = "ai_narrative_language_invalid"
+                retryable = True
+                detail_code = "narrative_language"
+                retry_code = "ai_narrative_language_invalid"
             except AIProviderError as error:
                 failure_code = error.stable_code
                 retryable = error.retryable

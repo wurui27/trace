@@ -510,6 +510,8 @@ export function AnalysisProgressView({
           </section>
           <AnalysisReportView
             report={report}
+            teamId={analysis.team_id}
+            client={defaultClient}
             onRetrySynthesis={onRetrySynthesis}
             retrying={retrying}
           />

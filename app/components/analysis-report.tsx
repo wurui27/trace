@@ -2,21 +2,28 @@
 
 import { useState } from "react";
 
-import type {
-  AnalysisReport,
-  LegacyAnalysisReport,
-  ReportEvidence,
-  ReportFinding,
-  ReportMetric,
+import {
+  createPerfPilotClient,
+  type PerfPilotClient,
+  type AnalysisReport,
+  type LegacyAnalysisReport,
+  type ReportEvidence,
+  type ReportFinding,
+  type ReportMetric,
 } from "../lib/perfpilot-api";
 import { ConciseReportSummary } from "./concise-report-summary";
 import { SourceFixesPanel } from "./source-fixes-panel";
 import { TechnicalAppendix } from "./technical-appendix";
+import { SmartPerfettoOriginalReport } from "./smartperfetto-original-report";
+
+const defaultClient = createPerfPilotClient();
 
 interface AnalysisReportViewProps {
   readonly report: AnalysisReport;
   readonly onRetrySynthesis: () => void | Promise<void>;
   readonly retrying: boolean;
+  readonly teamId?: string;
+  readonly client?: PerfPilotClient;
 }
 
 interface LegacyAnalysisReportViewProps extends Omit<AnalysisReportViewProps, "report"> {
@@ -154,17 +161,21 @@ function memoryMetricRank(metric: ReportMetric): number {
 
 export function AnalysisReportView(props: AnalysisReportViewProps) {
   if (props.report.schema_version === "1.2") {
-    return <SourceAwareAnalysisReportView report={props.report} />;
+    return <SourceAwareAnalysisReportView report={props.report} teamId={props.teamId} client={props.client ?? defaultClient} />;
   }
   return <LegacyAnalysisReportView {...props} report={props.report} />;
 }
 
 function SourceAwareAnalysisReportView({
   report,
+  teamId,
+  client,
 }: {
   readonly report: Extract<AnalysisReport, { readonly schema_version: "1.2" }>;
+  readonly teamId?: string;
+  readonly client: PerfPilotClient;
 }) {
-  const [tab, setTab] = useState<"conclusion" | "source" | "appendix">("conclusion");
+  const [tab, setTab] = useState<"conclusion" | "source" | "appendix" | "original">("conclusion");
   return (
     <article className="analysis-report-card source-aware-report" aria-label="PerfPilot 分析报告">
       <div className="source-aware-report-tabs" role="tablist" aria-label="报告内容">
@@ -172,6 +183,7 @@ function SourceAwareAnalysisReportView({
           ["conclusion", "结论"],
           ["source", "源码修复"],
           ["appendix", "技术附录"],
+          ["original", "SmartPerfetto 原始报告"],
         ] as const).map(([id, label]) => (
           <button
             key={id}
@@ -193,6 +205,14 @@ function SourceAwareAnalysisReportView({
       </div>
       <div id="report-panel-appendix" role="tabpanel" hidden={tab !== "appendix"} data-report-layer="appendix">
         <TechnicalAppendix report={report} />
+      </div>
+      <div id="report-panel-original" role="tabpanel" hidden={tab !== "original"} data-report-layer="original">
+        <SmartPerfettoOriginalReport
+          active={tab === "original"}
+          analysisId={report.analysis_id}
+          teamId={teamId}
+          client={client}
+        />
       </div>
     </article>
   );

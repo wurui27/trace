@@ -1421,7 +1421,7 @@ class _ProjectionReportProvider:
                     {
                         "finding_id": finding["finding_id"],
                         "evidence_ids": evidence_ids,
-                        "user_impact": finding["summary"],
+                        "user_impact": "该问题会延迟用户看到可交互界面的时间。",
                     }
                 )
                 if finding["status"] in {"confirmed", "suspected"} and evidence_ids:
@@ -1431,7 +1431,7 @@ class _ProjectionReportProvider:
                     recommendations.append(
                         {
                             "priority": priority,
-                            "title": finding["title"],
+                            "title": "处理已确认的性能瓶颈",
                             "action": "修复该性能问题，并使用相同场景复测。",
                             "expected_effect": "降低该问题对用户体验的影响。",
                             "finding_ids": [finding["finding_id"]],
@@ -1468,7 +1468,7 @@ class _ProjectionReportProvider:
             "limitations": [
                 {
                     "limitation_id": item["limitation_id"],
-                    "summary": item["summary"],
+                    "summary": "当前证据存在已标记的覆盖限制。",
                 }
                 for item in projected["limitations"]
             ],
@@ -2904,6 +2904,22 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
         assert len(validated["synthesis"]["output"]["top_findings"]) <= 3
         assert len(validated["synthesis"]["output"]["recommendations"]) <= 3
         assert validated["synthesis"]["output"]["recommendations"]
+        assert validated["smartperfetto_original"]["available"] is True
+        original = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/smartperfetto-original"
+        )
+        downloaded = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/smartperfetto-original?download=true"
+        )
+        assert original.status_code == 200
+        assert original.content == canonical_json_bytes(result_factory().payload["report"])
+        assert original.headers["cache-control"] == "private, no-store"
+        assert original.headers["x-content-type-options"] == "nosniff"
+        assert "content-disposition" not in original.headers
+        assert downloaded.content == original.content
+        assert downloaded.headers["content-disposition"] == (
+            f'attachment; filename="smartperfetto-{analysis_id}.json"'
+        )
         analysis_directory = tmp_path / "teams" / team_id / "analyses" / analysis_id
         assert (analysis_directory / "round-1.json").is_file()
         assert not (analysis_directory / "round-2.json").exists()
@@ -3037,9 +3053,14 @@ def test_local_app_persists_bounded_single_pass_failure(tmp_path: Path) -> None:
         published = client.get(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
         )
+        original = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/smartperfetto-original"
+        )
 
     assert provider.calls == 2
     assert published.status_code == 200
+    assert original.status_code == 200
+    assert original.content == canonical_json_bytes(_smartperfetto_result().payload["report"])
     report = validate_contract("analysis-report", published.json())
     assert report["synthesis"]["state"] == "failed"
     assert report["synthesis"]["failure_code"] == "ai_output_invalid"
