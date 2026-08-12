@@ -60,6 +60,7 @@ from perfpilot_api.local_analysis_store import (
     LocalAnalysisStoreDurabilityError,
     LocalAnalysisStoreError,
 )
+from perfpilot_api.local_agent_store import LocalAgentStore, LocalDeviceDirectoryRepository
 from perfpilot_api.local_control_store import (
     LOCAL_SESSION_TTL,
     LocalControlStore,
@@ -102,7 +103,43 @@ from perfpilot_api.reports.projection import (
 )
 from perfpilot_api.reports.writer import AnalysisReportWriteRequest, compose_analysis_report
 from perfpilot_api.services.canonical_result_reader import LoadedCanonicalResult
-from perfpilot_api.services.source_workspaces import SourceBinding
+from perfpilot_api.security.agent_credentials import AgentCredentialCodec
+from perfpilot_api.security.agent_signatures import (
+    InMemoryAgentNonceStore,
+    encode_ed25519_public_key,
+)
+from perfpilot_api.services.agents import (
+    AgentAuthenticationRejected,
+    AgentInvalidRequestError,
+    AgentNameConflictError,
+    AgentNotFoundError,
+    AgentRegistration,
+    AgentRegistrationRejected,
+    AgentService,
+    TaskSigningKey,
+)
+from perfpilot_api.services.device_directory import (
+    AgentHeartbeat,
+    DeviceDirectory,
+    DeviceHeartbeatRejected,
+)
+from perfpilot_api.services.source_workspaces import (
+    SourceBinding,
+    SourceBindingInvalid,
+    SourceBindingNotFound,
+    SourceCodeAnalysisDisabled,
+    SourceWorkspaceService,
+)
+from perfpilot_api.api.agents import (
+    CreateRegistrationCodeRequest,
+    RenameAgentRequest,
+    RevokeAgentRequest,
+)
+from perfpilot_api.api.agent_control import (
+    AgentHeartbeatRequest,
+    RegisterAgentRequest,
+)
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from perfpilot_api.errors import ApiError
 
 
@@ -3447,6 +3484,29 @@ def create_local_app(
         state_root
         or Path(os.getenv("PERFPILOT_LOCAL_STATE_DIR", ".perfpilot/local-control"))
     )
+    resolved_agent_store = LocalAgentStore(
+        (state_root or Path(os.getenv("PERFPILOT_LOCAL_STATE_DIR", ".perfpilot/local-control")))
+        / "agents"
+    )
+    runtime_secret = resolved_agent_store.runtime_secret()
+    task_key = Ed25519PrivateKey.from_private_bytes(runtime_secret)
+    resolved_agent_service = AgentService(
+        repository=resolved_agent_store,
+        credentials=AgentCredentialCodec(runtime_secret),
+        nonce_store=InMemoryAgentNonceStore(key_secret=runtime_secret),
+        task_signing_key=TaskSigningKey(
+            kid="local-agent-v1",
+            public_key_b64=encode_ed25519_public_key(task_key.public_key()),
+        ),
+    )
+    resolved_device_directory = DeviceDirectory(
+        repository=LocalDeviceDirectoryRepository(resolved_agent_store),
+        serial_hmac_key=runtime_secret,
+    )
+    resolved_source_workspace_service = SourceWorkspaceService(
+        repository=resolved_device_directory,
+        enabled=source_code_analysis_enabled,
+    )
     resolved_device_probe = device_probe
     if resolved_device_probe is None:
         try:
@@ -3495,6 +3555,7 @@ def create_local_app(
             yield
         finally:
             await runtime.close()
+            resolved_agent_store.close()
 
     app = FastAPI(lifespan=lifespan)
 
@@ -3531,6 +3592,10 @@ def create_local_app(
     app.add_exception_handler(RequestValidationError, local_request_validation_handler)
     app.state.local_runtime = runtime
     app.state.local_control_store = resolved_control_store
+    app.state.local_agent_store = resolved_agent_store
+    app.state.agent_service = resolved_agent_service
+    app.state.device_directory = resolved_device_directory
+    app.state.source_workspace_service = resolved_source_workspace_service
     allowed_web_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
     configured_web_origin = os.getenv("PERFPILOT_LOCAL_WEB_ORIGIN")
     if configured_web_origin:
@@ -3539,7 +3604,7 @@ def create_local_app(
         CORSMiddleware,
         allow_origins=allowed_web_origins,
         allow_credentials=True,
-        allow_methods=["GET", "POST", "PUT", "OPTIONS"],
+        allow_methods=["GET", "POST", "PUT", "PATCH", "OPTIONS"],
         allow_headers=["Content-Type", "x-amz-checksum-sha256", "x-csrf-token"],
     )
 
@@ -3580,6 +3645,33 @@ def create_local_app(
         if principal.must_change_password:
             raise ApiError("password_change_required", "请先修改初始密码", 403, False)
         return principal
+
+    def _agent_payload(agent: object) -> dict[str, object]:
+        return {
+            "agent_id": str(agent.agent_id),
+            "name": agent.name,
+            "platform": agent.platform,
+            "agent_version": agent.agent_version,
+            "hostname": agent.hostname,
+            "os_version": agent.os_version,
+            "state": agent.state,
+            "last_heartbeat_at": (
+                agent.last_heartbeat_at.isoformat()
+                if agent.last_heartbeat_at is not None
+                else None
+            ),
+            "created_at": agent.created_at.isoformat(),
+            "updated_at": agent.updated_at.isoformat(),
+        }
+
+    def _agent_auth(request: Request):
+        values = request.headers.getlist("authorization")
+        if len(values) != 1:
+            raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False)
+        scheme, separator, token = values[0].partition(" ")
+        if separator != " " or scheme.casefold() != "bearer" or not token or " " in token:
+            raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False)
+        return token
 
     @app.get("/v1/health")
     async def health() -> dict[str, object]:
@@ -3718,10 +3810,151 @@ def create_local_app(
         )
         return {"schema_version": "1.0", "devices": devices}
 
+    @app.post("/v1/teams/{team_id}/agents/registration-codes", status_code=201)
+    async def create_agent_registration_code(
+        request: Request,
+        team_id: UUID,
+        body: CreateRegistrationCodeRequest,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        principal = authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
+        try:
+            issued = await resolved_agent_service.create_registration_code(
+                team_id=team_id, owner_user_id=principal.user_id, name=body.name
+            )
+        except (AgentNameConflictError, AgentInvalidRequestError):
+            raise ApiError("invalid_request", "Agent 请求无效", 422, False) from None
+        return {
+            "schema_version": "1.0",
+            "agent_id": str(issued.agent_id),
+            "registration_code": issued.registration_code,
+            "expires_at": issued.expires_at.isoformat(),
+        }
+
+    @app.get("/v1/teams/{team_id}/agents")
+    async def list_team_agents(request: Request, team_id: UUID) -> dict[str, object]:
+        authorize_team(request, team_id)
+        return {
+            "schema_version": "1.0",
+            "agents": [_agent_payload(agent) for agent in await resolved_agent_service.list_agents(team_id=team_id)],
+        }
+
+    @app.patch("/v1/teams/{team_id}/agents/{agent_id}")
+    async def rename_team_agent(
+        request: Request,
+        team_id: UUID,
+        agent_id: UUID,
+        body: RenameAgentRequest,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
+        try:
+            agent = await resolved_agent_service.rename(team_id=team_id, agent_id=agent_id, name=body.name)
+        except AgentNotFoundError:
+            raise ApiError("resource_not_found", "资源不存在", 404, False) from None
+        except (AgentNameConflictError, AgentInvalidRequestError):
+            raise ApiError("invalid_request", "Agent 请求无效", 422, False) from None
+        return {"schema_version": "1.0", "agent": _agent_payload(agent)}
+
+    @app.post("/v1/teams/{team_id}/agents/{agent_id}/revoke")
+    async def revoke_team_agent(
+        request: Request,
+        team_id: UUID,
+        agent_id: UUID,
+        body: RevokeAgentRequest,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        del body
+        authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
+        try:
+            agent = await resolved_agent_service.revoke(team_id=team_id, agent_id=agent_id)
+        except AgentNotFoundError:
+            raise ApiError("resource_not_found", "资源不存在", 404, False) from None
+        return {"schema_version": "1.0", "agent": _agent_payload(agent)}
+
+    @app.post("/v1/agent/register", status_code=201)
+    async def register_local_agent(body: RegisterAgentRequest) -> dict[str, object]:
+        try:
+            credentials = await resolved_agent_service.register(
+                AgentRegistration(
+                    registration_code=body.registration_code,
+                    public_key_b64=body.public_key_b64,
+                    platform=body.platform,
+                    agent_version=body.agent_version,
+                    hostname=body.hostname,
+                    os_version=body.os_version,
+                )
+            )
+        except AgentRegistrationRejected:
+            raise ApiError("registration_rejected", "Agent 注册失败", 401, False) from None
+        return {
+            "schema_version": body.schema_version,
+            "agent_id": str(credentials.agent_id),
+            "team_id": str(credentials.team_id),
+            "access_token": credentials.access_token,
+            "access_token_expires_at": credentials.access_token_expires_at.isoformat(),
+            "refresh_token": credentials.refresh_token,
+            "refresh_token_expires_at": credentials.refresh_token_expires_at.isoformat(),
+            "task_signing_key": {"kid": credentials.task_signing_key.kid, "public_key_b64": credentials.task_signing_key.public_key_b64},
+            "heartbeat_interval_seconds": credentials.heartbeat_interval_seconds,
+        }
+
+    @app.post("/v1/agent/heartbeat")
+    async def heartbeat_local_agent(
+        request: Request, body: AgentHeartbeatRequest
+    ) -> dict[str, object]:
+        try:
+            principal = await resolved_agent_service.authenticate_access(_agent_auth(request))
+            observations = tuple(
+                resolved_device_directory.sanitize_observation(
+                    client_ref=device.client_ref, serial=device.serial,
+                    manufacturer=device.manufacturer, model=device.model,
+                    android_release=device.android_release, api_level=device.api_level,
+                    connection_type=device.connection_type, adb_state=device.adb_state,
+                    battery_percent=device.battery_percent, temperature_c=device.temperature_c,
+                    storage_available_bytes=device.storage_available_bytes,
+                    property_error_code=device.property_error_code,
+                ) for device in body.devices
+            )
+            receipt = await resolved_device_directory.replace_heartbeat(
+                agent_id=principal.agent_id,
+                heartbeat=AgentHeartbeat(
+                    agent_version=body.agent_version, platform=body.platform,
+                    hostname=body.hostname, observed_at=body.observed_at,
+                    clock_skew_ms=body.clock_skew_ms,
+                    disk_available_bytes=body.disk_available_bytes,
+                    execution_state=body.execution_slot.state,
+                    execution_id=body.execution_slot.execution_id,
+                    source_workspaces=(None if body.workspaces is None else tuple(item.model_dump(mode="json") for item in body.workspaces)),
+                ),
+                devices=observations,
+            )
+        except AgentAuthenticationRejected:
+            raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
+        except DeviceHeartbeatRejected:
+            raise ApiError("heartbeat_rejected", "设备状态上报失败", 409, False) from None
+        return {
+            "schema_version": "1.0",
+            "accepted_at": receipt.accepted_at.isoformat(),
+            "next_heartbeat_seconds": receipt.next_heartbeat_seconds,
+            "devices": [{"client_ref": str(item.client_ref), "device_id": str(item.device_id), "device_digest": item.device_digest} for item in receipt.devices],
+        }
+
     @app.get("/v1/teams/{team_id}/source-workspaces")
     async def source_workspaces(request: Request, team_id: UUID) -> dict[str, object]:
         authorize_team(request, team_id)
-        return {"schema_version": "1.0", "workspaces": []}
+        workspaces = await resolved_source_workspace_service.list_for_team(team_id=team_id)
+        return {"schema_version": "1.0", "workspaces": [{
+            "provider_kind": workspace.provider_kind, "agent_id": str(workspace.agent_id),
+            "agent_name": workspace.agent_name, "workspace_id": str(workspace.workspace_id),
+            "name": workspace.name, "state": workspace.state, "git_branch": workspace.git_branch,
+            "git_head": workspace.git_head, "tracked_dirty_count": workspace.tracked_dirty_count,
+            "snapshot_policy": workspace.snapshot_policy,
+            "validation_profiles": [{"profile_id": str(profile.profile_id), "name": profile.name} for profile in workspace.validation_profiles],
+        } for workspace in workspaces]}
 
     @app.post("/v1/teams/{team_id}/analyses", status_code=status.HTTP_201_CREATED)
     async def create_analysis(
@@ -3739,6 +3972,16 @@ def create_local_app(
                 422,
                 False,
             )
+        if body.source_binding is not None:
+            try:
+                await resolved_source_workspace_service.require_binding(
+                    team_id=team_id,
+                    binding=body.source_binding.binding(),
+                )
+            except SourceBindingNotFound:
+                raise ApiError("resource_not_found", "源码工作区不存在", 404, False) from None
+            except (SourceBindingInvalid, SourceCodeAnalysisDisabled):
+                raise ApiError("invalid_request", "源码工作区不可用", 422, False) from None
         if isinstance(body, _CreateDeviceAnalysisRequest):
             detected = await resolved_device_probe.inspect()
             if (

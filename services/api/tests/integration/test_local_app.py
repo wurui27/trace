@@ -40,6 +40,8 @@ from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contr
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
 from perfpilot_api.services.source_workspaces import SourceBinding
+from perfpilot_api.security.agent_signatures import encode_ed25519_public_key
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
 _create_local_app = create_local_app
@@ -126,6 +128,133 @@ def _authenticated_client(client: TestClient, username: str, password: str) -> d
     )
     assert login.status_code == 200, login.text
     return {"Origin": "http://localhost:3000", "x-csrf-token": login.json()["csrf_token"]}
+
+
+def test_local_app_persists_team_owned_agents_and_source_workspaces(tmp_path: Path) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    first = control.ensure_user("user01", "initial user password", False).principal
+    second = control.ensure_user("user02", "initial user password", False).principal
+    for principal in (first, second):
+        control.change_password(
+            principal.user_id, "initial user password", "established user password"
+        )
+    data_root = tmp_path / "data"
+    state_root = tmp_path / "state"
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=data_root,
+        state_root=state_root,
+        control_store=control,
+        source_code_analysis_enabled=True,
+    )
+    private_key = Ed25519PrivateKey.generate()
+    workspace_id = UUID("73000000-0000-4000-8000-000000000001")
+
+    with _RawTestClient(app) as first_client, _RawTestClient(app) as second_client:
+        first_headers = _authenticated_client(
+            first_client, "user01", "established user password"
+        )
+        _authenticated_client(second_client, "user02", "established user password")
+        rejected = first_client.post(
+            f"/v1/teams/{first.team_id}/agents/registration-codes",
+            headers=first_headers,
+            json={"schema_version": "1.0", "name": "/Users/private"},
+        )
+        assert rejected.status_code == 422
+        issued = first_client.post(
+            f"/v1/teams/{first.team_id}/agents/registration-codes",
+            headers=first_headers,
+            json={"schema_version": "1.0", "name": "Build Mac"},
+        )
+        assert issued.status_code == 201, issued.text
+        registered = first_client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1",
+                "registration_code": issued.json()["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "build-mac",
+                "os_version": "macOS 15",
+            },
+        )
+        assert registered.status_code == 201, registered.text
+        credentials = registered.json()
+        heartbeat = first_client.post(
+            "/v1/agent/heartbeat",
+            headers={"Authorization": f"Bearer {credentials['access_token']}"},
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "build-mac",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [],
+                "workspaces": [{
+                    "workspace_id": str(workspace_id),
+                    "name": "RivotekMedia",
+                    "state": "ready",
+                    "git_branch": "main",
+                    "git_head": "a" * 40,
+                    "tracked_dirty_count": 0,
+                    "snapshot_policy": "tracked_worktree",
+                    "validation_profiles": [],
+                }],
+            },
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        assert first_client.get(f"/v1/teams/{first.team_id}/agents").json()["agents"][0]["state"] == "online"
+        workspaces = first_client.get(f"/v1/teams/{first.team_id}/source-workspaces")
+        assert workspaces.status_code == 200
+        assert workspaces.json()["workspaces"][0]["workspace_id"] == str(workspace_id)
+        renamed = first_client.patch(
+            f"/v1/teams/{first.team_id}/agents/{issued.json()['agent_id']}",
+            headers=first_headers,
+            json={"schema_version": "1.0", "name": "Renamed Mac"},
+        )
+        assert renamed.status_code == 200
+        foreign_binding = first_client.post(
+            f"/v1/teams/{first.team_id}/analyses",
+            headers=first_headers,
+            json={
+                "schema_version": "1.1", "analysis_mode": "trace_upload",
+                "analysis_profile": "auto", "inputs": [{
+                    "kind": "trace", "mime": "application/octet-stream", "size": 1,
+                    "sha256_b64": base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+                }],
+                "source_binding": {
+                    "provider_kind": "agent_workspace",
+                    "agent_id": "71000000-0000-4000-8000-000000000002",
+                    "workspace_id": str(workspace_id),
+                    "snapshot_policy": "tracked_worktree",
+                    "validation_profile_id": None,
+                },
+            },
+        )
+        assert foreign_binding.status_code == 404
+        assert second_client.get(f"/v1/teams/{first.team_id}/agents").status_code == 404
+        assert second_client.get(f"/v1/teams/{second.team_id}/agents").json()["agents"] == []
+
+    payload = (state_root / "agents" / "agents.json").read_text(encoding="utf-8")
+    assert credentials["access_token"] not in payload
+    assert credentials["refresh_token"] not in payload
+    assert "/Users/" not in payload
+
+    restarted = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=data_root,
+        state_root=state_root,
+        control_store=control,
+        source_code_analysis_enabled=True,
+    )
+    with _RawTestClient(restarted) as client:
+        headers = _authenticated_client(client, "user01", "established user password")
+        assert client.get(f"/v1/teams/{first.team_id}/agents", headers=headers).json()["agents"][0]["name"] == "Renamed Mac"
+        assert client.get(f"/v1/teams/{first.team_id}/source-workspaces", headers=headers).json()["workspaces"][0]["name"] == "RivotekMedia"
 
 
 def test_local_analyses_are_isolated_between_logged_in_user_teams(
@@ -1189,29 +1318,13 @@ def test_local_source_binding_disabled_persistence_and_old_json_compatibility(
     with TestClient(enabled_app) as client:
         team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
         csrf = client.get("/v1/auth/csrf").json()["csrf_token"]
-        created = client.post(
+        unavailable = client.post(
             f"/v1/teams/{team_id}/analyses",
             json=body,
             headers={"x-csrf-token": csrf},
         )
-    assert created.status_code == 201
-    assert created.json()["schema_version"] == "1.1"
-    assert created.json()["source_code_analysis"]["context_state"] == "waiting_for_agent"
-    analysis_id = UUID(created.json()["analysis_id"])
-    store = LocalAnalysisStore(tmp_path / "enabled")
-    state = store.load_states()[(UUID(team_id), analysis_id)]
-    assert state["source_binding"] == binding
-    assert "path" not in json.dumps(state)
-
-    state.pop("source_binding")
-    state.pop("source_code_analysis")
-    store.save_state(UUID(team_id), analysis_id, state)
-    restarted = create_local_app(data_root=tmp_path / "enabled")
-    with TestClient(restarted) as client:
-        restored = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}")
-    assert restored.status_code == 200
-    assert restored.json()["schema_version"] == "1.0"
-    assert "source_code_analysis" not in restored.json()
+    assert unavailable.status_code == 404
+    assert unavailable.json()["error"]["code"] == "resource_not_found"
 
 
 def test_local_app_rejects_present_null_persisted_ai_rounds_after_restart(
