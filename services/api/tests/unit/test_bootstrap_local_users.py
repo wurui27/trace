@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import runpy
 import stat
 from pathlib import Path
@@ -104,3 +105,45 @@ def test_find_user_is_read_only_and_does_not_require_a_password(tmp_path: Path) 
     assert store.find_user("ＲＡＹ_ＷＵ") == created
     assert store.find_user("missing") is None
     assert (tmp_path / "control.json").read_bytes() == before
+
+
+def test_bootstrap_resumes_journal_after_user_creation_crash(
+    tmp_path: Path, monkeypatch
+) -> None:
+    state_root = tmp_path / "state"
+    admin_file = tmp_path / "admin-password"
+    admin_file.write_text("recoverable administrator password\n", encoding="utf-8")
+    admin_file.chmod(0o600)
+    original_ensure_user = LocalControlStore.ensure_user
+
+    def crash_after_user01(self, username: str, password: str, admin: bool):
+        result = original_ensure_user(self, username, password, admin)
+        if username == "user01":
+            raise RuntimeError("injected crash after user01")
+        return result
+
+    monkeypatch.setattr(LocalControlStore, "ensure_user", crash_after_user01)
+    try:
+        _run_bootstrap(monkeypatch, state_root, admin_file)
+    except RuntimeError as error:
+        assert str(error) == "injected crash after user01"
+    else:
+        raise AssertionError("injected bootstrap crash did not occur")
+
+    pending = state_root / "bootstrap-users.pending.json"
+    assert pending.exists()
+    assert stat.S_IMODE(pending.stat().st_mode) == 0o600
+    assert not (state_root / "bootstrap-users.txt").exists()
+    journal = json.loads(pending.read_text(encoding="utf-8"))
+    user01_password = next(
+        item["password"] for item in journal["users"] if item["username"] == "user01"
+    )
+    assert LocalControlStore(state_root).authenticate("user01", user01_password) is not None
+
+    monkeypatch.setattr(LocalControlStore, "ensure_user", original_ensure_user)
+    _run_bootstrap(monkeypatch, state_root, admin_file)
+
+    credentials = (state_root / "bootstrap-users.txt").read_text(encoding="utf-8")
+    assert f"user01={user01_password}\n" in credentials
+    assert not pending.exists()
+    assert LocalControlStore(state_root).authenticate("user01", user01_password) is not None
