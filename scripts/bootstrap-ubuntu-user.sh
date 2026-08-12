@@ -11,6 +11,8 @@ INSTALL_ROOT="${PERFPILOT_SERVER_ROOT:-$HOME/perfpilot}"
 ENGINE_ROOT="$INSTALL_ROOT/engines"
 CONFIG_ROOT="$INSTALL_ROOT/config"
 DATA_ROOT="$INSTALL_ROOT/data"
+STATE_ROOT="$INSTALL_ROOT/state"
+ADMIN_PASSWORD_FILE="${PERFPILOT_BOOTSTRAP_ADMIN_PASSWORD_FILE:-$STATE_ROOT/local-control/bootstrap-admin-password.txt}"
 LOCAL_BIN="$HOME/.local/bin"
 LOCAL_OPT="$HOME/.local/opt"
 NODE_ARCHIVE="node-v$NODE_VERSION-linux-x64.tar.xz"
@@ -170,6 +172,10 @@ write_initial_environment() {
     printf 'PERFPILOT_PROXY_SECRET=%s\n' "$proxy_secret"
     printf 'PERFPILOT_LOCAL_SMARTPERFETTO_URL=http://127.0.0.1:3001\n'
     printf 'PERFPILOT_LOCAL_DATA_DIR=%s/local-runtime\n' "$DATA_ROOT"
+    printf 'PERFPILOT_LOCAL_STATE_DIR=%s/local-control\n' "$STATE_ROOT"
+    printf 'PERFPILOT_RESET_ANALYSIS_DATA=true\n'
+    printf 'PERFPILOT_EXPECTED_ANALYSIS_ROOT=%s/local-runtime\n' "$DATA_ROOT"
+    printf 'PERFPILOT_BOOTSTRAP_ADMIN_PASSWORD_FILE=%s\n' "$ADMIN_PASSWORD_FILE"
     printf 'PERFPILOT_LOCAL_API_ORIGIN=http://%s:8000\n' "$SERVER_IP"
     printf 'PERFPILOT_LOCAL_WEB_ORIGIN=http://%s:3000\n' "$SERVER_IP"
     printf 'PERFPILOT_LOCAL_ANDROID_MEMORY_ROOT=%s/Android-App-Memory-Analysis\n' \
@@ -180,8 +186,34 @@ write_initial_environment() {
   mv "$temporary_file" "$environment_file"
 }
 
+configure_deployment_environment() {
+  local environment_file="$CONFIG_ROOT/perfpilot.env"
+  local key
+  local value
+
+  for entry in \
+    "PERFPILOT_LOCAL_DATA_DIR=$DATA_ROOT/local-runtime" \
+    "PERFPILOT_LOCAL_STATE_DIR=$STATE_ROOT/local-control" \
+    "PERFPILOT_RESET_ANALYSIS_DATA=true" \
+    "PERFPILOT_EXPECTED_ANALYSIS_ROOT=$DATA_ROOT/local-runtime"; do
+    key="${entry%%=*}"
+    value="${entry#*=}"
+    if grep -q "^$key=" "$environment_file"; then
+      sed -i -E "s|^$key=.*|$key=$value|" "$environment_file"
+    else
+      printf '%s=%s\n' "$key" "$value" >> "$environment_file"
+    fi
+  done
+  if ! grep -q '^PERFPILOT_BOOTSTRAP_ADMIN_PASSWORD_FILE=' "$environment_file"; then
+    printf 'PERFPILOT_BOOTSTRAP_ADMIN_PASSWORD_FILE=%s\n' "$ADMIN_PASSWORD_FILE" \
+      >> "$environment_file"
+  fi
+  chmod 600 "$environment_file"
+}
+
 install_node
-mkdir -p "$ENGINE_ROOT" "$CONFIG_ROOT" "$DATA_ROOT/local-runtime"
+install -d -m 0700 "$STATE_ROOT" "$STATE_ROOT/local-control" "$DATA_ROOT/local-runtime"
+mkdir -p "$ENGINE_ROOT" "$CONFIG_ROOT"
 
 sync_engine \
   SmartPerfetto \
@@ -218,16 +250,23 @@ printf '%s\n' '正在构建 SmartPerfetto……'
 )
 
 write_initial_environment
+configure_deployment_environment
+
+set -a
+# shellcheck disable=SC1090
+source "$CONFIG_ROOT/perfpilot.env"
+set +a
+"$PROJECT_DIR/.venv/bin/python" "$PROJECT_DIR/scripts/bootstrap-local-users.py"
 
 mkdir -p "$HOME/.config/systemd/user"
 install -m 0644 "$PROJECT_DIR"/infra/ubuntu-user/systemd/*.service \
+  "$PROJECT_DIR"/infra/ubuntu-user/systemd/*.target \
   "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
-systemctl --user enable perfpilot-smartperfetto.service perfpilot-api.service \
-  perfpilot-web.service
-systemctl --user restart perfpilot-smartperfetto.service
-systemctl --user restart perfpilot-api.service
-systemctl --user restart perfpilot-web.service
+systemctl --user disable perfpilot-smartperfetto.service perfpilot-api.service \
+  perfpilot-web.service 2>/dev/null || true
+systemctl --user enable perfpilot.target
+"$PROJECT_DIR/scripts/restart-ubuntu-perfpilot.sh"
 
 wait_for_url http://127.0.0.1:3001/health SmartPerfetto
 wait_for_url "http://$SERVER_IP:8000/v1/health" PerfPilot-API
@@ -238,4 +277,5 @@ printf '%s\n' \
   'Ubuntu 服务器测试版已启动。' \
   "网页：http://$SERVER_IP:3000" \
   "API：http://$SERVER_IP:8000/v1/health" \
-  '状态：systemctl --user status perfpilot-web perfpilot-api perfpilot-smartperfetto'
+  '重启（永久清空分析数据）：bash scripts/restart-ubuntu-perfpilot.sh' \
+  '状态：systemctl --user status perfpilot.target'

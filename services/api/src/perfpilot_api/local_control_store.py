@@ -182,6 +182,18 @@ class LocalControlStore:
         assert result is not None
         return result
 
+    def find_user(self, username: str) -> LocalPrincipal | None:
+        """Return an existing local principal without changing credentials or role."""
+        if not isinstance(username, str):
+            return None
+        normalized = normalize_username(username)
+        if not normalized or len(normalized) > 128:
+            return None
+        with self._exclusive_lock():
+            document = self._read_document()
+            user = self._find_user(document, normalized)
+            return None if user is None else self._principal_from_user(document, user)
+
     def authenticate(self, username: str, password: str) -> LocalPrincipal | None:
         if not isinstance(username, str) or not isinstance(password, str):
             return None

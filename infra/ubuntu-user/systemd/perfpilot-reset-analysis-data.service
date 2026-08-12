@@ -1,0 +1,9 @@
+[Unit]
+Description=Reset PerfPilot isolated analysis data
+Before=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service
+
+[Service]
+Type=oneshot
+EnvironmentFile=%h/perfpilot/config/perfpilot.env
+ExecStart=%h/perfpilot/platform/scripts/reset-ubuntu-analysis-data.sh
+UMask=0077

@@ -1,7 +1,11 @@
 [Unit]
 Description=PerfPilot SmartPerfetto analysis engine
 Wants=network-online.target
+Requires=perfpilot-reset-analysis-data.service
 After=network-online.target
+After=perfpilot-reset-analysis-data.service
+PartOf=perfpilot.target
+RefuseManualStart=yes
 
 [Service]
 Type=simple
@@ -16,6 +20,3 @@ RestartSec=3
 TimeoutStopSec=30
 KillMode=mixed
 UMask=0077
-
-[Install]
-WantedBy=default.target

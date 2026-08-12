@@ -1,7 +1,10 @@
 [Unit]
 Description=PerfPilot server test API
 Wants=network-online.target perfpilot-smartperfetto.service
-After=network-online.target perfpilot-smartperfetto.service
+Requires=perfpilot-reset-analysis-data.service
+After=network-online.target perfpilot-reset-analysis-data.service perfpilot-smartperfetto.service
+PartOf=perfpilot.target
+RefuseManualStart=yes
 
 [Service]
 Type=simple
@@ -14,6 +17,3 @@ RestartSec=3
 TimeoutStopSec=30
 KillMode=mixed
 UMask=0077
-
-[Install]
-WantedBy=default.target

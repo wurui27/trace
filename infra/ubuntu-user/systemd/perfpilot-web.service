@@ -1,7 +1,10 @@
 [Unit]
 Description=PerfPilot production web server
 Wants=network-online.target perfpilot-api.service
-After=network-online.target perfpilot-api.service
+Requires=perfpilot-reset-analysis-data.service
+After=network-online.target perfpilot-reset-analysis-data.service perfpilot-api.service
+PartOf=perfpilot.target
+RefuseManualStart=yes
 
 [Service]
 Type=simple
@@ -15,6 +18,3 @@ RestartSec=3
 TimeoutStopSec=30
 KillMode=mixed
 UMask=0077
-
-[Install]
-WantedBy=default.target
