@@ -937,6 +937,7 @@ def _validate_display_string(value: str, *, maximum: int) -> None:
         or not value
         or len(value) > maximum
         or any(unicodedata.category(character) == "Cc" for character in value)
+        or not is_public_source_display_name(value)
     ):
         raise AgentInvalidRequestError
 

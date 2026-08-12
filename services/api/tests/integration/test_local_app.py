@@ -40,7 +40,11 @@ from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contr
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
 from perfpilot_api.services.source_workspaces import SourceBinding
-from perfpilot_api.security.agent_signatures import encode_ed25519_public_key
+from perfpilot_api.security.agent_signatures import (
+    encode_ed25519_public_key,
+    encode_signature,
+    refresh_proof_message,
+)
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 
@@ -255,6 +259,131 @@ def test_local_app_persists_team_owned_agents_and_source_workspaces(tmp_path: Pa
         headers = _authenticated_client(client, "user01", "established user password")
         assert client.get(f"/v1/teams/{first.team_id}/agents", headers=headers).json()["agents"][0]["name"] == "Renamed Mac"
         assert client.get(f"/v1/teams/{first.team_id}/source-workspaces", headers=headers).json()["workspaces"][0]["name"] == "RivotekMedia"
+
+
+def test_local_agent_control_refresh_unregister_and_team_devices(tmp_path: Path) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    first = control.ensure_user("user01", "initial user password", False).principal
+    second = control.ensure_user("user02", "initial user password", False).principal
+    for principal in (first, second):
+        control.change_password(principal.user_id, "initial user password", "established user password")
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+    )
+    private_key = Ed25519PrivateKey.generate()
+    with _RawTestClient(app) as first_client, _RawTestClient(app) as second_client:
+        first_headers = _authenticated_client(first_client, "user01", "established user password")
+        _authenticated_client(second_client, "user02", "established user password")
+        issued = first_client.post(
+            f"/v1/teams/{first.team_id}/agents/registration-codes",
+            headers=first_headers,
+            json={"schema_version": "1.0", "name": "Build Mac"},
+        ).json()
+        registered = first_client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1", "registration_code": issued["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos", "agent_version": "1.2.3",
+                "hostname": "build-mac", "os_version": "macOS 15.0",
+            },
+        ).json()
+        timestamp = int(time.time())
+        refreshed = first_client.post(
+            "/v1/agent/token/refresh",
+            json={
+                "schema_version": "1.1", "agent_id": registered["agent_id"],
+                "refresh_token": registered["refresh_token"], "nonce": "n" * 22,
+                "timestamp": timestamp,
+                "signature_b64": encode_signature(private_key.sign(refresh_proof_message(UUID(registered["agent_id"]), "n" * 22, timestamp))),
+            },
+        )
+        assert refreshed.status_code == 200, refreshed.text
+        heartbeat_payload = {
+            "schema_version": "1.0", "agent_version": "1.2.3", "platform": "macos",
+            "hostname": "build-mac", "observed_at": datetime.now().astimezone().isoformat(),
+            "clock_skew_ms": 0, "disk_available_bytes": 1024,
+            "execution_slot": {"state": "idle", "execution_id": None},
+            "devices": [{
+                "client_ref": "74000000-0000-4000-8000-000000000001",
+                "serial": "emulator-5554", "manufacturer": "Google", "model": "Pixel",
+                "android_release": "16", "api_level": 36, "connection_type": "usb",
+                "adb_state": "device", "battery_percent": 80, "temperature_c": None,
+                "storage_available_bytes": 1024, "property_error_code": None,
+            }],
+        }
+        assert first_client.post(
+            "/v1/agent/heartbeat",
+            headers={"Authorization": f"Bearer {registered['access_token']}"},
+            json=heartbeat_payload,
+        ).status_code == 401
+        assert first_client.post(
+            "/v1/agent/heartbeat",
+            headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
+            json=heartbeat_payload,
+        ).status_code == 200
+        devices = first_client.get(f"/v1/teams/{first.team_id}/devices")
+        assert devices.status_code == 200
+        assert devices.json()["devices"][0]["serial_suffix"] == "5554"
+        assert second_client.get(f"/v1/teams/{second.team_id}/devices").json()["devices"] == []
+        unsupported = first_client.post(
+            f"/v1/teams/{first.team_id}/analyses",
+            headers=first_headers,
+            json={
+                "schema_version": "1.0", "analysis_mode": "device",
+                "device_id": devices.json()["devices"][0]["device_id"],
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": 1,
+                    "sha256_b64": base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+                },
+            },
+        )
+        assert unsupported.status_code == 409
+        assert unsupported.json()["error"]["code"] == "remote_device_capture_unavailable"
+        revoked = first_client.post(
+            "/v1/agent/unregister",
+            headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
+        )
+        assert revoked.status_code == 200
+        assert first_client.post(
+            "/v1/agent/heartbeat",
+            headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
+            json=heartbeat_payload,
+        ).status_code == 401
+
+
+@pytest.mark.parametrize("value", ["/tmp/agent", r"C:\\agent", r"\\\\server\\agent", "~/agent", "../agent"])
+def test_local_agent_registration_rejects_path_shaped_public_metadata(
+    tmp_path: Path, value: str
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    principal = control.ensure_user("user01", "initial user password", False).principal
+    control.change_password(principal.user_id, "initial user password", "established user password")
+    state_root = tmp_path / "state"
+    app = create_local_app(data_root=tmp_path / "data", state_root=state_root, control_store=control)
+    with _RawTestClient(app) as client:
+        headers = _authenticated_client(client, "user01", "established user password")
+        issued = client.post(
+            f"/v1/teams/{principal.team_id}/agents/registration-codes", headers=headers,
+            json={"schema_version": "1.0", "name": "Build Mac"},
+        ).json()
+        rejected = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.0", "registration_code": issued["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(Ed25519PrivateKey.generate().public_key()),
+                "platform": "macos", "agent_version": "1.2.3", "hostname": value,
+                "os_version": value,
+            },
+        )
+    assert rejected.status_code == 401
+    assert value not in (state_root / "agents" / "agents.json").read_text(encoding="utf-8")
 
 
 def test_local_analyses_are_isolated_between_logged_in_user_teams(
@@ -1485,7 +1614,7 @@ def test_local_app_reports_the_device_currently_connected_over_adb(tmp_path: Pat
     assert device_probe.calls == 1
 
 
-def test_local_app_exposes_connected_adb_device_through_team_directory(
+def test_local_app_does_not_expose_host_adb_through_team_directory(
     tmp_path: Path,
 ) -> None:
     serial = "0123456789ABCDEF"
@@ -1514,24 +1643,9 @@ def test_local_app_exposes_connected_adb_device_through_team_directory(
 
     assert first.status_code == 200
     assert second.status_code == 200
-    device = first.json()["devices"][0]
-    assert device == {
-        "device_id": second.json()["devices"][0]["device_id"],
-        "agent_id": "71000000-0000-4000-8000-000000000001",
-        "agent_name": "本机 ADB",
-        "serial_suffix": "CDEF",
-        "manufacturer": "UNISOC",
-        "model": "uis7870_2h10_car_c200_6",
-        "android_release": "13",
-        "api_level": 33,
-        "connection_type": "usb",
-        "adb_state": "device",
-        "state": "ready",
-        "last_seen_at": device["last_seen_at"],
-    }
-    assert serial not in json.dumps(first.json())
-    assert datetime.fromisoformat(device["last_seen_at"]).tzinfo is not None
-    assert device_probe.calls == 2
+    assert first.json() == {"schema_version": "1.0", "devices": []}
+    assert second.json() == {"schema_version": "1.0", "devices": []}
+    assert device_probe.calls == 0
 
 
 def test_local_team_device_directory_is_empty_without_one_ready_device(
@@ -1554,7 +1668,7 @@ def test_local_team_device_directory_is_empty_without_one_ready_device(
     assert response.json() == {"schema_version": "1.0", "devices": []}
 
 
-def test_local_app_creates_device_analysis_with_embedded_apk_upload(
+def test_local_app_rejects_host_device_analysis_without_remote_capture(
     tmp_path: Path,
 ) -> None:
     serial = "0123456789ABCDEF"
@@ -1583,9 +1697,7 @@ def test_local_app_creates_device_analysis_with_embedded_apk_upload(
         csrf = client.get("/v1/auth/csrf").json()["csrf_token"]
         headers = {"x-csrf-token": csrf}
         team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
-        device_id = client.get(f"/v1/teams/{team_id}/devices").json()["devices"][0][
-            "device_id"
-        ]
+        device_id = "72000000-0000-4000-8000-000000000001"
         created = client.post(
             f"/v1/teams/{team_id}/analyses",
             headers=headers,
@@ -1603,46 +1715,11 @@ def test_local_app_creates_device_analysis_with_embedded_apk_upload(
             },
         )
 
-    assert created.status_code == 201, created.text
-    payload = created.json()
-    assert payload["analysis_mode"] == "device"
-    assert payload["device_id"] == device_id
-    assert payload["application_version_id"] is None
-    assert payload["application_metadata"] is None
-    assert payload["active_lease"] is None
-    assert payload["started_at"] is None
-    assert payload["completed_at"] is None
-    assert payload["report_available"] is False
-    assert [item["scenario_type"] for item in payload["scenarios"]] == [
-        "cold_start",
-        "scroll",
-        "memory_cycle",
-    ]
-    assert {item["state"] for item in payload["scenarios"]} == {"awaiting_input"}
-    assert payload["sample_verdict_counts"] == {
-        "valid": 0,
-        "invalid": 0,
-        "pending": 0,
-        "validation_error": 0,
-        "total": 0,
-    }
-    upload = payload["apk_upload"]
-    assert upload["state"] == "pending"
-    assert upload["artifact_kind"] == "apk"
-    assert upload["mime"] == "application/vnd.android.package-archive"
-    assert upload["size"] == len(apk)
-    assert upload["sha256_b64"] == checksum
-    assert datetime.fromisoformat(upload["expires_at"]).tzinfo is not None
-    assert urlsplit(upload["put_url"]).path.startswith("/local/v1/uploads/")
-    assert upload["required_headers"] == {
-        "Content-Type": "application/vnd.android.package-archive",
-        "x-amz-checksum-sha256": checksum,
-    }
-    assert "ai_rounds" not in payload
-    assert "source_analysis" not in payload
-    assert serial not in json.dumps(payload)
+    assert created.status_code == 409
+    assert created.json()["error"]["code"] == "remote_device_capture_unavailable"
 
 
+@pytest.mark.skip(reason="remote device capture is not wired in the local control plane")
 def test_local_device_analysis_captures_in_background_and_publishes_report(
     tmp_path: Path,
 ) -> None:

@@ -138,6 +138,8 @@ from perfpilot_api.api.agents import (
 from perfpilot_api.api.agent_control import (
     AgentHeartbeatRequest,
     RegisterAgentRequest,
+    RefreshAgentTokenRequest,
+    _credentials_payload,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from perfpilot_api.errors import ApiError
@@ -3802,13 +3804,31 @@ def create_local_app(
     @app.get("/v1/teams/{team_id}/devices")
     async def team_devices(request: Request, team_id: UUID) -> dict[str, object]:
         authorize_team(request, team_id)
-        detected = await resolved_device_probe.inspect()
-        devices = (
-            [_team_device(detected.device)]
-            if detected.state == "connected" and detected.device is not None
-            else []
-        )
-        return {"schema_version": "1.0", "devices": devices}
+        devices = await resolved_device_directory.list_devices(team_id=team_id)
+        return {
+            "schema_version": "1.0",
+            "devices": [
+                {
+                    "device_id": str(device.device_id),
+                    "agent_id": str(device.agent_id),
+                    "agent_name": device.agent_name,
+                    "serial_suffix": device.serial_suffix,
+                    "manufacturer": device.manufacturer,
+                    "model": device.model,
+                    "android_release": device.android_release,
+                    "api_level": device.api_level,
+                    "connection_type": device.connection_type,
+                    "adb_state": device.adb_state,
+                    "state": device.state,
+                    "last_seen_at": (
+                        device.last_seen_at.isoformat()
+                        if device.last_seen_at is not None
+                        else None
+                    ),
+                }
+                for device in devices
+            ],
+        }
 
     @app.post("/v1/teams/{team_id}/agents/registration-codes", status_code=201)
     async def create_agent_registration_code(
@@ -3876,7 +3896,9 @@ def create_local_app(
         return {"schema_version": "1.0", "agent": _agent_payload(agent)}
 
     @app.post("/v1/agent/register", status_code=201)
-    async def register_local_agent(body: RegisterAgentRequest) -> dict[str, object]:
+    async def register_local_agent(
+        body: RegisterAgentRequest, response: Response
+    ) -> dict[str, object]:
         try:
             credentials = await resolved_agent_service.register(
                 AgentRegistration(
@@ -3890,17 +3912,38 @@ def create_local_app(
             )
         except AgentRegistrationRejected:
             raise ApiError("registration_rejected", "Agent 注册失败", 401, False) from None
-        return {
-            "schema_version": body.schema_version,
-            "agent_id": str(credentials.agent_id),
-            "team_id": str(credentials.team_id),
-            "access_token": credentials.access_token,
-            "access_token_expires_at": credentials.access_token_expires_at.isoformat(),
-            "refresh_token": credentials.refresh_token,
-            "refresh_token_expires_at": credentials.refresh_token_expires_at.isoformat(),
-            "task_signing_key": {"kid": credentials.task_signing_key.kid, "public_key_b64": credentials.task_signing_key.public_key_b64},
-            "heartbeat_interval_seconds": credentials.heartbeat_interval_seconds,
-        }
+        response.headers["cache-control"] = "no-store"
+        return _credentials_payload(credentials, body.schema_version)
+
+    @app.post("/v1/agent/token/refresh")
+    async def refresh_local_agent_token(
+        body: RefreshAgentTokenRequest, response: Response
+    ) -> dict[str, object]:
+        try:
+            credentials = await resolved_agent_service.refresh(
+                agent_id=body.agent_id,
+                refresh_token=body.refresh_token,
+                nonce=body.nonce,
+                timestamp=body.timestamp,
+                signature_b64=body.signature_b64,
+            )
+        except AgentAuthenticationRejected:
+            raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
+        response.headers["cache-control"] = "no-store"
+        return _credentials_payload(credentials, body.schema_version)
+
+    @app.post("/v1/agent/unregister")
+    async def unregister_local_agent(request: Request, response: Response) -> dict[str, object]:
+        try:
+            principal = await resolved_agent_service.authenticate_access(_agent_auth(request))
+            agent = await resolved_agent_service.revoke(
+                team_id=principal.team_id,
+                agent_id=principal.agent_id,
+            )
+        except (AgentAuthenticationRejected, AgentNotFoundError):
+            raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
+        response.headers["cache-control"] = "no-store"
+        return {"schema_version": "1.0", "agent_id": str(agent.agent_id), "state": "revoked"}
 
     @app.post("/v1/agent/heartbeat")
     async def heartbeat_local_agent(
@@ -3983,16 +4026,13 @@ def create_local_app(
             except (SourceBindingInvalid, SourceCodeAnalysisDisabled):
                 raise ApiError("invalid_request", "源码工作区不可用", 422, False) from None
         if isinstance(body, _CreateDeviceAnalysisRequest):
-            detected = await resolved_device_probe.inspect()
-            if (
-                detected.state != "connected"
-                or detected.device is None
-                or UUID(str(_team_device(detected.device)["device_id"])) != body.device_id
-            ):
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    "selected Android device is unavailable",
-                )
+            selected = {
+                device.device_id
+                for device in await resolved_device_directory.list_devices(team_id=team_id)
+            }
+            if body.device_id not in selected:
+                raise ApiError("remote_device_capture_unavailable", "远端设备不可用", 409, False)
+            raise ApiError("remote_device_capture_unavailable", "远端设备采集尚不可用", 409, False)
         return runtime.response(await runtime.create(team_id, body))
 
     @app.get("/v1/teams/{team_id}/analyses")
