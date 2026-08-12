@@ -150,7 +150,9 @@ export function SourceWorkspaceField({
       {status === "error" ? <span>源码工作区暂时不可用，不影响本次分析。</span> : null}
       {status === "ready" && workspaces.length === 0 ? (
         <span>
-          尚无可用工作区。请在开发机运行 Agent 工作区注册命令，或前往{" "}
+          尚无可用工作区。请在开发机运行{" "}
+          <code>{'perfpilot-agent source add --name "RivotekMedia" --path "$PWD"'}</code>
+          {" "}后运行 <code>perfpilot-agent run</code>，或前往{" "}
           <Link href="/agents" prefetch={false}>Agent 管理</Link>。
         </span>
       ) : null}

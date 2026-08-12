@@ -265,7 +265,11 @@ export function AgentManagement() {
         {loading ? <p className="agent-list-state" role="status">正在读取 Agent…</p> : null}
         {loadError ? <p className="agent-list-state is-error" role="alert">{loadError}</p> : null}
         {!loading && !loadError && agents.length === 0 ? (
-          <p className="agent-list-state">尚未注册 Agent，请先生成注册码。</p>
+          <div className="agent-list-state">
+            <p>尚未注册 Agent，请先生成注册码，然后在开发机完成源码接入：</p>
+            <code>{'perfpilot-agent source add --name "RivotekMedia" --path "$PWD"'}</code>
+            <code>perfpilot-agent run</code>
+          </div>
         ) : null}
 
         {agents.length > 0 ? (

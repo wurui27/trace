@@ -101,12 +101,17 @@ from perfpilot_api.reports.projection import (
     ProjectionSizeError,
     build_ai_projection,
 )
+from perfpilot_api.reports.source_context import SourceContextValidationError
 from perfpilot_api.reports.writer import AnalysisReportWriteRequest, compose_analysis_report
 from perfpilot_api.services.canonical_result_reader import LoadedCanonicalResult
 from perfpilot_api.security.agent_credentials import AgentCredentialCodec
 from perfpilot_api.security.agent_signatures import (
     InMemoryAgentNonceStore,
     encode_ed25519_public_key,
+)
+from perfpilot_api.security.task_snapshots import (
+    SourceTaskSnapshotSigner,
+    TaskSnapshotSigner,
 )
 from perfpilot_api.services.agents import (
     AgentAuthenticationRejected,
@@ -130,6 +135,21 @@ from perfpilot_api.services.source_workspaces import (
     SourceCodeAnalysisDisabled,
     SourceWorkspaceService,
 )
+from perfpilot_api.services.agent_tasks import (
+    AgentTaskService,
+    InMemoryAgentTaskRepository,
+    InMemoryAgentTaskWakeup,
+)
+from perfpilot_api.services.source_artifacts import (
+    SourceArtifactError,
+    SourceArtifactService,
+)
+from perfpilot_api.services.source_tasks import (
+    InMemorySourceTaskRepository,
+    SourceTaskError,
+    SourceTaskService,
+)
+from perfpilot_api.workers.source_orchestrator import derive_source_authority
 from perfpilot_api.api.agents import (
     CreateRegistrationCodeRequest,
     RenameAgentRequest,
@@ -140,6 +160,7 @@ from perfpilot_api.api.agent_control import (
     RegisterAgentRequest,
     RefreshAgentTokenRequest,
     _credentials_payload,
+    router as agent_control_router,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from perfpilot_api.errors import ApiError
@@ -720,6 +741,7 @@ class _LocalAnalysis:
     source_code_analysis: dict[str, object] = field(
         default_factory=lambda: _source_code_analysis_document(None)
     )
+    source_context: dict[str, object] | None = field(default=None, repr=False)
     evidence_format_version: Literal["normalized-core-v1"] | None = None
     evidence_manifest: dict[str, str] | None = None
     ai_rounds: list[_LocalAIRound] = field(default_factory=_default_ai_rounds)
@@ -1351,6 +1373,7 @@ def _prepare_local_report(
     scroll_result: EngineResult | None = None,
     memory_result: EngineResult | None = None,
     memory_engine_commit_sha: str | None = None,
+    source_context: Mapping[str, object] | None = None,
 ) -> _PreparedLocalReport:
     primary = _normalize_local_smartperfetto_result(
         analysis,
@@ -1404,6 +1427,7 @@ def _prepare_local_report(
             normalized,
             analysis_profile=analysis.profile,  # type: ignore[arg-type]
             question=analysis.question,
+            source_context=source_context,
         )
     except ProjectionPrivacyError:
         projection_failure_code = "ai_projection_private_data"
@@ -1521,16 +1545,55 @@ def _local_source_code_document(analysis: _LocalAnalysis) -> dict[str, object]:
             "fixes": [],
             "limitations": [],
         }
+    context = analysis.source_context
+    available = (
+        isinstance(context, Mapping)
+        and analysis.source_code_analysis.get("context_state") == "available"
+    )
+    match_summary = (
+        str(context.get("match_summary"))
+        if available
+        else str(analysis.source_code_analysis.get("match_summary", "none"))
+    )
+    source_refs: list[dict[str, object]] = []
+    if available and match_summary in {"strong", "weak"}:
+        fragments = context.get("fragments")
+        if isinstance(fragments, list):
+            source_refs = [
+                {
+                    **{
+                        key: value
+                        for key, value in fragment.items()
+                        if key != "content"
+                    },
+                    "snapshot_hash": context["snapshot_hash"],
+                }
+                for fragment in fragments
+                if isinstance(fragment, Mapping)
+                and fragment.get("match_grade") in {"strong", "weak"}
+            ]
+    snapshot = (
+        {
+            "snapshot_id": context["snapshot_id"],
+            "snapshot_hash": context["snapshot_hash"],
+            "git_head": context["git_head"],
+        }
+        if available
+        else None
+    )
+    exclusions = (
+        list(context.get("exclusions", [])) if available else []
+    )
     return {
         "requested": True,
         **_source_binding_document(binding),
-        "snapshot": None,
+        "snapshot": snapshot,
         "context_state": analysis.source_code_analysis.get(
             "context_state", "unavailable"
         ),
-        "match_summary": "none",
-        "source_refs": [],
-        "exclusions": [],
+        "match_summary": match_summary,
+        "source_refs": source_refs,
+        "exclusions": exclusions,
         "fixes": [],
         "limitations": [],
     }
@@ -1811,9 +1874,18 @@ class _LocalRuntime:
         data_root: Path,
         public_origin: str,
         poll_interval_seconds: float,
+        source_tasks: SourceTaskService,
+        source_artifacts: SourceArtifactService,
+        source_wait_seconds: float,
     ) -> None:
         if poll_interval_seconds < 0:
             raise ValueError("poll interval must not be negative")
+        if (
+            isinstance(source_wait_seconds, bool)
+            or not isinstance(source_wait_seconds, (int, float))
+            or not 0 <= source_wait_seconds <= 120
+        ):
+            raise ValueError("source wait must be between zero and 120 seconds")
         self.gateway = gateway
         self.synthesizer = synthesizer
         self.device_probe = device_probe
@@ -1823,6 +1895,9 @@ class _LocalRuntime:
         self.store = LocalAnalysisStore(self.data_root)
         self.public_origin = _public_origin(public_origin)
         self.poll_interval_seconds = poll_interval_seconds
+        self.source_tasks = source_tasks
+        self.source_artifacts = source_artifacts
+        self.source_wait_seconds = source_wait_seconds
         self.analyses: dict[tuple[UUID, UUID], _LocalAnalysis] = {}
         self.uploads: dict[tuple[UUID, UUID, str], _LocalUpload] = {}
         self.upload_authorizations: dict[str, tuple[UUID, UUID, str]] = {}
@@ -2083,9 +2158,6 @@ class _LocalRuntime:
             ai_rounds=ai_rounds,
             stages={key: str(value) for key, value in stages.items()},
         )
-        expected_source = _source_code_analysis_document(analysis.source_binding)
-        if analysis.source_code_analysis != expected_source:
-            raise ValueError("invalid persisted local analysis")
         return analysis
 
     async def start(self) -> None:
@@ -2093,6 +2165,7 @@ class _LocalRuntime:
         for (team_id, analysis_id), document in persisted.items():
             analysis = self._restore_analysis(document)
             migrate_created_at = document.get("created_at") is None
+            source_degraded = False
             if analysis.team_id != team_id or analysis.analysis_id != analysis_id:
                 raise ValueError("persisted local analysis identity changed")
             if document.get("report_available") is True:
@@ -2107,6 +2180,32 @@ class _LocalRuntime:
                         _parse_utc_datetime(analysis.report.get("generated_at"))
                         or _EARLIEST_LOCAL_ANALYSIS_TIME
                     )
+            if analysis.source_binding is not None:
+                if analysis.source_code_analysis.get("context_state") == "available":
+                    context = await asyncio.to_thread(
+                        self.store.load_document,
+                        analysis.team_id,
+                        analysis.analysis_id,
+                        "source-context.json",
+                    )
+                    if context is None:
+                        analysis.source_code_analysis = {
+                            **_source_code_analysis_unavailable_document(
+                                analysis.source_binding
+                            ),
+                            "failure_code": "source_agent_unavailable",
+                        }
+                        source_degraded = True
+                    else:
+                        analysis.source_context = context
+                elif analysis.state in _ACTIVE_ANALYSIS_STATES:
+                    analysis.source_code_analysis = {
+                        **_source_code_analysis_unavailable_document(
+                            analysis.source_binding
+                        ),
+                        "failure_code": "source_agent_unavailable",
+                    }
+                    source_degraded = True
             for item in analysis.inputs.values():
                 if item.upload_id is None:
                     continue
@@ -2138,7 +2237,7 @@ class _LocalRuntime:
                     if stage_state not in {"completed", "failed", "not_requested"}:
                         analysis.stages[stage_name] = "canceled"
                 analysis.version += 1
-            if migrate_created_at or restore_canceled:
+            if migrate_created_at or restore_canceled or source_degraded:
                 await self._persist(analysis)
 
     async def close(self) -> None:
@@ -2578,6 +2677,15 @@ class _LocalRuntime:
             )
         await self._persist(analysis)
 
+        if analysis.source_binding is not None:
+            try:
+                await self.source_tasks.request_cancel(
+                    team_id=analysis.team_id,
+                    analysis_id=analysis.analysis_id,
+                )
+            except SourceTaskError:
+                pass
+
         if run is not None:
             try:
                 await self.gateway.cancel(run)
@@ -2999,7 +3107,12 @@ class _LocalRuntime:
                 analysis,
                 generation=generation,
             )
-            prepared = _prepare_local_report(analysis, result)
+            source_context = await self._await_source_context(analysis, result)
+            prepared = _prepare_local_report(
+                analysis,
+                result,
+                source_context=source_context,
+            )
             await self._publish_prepared(
                 analysis,
                 prepared,
@@ -3015,6 +3128,121 @@ class _LocalRuntime:
                 type(error).__name__,
             )
             await self._fail_analysis(analysis, generation=generation)
+
+    async def _await_source_context(
+        self,
+        analysis: _LocalAnalysis,
+        result: EngineResult,
+    ) -> dict[str, object] | None:
+        binding = analysis.source_binding
+        if binding is None:
+            return None
+        try:
+            normalized = _normalize_local_smartperfetto_result(
+                analysis,
+                result,
+                profile=analysis.profile,
+            ).report
+            authority = derive_source_authority(normalized.document)
+            await self.source_tasks.create_context_task(
+                team_id=analysis.team_id,
+                analysis_id=analysis.analysis_id,
+                agent_id=binding.agent_id,
+                workspace_id=binding.workspace_id,
+                validation_profile_id=binding.validation_profile_id,
+                finding_hints=authority.finding_hints,
+            )
+        except (SourceTaskError, ValueError):
+            await self._degrade_source(analysis, "source_agent_unavailable")
+            return None
+        deadline = asyncio.get_running_loop().time() + self.source_wait_seconds
+        while asyncio.get_running_loop().time() < deadline:
+            async with self.lock:
+                if analysis.cancel_requested_at is not None:
+                    raise asyncio.CancelledError
+            status = await self.source_tasks.context_status(
+                team_id=analysis.team_id,
+                analysis_id=analysis.analysis_id,
+            )
+            if status is None:
+                await self._degrade_source(analysis, "source_agent_unavailable")
+                return None
+            if (
+                status.state == "completed"
+                and status.artifact_id is not None
+                and status.checksum is not None
+            ):
+                try:
+                    context = await self.source_artifacts.read_context(
+                        team_id=analysis.team_id,
+                        analysis_id=analysis.analysis_id,
+                        artifact_id=status.artifact_id,
+                        expected_checksum=status.checksum,
+                        direct_identifiers=authority.direct_identifiers,
+                        allowed_finding_ids=authority.finding_ids,
+                        allowed_evidence_ids=authority.evidence_ids,
+                    )
+                    validated = await self.source_artifacts.persist_validated_context(
+                        team_id=analysis.team_id,
+                        analysis_id=analysis.analysis_id,
+                        source_artifact_id=status.artifact_id,
+                        context=context,
+                        now=datetime.now(UTC),
+                    )
+                    await asyncio.to_thread(
+                        self.store.save_document,
+                        analysis.team_id,
+                        analysis.analysis_id,
+                        "source-context.json",
+                        context,
+                    )
+                except (SourceArtifactError, SourceContextValidationError, ValueError):
+                    await self._degrade_source(analysis, "source_context_invalid")
+                    return None
+                async with self.lock:
+                    analysis.source_context = dict(context)
+                    analysis.source_code_analysis = {
+                        "requested": True,
+                        **_source_binding_document(binding),
+                        "context_state": "available",
+                        "match_summary": context["match_summary"],
+                        "verification_state": "not_requested",
+                        "failure_code": None,
+                    }
+                    analysis.version += 1
+                await self._persist(analysis)
+                del validated
+                return dict(context)
+            if status.state not in {"queued", "leased", "running", "cancel_requested"}:
+                await self._degrade_source(
+                    analysis,
+                    status.failure_code or "source_agent_unavailable",
+                )
+                return None
+            await asyncio.sleep(min(self.poll_interval_seconds or 0.01, 0.05))
+        await self._degrade_source(analysis, "source_context_timeout")
+        return None
+
+    async def _degrade_source(
+        self,
+        analysis: _LocalAnalysis,
+        failure_code: str,
+    ) -> None:
+        binding = analysis.source_binding
+        if binding is None:
+            return
+        async with self.lock:
+            analysis.source_context = None
+            analysis.source_code_analysis = {
+                "requested": True,
+                **_source_binding_document(binding),
+                "context_state": "unavailable",
+                "match_summary": "none",
+                "verification_state": "not_requested",
+                "failure_code": failure_code,
+            }
+            analysis.version += 1
+        await self._persist(analysis)
 
     async def _publish_prepared(
         self,
@@ -3474,6 +3702,7 @@ def create_local_app(
     public_origin: str | None = None,
     poll_interval_seconds: float = 2.0,
     source_code_analysis_enabled: bool = False,
+    source_wait_seconds: float = 120.0,
 ) -> FastAPI:
     resolved_gateway = gateway or SmartPerfettoLocalGateway(
         base_url=os.getenv("PERFPILOT_LOCAL_SMARTPERFETTO_URL", "http://127.0.0.1:3001")
@@ -3508,6 +3737,22 @@ def create_local_app(
     resolved_source_workspace_service = SourceWorkspaceService(
         repository=resolved_device_directory,
         enabled=source_code_analysis_enabled,
+    )
+    resolved_source_task_service = SourceTaskService(
+        repository=InMemorySourceTaskRepository(),
+        signer=SourceTaskSnapshotSigner(
+            private_key=task_key,
+            kid="local-agent-v1",
+        ),
+    )
+    resolved_source_artifacts = SourceArtifactService.in_memory()
+    resolved_agent_task_service = AgentTaskService(
+        repository=InMemoryAgentTaskRepository(),
+        signer=TaskSnapshotSigner(
+            private_key=task_key,
+            kid="local-agent-v1",
+        ),
+        wakeup=InMemoryAgentTaskWakeup(),
     )
     resolved_device_probe = device_probe
     if resolved_device_probe is None:
@@ -3547,6 +3792,9 @@ def create_local_app(
         public_origin=public_origin
         or os.getenv("PERFPILOT_LOCAL_API_ORIGIN", "http://localhost:8000"),
         poll_interval_seconds=poll_interval_seconds,
+        source_tasks=resolved_source_task_service,
+        source_artifacts=resolved_source_artifacts,
+        source_wait_seconds=source_wait_seconds,
     )
     session_cookie_name = "perfpilot_local_session"
 
@@ -3598,6 +3846,12 @@ def create_local_app(
     app.state.agent_service = resolved_agent_service
     app.state.device_directory = resolved_device_directory
     app.state.source_workspace_service = resolved_source_workspace_service
+    app.state.agent_task_service = resolved_agent_task_service
+    app.state.source_task_service = resolved_source_task_service
+    app.state.source_task_completion_recorder = resolved_source_artifacts
+    # Source routes declare the device-upload dependency, but never call it for
+    # a source execution. Local device execution remains deliberately disabled.
+    app.state.agent_upload_service = object()
     allowed_web_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
     configured_web_origin = os.getenv("PERFPILOT_LOCAL_WEB_ORIGIN")
     if configured_web_origin:
@@ -4176,6 +4430,9 @@ def create_local_app(
             "state": "queued",
         }
 
+    # Keep the local registration/heartbeat routes above as the established
+    # local composition, then add the exact shared task routes they do not own.
+    app.include_router(agent_control_router)
     return app
 
 

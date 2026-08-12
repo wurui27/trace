@@ -22,11 +22,16 @@ from perfpilot_api.ai.openai_compatible import SynthesisCandidate
 from perfpilot_api.engines.contracts import EngineResult
 from perfpilot_api.local_app import (
     LocalEngineRun,
+    _InputDescriptor,
+    _LocalAnalysis,
+    _LocalInput,
+    _compose_local_report,
     _evidence_manifest,
     _prepare_local_report,
     _public_origin,
     _restore_ai_rounds,
     _source_code_analysis_unavailable_document,
+    _source_code_analysis_document,
     create_local_app,
 )
 from perfpilot_api.local_analysis_store import (
@@ -39,6 +44,7 @@ from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapt
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
+from perfpilot_api.security.task_snapshots import validate_source_task_snapshot
 from perfpilot_api.services.source_workspaces import SourceBinding
 from perfpilot_api.security.agent_signatures import (
     encode_ed25519_public_key,
@@ -796,6 +802,292 @@ def test_local_source_binding_degrades_when_no_source_agent_is_available() -> No
     assert document["match_summary"] == "none"
 
 
+def test_local_bound_trace_dispatches_signed_source_context_task(
+    tmp_path: Path,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user(
+        "user01", "initial user password", False
+    ).principal
+    control.change_password(
+        user.user_id, "initial user password", "established user password"
+    )
+    smartperfetto_result = _smartperfetto_result()
+    smartperfetto_result.payload["report"]["dataEnvelopes"][0]["evidence"][0][
+        "fields"
+    ]["mapped_symbol"] = "demo.Startup.init"
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(smartperfetto_result),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+        source_code_analysis_enabled=True,
+        poll_interval_seconds=0.001,
+    )
+    private_key = Ed25519PrivateKey.generate()
+    workspace_id = UUID("73000000-0000-4000-8000-000000000001")
+    validation_profile_id = UUID("96000000-0000-4000-8000-000000000001")
+    trace = b"bound-local-trace"
+    checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
+
+    with _RawTestClient(app) as client:
+        browser_headers = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        registration = client.post(
+            f"/v1/teams/{user.team_id}/agents/registration-codes",
+            headers=browser_headers,
+            json={"schema_version": "1.0", "name": "Source Mac"},
+        ).json()
+        credentials = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1",
+                "registration_code": registration["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "source-mac",
+                "os_version": "macOS 15",
+            },
+        ).json()
+        agent_headers = {
+            "Authorization": f"Bearer {credentials['access_token']}"
+        }
+        heartbeat = client.post(
+            "/v1/agent/heartbeat",
+            headers=agent_headers,
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "source-mac",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [],
+                "workspaces": [
+                    {
+                        "workspace_id": str(workspace_id),
+                        "name": "RivotekMedia",
+                        "state": "ready",
+                        "git_branch": "main",
+                        "git_head": "a" * 40,
+                        "tracked_dirty_count": 0,
+                        "snapshot_policy": "tracked_worktree",
+                        "validation_profiles": [
+                            {
+                                "profile_id": str(validation_profile_id),
+                                "name": "Unit tests",
+                            }
+                        ],
+                    }
+                ],
+            },
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        created = client.post(
+            f"/v1/teams/{user.team_id}/analyses",
+            headers=browser_headers,
+            json={
+                "schema_version": "1.1",
+                "analysis_mode": "trace_upload",
+                "analysis_profile": "startup",
+                "inputs": [
+                    {
+                        "kind": "trace",
+                        "mime": "application/octet-stream",
+                        "size": len(trace),
+                        "sha256_b64": checksum,
+                    }
+                ],
+                "source_binding": {
+                    "provider_kind": "agent_workspace",
+                    "agent_id": credentials["agent_id"],
+                    "workspace_id": str(workspace_id),
+                    "snapshot_policy": "tracked_worktree",
+                    "validation_profile_id": str(validation_profile_id),
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        analysis_id = created.json()["analysis_id"]
+        _upload_and_finalize_trace(
+            client,
+            team_id=str(user.team_id),
+            analysis_id=analysis_id,
+            headers=browser_headers,
+            checksum=checksum,
+            trace=trace,
+        )
+
+        client.cookies.clear()
+        for _ in range(100):
+            delivery = client.get(
+                "/v1/agent/tasks/next?wait_seconds=0", headers=agent_headers
+            )
+            if delivery.json().get("task_kind") == "source":
+                break
+            time.sleep(0.01)
+
+        assert delivery.status_code == 200, delivery.text
+        assert delivery.json()["schema_version"] == "1.1"
+        assert delivery.json()["task_kind"] == "source"
+        assert delivery.json()["snapshot"]["task_type"] == "source_context"
+        assert delivery.json()["snapshot"]["analysis_id"] == analysis_id
+        assert delivery.json()["snapshot"]["aud"] == "perfpilot-agent"
+        assert delivery.json()["signature_b64"]
+        assert delivery.json()["lease_token"]
+        validate_source_task_snapshot(
+            delivery.json()["snapshot"], now=datetime.now().astimezone()
+        )
+        snapshot = delivery.json()["snapshot"]
+        hint = snapshot["finding_hints"][0]
+        content = "fun init() = loadNow()"
+        result = {
+            "snapshot_id": "94000000-0000-4000-8000-000000000001",
+            "snapshot_hash": "b" * 64,
+            "git_head": "a" * 40,
+            "tracked_dirty_count": 0,
+            "fragments": [
+                {
+                    "source_ref_id": "97000000-0000-4000-8000-000000000001",
+                    "relative_path": "app/src/main/java/demo/Startup.kt",
+                    "language": "kotlin",
+                    "symbol": "demo.Startup.init",
+                    "start_line": 1,
+                    "end_line": 1,
+                    "content": content,
+                    "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                    "snapshot_hash": "b" * 64,
+                    "finding_ids": [hint["finding_id"]],
+                    "evidence_ids": hint["evidence_ids"],
+                    "rule_ids": ["android.startup.eager_initialization"],
+                    "match_signals": ["trace_symbol"],
+                }
+            ],
+            "exclusions": [],
+            "truncated": False,
+        }
+        unsigned = {
+            "schema_version": "1.0",
+            "task_type": "source_context",
+            "execution_id": snapshot["execution_id"],
+            "analysis_id": analysis_id,
+            "team_id": str(user.team_id),
+            "agent_id": credentials["agent_id"],
+            "workspace_id": str(workspace_id),
+            "lease_version": snapshot["lease_version"],
+            "state": "completed",
+            "result": result,
+        }
+        canonical = json.dumps(
+            unsigned,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        completion = client.post(
+            f"/v1/agent/tasks/{snapshot['execution_id']}/complete",
+            headers={
+                **agent_headers,
+                "x-perfpilot-lease-token": delivery.json()["lease_token"],
+            },
+            json={
+                **unsigned,
+                "signature_b64": base64.b64encode(private_key.sign(canonical)).decode(),
+            },
+        )
+        assert completion.status_code == 200, completion.text
+        _authenticated_client(client, "user01", "established user password")
+        for _ in range(100):
+            report_response = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{analysis_id}/report"
+            )
+            if report_response.status_code == 200:
+                break
+            time.sleep(0.01)
+    assert report_response.status_code == 200, report_response.text
+    source_code = report_response.json()["source_code"]
+    assert source_code["context_state"] == "available"
+    assert source_code["match_summary"] == "strong"
+    assert source_code["source_refs"][0]["relative_path"] == (
+        "app/src/main/java/demo/Startup.kt"
+    )
+    assert source_code["source_refs"][0]["symbol"] == "demo.Startup.init"
+    assert source_code["fixes"][0]["diff"].startswith("diff --git a/app/")
+    assert "重复冷启动" in source_code["fixes"][0]["retest_target"]
+    private_context = (
+        tmp_path
+        / "data"
+        / "teams"
+        / str(user.team_id)
+        / "analyses"
+        / analysis_id
+        / "source-context.json"
+    )
+    assert private_context.is_file()
+    assert str(tmp_path) not in report_response.text
+
+
+@pytest.mark.asyncio
+async def test_local_bound_source_timeout_degrades_without_blocking_report(
+    tmp_path: Path,
+) -> None:
+    binding = SourceBinding(
+        provider_kind="agent_workspace",
+        agent_id=UUID("91000000-0000-4000-8000-000000000001"),
+        workspace_id=UUID("92000000-0000-4000-8000-000000000001"),
+        snapshot_policy="tracked_worktree",
+        validation_profile_id=None,
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+        source_code_analysis_enabled=True,
+        source_wait_seconds=0.01,
+        poll_interval_seconds=0.001,
+    )
+    runtime = app.state.local_runtime
+    trace = _InputDescriptor(
+        kind="trace",
+        mime="application/octet-stream",
+        size=1,
+        sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+    )
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={"trace": _LocalInput(trace)},
+        source_binding=binding,
+        source_code_analysis=_source_code_analysis_document(binding),
+    )
+
+    result = _smartperfetto_result()
+    context = await runtime._await_source_context(analysis, result)
+    prepared = _prepare_local_report(analysis, result)
+    report = _compose_local_report(
+        analysis,
+        prepared,
+        generation=1,
+        synthesis=None,
+        synthesis_failure_code="ai_not_configured",
+        rounds=(),
+        synthesizer=None,
+    )
+
+    assert context is None
+    assert analysis.source_code_analysis["context_state"] == "unavailable"
+    assert analysis.source_code_analysis["failure_code"] == "source_context_timeout"
+    assert report["state"] == "partially_completed"
+    assert report["source_code"]["context_state"] == "unavailable"
+
+
 def test_local_runtime_allows_configured_private_lan_web_origin(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1011,6 +1303,41 @@ class _ProjectionReportProvider:
                 for item in projected["limitations"]
             ],
         }
+        source_context = projected.get("source_context")
+        if (
+            isinstance(source_context, dict)
+            and source_context.get("match_summary") == "strong"
+            and source_context.get("fragments")
+            and recommendations
+        ):
+            source_ref = source_context["fragments"][0]
+            path = source_ref["relative_path"]
+            document["source_fixes"] = [
+                {
+                    "fix_id": "95000000-0000-4000-8000-000000000001",
+                    "finding_id": source_ref["finding_ids"][0],
+                    "evidence_ids": source_ref["evidence_ids"],
+                    "recommendation_priority": recommendations[0]["priority"],
+                    "source_ref_ids": [source_ref["source_ref_id"]],
+                    "rule_id": source_ref["rule_ids"][0],
+                    "match_grade": "strong",
+                    "relative_path": path,
+                    "symbol": source_ref["symbol"],
+                    "diagnosis": "启动路径在主线程执行了可延迟初始化。",
+                    "diff": (
+                        f"diff --git a/{path} b/{path}\n"
+                        f"--- a/{path}\n"
+                        f"+++ b/{path}\n"
+                        "@@ -1 +1 @@\n"
+                        "-fun init() = loadNow()\n"
+                        "+fun init() = loadLazily()\n"
+                    ),
+                    "validation_profile_id": (
+                        "96000000-0000-4000-8000-000000000001"
+                    ),
+                    "retest_target": "重复冷启动并对比首帧耗时。",
+                }
+            ]
         return SynthesisCandidate(
             candidate_json=canonical_json_bytes(document),
             prompt_tokens=10,
