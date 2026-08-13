@@ -791,6 +791,9 @@ class _LocalAnalysis:
     device_digest: str | None = field(default=None, repr=False)
     application_version_id: UUID | None = None
     application_metadata: dict[str, object] | None = None
+    remote_publication: Literal["not_requested", "publishing", "published"] = (
+        "not_requested"
+    )
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
     started_at: datetime | None = None
     completed_at: datetime | None = None
@@ -854,6 +857,7 @@ _PERSISTED_STATE_KEYS = {
     "device_digest",
     "application_version_id",
     "application_metadata",
+    "remote_publication",
     "profile",
     "question",
     "created_at",
@@ -885,6 +889,7 @@ _PERSISTED_OPTIONAL_STATE_KEYS = {
     "evidence_format_version",
     "evidence_manifest",
     "smartperfetto_original",
+    "remote_publication",
 }
 _PERSISTED_STAGE_KEYS = {
     "input_validation",
@@ -971,6 +976,12 @@ def _validate_persisted_state_shape(document: Mapping[str, object]) -> None:
             "has_native_libraries",
         },
     ):
+        raise ValueError
+    if document.get("remote_publication", "not_requested") not in {
+        "not_requested",
+        "publishing",
+        "published",
+    }:
         raise ValueError
     failure = document.get("failure")
     if failure is not None and not _has_exact_keys(
@@ -2040,6 +2051,7 @@ class _LocalRuntime:
                 else None
             ),
             "application_metadata": analysis.application_metadata,
+            "remote_publication": analysis.remote_publication,
             "profile": analysis.profile,
             "question": analysis.question,
             "created_at": analysis.created_at.isoformat(),
@@ -2324,6 +2336,17 @@ class _LocalRuntime:
                 if isinstance(document.get("application_metadata"), Mapping)
                 else None
             ),
+            remote_publication=(
+                str(document["remote_publication"])  # type: ignore[arg-type]
+                if "remote_publication" in document
+                else (
+                    "publishing"
+                    if analysis_mode == "device"
+                    and document.get("application_metadata") is not None
+                    and any(item.finalized for item in inputs.values())
+                    else "not_requested"
+                )
+            ),
             created_at=created_at or _EARLIEST_LOCAL_ANALYSIS_TIME,
             started_at=started_at,
             completed_at=completed_at,
@@ -2371,6 +2394,7 @@ class _LocalRuntime:
 
     async def start(self) -> None:
         persisted = await asyncio.to_thread(self.store.load_states)
+        pending_remote_publications: list[tuple[_LocalAnalysis, _LocalUpload]] = []
         for (team_id, analysis_id), document in persisted.items():
             analysis = self._restore_analysis(document)
             migrate_created_at = document.get("created_at") is None
@@ -2488,6 +2512,26 @@ class _LocalRuntime:
                     raise
             if resume_gate is not None:
                 resume_gate.set()
+            if (
+                analysis.remote_publication == "publishing"
+                and analysis.cancel_requested_at is None
+                and analysis.state not in _TERMINAL_ANALYSIS_STATES
+            ):
+                target = analysis.inputs.get("apk")
+                if target is not None and target.upload_id is not None:
+                    upload = self.uploads.get(
+                        (analysis.team_id, analysis.analysis_id, target.upload_id)
+                    )
+                    if upload is not None and upload.bytes_ready:
+                        pending_remote_publications.append((analysis, upload))
+        for analysis, upload in pending_remote_publications:
+            try:
+                await self._publish_remote_device(analysis, upload)
+            except Exception as error:
+                _LOGGER.warning(
+                    "Remote capture publication recovery deferred type=%s",
+                    type(error).__name__,
+                )
 
     async def close(self) -> None:
         tasks = tuple(self.tasks)
@@ -2569,6 +2613,7 @@ class _LocalRuntime:
                 path=self.store.upload_path(team_id, analysis.analysis_id, upload_id),
             )
             target.upload_id = upload_id
+            analysis.state = "uploading"
         async with self.lock:
             if any(
                 current.state in _ACTIVE_ANALYSIS_STATES
@@ -3183,10 +3228,9 @@ class _LocalRuntime:
             ):
                 raise HTTPException(status.HTTP_409_CONFLICT, "upload is not ready")
             target = analysis.inputs[upload.kind]
-            if target.finalized:
-                return upload
+            needs_inspection = analysis.remote_publication == "not_requested"
             if (
-                self.apk_inspector is None
+                (needs_inspection and self.apk_inspector is None)
                 or analysis.device_id is None
                 or analysis.device_agent_id is None
                 or analysis.device_digest is None
@@ -3195,7 +3239,11 @@ class _LocalRuntime:
                     status.HTTP_409_CONFLICT,
                     "APK metadata is unavailable",
                 )
+        if not needs_inspection:
+            await self._publish_remote_device(analysis, upload)
+            return upload
         try:
+            assert self.apk_inspector is not None
             metadata = await self.apk_inspector.inspect(upload.path)
         except LocalDeviceCaptureError:
             async with self.lock:
@@ -3237,18 +3285,82 @@ class _LocalRuntime:
             "supported_abis": list(metadata.supported_abis),
             "has_native_libraries": metadata.has_native_libraries,
         }
-        definition = AgentTaskDefinition(
+        async with self.lock:
+            if analysis.remote_publication != "not_requested":
+                publish_existing = True
+            else:
+                publish_existing = False
+                previous_finalized = target.finalized
+                previous_artifact_id = target.artifact_id
+                previous_application_version_id = analysis.application_version_id
+                previous_application_metadata = analysis.application_metadata
+                previous_failure = analysis.failure
+                previous_stages = dict(analysis.stages)
+                previous_state = analysis.state
+                previous_version = analysis.version
+                target.finalized = True
+                target.artifact_id = str(artifact_id)
+                analysis.application_version_id = application_version_id
+                analysis.application_metadata = application_metadata
+                analysis.remote_publication = "publishing"
+                analysis.failure = None
+                analysis.stages["input_validation"] = "completed"
+                analysis.state = "uploading"
+                analysis.version += 1
+        if publish_existing:
+            await self._publish_remote_device(analysis, upload)
+            return upload
+        try:
+            await self._persist(analysis)
+        except LocalAnalysisStoreDurabilityError:
+            raise
+        except BaseException:
+            async with self.lock:
+                target.finalized = previous_finalized
+                target.artifact_id = previous_artifact_id
+                analysis.application_version_id = previous_application_version_id
+                analysis.application_metadata = previous_application_metadata
+                analysis.remote_publication = "not_requested"
+                analysis.failure = previous_failure
+                analysis.stages = previous_stages
+                analysis.state = previous_state
+                analysis.version = previous_version
+            raise
+        await self._publish_remote_device(analysis, upload)
+        return upload
+
+    def _remote_device_definition(
+        self,
+        analysis: _LocalAnalysis,
+        upload: _LocalUpload,
+    ) -> AgentTaskDefinition:
+        metadata = analysis.application_metadata
+        target = analysis.inputs.get("apk")
+        if (
+            metadata is None
+            or target is None
+            or target.artifact_id is None
+            or analysis.device_agent_id is None
+            or analysis.device_id is None
+            or analysis.device_digest is None
+        ):
+            raise RuntimeError("Remote capture publication is incomplete")
+        package_name = metadata.get("package_name")
+        launch_activity = metadata.get("launch_activity")
+        if not isinstance(package_name, str) or not isinstance(launch_activity, str):
+            raise RuntimeError("Remote capture publication is incomplete")
+        return AgentTaskDefinition(
             analysis_id=analysis.analysis_id,
             team_id=analysis.team_id,
             agent_id=analysis.device_agent_id,
             device_id=analysis.device_id,
             device_digest=analysis.device_digest,
-            package_name=metadata.package_name,
-            launch_activity=metadata.launch_activity,
+            package_name=package_name,
+            launch_activity=launch_activity,
             cleanup_policy="uninstall",
             input_artifacts=(
                 TaskInputArtifact(
-                    artifact_id=artifact_id,
+                    artifact_id=UUID(target.artifact_id),
                     kind="apk",
                     mime=upload.mime,
                     size=upload.size,
@@ -3275,47 +3387,52 @@ class _LocalRuntime:
             ),
             schema_version="1.1",
         )
-        async with self.lock:
-            if target.finalized:
-                return upload
-            target.finalized = True
-            target.artifact_id = str(artifact_id)
-            analysis.application_version_id = application_version_id
-            analysis.application_metadata = application_metadata
-            analysis.failure = None
-            analysis.stages["input_validation"] = "completed"
-            analysis.state = "queued"
-            analysis.version += 1
-        await self._persist(analysis)
+
+    async def _publish_remote_device(
+        self,
+        analysis: _LocalAnalysis,
+        upload: _LocalUpload,
+    ) -> None:
+        definition = self._remote_device_definition(analysis, upload)
+        artifact = definition.input_artifacts[0]
+        registered = False
         try:
-            self.agent_artifacts.register_input(
+            registered = self.agent_artifacts.register_input(
                 team_id=analysis.team_id,
                 analysis_id=analysis.analysis_id,
-                artifact_id=artifact_id,
+                artifact_id=artifact.artifact_id,
                 upload_id=UUID(upload.upload_id),
-                mime=upload.mime,
-                size=upload.size,
-                sha256_b64=upload.sha256_b64,
+                mime=artifact.mime,
+                size=artifact.size,
+                sha256_b64=artifact.sha256_b64,
             )
             await self.agent_tasks.enqueue(definition)
-        except Exception:
-            self.agent_artifacts.unregister_input(
-                team_id=analysis.team_id,
-                analysis_id=analysis.analysis_id,
-                artifact_id=artifact_id,
-            )
-            async with self.lock:
-                if target.artifact_id == str(artifact_id):
-                    target.finalized = False
-                    target.artifact_id = None
-                    analysis.application_version_id = None
-                    analysis.application_metadata = None
-                    analysis.state = "uploading"
-                    analysis.stages["input_validation"] = "running"
-                    analysis.version += 1
-            await self._persist(analysis)
+        except BaseException:
+            if registered:
+                self.agent_artifacts.unregister_input(
+                    team_id=analysis.team_id,
+                    analysis_id=analysis.analysis_id,
+                    artifact_id=artifact.artifact_id,
+                )
             raise
-        return upload
+        async with self.lock:
+            if analysis.remote_publication == "published":
+                return
+            previous_state = analysis.state
+            previous_version = analysis.version
+            analysis.remote_publication = "published"
+            analysis.state = "queued"
+            analysis.version += 1
+        try:
+            await self._persist(analysis)
+        except LocalAnalysisStoreDurabilityError:
+            raise
+        except BaseException:
+            async with self.lock:
+                analysis.remote_publication = "publishing"
+                analysis.state = previous_state
+                analysis.version = previous_version
+            raise
 
     async def _execute(self, analysis: _LocalAnalysis) -> None:
         generation = analysis.generation

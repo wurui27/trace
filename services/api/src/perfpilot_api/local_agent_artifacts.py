@@ -408,7 +408,7 @@ class LocalAgentArtifactService:
         mime: str,
         size: int,
         sha256_b64: str,
-    ) -> None:
+    ) -> bool:
         for value, name in (
             (team_id, "team_id"),
             (analysis_id, "analysis_id"),
@@ -460,8 +460,11 @@ class LocalAgentArtifactService:
         )
         if existing is not None and existing != item:
             raise AgentUploadMismatch("input artifact metadata does not match")
+        if existing is not None:
+            return False
         self._inputs[artifact_id] = item
         self._save_state(team_id, analysis_id)
+        return True
 
     def unregister_input(
         self,

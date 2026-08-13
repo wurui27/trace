@@ -135,10 +135,8 @@ class TaskLoop:
                 lease_version=response.lease_version,
             )
             return True
-        if not isinstance(response, TaskExecuteResponse):
+        if not isinstance(response, (TaskExecuteResponse, DeviceTaskExecuteResponse)):
             if not isinstance(response, SourceTaskExecuteResponse):
-                if isinstance(response, DeviceTaskExecuteResponse):
-                    raise TaskRejected
                 raise ControlClientError
             credentials = self._control.credentials
             if credentials.team_id is None:
@@ -165,19 +163,31 @@ class TaskLoop:
                 self._state.set_execution(None)
             return True
         credentials = self._control.credentials
-        task = TaskVerifier(
+        verifier = TaskVerifier(
             public_key_b64=credentials.task_signing_key.public_key_b64,
             kid=credentials.task_signing_key.kid,
             clock=self._clock,
-        ).verify(
-            response.snapshot_jws,
-            expected_agent_id=credentials.agent_id,
-            expected_team_id=credentials.team_id,
-            expected_lease_version=None,
-            known_device_digests=self._state.known_device_digests(),
         )
-        if task.expires_at != response.lease_expires_at.astimezone(UTC):
-            raise TaskRejected
+        if isinstance(response, DeviceTaskExecuteResponse):
+            if credentials.team_id is None:
+                raise TaskRejected
+            task = verifier.verify_device(
+                response.snapshot,
+                response.signature_b64,
+                expected_agent_id=credentials.agent_id,
+                expected_team_id=credentials.team_id,
+                known_device_digests=self._state.known_device_digests(),
+            )
+        else:
+            task = verifier.verify(
+                response.snapshot_jws,
+                expected_agent_id=credentials.agent_id,
+                expected_team_id=credentials.team_id,
+                expected_lease_version=None,
+                known_device_digests=self._state.known_device_digests(),
+            )
+            if task.expires_at != response.lease_expires_at.astimezone(UTC):
+                raise TaskRejected
         await self._executor.run(task)
         return True
 

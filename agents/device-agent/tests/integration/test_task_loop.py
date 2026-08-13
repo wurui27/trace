@@ -14,6 +14,7 @@ from perfpilot_agent.config import AgentConfig
 from perfpilot_agent.control_client import (
     ControlClient,
     ControlClientError,
+    DeviceTaskExecuteResponse,
     SourceTaskExecuteResponse,
     TaskExecuteResponse,
     TaskWaitResponse,
@@ -129,6 +130,96 @@ async def test_task_loop_verifies_snapshot_before_dispatch(
 
     assert handled is True
     assert [task.execution_id for task in executor.tasks] == [UUID(task_claims["execution_id"])]
+
+
+@pytest.mark.asyncio
+async def test_task_loop_dispatches_v11_device_response_from_control_client(
+    tmp_path,
+    signing_key,
+    task_claims,
+) -> None:
+    now = datetime.fromisoformat(task_claims["issued_at"])
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    claims = {
+        **task_claims,
+        "schema_version": "1.1",
+        "team_id": str(team_id),
+        "scenarios": [
+            task_claims["scenarios"][0],
+            {
+                "scenario_type": "scroll",
+                "recipe_version": 1,
+                "recipe_hash": "c" * 64,
+                "duration_seconds": 30,
+                "memory_rounds": 0,
+                "swipe_count": 3,
+            },
+        ],
+        "allowed_uploads": ["startup_trace", "scroll_trace", "agent_log"],
+    }
+    canonical = json.dumps(
+        claims,
+        ensure_ascii=False,
+        allow_nan=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    signature = base64.b64encode(signing_key.sign(canonical)).decode("ascii")
+    response_document = {
+        "schema_version": "1.1",
+        "task_kind": "device",
+        "lease_token": "opaque-device-lease-token",
+        "snapshot": claims,
+        "signature_b64": signature,
+    }
+    ca = tmp_path / "ca.crt"
+    ca.write_text("test", encoding="utf-8")
+    config = AgentConfig(
+        server_url="https://control.example.test",
+        ca_bundle=ca,
+        workspace_root=tmp_path / "work",
+    )
+    credentials = _credentials(
+        signing_key,
+        "task-key-2026-08",
+        UUID(task_claims["agent_id"]),
+        now,
+        team_id=team_id,
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, request=request, json=response_document)
+
+    state = AgentRuntimeState()
+    state.replace_device_bindings(
+        (
+            DeviceBinding(
+                client_ref="74000000-0000-4000-8000-000000000001",
+                device_id="72000000-0000-4000-8000-000000000001",
+                device_digest=claims["device_digest"],
+                serial="device-under-test",
+            ),
+        )
+    )
+    capture = FakeExecutor()
+    source = FakeExecutor()
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        control = ControlClient(config, http_client=http_client, credentials=credentials)
+        assert isinstance(await control.poll_task(wait_seconds=0), DeviceTaskExecuteResponse)
+        loop = TaskLoop(
+            control=control,
+            executor=capture,
+            source_executor=source,
+            state=state,
+            clock=lambda: now,
+            sleep=lambda _: _completed_sleep(),
+        )
+
+        handled = await loop.poll_once()
+
+    assert handled is True
+    assert [task.execution_id for task in capture.tasks] == [UUID(claims["execution_id"])]
+    assert source.tasks == []
 
 
 @pytest.mark.asyncio

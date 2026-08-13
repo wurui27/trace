@@ -401,8 +401,14 @@ class DeviceTaskExecuteResponse(BaseModel):
     schema_version: Literal["1.1"]
     task_kind: Literal["device"]
     lease_token: str = Field(min_length=16, max_length=256, pattern=r"^[A-Za-z0-9_-]+$", repr=False)
-    snapshot: TaskSnapshot
+    snapshot: dict[str, object] = Field(repr=False)
     signature_b64: str = Field(pattern=r"^[A-Za-z0-9+/]{86}==$", repr=False)
+
+    @field_validator("snapshot")
+    @classmethod
+    def validate_closed_snapshot(cls, value: dict[str, object]) -> dict[str, object]:
+        TaskSnapshot.model_validate(value)
+        return value
 
 
 class TaskCancellationResponse(BaseModel):

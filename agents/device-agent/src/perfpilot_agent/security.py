@@ -405,6 +405,61 @@ class TaskVerifier:
         ):
             raise TaskRejected from None
 
+    def verify_device(
+        self,
+        snapshot: object,
+        signature_b64: str,
+        *,
+        expected_agent_id: UUID,
+        expected_team_id: UUID,
+        known_device_digests: Collection[str],
+    ) -> TaskSnapshot:
+        try:
+            if not isinstance(snapshot, dict):
+                raise TaskRejected
+            canonical = json.dumps(
+                snapshot,
+                ensure_ascii=False,
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ).encode("utf-8")
+            signature = base64.b64decode(signature_b64, validate=True)
+            if (
+                len(signature) != 64
+                or base64.b64encode(signature).decode("ascii") != signature_b64
+            ):
+                raise TaskRejected
+            self._public_key.verify(signature, canonical)
+            task = TaskSnapshot.model_validate(snapshot)
+            now = self._clock()
+            if now.tzinfo is None or now.utcoffset() is None:
+                raise TaskRejected
+            normalized_now = now.astimezone(UTC)
+            lifetime = task.expires_at - task.issued_at
+            if (
+                task.schema_version != "1.1"
+                or lifetime <= timedelta(0)
+                or lifetime > _MAXIMUM_LIFETIME
+                or task.issued_at > normalized_now + _MAXIMUM_ISSUED_AT_SKEW
+                or task.expires_at <= normalized_now
+                or task.agent_id != expected_agent_id
+                or task.team_id != expected_team_id
+                or task.device_digest not in known_device_digests
+            ):
+                raise TaskRejected
+            return task
+        except TaskRejected:
+            raise
+        except (
+            InvalidSignature,
+            ValidationError,
+            UnicodeError,
+            ValueError,
+            TypeError,
+        ):
+            raise TaskRejected from None
+
 
 __all__ = [
     "TaskInputArtifact",

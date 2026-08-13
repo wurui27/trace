@@ -3111,7 +3111,16 @@ def test_local_remote_capture_rejects_invalid_apk_without_agent_task(
 
 
 @pytest.mark.parametrize(
-    "outcome", ["completed", "failed", "canceled", "enqueue_failed"]
+    "outcome",
+    [
+        "completed",
+        "failed",
+        "canceled",
+        "enqueue_failed",
+        "intent_persist_failed",
+        "published_persist_failed",
+        "restart_reconciled",
+    ],
 )
 def test_local_remote_capture_runs_real_agent_lifecycle(
     tmp_path: Path,
@@ -3127,12 +3136,13 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
     host_probe = _FakeDeviceProbe(
         _FakeDeviceStatus(state="disconnected", device=None)
     )
+    inspector = _FakeLocalApkInspector()
     app = create_local_app(
         gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
         data_root=tmp_path / "data",
         state_root=tmp_path / "state",
         control_store=control,
-        apk_inspector=_FakeLocalApkInspector(),
+        apk_inspector=inspector,
         device_probe=host_probe,
         public_origin="https://testserver",
     )
@@ -3214,11 +3224,27 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
             content=apk,
             headers=slot["required_headers"],
         ).status_code == 200
-        if outcome == "enqueue_failed":
+        original_enqueue = app.state.local_runtime.agent_tasks.enqueue
+        original_persist = app.state.local_runtime._persist
+        if outcome in {"enqueue_failed", "restart_reconciled"}:
             async def fail_enqueue(_definition: object) -> bool:
                 raise RuntimeError("injected enqueue failure")
 
             app.state.local_runtime.agent_tasks.enqueue = fail_enqueue
+        elif outcome in {"intent_persist_failed", "published_persist_failed"}:
+            failure_phase = (
+                "publishing" if outcome == "intent_persist_failed" else "published"
+            )
+            failed = False
+
+            async def fail_selected_persist(analysis) -> None:
+                nonlocal failed
+                if not failed and analysis.remote_publication == failure_phase:
+                    failed = True
+                    raise LocalAnalysisStoreError("injected publication persistence failure")
+                await original_persist(analysis)
+
+            app.state.local_runtime._persist = fail_selected_persist
         def finalize_request():
             return client.post(
                 (
@@ -3232,19 +3258,52 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                     "size": len(apk),
                 },
             )
-        if outcome == "enqueue_failed":
-            with pytest.raises(RuntimeError, match="injected enqueue failure"):
+        if outcome in {
+            "enqueue_failed",
+            "intent_persist_failed",
+            "published_persist_failed",
+            "restart_reconciled",
+        }:
+            error_type = (
+                RuntimeError
+                if outcome in {"enqueue_failed", "restart_reconciled"}
+                else LocalAnalysisStoreError
+            )
+            with pytest.raises(error_type):
                 finalize_request()
+            if outcome == "intent_persist_failed":
+                failed_analysis = app.state.local_runtime.analyses[
+                    (user.team_id, UUID(created["analysis_id"]))
+                ]
+                assert failed_analysis.remote_publication == "not_requested"
+                assert failed_analysis.inputs["apk"].finalized is False
+                assert failed_analysis.application_metadata is None
             projected = client.get(
                 f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
             ).json()
-            client.cookies.clear()
-            delivery = client.get(
-                "/v1/agent/tasks/next?wait_seconds=0",
-                headers={"Authorization": f"Bearer {credentials['access_token']}"},
-            )
-            assert delivery.json()["action"] == "wait"
-            assert app.state.agent_upload_service._inputs == {}
+            if outcome != "published_persist_failed":
+                client.cookies.clear()
+                delivery = client.get(
+                    "/v1/agent/tasks/next?wait_seconds=0",
+                    headers={"Authorization": f"Bearer {credentials['access_token']}"},
+                )
+                assert delivery.json()["action"] == "wait"
+                assert app.state.agent_upload_service._inputs == {}
+                browser_headers = _authenticated_client(
+                    client, "user01", "established user password"
+                )
+            if outcome != "restart_reconciled":
+                app.state.local_runtime.agent_tasks.enqueue = original_enqueue
+                app.state.local_runtime._persist = original_persist
+                assert finalize_request().status_code == 200
+                assert inspector.calls == (
+                    [apk, apk] if outcome == "intent_persist_failed" else [apk]
+                )
+                repository = app.state.agent_task_service._repository
+                assert list(repository._definitions) == [UUID(created["analysis_id"])]
+                projected = client.get(
+                    f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+                ).json()
             captured = None
         else:
             assert finalize_request().status_code == 200
@@ -3278,9 +3337,42 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                 f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
             ).json()
 
+    if outcome == "restart_reconciled":
+        restarted = create_local_app(
+            gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+            data_root=tmp_path / "data",
+            state_root=tmp_path / "state",
+            control_store=control,
+            apk_inspector=inspector,
+            device_probe=host_probe,
+            public_origin="https://testserver",
+        )
+        with _RawTestClient(restarted) as client:
+            browser_headers = _authenticated_client(
+                client, "user01", "established user password"
+            )
+            projected = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            ).json()
+            client.cookies.clear()
+            delivery = client.get(
+                "/v1/agent/tasks/next?wait_seconds=0",
+                headers={"Authorization": f"Bearer {credentials['access_token']}"},
+            )
+            assert delivery.status_code == 200, delivery.text
+            assert delivery.json()["action"] == "execute"
+            repository = restarted.state.agent_task_service._repository
+            assert list(repository._definitions) == [UUID(created["analysis_id"])]
+            assert restarted.state.agent_upload_service._inputs
+            assert inspector.calls == [apk]
     assert host_probe.calls == 0
-    if outcome == "enqueue_failed":
-        assert projected["state"] == "uploading"
+    if outcome in {
+        "enqueue_failed",
+        "intent_persist_failed",
+        "published_persist_failed",
+        "restart_reconciled",
+    }:
+        assert projected["state"] == "queued"
     elif outcome == "completed":
         assert projected["scenarios"][2]["state"] == "not_requested"
         assert captured is not None
