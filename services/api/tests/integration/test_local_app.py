@@ -28,6 +28,7 @@ from perfpilot_api.local_app import (
     LocalEngineRun,
     _LOCAL_EVIDENCE_FORMAT_VERSION,
     _InputDescriptor,
+    _FinalizeUploadRequest,
     _LocalAnalysis,
     _LocalInput,
     _LocalUpload,
@@ -1679,6 +1680,34 @@ class _FakeLocalApkInspector:
         )
 
 
+class _GatedLocalApkInspector(_FakeLocalApkInspector):
+    def __init__(self, *, expected_entries: int = 1) -> None:
+        super().__init__()
+        self.first_entered = asyncio.Event()
+        self.expected_entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self._expected_entries = expected_entries
+
+    async def inspect(self, apk_path: Path) -> LocalApkMetadata:
+        self.calls.append(apk_path.read_bytes())
+        self.first_entered.set()
+        if len(self.calls) >= self._expected_entries:
+            self.expected_entered.set()
+        await self.release.wait()
+        return LocalApkMetadata(
+            package_name="com.example.perfpilot",
+            version_name="1.2.3",
+            version_code=123,
+            launch_activity=(
+                "com.example.perfpilot/com.example.perfpilot.MainActivity"
+            ),
+            min_sdk=26,
+            target_sdk=35,
+            supported_abis=("arm64-v8a",),
+            has_native_libraries=True,
+        )
+
+
 class _InvalidLocalApkInspector:
     def __init__(self) -> None:
         self.calls = 0
@@ -3108,6 +3137,253 @@ def test_local_remote_capture_rejects_invalid_apk_without_agent_task(
     assert analysis["state"] == "failed"
     assert analysis["failure"]["code"] == "apk_metadata_invalid"
     assert delivery.json()["action"] == "wait"
+
+
+async def _prepare_remote_finalize(
+    runtime,
+    *,
+    team_id: UUID,
+    analysis_id: UUID,
+    upload_id: str,
+    apk: bytes,
+) -> tuple[_LocalAnalysis, _LocalUpload, _FinalizeUploadRequest]:
+    checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
+    descriptor = _InputDescriptor(
+        kind="apk",
+        mime="application/vnd.android.package-archive",
+        size=len(apk),
+        sha256_b64=checksum,
+    )
+    target = _LocalInput(descriptor, upload_id=upload_id)
+    analysis = _LocalAnalysis(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        profile="startup",
+        question=None,
+        inputs={"apk": target},
+        analysis_mode="device",
+        device_id=UUID("72000000-0000-4000-8000-000000000001"),
+        device_agent_id=UUID("71000000-0000-4000-8000-000000000001"),
+        device_digest="a" * 64,
+        state="uploading",
+    )
+    path = runtime.store.upload_path(team_id, analysis_id, upload_id)
+    path.write_bytes(apk)
+    path.chmod(0o600)
+    upload = _LocalUpload(
+        upload_id=upload_id,
+        team_id=team_id,
+        analysis_id=analysis_id,
+        kind="apk",
+        mime=descriptor.mime,
+        size=descriptor.size,
+        sha256_b64=checksum,
+        token=f"private-finalize-token-{analysis_id}",
+        path=path,
+        bytes_ready=True,
+    )
+    runtime.analyses[(team_id, analysis_id)] = analysis
+    runtime._register_upload(upload)
+    await runtime._persist(analysis)
+    request = _FinalizeUploadRequest(
+        upload_id=upload_id,
+        sha256_b64=checksum,
+        size=len(apk),
+    )
+    return analysis, upload, request
+
+
+@pytest.mark.asyncio
+async def test_local_remote_finalize_serializes_exact_concurrent_requests(
+    tmp_path: Path,
+) -> None:
+    inspector = _GatedLocalApkInspector(expected_entries=2)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        apk_inspector=inspector,
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+    )
+    runtime = app.state.local_runtime
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    apk = b"concurrent remote apk"
+    analysis, upload, request = await _prepare_remote_finalize(
+        runtime,
+        team_id=team_id,
+        analysis_id=analysis_id,
+        upload_id="51000000-0000-4000-8000-000000000001",
+        apk=apk,
+    )
+    first = asyncio.create_task(runtime._finalize_remote_device(analysis, request))
+    await inspector.first_entered.wait()
+    second = asyncio.create_task(runtime._finalize_remote_device(analysis, request))
+    try:
+        await asyncio.sleep(0.05)
+        assert inspector.calls == [apk]
+    finally:
+        inspector.release.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        await runtime.close()
+        app.state.agent_upload_service.close()
+        app.state.local_agent_store.close()
+
+    assert results == [upload, upload]
+    repository = app.state.agent_task_service._repository
+    assert list(repository._definitions) == [analysis_id]
+
+
+@pytest.mark.asyncio
+async def test_local_remote_finalize_waits_for_durable_intent_before_publication(
+    tmp_path: Path,
+) -> None:
+    inspector = _FakeLocalApkInspector()
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        apk_inspector=inspector,
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+    )
+    runtime = app.state.local_runtime
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    analysis, upload, request = await _prepare_remote_finalize(
+        runtime,
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=analysis_id,
+        upload_id="51000000-0000-4000-8000-000000000001",
+        apk=b"durable intent remote apk",
+    )
+    original_persist = runtime._persist
+    intent_entered = asyncio.Event()
+    release_intent = asyncio.Event()
+    failed = False
+
+    async def fail_first_intent(current: _LocalAnalysis) -> None:
+        nonlocal failed
+        if not failed and current.remote_publication == "publishing":
+            failed = True
+            intent_entered.set()
+            await release_intent.wait()
+            raise LocalAnalysisStoreError("injected intent failure")
+        await original_persist(current)
+
+    runtime._persist = fail_first_intent
+    first = asyncio.create_task(runtime._finalize_remote_device(analysis, request))
+    await intent_entered.wait()
+    second = asyncio.create_task(runtime._finalize_remote_device(analysis, request))
+    try:
+        await asyncio.sleep(0.05)
+        assert second.done() is False
+        assert app.state.agent_upload_service._inputs == {}
+        assert app.state.agent_task_service._repository._definitions == {}
+    finally:
+        release_intent.set()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        await runtime.close()
+        app.state.agent_upload_service.close()
+        app.state.local_agent_store.close()
+
+    assert isinstance(results[0], LocalAnalysisStoreError)
+    assert results[1] is upload
+    assert inspector.calls == [b"durable intent remote apk"] * 2
+    assert list(app.state.agent_task_service._repository._definitions) == [analysis_id]
+
+
+@pytest.mark.asyncio
+async def test_local_remote_finalize_locks_are_scoped_per_analysis(
+    tmp_path: Path,
+) -> None:
+    inspector = _GatedLocalApkInspector(expected_entries=2)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        apk_inspector=inspector,
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+    )
+    runtime = app.state.local_runtime
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    first_analysis, _, first_request = await _prepare_remote_finalize(
+        runtime,
+        team_id=team_id,
+        analysis_id=UUID("30000000-0000-4000-8000-000000000001"),
+        upload_id="51000000-0000-4000-8000-000000000001",
+        apk=b"first independent apk",
+    )
+    second_analysis, _, second_request = await _prepare_remote_finalize(
+        runtime,
+        team_id=team_id,
+        analysis_id=UUID("30000000-0000-4000-8000-000000000002"),
+        upload_id="51000000-0000-4000-8000-000000000002",
+        apk=b"second independent apk",
+    )
+    first = asyncio.create_task(
+        runtime._finalize_remote_device(first_analysis, first_request)
+    )
+    await inspector.first_entered.wait()
+    second = asyncio.create_task(
+        runtime._finalize_remote_device(second_analysis, second_request)
+    )
+    try:
+        await asyncio.wait_for(inspector.expected_entered.wait(), timeout=1)
+        assert inspector.calls == [b"first independent apk", b"second independent apk"]
+    finally:
+        inspector.release.set()
+        await asyncio.gather(first, second)
+        await runtime.close()
+        app.state.agent_upload_service.close()
+        app.state.local_agent_store.close()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_remote_finalize_releases_analysis_lock_for_retry(
+    tmp_path: Path,
+) -> None:
+    inspector = _GatedLocalApkInspector(expected_entries=2)
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        apk_inspector=inspector,
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+    )
+    runtime = app.state.local_runtime
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    analysis, upload, request = await _prepare_remote_finalize(
+        runtime,
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=analysis_id,
+        upload_id="51000000-0000-4000-8000-000000000001",
+        apk=b"canceled finalize apk",
+    )
+    first = asyncio.create_task(runtime._finalize_remote_device(analysis, request))
+    await inspector.first_entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    retry = asyncio.create_task(runtime._finalize_remote_device(analysis, request))
+    try:
+        await asyncio.wait_for(inspector.expected_entered.wait(), timeout=1)
+    finally:
+        inspector.release.set()
+        result = await retry
+        await runtime.close()
+        app.state.agent_upload_service.close()
+        app.state.local_agent_store.close()
+
+    assert result is upload
+    assert analysis.remote_publication == "published"
+    assert list(app.state.agent_task_service._repository._definitions) == [analysis_id]
 
 
 @pytest.mark.parametrize(

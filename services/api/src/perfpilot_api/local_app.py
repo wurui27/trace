@@ -2007,7 +2007,12 @@ class _LocalRuntime:
         self.uploads: dict[tuple[UUID, UUID, str], _LocalUpload] = {}
         self.upload_authorizations: dict[str, tuple[UUID, UUID, str]] = {}
         self.lock = asyncio.Lock()
+        self.remote_publication_locks: dict[tuple[UUID, UUID], asyncio.Lock] = {}
         self.tasks: set[asyncio.Task[None]] = set()
+
+    def _remote_publication_lock(self, analysis: _LocalAnalysis) -> asyncio.Lock:
+        key = (analysis.team_id, analysis.analysis_id)
+        return self.remote_publication_locks.setdefault(key, asyncio.Lock())
 
     @staticmethod
     def _upload_key(upload: _LocalUpload) -> tuple[UUID, UUID, str]:
@@ -2526,7 +2531,8 @@ class _LocalRuntime:
                         pending_remote_publications.append((analysis, upload))
         for analysis, upload in pending_remote_publications:
             try:
-                await self._publish_remote_device(analysis, upload)
+                async with self._remote_publication_lock(analysis):
+                    await self._publish_remote_device(analysis, upload)
             except Exception as error:
                 _LOGGER.warning(
                     "Remote capture publication recovery deferred type=%s",
@@ -3212,6 +3218,14 @@ class _LocalRuntime:
         return upload
 
     async def _finalize_remote_device(
+        self,
+        analysis: _LocalAnalysis,
+        request: _FinalizeUploadRequest,
+    ) -> _LocalUpload:
+        async with self._remote_publication_lock(analysis):
+            return await self._finalize_remote_device_serialized(analysis, request)
+
+    async def _finalize_remote_device_serialized(
         self,
         analysis: _LocalAnalysis,
         request: _FinalizeUploadRequest,
