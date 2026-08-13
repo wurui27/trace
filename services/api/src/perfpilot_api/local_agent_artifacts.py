@@ -13,6 +13,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 from collections.abc import AsyncIterable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -51,6 +52,7 @@ _MIME = re.compile(
 )
 _ALLOWED_KINDS = frozenset({"startup_trace", "scroll_trace", "agent_log"})
 _ETAG = re.compile(r'"[0-9a-f]{64}"\Z')
+_PART_TEMP = re.compile(r"\.([1-9][0-9]?)\.([0-9a-f]{32})\.tmp\Z")
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
@@ -752,19 +754,24 @@ class LocalAgentArtifactService:
                 self._save_state(upload.team_id, upload.analysis_id)
                 return etag
             except AgentUploadError:
+                raise
+            except OSError:
+                raise AgentUploadUnavailable("local artifact storage is unavailable") from None
+            except Exception:
+                raise AgentUploadUnavailable("local artifact storage is unavailable") from None
+            finally:
+                active_error = sys.exception()
                 try:
                     os.unlink(temporary, dir_fd=directory)
                 except FileNotFoundError:
                     pass
-                raise
-            except OSError:
-                try:
-                    os.unlink(temporary, dir_fd=directory)
                 except OSError:
-                    pass
-                raise AgentUploadUnavailable("local artifact storage is unavailable") from None
-            finally:
-                os.close(directory)
+                    if active_error is None:
+                        raise AgentUploadUnavailable(
+                            "local artifact storage is unavailable"
+                        ) from None
+                finally:
+                    os.close(directory)
 
     @staticmethod
     def _write_chunk(
@@ -1155,7 +1162,7 @@ class LocalAgentArtifactService:
         team_id: UUID,
         analysis_id: UUID,
         artifacts_fd: int,
-    ) -> _Upload:
+    ) -> _Upload | None:
         if not isinstance(raw, Mapping) or set(raw) != {
             "team_id",
             "analysis_id",
@@ -1189,6 +1196,7 @@ class LocalAgentArtifactService:
         lease_version = raw["lease_version"]
         part_count = raw["part_count"]
         expires_at = self._aware_document_time(raw["expires_at"])
+        now = self._now()
         if (
             item_team != team_id
             or item_analysis != analysis_id
@@ -1199,7 +1207,6 @@ class LocalAgentArtifactService:
             or not isinstance(part_count, int)
             or part_count != expected_count
             or not 1 <= part_count <= _MAX_PARTS
-            or expires_at <= self._now()
         ):
             raise ValueError
         finalized_raw = raw["finalized_at"]
@@ -1208,7 +1215,9 @@ class LocalAgentArtifactService:
             if finalized_raw is None
             else self._aware_document_time(finalized_raw)
         )
-        if finalized_at is not None and finalized_at > self._now():
+        if finalized_at is not None and (
+            finalized_at > now or finalized_at > expires_at
+        ):
             raise ValueError
         parts_raw = raw["parts"]
         if not isinstance(parts_raw, list) or len(parts_raw) > part_count:
@@ -1247,7 +1256,12 @@ class LocalAgentArtifactService:
             try:
                 actual_entries = self._directory_entries(upload_fd)
                 expected_entries = tuple(f"{number}.part" for number in parts)
-                if actual_entries != expected_entries:
+                for name in actual_entries:
+                    if name not in expected_entries:
+                        self._remove_owned_part_temp(
+                            upload_fd, name, part_count=part_count
+                        )
+                if self._directory_entries(upload_fd) != expected_entries:
                     raise ValueError
                 for number, etag in parts.items():
                     self._verify_file(
@@ -1260,28 +1274,69 @@ class LocalAgentArtifactService:
                     )
             finally:
                 os.close(upload_fd)
+            completed_fd = self._open_directory(artifacts_fd, "completed", create=False)
+            try:
+                completed_name = f"{kind}-{artifact_id}.bin"
+                if finalized_at is None:
+                    try:
+                        os.stat(completed_name, dir_fd=completed_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    else:
+                        raise ValueError
+                else:
+                    self._verify_file(
+                        completed_fd,
+                        completed_name,
+                        expected_size=size,
+                        expected_sha256_b64=checksum,
+                    )
+            finally:
+                os.close(completed_fd)
+            if finalized_at is None and expires_at <= now:
+                upload_fd = self._open_directory(parts_fd, str(upload_id), create=False)
+                try:
+                    for name in self._directory_entries(upload_fd):
+                        os.unlink(name, dir_fd=upload_fd)
+                    os.fsync(upload_fd)
+                finally:
+                    os.close(upload_fd)
+                os.rmdir(str(upload_id), dir_fd=parts_fd)
+                os.fsync(parts_fd)
+                return None
         finally:
             os.close(parts_fd)
-        completed_fd = self._open_directory(artifacts_fd, "completed", create=False)
-        try:
-            completed_name = f"{kind}-{artifact_id}.bin"
-            if finalized_at is None:
-                try:
-                    os.stat(completed_name, dir_fd=completed_fd, follow_symlinks=False)
-                except FileNotFoundError:
-                    pass
-                else:
-                    raise ValueError
-            else:
-                self._verify_file(
-                    completed_fd,
-                    completed_name,
-                    expected_size=size,
-                    expected_sha256_b64=checksum,
-                )
-        finally:
-            os.close(completed_fd)
         return upload
+
+    @staticmethod
+    def _remove_owned_part_temp(
+        directory_fd: int, name: str, *, part_count: int
+    ) -> None:
+        matched = _PART_TEMP.fullmatch(name)
+        if matched is None:
+            raise ValueError
+        part_number = int(matched.group(1))
+        temporary_id = UUID(hex=matched.group(2))
+        if part_number > part_count or temporary_id.version != 4:
+            raise ValueError
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _NOFOLLOW | _CLOEXEC | _NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        try:
+            held = os.fstat(descriptor)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+            if (
+                not stat.S_ISREG(held.st_mode)
+                or not stat.S_ISREG(current.st_mode)
+                or (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)
+            ):
+                raise OSError
+            os.unlink(name, dir_fd=directory_fd)
+            os.fsync(directory_fd)
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _verify_file(
@@ -1326,6 +1381,7 @@ class LocalAgentArtifactService:
         recovered_inputs: dict[UUID, _Input] = {}
         recovered_uploads: dict[UUID, _Upload] = {}
         recovered_artifacts: dict[UUID, _Upload] = {}
+        cleaned_analyses: set[tuple[UUID, UUID]] = set()
         for team_name in self._directory_entries(self._root_fd):
             team_id = self._document_uuid(team_name)
             team_fd = self._open_directory(self._root_fd, team_name, create=False)
@@ -1381,6 +1437,9 @@ class LocalAgentArtifactService:
                                         analysis_id=analysis_id,
                                         artifacts_fd=artifacts_fd,
                                     )
+                                    if item is None:
+                                        cleaned_analyses.add((team_id, analysis_id))
+                                        continue
                                     if (
                                         item.upload_id in recovered_uploads
                                         or item.artifact_id in recovered_artifacts
@@ -1399,6 +1458,8 @@ class LocalAgentArtifactService:
         self._inputs.update(recovered_inputs)
         self._uploads.update(recovered_uploads)
         self._artifacts.update(recovered_artifacts)
+        for team_id, analysis_id in cleaned_analyses:
+            self._save_state(team_id, analysis_id)
 
     async def validate_completion(
         self,

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import json
@@ -37,8 +38,11 @@ UPLOAD_ID = UUID("77000000-0000-4000-8000-000000000001")
 
 
 class FixedExecutionAuthorizer:
-    def __init__(self) -> None:
+    def __init__(
+        self, *, lease_expires_at: datetime = NOW + timedelta(minutes=5)
+    ) -> None:
         self.active = True
+        self.lease_expires_at = lease_expires_at
 
     async def authorize_execution(self, **kwargs: object) -> AgentExecutionAccess:
         if kwargs["lease_version"] != 3:
@@ -53,7 +57,7 @@ class FixedExecutionAuthorizer:
             agent_id=AGENT_ID,
             execution_id=EXECUTION_ID,
             lease_version=3,
-            lease_expires_at=NOW + timedelta(minutes=5),
+            lease_expires_at=self.lease_expires_at,
             allowed_uploads=("startup_trace", "scroll_trace", "agent_log"),
             scenario_types=("startup", "scroll"),
             input_artifact_ids=(INPUT_ID,),
@@ -146,12 +150,17 @@ def _write_state(tmp_path: Path, document: dict[str, object]) -> None:
     )
 
 
-def _reopen(tmp_path: Path) -> LocalAgentArtifactService:
+def _reopen(
+    tmp_path: Path,
+    *,
+    now: datetime = NOW,
+    authorizer: FixedExecutionAuthorizer | None = None,
+) -> LocalAgentArtifactService:
     return LocalAgentArtifactService(
         root=tmp_path,
         public_origin="http://testserver",
-        execution_authorizer=FixedExecutionAuthorizer(),
-        clock=lambda: NOW,
+        execution_authorizer=authorizer or FixedExecutionAuthorizer(),
+        clock=lambda: now,
     )
 
 
@@ -354,6 +363,39 @@ async def test_part_put_revalidates_lease_before_atomic_publish(tmp_path: Path) 
         )
 
     part_dir = _state_path(tmp_path).parent / "parts" / str(slot.upload_id)
+    assert list(part_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_part_put_cleans_temp_when_async_body_raises(tmp_path: Path) -> None:
+    service, token = await _pending_upload(tmp_path)
+
+    async def broken_body():
+        yield b"x"
+        raise RuntimeError("private transport detail")
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ) as raised:
+        await service.put_part(token, broken_body())
+
+    assert "private transport detail" not in str(raised.value)
+    part_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
+    assert list(part_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_part_put_cleans_temp_and_reraises_cancellation(tmp_path: Path) -> None:
+    service, token = await _pending_upload(tmp_path)
+
+    async def canceled_body():
+        yield b"x"
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        await service.put_part(token, canceled_body())
+
+    part_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
     assert list(part_dir.iterdir()) == []
 
 
@@ -721,6 +763,59 @@ raise SystemExit(2)
 
 
 @pytest.mark.asyncio
+async def test_recovery_removes_only_owned_stale_part_temp(tmp_path: Path) -> None:
+    document = await _persisted_part(tmp_path)
+    upload_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
+    owned_temp = upload_dir / ".1.12345678123442348123456789abcdef.tmp"
+    owned_temp.write_bytes(b"interrupted")
+
+    reopened = _reopen(tmp_path)
+
+    assert not owned_temp.exists()
+    resumed = await reopened.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=1,
+        sha256_b64=_checksum(b"x"),
+    )
+    assert resumed.upload_id == UUID(document["uploads"][0]["upload_id"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("unknown_name", (".1.bad.tmp", "secret.txt"))
+async def test_recovery_rejects_unknown_part_entries(
+    tmp_path: Path, unknown_name: str
+) -> None:
+    await _persisted_part(tmp_path)
+    upload_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
+    (upload_dir / unknown_name).write_bytes(b"unexpected")
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_symlink_with_owned_temp_name(tmp_path: Path) -> None:
+    await _persisted_part(tmp_path)
+    upload_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
+    marker = tmp_path / "outside-marker"
+    marker.write_bytes(b"outside")
+    owned_name = ".1.12345678123442348123456789abcdef.tmp"
+    (upload_dir / owned_name).symlink_to(marker)
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+    assert marker.read_bytes() == b"outside"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("field", "value"),
     (
@@ -729,7 +824,6 @@ raise SystemExit(2)
         ("agent_id", "71000000-0000-4000-8000-00000000000A"),
         ("mime", "Invalid Mime"),
         ("lease_version", 0),
-        ("expires_at", "2026-08-13T08:59:59+00:00"),
         ("expires_at", "2026-08-13T09:05:00"),
         ("parts", [{"part_number": 1, "etag": "bad\nvalue"}]),
     ),
@@ -816,3 +910,71 @@ async def test_valid_finalized_artifact_reopens_idempotently(tmp_path: Path) -> 
     )
 
     assert completed.state == "finalized"
+
+
+@pytest.mark.asyncio
+async def test_expired_finalized_artifact_reopens_for_completion_projection(
+    tmp_path: Path,
+) -> None:
+    service, token = await _pending_upload(tmp_path)
+    etag = await service.put_part(token, (b"x",))
+    receipt = (MultipartPart(part_number=1, etag=etag),)
+    await service.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=UPLOAD_ID,
+        parts=receipt,
+    )
+    service.close()
+    later = NOW + timedelta(hours=1)
+
+    reopened = _reopen(
+        tmp_path,
+        now=later,
+        authorizer=FixedExecutionAuthorizer(
+            lease_expires_at=later + timedelta(minutes=5)
+        ),
+    )
+    completed = await reopened.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=UPLOAD_ID,
+        parts=receipt,
+    )
+
+    assert completed.state == "finalized"
+
+
+@pytest.mark.asyncio
+async def test_expired_pending_upload_is_cleaned_during_recovery(tmp_path: Path) -> None:
+    await _persisted_part(tmp_path)
+    later = NOW + timedelta(hours=1)
+
+    reopened = _reopen(
+        tmp_path,
+        now=later,
+        authorizer=FixedExecutionAuthorizer(
+            lease_expires_at=later + timedelta(minutes=5)
+        ),
+    )
+    part_root = _state_path(tmp_path).parent / "parts"
+
+    assert not (part_root / str(UPLOAD_ID)).exists()
+    reopened.close()
+    reopened = _reopen(
+        tmp_path,
+        now=later,
+        authorizer=FixedExecutionAuthorizer(
+            lease_expires_at=later + timedelta(minutes=5)
+        ),
+    )
+    with pytest.raises(AgentUploadNotFound, match="upload was not found"):
+        await reopened.complete_upload(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=3,
+            upload_id=UPLOAD_ID,
+            parts=(MultipartPart(part_number=1, etag='"' + "0" * 64 + '"'),),
+        )
