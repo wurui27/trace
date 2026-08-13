@@ -1611,7 +1611,10 @@ def _prepare_local_report(
     analysis: _LocalAnalysis,
     result: EngineResult,
     *,
+    primary_profile: Literal["startup", "scroll"] | None = None,
+    primary_normalized: _NormalizedLocalResult | None = None,
     scroll_result: EngineResult | None = None,
+    scroll_normalized: _NormalizedLocalResult | None = None,
     memory_result: EngineResult | None = None,
     memory_engine_commit_sha: str | None = None,
     source_context: Mapping[str, object] | None = None,
@@ -1622,20 +1625,22 @@ def _prepare_local_report(
     ]
     | None = None,
 ) -> _PreparedLocalReport:
-    primary = _normalize_local_smartperfetto_result(
+    primary = primary_normalized or _normalize_local_smartperfetto_result(
         analysis,
         result,
-        profile=analysis.profile,
+        profile=primary_profile or analysis.profile,
     )
-    scroll: _NormalizedLocalResult | None = None
+    scroll: _NormalizedLocalResult | None = scroll_normalized
     normalized = primary.report
     if analysis.analysis_mode == "device":
-        if scroll_result is not None:
-            scroll = _normalize_local_smartperfetto_result(
-                analysis,
-                scroll_result,
-                profile="scroll",
-            )
+        if scroll_result is not None or scroll is not None:
+            if scroll is None:
+                assert scroll_result is not None
+                scroll = _normalize_local_smartperfetto_result(
+                    analysis,
+                    scroll_result,
+                    profile="scroll",
+                )
             normalized = _merge_local_smartperfetto_reports(
                 analysis.team_id, normalized, scroll.report
             )
@@ -1725,9 +1730,12 @@ def _prepare_local_report(
                 )
                 for scenario_type, item in (
                     (
-                        "startup"
-                        if "startup" in remote_completed_scenarios
-                        else "scroll",
+                        primary_profile
+                        or (
+                            "startup"
+                            if "startup" in remote_completed_scenarios
+                            else "scroll"
+                        ),
                         primary,
                     ),
                     ("scroll", scroll),
@@ -2448,6 +2456,7 @@ class _LocalRuntime:
                 analysis.version += 1
             await self._persist(analysis)
             results: dict[str, EngineResult] = {}
+            normalized_results: dict[str, _NormalizedLocalResult] = {}
             failures: dict[str, Literal["capture_failed", "smartperfetto_failed"]] = {}
             artifacts = {item.artifact_id: item for item in manifest.artifacts}
             for scenario_type in ("startup", "scroll"):
@@ -2475,32 +2484,35 @@ class _LocalRuntime:
                 if artifact is None:
                     failures[scenario_type] = "capture_failed"
                     continue
-                trace = await self.agent_artifacts.read_completed_artifact(
-                    team_id=analysis.team_id,
-                    analysis_id=analysis.analysis_id,
-                    agent_id=access.agent_id,
-                    execution_id=access.execution_id,
-                    lease_version=access.lease_version,
-                    artifact_id=artifact.artifact_id,
-                    artifact_kind=artifact.kind,
-                    mime=artifact.mime,
-                    size=artifact.size,
-                    sha256_b64=artifact.sha256_b64,
-                )
-                temporary = (
-                    self.store.analysis_subdirectory(
-                        analysis.team_id,
-                        analysis.analysis_id,
-                        "device-captures",
-                    )
-                    / f".{scenario_type}-{uuid4().hex}.trace"
-                )
-                descriptor = os.open(
-                    temporary,
-                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                    0o600,
-                )
+                temporary: Path | None = None
+                descriptor = -1
+                run: LocalEngineRun | None = None
                 try:
+                    trace = await self.agent_artifacts.read_completed_artifact(
+                        team_id=analysis.team_id,
+                        analysis_id=analysis.analysis_id,
+                        agent_id=access.agent_id,
+                        execution_id=access.execution_id,
+                        lease_version=access.lease_version,
+                        artifact_id=artifact.artifact_id,
+                        artifact_kind=artifact.kind,
+                        mime=artifact.mime,
+                        size=artifact.size,
+                        sha256_b64=artifact.sha256_b64,
+                    )
+                    temporary = (
+                        self.store.analysis_subdirectory(
+                            analysis.team_id,
+                            analysis.analysis_id,
+                            "device-captures",
+                        )
+                        / f".{scenario_type}-{uuid4().hex}.trace"
+                    )
+                    descriptor = os.open(
+                        temporary,
+                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                        0o600,
+                    )
                     with os.fdopen(descriptor, "wb") as stream:
                         descriptor = -1
                         stream.write(trace)
@@ -2511,25 +2523,37 @@ class _LocalRuntime:
                         profile=scenario_type,
                         question=None,
                     )
-                finally:
-                    if descriptor >= 0:
-                        os.close(descriptor)
-                    temporary.unlink(missing_ok=True)
-                await self._register_source_run(analysis, run)
-                try:
-                    results[scenario_type] = await self._wait_engine_result(
+                    await self._register_source_run(analysis, run)
+                    result = await self._wait_engine_result(
                         analysis,
                         run,
                     )
+                    normalized = _normalize_local_smartperfetto_result(
+                        analysis,
+                        result,
+                        profile=scenario_type,
+                    )
+                    results[scenario_type] = result
+                    normalized_results[scenario_type] = normalized
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
                     failures[scenario_type] = "smartperfetto_failed"
+                    if run is not None and analysis.cancel_requested_at is None:
+                        try:
+                            await self.gateway.cancel(run)
+                        except Exception:
+                            pass
                     _LOGGER.warning(
                         "Remote SmartPerfetto scenario unavailable scenario=%s type=%s",
                         scenario_type,
                         type(error).__name__,
                     )
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
             if not results:
                 await self._fail_analysis(
                     analysis,
@@ -2541,11 +2565,21 @@ class _LocalRuntime:
                 analysis,
                 generation=generation,
             )
-            startup = results.get("startup") or results["scroll"]
+            primary_profile: Literal["startup", "scroll"] = (
+                "startup" if "startup" in results else "scroll"
+            )
+            startup = results[primary_profile]
             prepared = _prepare_local_report(
                 analysis,
                 startup,
+                primary_profile=primary_profile,
+                primary_normalized=normalized_results[primary_profile],
                 scroll_result=results.get("scroll") if "startup" in results else None,
+                scroll_normalized=(
+                    normalized_results.get("scroll")
+                    if "startup" in results
+                    else None
+                ),
                 include_memory=False,
                 remote_completed_scenarios=frozenset(results),
                 remote_scenario_failures=failures,
@@ -2558,8 +2592,15 @@ class _LocalRuntime:
                 prepared = _prepare_local_report(
                     analysis,
                     startup,
+                    primary_profile=primary_profile,
+                    primary_normalized=normalized_results[primary_profile],
                     scroll_result=(
                         results.get("scroll") if "startup" in results else None
+                    ),
+                    scroll_normalized=(
+                        normalized_results.get("scroll")
+                        if "startup" in results
+                        else None
                     ),
                     source_context=source_context,
                     include_memory=False,
@@ -2859,11 +2900,16 @@ class _LocalRuntime:
                         analysis.stages[stage_name] = "canceled"
                 analysis.version += 1
             resume_from_prepared = (
-                source_degraded
-                and not restore_canceled
+                not restore_canceled
                 and analysis.state in _ACTIVE_ANALYSIS_STATES
                 and analysis.stages.get("smartperfetto") == "completed"
                 and analysis.evidence_manifest is not None
+                and analysis.report is None
+                and (
+                    analysis.source_binding is None
+                    or analysis.source_code_analysis.get("context_state")
+                    in {"available", "unavailable"}
+                )
                 and analysis.task is None
             )
             if resume_from_prepared:
@@ -2903,6 +2949,7 @@ class _LocalRuntime:
                 analysis.remote_publication in {"publishing", "published"}
                 and analysis.cancel_requested_at is None
                 and analysis.state not in _TERMINAL_ANALYSIS_STATES
+                and analysis.stages.get("smartperfetto") != "completed"
             ):
                 target = analysis.inputs.get("apk")
                 if target is not None and target.upload_id is not None:

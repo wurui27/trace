@@ -246,6 +246,33 @@ class _ScenarioOriginalSmartPerfettoGateway(_FakeSmartPerfettoGateway):
         )
 
 
+class _ScenarioSubmitFailingSmartPerfettoGateway(_ScenarioOriginalSmartPerfettoGateway):
+    def __init__(
+        self,
+        result: EngineResult,
+        *,
+        failed_profile: str,
+        original_report_bytes: dict[str, bytes],
+    ) -> None:
+        super().__init__(result, original_report_bytes=original_report_bytes)
+        self.failed_profile = failed_profile
+
+    async def submit(
+        self,
+        *,
+        trace_path: Path,
+        profile: str,
+        question: str | None,
+    ) -> LocalEngineRun:
+        if profile == self.failed_profile:
+            raise RuntimeError("private gateway failure detail")
+        return await super().submit(
+            trace_path=trace_path,
+            profile=profile,
+            question=question,
+        )
+
+
 class _BlockingRemoteSmartPerfettoGateway(_FakeSmartPerfettoGateway):
     def __init__(self, result: EngineResult) -> None:
         super().__init__(result)
@@ -2373,6 +2400,20 @@ class _CountingProjectionReportProvider(_ProjectionReportProvider):
         return await super().complete(projection=projection)
 
 
+class _PersistedEvidenceBarrierProvider(_ProjectionReportProvider):
+    def __init__(self) -> None:
+        self.calls = 0
+        self.entered = threading.Event()
+        self.release = threading.Event()
+
+    async def complete(self, *, projection) -> SynthesisCandidate:
+        self.calls += 1
+        self.entered.set()
+        while not self.release.is_set():
+            await asyncio.sleep(0.01)
+        return await super().complete(projection=projection)
+
+
 def _test_synthesizer() -> LocalReportSynthesizer:
     return LocalReportSynthesizer(provider=_ProjectionReportProvider())
 
@@ -2459,6 +2500,28 @@ def _smartperfetto_result() -> EngineResult:
         state="completed",
         payload=payload,
     )
+
+
+def _smartperfetto_scenario_result(scenario_type: str) -> EngineResult:
+    result = _smartperfetto_result()
+    report = result.payload["report"]
+    report["dataEnvelopes"] = [
+        item for item in report["dataEnvelopes"] if item["scenario"] == scenario_type
+    ]
+    report["diagnostics"] = [
+        item for item in report["diagnostics"] if item["scenario"] == scenario_type
+    ]
+    envelope_evidence = {
+        item["id"]
+        for envelope in report["dataEnvelopes"]
+        for item in envelope["evidence"]
+    }
+    report["claimVerificationResult"] = [
+        item
+        for item in report["claimVerificationResult"]
+        if set(item["evidenceIds"]).issubset(envelope_evidence)
+    ]
+    return result
 
 
 def _live_smartperfetto_result() -> EngineResult:
@@ -4718,6 +4781,341 @@ def test_local_remote_report_preserves_completed_startup_when_scroll_capture_fai
     assert provider.calls == 1
     assert response["scenarios"][2]["state"] == "not_requested"
 
+
+@pytest.mark.parametrize(
+    ("failed_profile", "failure_boundary"),
+    [
+        ("startup", "submit"),
+        ("scroll", "submit"),
+        ("startup", "read"),
+        ("scroll", "read"),
+    ],
+)
+def test_local_remote_scenario_failure_preserves_other_scenario_report(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failed_profile: str,
+    failure_boundary: str,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user("user01", "initial user password", False).principal
+    control.change_password(
+        user.user_id, "initial user password", "established user password"
+    )
+    successful = "scroll" if failed_profile == "startup" else "startup"
+    result = _smartperfetto_scenario_result(successful)
+    originals = {
+        scenario: json.dumps({"scenario": scenario}).encode()
+        for scenario in ("startup", "scroll")
+    }
+    gateway = (
+        _ScenarioSubmitFailingSmartPerfettoGateway(
+            result,
+            failed_profile=failed_profile,
+            original_report_bytes=originals,
+        )
+        if failure_boundary == "submit"
+        else _ScenarioOriginalSmartPerfettoGateway(
+            result,
+            original_report_bytes=originals,
+        )
+    )
+    provider = _CountingProjectionReportProvider()
+    app = create_local_app(
+        gateway=gateway,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+        apk_inspector=_FakeLocalApkInspector(),
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+        public_origin="https://testserver",
+    )
+    private_key = Ed25519PrivateKey.generate()
+    apk = b"inverse remote partial apk"
+    checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
+    if failure_boundary == "read":
+        read_completed_artifact = (
+            app.state.local_runtime.agent_artifacts.read_completed_artifact
+        )
+
+        async def fail_selected_read(**kwargs):
+            if kwargs["artifact_kind"] == f"{failed_profile}_trace":
+                raise RuntimeError("private artifact read failure detail")
+            return await read_completed_artifact(**kwargs)
+
+        monkeypatch.setattr(
+            app.state.local_runtime.agent_artifacts,
+            "read_completed_artifact",
+            fail_selected_read,
+        )
+
+    with _RawTestClient(app) as client:
+        browser_headers = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        registration = client.post(
+            f"/v1/teams/{user.team_id}/agents/registration-codes",
+            headers=browser_headers,
+            json={"schema_version": "1.0", "name": "Inverse Capture Mac"},
+        ).json()
+        credentials = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1",
+                "registration_code": registration["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "inverse-capture-mac",
+                "os_version": "macOS 15",
+            },
+        ).json()
+        heartbeat = client.post(
+            "/v1/agent/heartbeat",
+            headers={"Authorization": f"Bearer {credentials['access_token']}"},
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "inverse-capture-mac",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [
+                    {
+                        "client_ref": "74000000-0000-4000-8000-000000000001",
+                        "serial": "emulator-5554",
+                        "manufacturer": "Google",
+                        "model": "Pixel",
+                        "android_release": "16",
+                        "api_level": 36,
+                        "connection_type": "usb",
+                        "adb_state": "device",
+                        "battery_percent": 80,
+                        "temperature_c": None,
+                        "storage_available_bytes": 1024,
+                        "property_error_code": None,
+                    }
+                ],
+                "workspaces": [],
+            },
+        ).json()
+        device = heartbeat["devices"][0]
+        created = client.post(
+            f"/v1/teams/{user.team_id}/analyses",
+            headers=browser_headers,
+            json={
+                "schema_version": "1.1",
+                "analysis_mode": "device",
+                "device_id": device["device_id"],
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": len(apk),
+                    "sha256_b64": checksum,
+                },
+            },
+        ).json()
+        slot = created["apk_upload"]
+        put = urlsplit(slot["put_url"])
+        assert (
+            client.put(
+                f"{put.path}?{put.query}", content=apk, headers=slot["required_headers"]
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/finalize-upload",
+                headers=browser_headers,
+                json={
+                    "upload_id": slot["upload_id"],
+                    "sha256_b64": checksum,
+                    "size": len(apk),
+                },
+            ).status_code
+            == 200
+        )
+        asyncio.run(
+            _run_real_remote_agent_capture(
+                app=app,
+                tmp_path=tmp_path,
+                private_key=private_key,
+                credentials=credentials,
+                team_id=user.team_id,
+                device_id=UUID(device["device_id"]),
+                device_digest=device["device_digest"],
+                wait_for_report=True,
+                analysis_id=UUID(created["analysis_id"]),
+            )
+        )
+        report_response = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/report"
+        )
+        analysis_response = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+        )
+        downloaded = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            f"/smartperfetto-original?scenario={successful}&download=true"
+        )
+        missing_original = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            f"/smartperfetto-original?scenario={failed_profile}"
+        )
+        core = app.state.local_runtime.store.load_document(
+            user.team_id,
+            UUID(created["analysis_id"]),
+            "normalized-core.json",
+        )
+
+    assert report_response.status_code == 200, report_response.text
+    report = report_response.json()
+    assert report["state"] == "partially_completed"
+    assert [item["scenario_type"] for item in report["scenario_reports"]] == [
+        "startup",
+        "scroll",
+    ]
+    states = {
+        item["scenario_type"]: item["result_state"]
+        for item in report["scenario_reports"]
+    }
+    assert states == {failed_profile: "failed", successful: "completed"}
+    scenario_reports = {
+        item["scenario_type"]: item for item in report["scenario_reports"]
+    }
+    assert scenario_reports[successful]["bundle"]["metrics"]
+    assert scenario_reports[successful]["bundle"]["evidence"]
+    assert scenario_reports[failed_profile]["bundle"]["metrics"] == []
+    assert [item[0] for item in gateway.submissions] == [f"{successful}-trace".encode()]
+    assert provider.calls == 1
+    assert [
+        item["scenario_type"] for item in report["smartperfetto_original"]["reports"]
+    ] == [successful]
+    assert analysis_response.json()["scenarios"][2]["state"] == "not_requested"
+    assert downloaded.status_code == 200
+    assert downloaded.content == originals[successful]
+    assert missing_original.status_code == 404
+    assert "private" not in report_response.text.lower()
+    assert core is not None
+    assert {item["scenario_type"] for item in core["scenario_reports"]} == {
+        "startup",
+        "scroll",
+    }
+    assert all(
+        item["code"] != "android_memory.result_unavailable"
+        for item in core["limitations"]
+    )
+    assert f"smartperfetto.{failed_profile}_result_unavailable" in {
+        item["code"] for item in core["limitations"]
+    }
+
+
+def test_local_restart_resumes_persisted_remote_evidence_without_source(
+    tmp_path: Path,
+) -> None:
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("82000000-0000-4000-8000-000000000001")
+    descriptor = _InputDescriptor(
+        kind="apk",
+        mime="application/vnd.android.package-archive",
+        size=1,
+        sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+    )
+    analysis = _LocalAnalysis(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        profile="startup",
+        question=None,
+        inputs={"apk": _LocalInput(descriptor)},
+        analysis_mode="device",
+        state="analyzing",
+        remote_publication="published",
+    )
+    analysis.stages.update(
+        {
+            "input_validation": "completed",
+            "smartperfetto": "completed",
+            "perfpilot_ai": "pending",
+            "report": "pending",
+        }
+    )
+    barrier = _PersistedEvidenceBarrierProvider()
+    first = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=LocalReportSynthesizer(provider=barrier),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+    )
+    runtime = first.state.local_runtime
+    capture_enqueue_calls = 0
+
+    async def reject_capture_enqueue(_definition) -> None:
+        nonlocal capture_enqueue_calls
+        capture_enqueue_calls += 1
+        raise AssertionError("persisted synthesis must not enqueue agent capture")
+
+    runtime.agent_tasks.enqueue = reject_capture_enqueue
+    runtime.analyses[(team_id, analysis_id)] = analysis
+    prepared = _prepare_local_report(
+        analysis,
+        _smartperfetto_scenario_result("startup"),
+        include_memory=False,
+        remote_completed_scenarios=frozenset({"startup"}),
+        remote_scenario_failures={"scroll": "smartperfetto_failed"},
+    )
+
+    async def reach_barrier() -> None:
+        task = asyncio.create_task(
+            runtime._publish_prepared(analysis, prepared, generation=1)
+        )
+        for _ in range(200):
+            if barrier.entered.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert barrier.entered.is_set()
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        await runtime.close()
+
+    asyncio.run(reach_barrier())
+    assert capture_enqueue_calls == 0
+    gateway = _FakeSmartPerfettoGateway(_smartperfetto_result())
+    provider = _CountingProjectionReportProvider()
+    restarted = create_local_app(
+        gateway=gateway,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+    )
+    with _RawTestClient(restarted):
+        for _ in range(200):
+            restored = restarted.state.local_runtime.analyses[(team_id, analysis_id)]
+            if restored.report is not None:
+                break
+            time.sleep(0.01)
+        assert restored.report is not None
+        assert restored.state == "partially_completed"
+        assert gateway.submissions == []
+        assert provider.calls == 1
+        assert capture_enqueue_calls == 0
+
+    converged_provider = _CountingProjectionReportProvider()
+    converged = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=LocalReportSynthesizer(provider=converged_provider),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+    )
+    with _RawTestClient(converged):
+        restored = converged.state.local_runtime.analyses[(team_id, analysis_id)]
+        assert restored.report is not None
+    assert converged_provider.calls == 0
 
 @pytest.mark.skip(
     reason="remote device capture is not wired in the local control plane"
