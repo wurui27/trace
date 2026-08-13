@@ -456,6 +456,15 @@ def validate_agent_execution_manifest(
 
 
 class AgentTaskRepository(Protocol):
+    async def enqueue(
+        self,
+        definition: AgentTaskDefinition,
+        *,
+        queued_at: datetime,
+    ) -> bool: ...
+
+    async def rollback_enqueue(self, definition: AgentTaskDefinition) -> None: ...
+
     async def schedule(
         self,
         *,
@@ -650,6 +659,15 @@ class InMemoryAgentTaskRepository:
             self._definitions[definition.analysis_id] = definition
             self._queued_at[definition.analysis_id] = queued_at.astimezone(UTC)
             return True
+
+    async def rollback_enqueue(self, definition: AgentTaskDefinition) -> None:
+        async with self._lock:
+            if self._definitions.get(definition.analysis_id) == definition and not any(
+                lease.definition.analysis_id == definition.analysis_id
+                for lease in self._leases.values()
+            ):
+                self._definitions.pop(definition.analysis_id, None)
+                self._queued_at.pop(definition.analysis_id, None)
 
     async def schedule(
         self,
@@ -863,6 +881,8 @@ class InMemoryAgentTaskRepository:
             None,
         )
         if lease is None:
+            self._definitions.pop(analysis_id, None)
+            self._queued_at.pop(analysis_id, None)
             return AgentCancellationRequest(
                 team_id=team_id,
                 analysis_id=analysis_id,
@@ -1139,6 +1159,19 @@ class AgentTaskService:
         self._signer = signer
         self._wakeup = wakeup
         self._clock = clock
+
+    async def enqueue(self, definition: AgentTaskDefinition) -> bool:
+        queued = await self._repository.enqueue(
+            definition,
+            queued_at=_aware_now(self._clock()),
+        )
+        try:
+            await self._wakeup.wake(definition.agent_id)
+        except BaseException:
+            if queued:
+                await self._repository.rollback_enqueue(definition)
+            raise
+        return queued
 
     async def schedule(
         self,

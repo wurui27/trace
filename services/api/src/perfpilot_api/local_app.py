@@ -71,10 +71,13 @@ from perfpilot_api.local_control_store import (
     LocalPrincipal,
 )
 from perfpilot_api.local_device_capture import (
+    Aapt2LocalApkInspector,
     LocalAndroidToolchain,
+    LocalApkInspector,
     LocalDeviceCaptureError,
     LocalDeviceCaptureGateway,
     build_local_device_capture_gateway,
+    resolve_local_aapt2,
     resolve_local_adb,
     resolve_local_android_toolchain,
 )
@@ -146,9 +149,14 @@ from perfpilot_api.services.source_workspaces import (
     SourceWorkspaceService,
 )
 from perfpilot_api.services.agent_tasks import (
+    AgentExecutionAccess,
+    AgentTaskDefinition,
     AgentTaskService,
     InMemoryAgentTaskRepository,
     InMemoryAgentTaskWakeup,
+    TaskInputArtifact,
+    TaskScenario,
+    ValidatedAgentExecutionManifest,
 )
 from perfpilot_api.services.source_artifacts import (
     SourceArtifactError,
@@ -779,6 +787,8 @@ class _LocalAnalysis:
     inputs: dict[str, _LocalInput]
     analysis_mode: Literal["trace_upload", "device"] = "trace_upload"
     device_id: UUID | None = None
+    device_agent_id: UUID | None = None
+    device_digest: str | None = field(default=None, repr=False)
     application_version_id: UUID | None = None
     application_metadata: dict[str, object] | None = None
     created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
@@ -840,6 +850,8 @@ _PERSISTED_STATE_KEYS = {
     "analysis_id",
     "analysis_mode",
     "device_id",
+    "device_agent_id",
+    "device_digest",
     "application_version_id",
     "application_metadata",
     "profile",
@@ -1048,15 +1060,16 @@ def _public_origin(value: str) -> str:
         except ValueError:
             private_hostname = False
     if (
-        parsed.scheme != "http"
-        or not private_hostname
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or (parsed.scheme == "http" and not private_hostname)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path not in {"", "/"}
         or parsed.query
         or parsed.fragment
     ):
-        raise ValueError("local public origin must be loopback or private LAN HTTP")
+        raise ValueError("local public origin must be HTTPS or private-network HTTP")
     return value.rstrip("/")
 
 
@@ -1950,6 +1963,10 @@ class _LocalRuntime:
         source_tasks: SourceTaskService,
         source_artifacts: SourceArtifactService,
         source_wait_seconds: float,
+        device_directory: DeviceDirectory,
+        agent_tasks: AgentTaskService,
+        agent_artifacts: LocalAgentArtifactService,
+        apk_inspector: LocalApkInspector | None,
     ) -> None:
         if poll_interval_seconds < 0:
             raise ValueError("poll interval must not be negative")
@@ -1971,6 +1988,10 @@ class _LocalRuntime:
         self.source_tasks = source_tasks
         self.source_artifacts = source_artifacts
         self.source_wait_seconds = source_wait_seconds
+        self.device_directory = device_directory
+        self.agent_tasks = agent_tasks
+        self.agent_artifacts = agent_artifacts
+        self.apk_inspector = apk_inspector
         self.analyses: dict[tuple[UUID, UUID], _LocalAnalysis] = {}
         self.uploads: dict[tuple[UUID, UUID, str], _LocalUpload] = {}
         self.upload_authorizations: dict[str, tuple[UUID, UUID, str]] = {}
@@ -2007,6 +2028,12 @@ class _LocalRuntime:
             "analysis_id": str(analysis.analysis_id),
             "analysis_mode": analysis.analysis_mode,
             "device_id": str(analysis.device_id) if analysis.device_id is not None else None,
+            "device_agent_id": (
+                str(analysis.device_agent_id)
+                if analysis.device_agent_id is not None
+                else None
+            ),
+            "device_digest": analysis.device_digest,
             "application_version_id": (
                 str(analysis.application_version_id)
                 if analysis.application_version_id is not None
@@ -2091,6 +2118,94 @@ class _LocalRuntime:
             analysis.analysis_id,
             document,
         )
+
+    async def observe_agent_completion(
+        self,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None:
+        analysis = await self.analysis(access.team_id, access.analysis_id)
+        manifest_document: dict[str, object] = {
+            "schema_version": "1.0",
+            "execution_id": str(manifest.execution_id),
+            "lease_version": manifest.lease_version,
+            "state": manifest.state,
+            "started_at": manifest.started_at.isoformat(),
+            "completed_at": manifest.completed_at.isoformat(),
+            "agent_version": manifest.agent_version,
+            "adb_version": manifest.adb_version,
+            "artifacts": [
+                {
+                    "artifact_id": str(item.artifact_id),
+                    "kind": item.kind,
+                    "mime": item.mime,
+                    "size": item.size,
+                    "sha256_b64": item.sha256_b64,
+                }
+                for item in manifest.artifacts
+            ],
+            "scenarios": [
+                {
+                    "scenario_type": item.scenario_type,
+                    "state": item.state,
+                    "started_at": item.started_at.isoformat(),
+                    "completed_at": item.completed_at.isoformat(),
+                    "temperature_start_c": item.temperature_start_c,
+                    "temperature_end_c": item.temperature_end_c,
+                    "artifact_ids": [str(value) for value in item.artifact_ids],
+                    "diagnostic_code": item.diagnostic_code,
+                }
+                for item in manifest.scenarios
+            ],
+            "diagnostic_code": manifest.diagnostic_code,
+            "accepted_at": now.isoformat(),
+        }
+        await asyncio.to_thread(
+            self.store.save_document,
+            access.team_id,
+            access.analysis_id,
+            "agent-capture-manifest.json",
+            manifest_document,
+        )
+        completed = any(item.state == "completed" for item in manifest.scenarios)
+        async with self.lock:
+            if analysis.state in _TERMINAL_ANALYSIS_STATES:
+                return
+            analysis.started_at = analysis.started_at or manifest.started_at
+            analysis.completed_at = manifest.completed_at if not completed else None
+            analysis.state = "analyzing" if completed else "failed"
+            analysis.failure = (
+                None
+                if completed
+                else {
+                    "code": "remote_capture_failed",
+                    "message": "Remote Android capture failed",
+                    "retryable": False,
+                }
+            )
+            analysis.stages["smartperfetto"] = "pending" if completed else "not_requested"
+            analysis.stages["report"] = "pending" if completed else "not_requested"
+            analysis.version += 1
+        await self._persist(analysis)
+
+    async def observe_agent_cancellation(
+        self,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> None:
+        analysis = await self.analysis(access.team_id, access.analysis_id)
+        async with self.lock:
+            if analysis.state in _TERMINAL_ANALYSIS_STATES:
+                return
+            analysis.state = "canceled"
+            analysis.failure = None
+            analysis.completed_at = now
+            for stage_name, stage_state in analysis.stages.items():
+                if stage_state not in {"completed", "failed", "not_requested"}:
+                    analysis.stages[stage_name] = "canceled"
+            analysis.version += 1
+        await self._persist(analysis)
 
     def _restore_analysis(self, document: Mapping[str, object]) -> _LocalAnalysis:
         try:
@@ -2187,6 +2302,16 @@ class _LocalRuntime:
             device_id=(
                 UUID(str(document["device_id"]))
                 if document.get("device_id") is not None
+                else None
+            ),
+            device_agent_id=(
+                UUID(str(document["device_agent_id"]))
+                if document.get("device_agent_id") is not None
+                else None
+            ),
+            device_digest=(
+                str(document["device_digest"])
+                if isinstance(document.get("device_digest"), str)
                 else None
             ),
             application_version_id=(
@@ -2378,7 +2503,12 @@ class _LocalRuntime:
         self.store.close()
 
     async def create(
-        self, team_id: UUID, request: _CreateAnalysisRequest
+        self,
+        team_id: UUID,
+        request: _CreateAnalysisRequest,
+        *,
+        device_agent_id: UUID | None = None,
+        device_digest: str | None = None,
     ) -> _LocalAnalysis:
         if isinstance(request, _CreateDeviceAnalysisRequest):
             descriptor = _InputDescriptor(
@@ -2395,6 +2525,8 @@ class _LocalRuntime:
                 inputs={"apk": _LocalInput(descriptor)},
                 analysis_mode="device",
                 device_id=request.device_id,
+                device_agent_id=device_agent_id,
+                device_digest=device_digest,
                 source_binding=(
                     request.source_binding.binding()
                     if request.source_binding is not None
@@ -2801,6 +2933,20 @@ class _LocalRuntime:
             )
         await self._persist(analysis)
 
+        if analysis.analysis_mode == "device" and analysis.inputs["apk"].finalized:
+            try:
+                cancellation = await self.agent_tasks.request_cancel(
+                    team_id=analysis.team_id,
+                    analysis_id=analysis.analysis_id,
+                )
+            except Exception:
+                raise HTTPException(
+                    status.HTTP_503_SERVICE_UNAVAILABLE,
+                    "Remote capture cancellation failed",
+                ) from None
+            if cancellation.execution_id is not None:
+                return analysis, True
+
         if analysis.source_binding is not None:
             try:
                 await self.source_tasks.request_cancel(
@@ -2951,6 +3097,8 @@ class _LocalRuntime:
         analysis: _LocalAnalysis,
         request: _FinalizeUploadRequest,
     ) -> _LocalUpload:
+        if analysis.analysis_mode == "device":
+            return await self._finalize_remote_device(analysis, request)
         start_gate: asyncio.Event | None = None
         task: asyncio.Task[None] | None = None
         async with self.lock:
@@ -3016,6 +3164,157 @@ class _LocalRuntime:
             raise
         if start_gate is not None:
             start_gate.set()
+        return upload
+
+    async def _finalize_remote_device(
+        self,
+        analysis: _LocalAnalysis,
+        request: _FinalizeUploadRequest,
+    ) -> _LocalUpload:
+        async with self.lock:
+            upload = self.uploads.get(
+                (analysis.team_id, analysis.analysis_id, request.upload_id)
+            )
+            if (
+                upload is None
+                or upload.size != request.size
+                or upload.sha256_b64 != request.sha256_b64
+                or not upload.bytes_ready
+            ):
+                raise HTTPException(status.HTTP_409_CONFLICT, "upload is not ready")
+            target = analysis.inputs[upload.kind]
+            if target.finalized:
+                return upload
+            if (
+                self.apk_inspector is None
+                or analysis.device_id is None
+                or analysis.device_agent_id is None
+                or analysis.device_digest is None
+            ):
+                raise HTTPException(
+                    status.HTTP_409_CONFLICT,
+                    "APK metadata is unavailable",
+                )
+        try:
+            metadata = await self.apk_inspector.inspect(upload.path)
+        except LocalDeviceCaptureError:
+            async with self.lock:
+                analysis.failure = {
+                    "code": "apk_metadata_invalid",
+                    "message": "APK metadata is invalid",
+                    "retryable": False,
+                }
+                analysis.stages["input_validation"] = "failed"
+                analysis.state = "failed"
+                analysis.completed_at = datetime.now(UTC)
+                analysis.version += 1
+            await self._persist(analysis)
+            raise ApiError(
+                "apk_metadata_invalid",
+                "APK 元数据无效",
+                409,
+                False,
+            ) from None
+
+        artifact_id = uuid5(
+            _LOCAL_APPLICATION_NAMESPACE,
+            f"apk\0{analysis.team_id}\0{analysis.analysis_id}\0{upload.upload_id}",
+        )
+        application_version_id = uuid5(
+            _LOCAL_APPLICATION_NAMESPACE,
+            (
+                f"{analysis.team_id}\0{metadata.package_name}\0"
+                f"{metadata.version_code}\0{upload.sha256_b64}"
+            ),
+        )
+        application_metadata = {
+            "package_name": metadata.package_name,
+            "version_name": metadata.version_name,
+            "version_code": metadata.version_code,
+            "launch_activity": metadata.launch_activity,
+            "min_sdk": metadata.min_sdk,
+            "target_sdk": metadata.target_sdk,
+            "supported_abis": list(metadata.supported_abis),
+            "has_native_libraries": metadata.has_native_libraries,
+        }
+        definition = AgentTaskDefinition(
+            analysis_id=analysis.analysis_id,
+            team_id=analysis.team_id,
+            agent_id=analysis.device_agent_id,
+            device_id=analysis.device_id,
+            device_digest=analysis.device_digest,
+            package_name=metadata.package_name,
+            launch_activity=metadata.launch_activity,
+            cleanup_policy="uninstall",
+            input_artifacts=(
+                TaskInputArtifact(
+                    artifact_id=artifact_id,
+                    kind="apk",
+                    mime=upload.mime,
+                    size=upload.size,
+                    sha256_b64=upload.sha256_b64,
+                ),
+            ),
+            scenarios=(
+                TaskScenario(
+                    scenario_type="startup",
+                    recipe_version=1,
+                    recipe_hash=hashlib.sha256(b"startup-v1:15").hexdigest(),
+                    duration_seconds=15,
+                    memory_rounds=0,
+                    swipe_count=0,
+                ),
+                TaskScenario(
+                    scenario_type="scroll",
+                    recipe_version=1,
+                    recipe_hash=hashlib.sha256(b"scroll-v1:30:3").hexdigest(),
+                    duration_seconds=30,
+                    memory_rounds=0,
+                    swipe_count=3,
+                ),
+            ),
+            schema_version="1.1",
+        )
+        async with self.lock:
+            if target.finalized:
+                return upload
+            target.finalized = True
+            target.artifact_id = str(artifact_id)
+            analysis.application_version_id = application_version_id
+            analysis.application_metadata = application_metadata
+            analysis.failure = None
+            analysis.stages["input_validation"] = "completed"
+            analysis.state = "queued"
+            analysis.version += 1
+        await self._persist(analysis)
+        try:
+            self.agent_artifacts.register_input(
+                team_id=analysis.team_id,
+                analysis_id=analysis.analysis_id,
+                artifact_id=artifact_id,
+                upload_id=UUID(upload.upload_id),
+                mime=upload.mime,
+                size=upload.size,
+                sha256_b64=upload.sha256_b64,
+            )
+            await self.agent_tasks.enqueue(definition)
+        except Exception:
+            self.agent_artifacts.unregister_input(
+                team_id=analysis.team_id,
+                analysis_id=analysis.analysis_id,
+                artifact_id=artifact_id,
+            )
+            async with self.lock:
+                if target.artifact_id == str(artifact_id):
+                    target.finalized = False
+                    target.artifact_id = None
+                    analysis.application_version_id = None
+                    analysis.application_metadata = None
+                    analysis.state = "uploading"
+                    analysis.stages["input_validation"] = "running"
+                    analysis.version += 1
+            await self._persist(analysis)
+            raise
         return upload
 
     async def _execute(self, analysis: _LocalAnalysis) -> None:
@@ -3653,7 +3952,7 @@ class _LocalRuntime:
                     }
 
             def render_scenario(scenario_type: str) -> dict[str, object]:
-                if scenario_type == "memory_cycle" and analysis.source_binding is not None:
+                if scenario_type == "memory_cycle":
                     return {
                         "scenario_job_id": None,
                         "scenario_type": "memory_cycle",
@@ -3850,6 +4149,7 @@ def create_local_app(
     synthesizer: LocalReportSynthesizer | None = None,
     device_probe: LocalDeviceProbe | None = None,
     device_capture_gateway: LocalDeviceCaptureGateway | None = None,
+    apk_inspector: LocalApkInspector | None = None,
     memory_analysis_gateway: LocalMemoryAnalysisGateway | None = None,
     data_root: Path | None = None,
     control_store: LocalControlStore | None = None,
@@ -3911,12 +4211,44 @@ def create_local_app(
         ),
         wakeup=InMemoryAgentTaskWakeup(),
     )
+    runtime_holder: list[_LocalRuntime] = []
+
+    async def observe_agent_completion(
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None:
+        if not runtime_holder:
+            raise RuntimeError("Local runtime is unavailable")
+        await runtime_holder[0].observe_agent_completion(access, manifest, now)
+
+    async def observe_agent_cancellation(
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> None:
+        if not runtime_holder:
+            raise RuntimeError("Local runtime is unavailable")
+        await runtime_holder[0].observe_agent_cancellation(access, now)
+
     resolved_agent_artifacts = LocalAgentArtifactService(
         root=resolved_data_root,
         public_origin=public_origin
         or os.getenv("PERFPILOT_LOCAL_API_ORIGIN", "http://localhost:8000"),
         execution_authorizer=resolved_agent_task_service,
+        completion_observer=observe_agent_completion,
+        cancellation_observer=observe_agent_cancellation,
     )
+    resolved_apk_inspector = apk_inspector
+    if resolved_apk_inspector is None:
+        try:
+            resolved_apk_inspector = Aapt2LocalApkInspector(
+                binary=resolve_local_aapt2()
+            )
+        except (LocalDeviceCaptureError, OSError, ValueError) as error:
+            _LOGGER.warning(
+                "Local APK inspection unavailable type=%s",
+                type(error).__name__,
+            )
     resolved_device_probe = device_probe
     if resolved_device_probe is None:
         try:
@@ -3958,7 +4290,12 @@ def create_local_app(
         source_tasks=resolved_source_task_service,
         source_artifacts=resolved_source_artifacts,
         source_wait_seconds=source_wait_seconds,
+        device_directory=resolved_device_directory,
+        agent_tasks=resolved_agent_task_service,
+        agent_artifacts=resolved_agent_artifacts,
+        apk_inspector=resolved_apk_inspector,
     )
+    runtime_holder.append(runtime)
     session_cookie_name = "perfpilot_local_session"
 
     @asynccontextmanager
@@ -4511,13 +4848,33 @@ def create_local_app(
             except (SourceBindingInvalid, SourceCodeAnalysisDisabled):
                 raise ApiError("invalid_request", "源码工作区不可用", 422, False) from None
         if isinstance(body, _CreateDeviceAnalysisRequest):
-            selected = {
-                device.device_id
-                for device in await resolved_device_directory.list_devices(team_id=team_id)
-            }
-            if body.device_id not in selected:
+            selected = next(
+                (
+                    device
+                    for device in await resolved_device_directory.list_devices(
+                        team_id=team_id
+                    )
+                    if device.device_id == body.device_id and device.state == "ready"
+                ),
+                None,
+            )
+            if selected is None:
                 raise ApiError("remote_device_capture_unavailable", "远端设备不可用", 409, False)
-            raise ApiError("remote_device_capture_unavailable", "远端设备采集尚不可用", 409, False)
+            target = await resolved_device_directory.get_task_target(
+                team_id=team_id,
+                agent_id=selected.agent_id,
+                device_id=selected.device_id,
+            )
+            if target is None:
+                raise ApiError("remote_device_capture_unavailable", "远端设备不可用", 409, False)
+            return runtime.response(
+                await runtime.create(
+                    team_id,
+                    body,
+                    device_agent_id=target.agent_id,
+                    device_digest=target.device_digest,
+                )
+            )
         return runtime.response(await runtime.create(team_id, body))
 
     @app.get("/v1/teams/{team_id}/analyses")

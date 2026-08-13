@@ -19,6 +19,7 @@ import pytest
 from fastapi.testclient import TestClient as _RawTestClient
 from starlette.requests import Request
 from starlette.requests import ClientDisconnect
+import httpx
 
 from perfpilot_api.ai.local_report import LocalReportSynthesizer
 from perfpilot_api.ai.openai_compatible import SynthesisCandidate
@@ -47,11 +48,27 @@ from perfpilot_api.local_analysis_store import (
 )
 from perfpilot_api.local_agent_artifacts import LocalAgentArtifactService
 from perfpilot_api.local_control_store import LocalControlStore
-from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapture
+from perfpilot_api.local_device_capture import (
+    LocalApkMetadata,
+    LocalDeviceCapture,
+    LocalDeviceCaptureError,
+)
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
-from perfpilot_api.security.task_snapshots import validate_source_task_snapshot
+from perfpilot_api.security.task_snapshots import (
+    validate_source_task_snapshot,
+    verify_task_jws,
+)
+from perfpilot_agent.capture import CaptureError, CaptureTaskRunner, ThermalReading
+from perfpilot_agent.config import AgentConfig
+from perfpilot_agent.control_client import ControlClient, TaskExecuteResponse
+from perfpilot_agent.credentials import AgentCredentials, TaskSigningKey
+from perfpilot_agent.executor import TaskExecutor
+from perfpilot_agent.service import TaskLoop
+from perfpilot_agent.security import TaskVerifier
+from perfpilot_agent.state import AgentRuntimeState, DeviceBinding
+from perfpilot_agent.uploads import InputDownloader, MultipartUploader
 from perfpilot_api.services.agent_tasks import AgentExecutionAccess
 from perfpilot_api.services.source_workspaces import SourceBinding
 from perfpilot_api.security.agent_signatures import (
@@ -60,6 +77,7 @@ from perfpilot_api.security.agent_signatures import (
     refresh_proof_message,
 )
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from cryptography.hazmat.primitives import serialization
 
 
 _create_local_app = create_local_app
@@ -586,7 +604,7 @@ def test_local_agent_control_refresh_unregister_and_team_devices(tmp_path: Path)
         assert devices.status_code == 200
         assert devices.json()["devices"][0]["serial_suffix"] == "5554"
         assert second_client.get(f"/v1/teams/{second.team_id}/devices").json()["devices"] == []
-        unsupported = first_client.post(
+        accepted = first_client.post(
             f"/v1/teams/{first.team_id}/analyses",
             headers=first_headers,
             json={
@@ -601,8 +619,13 @@ def test_local_agent_control_refresh_unregister_and_team_devices(tmp_path: Path)
                 },
             },
         )
-        assert unsupported.status_code == 409
-        assert unsupported.json()["error"]["code"] == "remote_device_capture_unavailable"
+        assert accepted.status_code == 201, accepted.text
+        assert accepted.json()["state"] == "uploading"
+        first_client.cookies.clear()
+        assert first_client.get(
+            "/v1/agent/tasks/next?wait_seconds=0",
+            headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
+        ).json()["action"] == "wait"
         revoked = first_client.post(
             "/v1/agent/unregister",
             headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
@@ -1022,12 +1045,15 @@ def test_change_password_validation_is_a_closed_redacted_422(
     assert "initial user password" not in response.text
 
 
-def test_local_runtime_accepts_only_loopback_or_private_lan_http_origins() -> None:
+def test_local_runtime_accepts_https_or_private_network_http_origins() -> None:
     assert _public_origin("http://127.0.0.1:8000") == "http://127.0.0.1:8000"
     assert _public_origin("http://10.166.0.125:8000") == "http://10.166.0.125:8000"
+    assert _public_origin("https://api.example.test") == "https://api.example.test"
 
-    with pytest.raises(ValueError, match="loopback or private LAN HTTP"):
+    with pytest.raises(ValueError, match="HTTPS or private-network HTTP"):
         _public_origin("http://8.8.8.8:8000")
+    with pytest.raises(ValueError, match="HTTPS or private-network HTTP"):
+        _public_origin("https://api.example.test/path")
 
 
 def test_local_runtime_rejects_malformed_persisted_ai_round_state() -> None:
@@ -1631,6 +1657,233 @@ class _FakeLocalDeviceCaptureGateway:
             scroll_trace=scroll_trace,
             memory_evidence=memory_evidence,
         )
+
+
+class _FakeLocalApkInspector:
+    def __init__(self) -> None:
+        self.calls: list[bytes] = []
+
+    async def inspect(self, apk_path: Path) -> LocalApkMetadata:
+        self.calls.append(apk_path.read_bytes())
+        return LocalApkMetadata(
+            package_name="com.example.perfpilot",
+            version_name="1.2.3",
+            version_code=123,
+            launch_activity=(
+                "com.example.perfpilot/com.example.perfpilot.MainActivity"
+            ),
+            min_sdk=26,
+            target_sdk=35,
+            supported_abis=("arm64-v8a",),
+            has_native_libraries=True,
+        )
+
+
+class _InvalidLocalApkInspector:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def inspect(self, apk_path: Path) -> LocalApkMetadata:
+        assert apk_path.is_file()
+        self.calls += 1
+        raise LocalDeviceCaptureError("apk_metadata_invalid")
+
+
+class _EndToEndCaptureDevice:
+    def __init__(self, *, block_capture: bool = False, fail_capture: bool = False) -> None:
+        self.installed: list[bytes] = []
+        self.captured: list[str] = []
+        self.cleaned = 0
+        self.capture_started = asyncio.Event()
+        self._block_capture = block_capture
+        self._fail_capture = fail_capture
+
+    async def adb_version(self) -> str:
+        return "Android Debug Bridge version 1.0.41"
+
+    async def thermal_reading(self) -> ThermalReading:
+        return ThermalReading(temperature_c=31.5, thermal_status=0)
+
+    async def install(self, apk: Path) -> None:
+        self.installed.append(apk.read_bytes())
+
+    async def capture_trace(
+        self, *, scenario_type: str, output: Path, **_kwargs: object
+    ) -> None:
+        self.captured.append(scenario_type)
+        self.capture_started.set()
+        if self._block_capture:
+            await asyncio.Event().wait()
+        if self._fail_capture:
+            raise CaptureError("trace_capture_failed")
+        output.write_bytes(f"{scenario_type}-trace".encode())
+
+    async def collect_memory_samples(self, **_kwargs: object) -> tuple[str, ...]:
+        raise AssertionError("memory capture must not run")
+
+    async def cleanup(self) -> None:
+        self.cleaned += 1
+
+    async def uninstall(self, package_name: str) -> None:
+        assert package_name == "com.example.perfpilot"
+
+
+async def _run_real_remote_agent_capture(
+    *,
+    app,
+    tmp_path: Path,
+    private_key: Ed25519PrivateKey,
+    credentials: dict[str, object],
+    team_id: UUID,
+    device_id: UUID,
+    device_digest: str,
+    block_capture: bool = False,
+    fail_capture: bool = False,
+    cancel_analysis_id: str | None = None,
+    browser_cookies: dict[str, str] | None = None,
+    csrf_token: str | None = None,
+) -> _EndToEndCaptureDevice:
+    ca = tmp_path / "ca.crt"
+    ca.write_text("test", encoding="utf-8")
+    config = AgentConfig(
+        server_url="https://testserver",
+        ca_bundle=ca,
+        workspace_root=tmp_path / "agent-work",
+    )
+    bound = AgentCredentials(
+        schema_version="1.1",
+        agent_id=UUID(str(credentials["agent_id"])),
+        team_id=team_id,
+        private_key_b64=base64.b64encode(
+            private_key.private_bytes(
+                serialization.Encoding.Raw,
+                serialization.PrivateFormat.Raw,
+                serialization.NoEncryption(),
+            )
+        ).decode("ascii"),
+        access_token=str(credentials["access_token"]),
+        access_token_expires_at=datetime.fromisoformat(
+            str(credentials["access_token_expires_at"])
+        ),
+        refresh_token=str(credentials["refresh_token"]),
+        refresh_token_expires_at=datetime.fromisoformat(
+            str(credentials["refresh_token_expires_at"])
+        ),
+        task_signing_key=TaskSigningKey.model_validate(
+            credentials["task_signing_key"]
+        ),
+        heartbeat_interval_seconds=10,
+    )
+    state = AgentRuntimeState()
+    state.replace_device_bindings(
+        (
+            DeviceBinding(
+                client_ref=UUID("74000000-0000-4000-8000-000000000001"),
+                device_id=device_id,
+                device_digest=device_digest,
+                serial="emulator-5554",
+            ),
+        )
+    )
+    observed_responses: list[tuple[str, int]] = []
+
+    async def observe_response(response: httpx.Response) -> None:
+        await response.aread()
+        observed_responses.append((response.request.url.path, response.status_code))
+
+    http_client = httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="https://testserver",
+        follow_redirects=False,
+        event_hooks={"response": [observe_response]},
+    )
+    control = ControlClient(config, http_client=http_client, credentials=bound)
+    device = _EndToEndCaptureDevice(
+        block_capture=block_capture,
+        fail_capture=fail_capture,
+    )
+    runner = CaptureTaskRunner(
+        config=config,
+        adb_binary=tmp_path / "agent-adb",
+        control=control,
+        state=state,
+        redactor=None,
+        device_factory=lambda **_kwargs: device,
+        downloader_factory=lambda **kwargs: InputDownloader(
+            control=control,
+            http_client=http_client,
+            **kwargs,
+        ),
+        uploader_factory=lambda **kwargs: MultipartUploader(
+            control=control,
+            http_client=http_client,
+            **kwargs,
+        ),
+        sleep=lambda _seconds: asyncio.sleep(0),
+    )
+    executor = TaskExecutor(
+        control=control,
+        runner=runner,
+        state=state,
+        control_poll_interval_seconds=0.01,
+        renewal_interval_seconds=20,
+    )
+    loop = TaskLoop(
+        control=control,
+        executor=executor,
+        state=state,
+        sleep=lambda _seconds: asyncio.sleep(0),
+    )
+    try:
+        delivery = await control.poll_task(wait_seconds=0)
+        assert isinstance(delivery, TaskExecuteResponse), delivery
+        TaskVerifier(
+            public_key_b64=bound.task_signing_key.public_key_b64,
+            kid=bound.task_signing_key.kid,
+        ).verify(
+            delivery.snapshot_jws,
+            expected_agent_id=bound.agent_id,
+            expected_team_id=bound.team_id,
+            expected_lease_version=None,
+            known_device_digests=state.known_device_digests(),
+        )
+        if cancel_analysis_id is None:
+            assert await loop.poll_once() is True
+        else:
+            task = asyncio.create_task(loop.poll_once())
+            await asyncio.wait_for(device.capture_started.wait(), timeout=2)
+            assert browser_cookies is not None and csrf_token is not None
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="https://testserver",
+                cookies=browser_cookies,
+            ) as browser:
+                canceled = await browser.post(
+                    f"/v1/teams/{team_id}/analyses/{cancel_analysis_id}/cancel",
+                    headers={
+                        "origin": "http://localhost:3000",
+                        "x-csrf-token": csrf_token,
+                    },
+                )
+            assert canceled.status_code == 202, canceled.text
+            assert await task is True
+            assert any(
+                path.endswith("/cancel-ack") and status_code == 200
+                for path, status_code in observed_responses
+            )
+        completion_responses = [
+            item for item in observed_responses if item[0].endswith("/complete")
+        ]
+        if cancel_analysis_id is None:
+            assert completion_responses and completion_responses[-1][1] == 200, (
+                observed_responses
+            )
+        else:
+            assert completion_responses == []
+    finally:
+        await control.aclose()
+        await http_client.aclose()
+    return device
 
 
 class _FakeLocalMemoryAnalysisGateway:
@@ -2472,6 +2725,586 @@ def test_local_app_rejects_host_device_analysis_without_remote_capture(
 
     assert created.status_code == 409
     assert created.json()["error"]["code"] == "remote_device_capture_unavailable"
+
+
+def test_local_remote_capture_finalizes_apk_and_publishes_agent_task(
+    tmp_path: Path,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user(
+        "user01", "initial user password", False
+    ).principal
+    control.change_password(
+        user.user_id, "initial user password", "established user password"
+    )
+    inspector = _FakeLocalApkInspector()
+    device_probe = _FakeDeviceProbe(
+        _FakeDeviceStatus(state="disconnected", device=None)
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+        apk_inspector=inspector,
+        device_probe=device_probe,
+    )
+    private_key = Ed25519PrivateKey.generate()
+    apk = b"valid remote apk"
+    checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
+
+    with _RawTestClient(app) as client:
+        browser_headers = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        registration = client.post(
+            f"/v1/teams/{user.team_id}/agents/registration-codes",
+            headers=browser_headers,
+            json={"schema_version": "1.0", "name": "Capture Mac"},
+        ).json()
+        credentials = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1",
+                "registration_code": registration["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "capture-mac",
+                "os_version": "macOS 15",
+            },
+        ).json()
+        agent_headers = {
+            "Authorization": f"Bearer {credentials['access_token']}"
+        }
+        heartbeat = client.post(
+            "/v1/agent/heartbeat",
+            headers=agent_headers,
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "capture-mac",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [{
+                    "client_ref": "74000000-0000-4000-8000-000000000001",
+                    "serial": "emulator-5554",
+                    "manufacturer": "Google",
+                    "model": "Pixel",
+                    "android_release": "16",
+                    "api_level": 36,
+                    "connection_type": "usb",
+                    "adb_state": "device",
+                    "battery_percent": 80,
+                    "temperature_c": None,
+                    "storage_available_bytes": 1024,
+                    "property_error_code": None,
+                }],
+                "workspaces": [],
+            },
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        device_id = heartbeat.json()["devices"][0]["device_id"]
+
+        created = client.post(
+            f"/v1/teams/{user.team_id}/analyses",
+            headers=browser_headers,
+            json={
+                "schema_version": "1.1",
+                "analysis_mode": "device",
+                "device_id": device_id,
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": len(apk),
+                    "sha256_b64": checksum,
+                },
+            },
+        )
+        assert created.status_code == 201, created.text
+        analysis_id = created.json()["analysis_id"]
+        slot = created.json()["apk_upload"]
+        put = urlsplit(slot["put_url"])
+        assert client.put(
+            f"{put.path}?{put.query}",
+            content=apk,
+            headers=slot["required_headers"],
+        ).status_code == 200
+        finalized = client.post(
+            f"/v1/teams/{user.team_id}/analyses/{analysis_id}/finalize-upload",
+            headers=browser_headers,
+            json={
+                "upload_id": slot["upload_id"],
+                "sha256_b64": checksum,
+                "size": len(apk),
+            },
+        )
+        assert finalized.status_code == 200, finalized.text
+        replayed = client.post(
+            f"/v1/teams/{user.team_id}/analyses/{analysis_id}/finalize-upload",
+            headers=browser_headers,
+            json={
+                "upload_id": slot["upload_id"],
+                "sha256_b64": checksum,
+                "size": len(apk),
+            },
+        )
+        assert replayed.status_code == 200, replayed.text
+        assert replayed.json()["upload"]["artifact_id"] == (
+            finalized.json()["upload"]["artifact_id"]
+        )
+        analysis = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{analysis_id}"
+        ).json()
+        client.cookies.clear()
+        delivery = client.get(
+            "/v1/agent/tasks/next?wait_seconds=0", headers=agent_headers
+        )
+        assert delivery.status_code == 200, delivery.text
+        assert delivery.json()["action"] == "execute"
+        claims = verify_task_jws(
+            delivery.json()["snapshot_jws"],
+            credentials["task_signing_key"]["public_key_b64"],
+            expected_kid=credentials["task_signing_key"]["kid"],
+            expected_team_id=user.team_id,
+        )
+        startup_trace = b"startup trace"
+        startup_checksum = base64.b64encode(
+            hashlib.sha256(startup_trace).digest()
+        ).decode("ascii")
+        execution_id = claims["execution_id"]
+        upload = client.post(
+            f"/v1/agent/tasks/{execution_id}/uploads",
+            headers=agent_headers,
+            json={
+                "schema_version": "1.0",
+                "lease_version": 1,
+                "artifact_kind": "startup_trace",
+                "mime": "application/x-perfetto-trace",
+                "size": len(startup_trace),
+                "sha256_b64": startup_checksum,
+            },
+        ).json()
+        part = client.post(
+            f"/v1/agent/tasks/{execution_id}/uploads/{upload['upload_id']}/parts",
+            headers=agent_headers,
+            json={
+                "schema_version": "1.0",
+                "lease_version": 1,
+                "part_number": 1,
+            },
+        ).json()
+        uploaded = client.put(urlsplit(part["put_url"]).path, content=startup_trace)
+        completed_upload = client.post(
+            f"/v1/agent/tasks/{execution_id}/uploads/{upload['upload_id']}/complete",
+            headers=agent_headers,
+            json={
+                "schema_version": "1.0",
+                "lease_version": 1,
+                "parts": [{"part_number": 1, "etag": uploaded.headers["etag"]}],
+            },
+        ).json()
+        started_at = datetime.now().astimezone()
+        completed_at = started_at + timedelta(seconds=2)
+        completion = client.post(
+            f"/v1/agent/tasks/{execution_id}/complete",
+            headers=agent_headers,
+            json={
+                "schema_version": "1.0",
+                "execution_id": execution_id,
+                "lease_version": 1,
+                "state": "completed",
+                "started_at": started_at.isoformat(),
+                "completed_at": completed_at.isoformat(),
+                "agent_version": "1.2.3",
+                "adb_version": "Android Debug Bridge version 1.0.41",
+                "artifacts": [{
+                    "artifact_id": completed_upload["artifact_id"],
+                    "kind": "startup_trace",
+                    "mime": "application/x-perfetto-trace",
+                    "size": len(startup_trace),
+                    "sha256_b64": startup_checksum,
+                }],
+                "scenarios": [
+                    {
+                        "scenario_type": "startup",
+                        "state": "completed",
+                        "started_at": started_at.isoformat(),
+                        "completed_at": completed_at.isoformat(),
+                        "temperature_start_c": None,
+                        "temperature_end_c": None,
+                        "artifact_ids": [completed_upload["artifact_id"]],
+                        "diagnostic_code": None,
+                    },
+                    {
+                        "scenario_type": "scroll",
+                        "state": "failed",
+                        "started_at": started_at.isoformat(),
+                        "completed_at": completed_at.isoformat(),
+                        "temperature_start_c": None,
+                        "temperature_end_c": None,
+                        "artifact_ids": [],
+                        "diagnostic_code": "scroll_capture_failed",
+                    },
+                ],
+                "diagnostic_code": None,
+            },
+        )
+        assert completion.status_code == 200, completion.text
+        projected = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        projected_analysis = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{analysis_id}",
+            headers=projected,
+        ).json()
+
+    assert inspector.calls == [apk]
+    assert device_probe.calls == 0
+    assert analysis["state"] == "queued"
+    assert analysis["application_metadata"]["package_name"] == (
+        "com.example.perfpilot"
+    )
+    assert claims["analysis_id"] == analysis_id
+    assert claims["agent_id"] == credentials["agent_id"]
+    assert claims["device_digest"] == heartbeat.json()["devices"][0]["device_digest"]
+    assert [scenario["scenario_type"] for scenario in claims["scenarios"]] == [
+        "startup",
+        "scroll",
+    ]
+    assert claims["allowed_uploads"] == [
+        "startup_trace",
+        "scroll_trace",
+        "agent_log",
+    ]
+    assert projected_analysis["state"] == "analyzing"
+
+
+def test_local_remote_capture_rejects_invalid_apk_without_agent_task(
+    tmp_path: Path,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user(
+        "user01", "initial user password", False
+    ).principal
+    control.change_password(
+        user.user_id, "initial user password", "established user password"
+    )
+    inspector = _InvalidLocalApkInspector()
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+        apk_inspector=inspector,
+    )
+    private_key = Ed25519PrivateKey.generate()
+    apk = b"invalid remote apk"
+    checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
+
+    with _RawTestClient(app) as client:
+        browser_headers = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        registration = client.post(
+            f"/v1/teams/{user.team_id}/agents/registration-codes",
+            headers=browser_headers,
+            json={"schema_version": "1.0", "name": "Capture Mac"},
+        ).json()
+        credentials = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1",
+                "registration_code": registration["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "capture-mac",
+                "os_version": "macOS 15",
+            },
+        ).json()
+        agent_headers = {
+            "Authorization": f"Bearer {credentials['access_token']}"
+        }
+        heartbeat = client.post(
+            "/v1/agent/heartbeat",
+            headers=agent_headers,
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "capture-mac",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [{
+                    "client_ref": "74000000-0000-4000-8000-000000000001",
+                    "serial": "emulator-5554",
+                    "manufacturer": "Google",
+                    "model": "Pixel",
+                    "android_release": "16",
+                    "api_level": 36,
+                    "connection_type": "usb",
+                    "adb_state": "device",
+                    "battery_percent": 80,
+                    "temperature_c": None,
+                    "storage_available_bytes": 1024,
+                    "property_error_code": None,
+                }],
+                "workspaces": [],
+            },
+        ).json()
+        created = client.post(
+            f"/v1/teams/{user.team_id}/analyses",
+            headers=browser_headers,
+            json={
+                "schema_version": "1.1",
+                "analysis_mode": "device",
+                "device_id": heartbeat["devices"][0]["device_id"],
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": len(apk),
+                    "sha256_b64": checksum,
+                },
+            },
+        ).json()
+        slot = created["apk_upload"]
+        put = urlsplit(slot["put_url"])
+        assert client.put(
+            f"{put.path}?{put.query}",
+            content=apk,
+            headers=slot["required_headers"],
+        ).status_code == 200
+        finalized = client.post(
+            (
+                f"/v1/teams/{user.team_id}/analyses/"
+                f"{created['analysis_id']}/finalize-upload"
+            ),
+            headers=browser_headers,
+            json={
+                "upload_id": slot["upload_id"],
+                "sha256_b64": checksum,
+                "size": len(apk),
+            },
+        )
+        analysis = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+        ).json()
+        client.cookies.clear()
+        delivery = client.get(
+            "/v1/agent/tasks/next?wait_seconds=0", headers=agent_headers
+        )
+
+    assert finalized.status_code == 409
+    assert finalized.json()["error"]["code"] == "apk_metadata_invalid"
+    assert inspector.calls == 1
+    assert analysis["state"] == "failed"
+    assert analysis["failure"]["code"] == "apk_metadata_invalid"
+    assert delivery.json()["action"] == "wait"
+
+
+@pytest.mark.parametrize(
+    "outcome", ["completed", "failed", "canceled", "enqueue_failed"]
+)
+def test_local_remote_capture_runs_real_agent_lifecycle(
+    tmp_path: Path,
+    outcome: str,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user(
+        "user01", "initial user password", False
+    ).principal
+    control.change_password(
+        user.user_id, "initial user password", "established user password"
+    )
+    host_probe = _FakeDeviceProbe(
+        _FakeDeviceStatus(state="disconnected", device=None)
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+        apk_inspector=_FakeLocalApkInspector(),
+        device_probe=host_probe,
+        public_origin="https://testserver",
+    )
+    private_key = Ed25519PrivateKey.generate()
+    apk = b"real agent remote apk"
+    checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
+
+    with _RawTestClient(app) as client:
+        browser_headers = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        registration = client.post(
+            f"/v1/teams/{user.team_id}/agents/registration-codes",
+            headers=browser_headers,
+            json={"schema_version": "1.0", "name": "Capture Mac"},
+        ).json()
+        credentials = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1",
+                "registration_code": registration["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "capture-mac",
+                "os_version": "macOS 15",
+            },
+        ).json()
+        heartbeat = client.post(
+            "/v1/agent/heartbeat",
+            headers={"Authorization": f"Bearer {credentials['access_token']}"},
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "capture-mac",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [{
+                    "client_ref": "74000000-0000-4000-8000-000000000001",
+                    "serial": "emulator-5554",
+                    "manufacturer": "Google",
+                    "model": "Pixel",
+                    "android_release": "16",
+                    "api_level": 36,
+                    "connection_type": "usb",
+                    "adb_state": "device",
+                    "battery_percent": 80,
+                    "temperature_c": None,
+                    "storage_available_bytes": 1024,
+                    "property_error_code": None,
+                }],
+                "workspaces": [],
+            },
+        ).json()
+        device = heartbeat["devices"][0]
+        created = client.post(
+            f"/v1/teams/{user.team_id}/analyses",
+            headers=browser_headers,
+            json={
+                "schema_version": "1.1",
+                "analysis_mode": "device",
+                "device_id": device["device_id"],
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": len(apk),
+                    "sha256_b64": checksum,
+                },
+            },
+        ).json()
+        slot = created["apk_upload"]
+        put = urlsplit(slot["put_url"])
+        assert client.put(
+            f"{put.path}?{put.query}",
+            content=apk,
+            headers=slot["required_headers"],
+        ).status_code == 200
+        if outcome == "enqueue_failed":
+            async def fail_enqueue(_definition: object) -> bool:
+                raise RuntimeError("injected enqueue failure")
+
+            app.state.local_runtime.agent_tasks.enqueue = fail_enqueue
+        def finalize_request():
+            return client.post(
+                (
+                    f"/v1/teams/{user.team_id}/analyses/"
+                    f"{created['analysis_id']}/finalize-upload"
+                ),
+                headers=browser_headers,
+                json={
+                    "upload_id": slot["upload_id"],
+                    "sha256_b64": checksum,
+                    "size": len(apk),
+                },
+            )
+        if outcome == "enqueue_failed":
+            with pytest.raises(RuntimeError, match="injected enqueue failure"):
+                finalize_request()
+            projected = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            ).json()
+            client.cookies.clear()
+            delivery = client.get(
+                "/v1/agent/tasks/next?wait_seconds=0",
+                headers={"Authorization": f"Bearer {credentials['access_token']}"},
+            )
+            assert delivery.json()["action"] == "wait"
+            assert app.state.agent_upload_service._inputs == {}
+            captured = None
+        else:
+            assert finalize_request().status_code == 200
+            captured = asyncio.run(
+                _run_real_remote_agent_capture(
+                    app=app,
+                    tmp_path=tmp_path,
+                    private_key=private_key,
+                    credentials=credentials,
+                    team_id=user.team_id,
+                    device_id=UUID(device["device_id"]),
+                    device_digest=device["device_digest"],
+                    block_capture=outcome == "canceled",
+                    fail_capture=outcome == "failed",
+                    cancel_analysis_id=(
+                        created["analysis_id"] if outcome == "canceled" else None
+                    ),
+                    browser_cookies=(
+                        {cookie.name: cookie.value for cookie in client.cookies.jar}
+                        if outcome == "canceled"
+                        else None
+                    ),
+                    csrf_token=(
+                        browser_headers["x-csrf-token"]
+                        if outcome == "canceled"
+                        else None
+                    ),
+                )
+            )
+            projected = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            ).json()
+
+    assert host_probe.calls == 0
+    if outcome == "enqueue_failed":
+        assert projected["state"] == "uploading"
+    elif outcome == "completed":
+        assert projected["scenarios"][2]["state"] == "not_requested"
+        assert captured is not None
+        assert captured.installed == [apk]
+        assert captured.captured == ["startup", "scroll"]
+        assert captured.cleaned >= 1
+        assert projected["state"] == "analyzing"
+        assert projected["failure"] is None
+    elif outcome == "failed":
+        assert projected["scenarios"][2]["state"] == "not_requested"
+        assert captured is not None
+        assert captured.installed == [apk]
+        assert captured.captured == ["startup", "scroll"]
+        assert captured.cleaned >= 1
+        assert projected["state"] == "failed"
+        assert projected["failure"]["code"] == "remote_capture_failed"
+    else:
+        assert projected["scenarios"][2]["state"] == "not_requested"
+        assert captured is not None
+        assert captured.installed == [apk]
+        assert captured.captured == ["startup"]
+        assert captured.cleaned >= 1
+        assert projected["state"] == "canceled"
+        assert projected["cancel_requested_at"] is not None
 
 
 def test_local_remote_device_response_marks_memory_cycle_not_requested(

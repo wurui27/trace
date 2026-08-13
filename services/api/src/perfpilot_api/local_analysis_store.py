@@ -14,7 +14,7 @@ from perfpilot_api.reports.contracts import canonical_json_bytes
 
 
 _DOCUMENT_NAME = re.compile(
-    r"(?:state|projection|report|smartperfetto-report|normalized-core|android-memory-result|source-context|round-[123])\.json\Z"
+    r"(?:state|projection|report|smartperfetto-report|normalized-core|android-memory-result|source-context|agent-capture-manifest|round-[123])\.json\Z"
 )
 _MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
 

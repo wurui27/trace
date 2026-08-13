@@ -182,6 +182,50 @@ async def test_remote_device_enqueue_is_replay_safe_and_oldest_first() -> None:
 
 
 @pytest.mark.asyncio
+async def test_enqueue_rolls_back_when_publication_wakeup_fails() -> None:
+    class FailingWakeup:
+        async def wake(self, _agent_id: UUID) -> None:
+            raise RuntimeError("injected wakeup failure")
+
+        async def wait(self, _agent_id: UUID, _seconds: int) -> None:
+            return None
+
+    definition = _remote_definition()
+    repository = InMemoryAgentTaskRepository()
+    service = AgentTaskService(
+        repository=repository,
+        signer=TaskSnapshotSigner(
+            private_key=Ed25519PrivateKey.generate(), kid="lan-test", clock=lambda: NOW
+        ),
+        wakeup=FailingWakeup(),
+        clock=lambda: NOW,
+    )
+
+    with pytest.raises(RuntimeError, match="injected wakeup failure"):
+        await service.enqueue(definition)
+
+    assert await repository.oldest_queued(agent_id=AGENT_ID, now=NOW) is None
+
+
+@pytest.mark.asyncio
+async def test_queued_remote_device_cancellation_prevents_future_lease() -> None:
+    repository = InMemoryAgentTaskRepository()
+    await repository.enqueue(_remote_definition(), queued_at=NOW)
+
+    cancellation = await repository.request_cancel(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert cancellation.analysis_state == "canceled"
+    assert await repository.schedule(
+        analysis_id=ANALYSIS_ID,
+        now=NOW + timedelta(seconds=2),
+    ) is None
+
+
+@pytest.mark.asyncio
 async def test_capture_lease_projection_tracks_acquire_renew_and_terminal_release() -> None:
     projection = RecordingCaptureLeaseProjection()
     repository = InMemoryAgentTaskRepository(

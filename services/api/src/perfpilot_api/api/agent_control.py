@@ -1066,7 +1066,7 @@ async def complete_agent_execution(
             agent_id=principal.agent_id,
             execution_id=execution_id,
             lease_version=payload.lease_version,
-            manifest_document=payload.model_dump(mode="json"),
+            manifest_document=raw_payload,
             artifact_validator=upload_service,
         )
     except StaleLeaseVersion:

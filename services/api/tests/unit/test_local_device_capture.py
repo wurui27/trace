@@ -11,6 +11,7 @@ from perfpilot_api.local_device_capture import (
     AdbLocalDeviceCaptureGateway,
     LocalApkMetadata,
     LocalDeviceCaptureError,
+    resolve_local_aapt2,
     resolve_local_adb,
     resolve_local_android_toolchain,
 )
@@ -140,6 +141,18 @@ def test_adb_discovery_does_not_require_installed_build_tools(tmp_path: Path) ->
     ) == adb
 
 
+def test_aapt2_discovery_does_not_require_adb(tmp_path: Path) -> None:
+    sdk = tmp_path / "Android" / "Sdk"
+    aapt2 = _executable(sdk / "build-tools" / "37.0.0" / "aapt2")
+
+    assert resolve_local_aapt2(
+        environ={"ANDROID_SDK_ROOT": str(sdk)},
+        which=lambda _name: None,
+        home=tmp_path / "home",
+        platform_name="linux",
+    ) == aapt2
+
+
 @pytest.mark.asyncio
 async def test_aapt2_inspector_returns_launcher_and_version_metadata(tmp_path: Path) -> None:
     binary = tmp_path / "aapt2"
@@ -183,6 +196,33 @@ async def test_aapt2_inspector_returns_launcher_and_version_metadata(tmp_path: P
         has_native_libraries=True,
     )
     assert calls == [[str(binary), "dump", "badging", str(apk)]]
+
+
+@pytest.mark.asyncio
+async def test_aapt2_inspector_does_not_inherit_sensitive_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    binary = tmp_path / "aapt2"
+    binary.write_text(
+        "#!/bin/sh\n"
+        "if [ -n \"$GIT_ASKPASS\" ] || [ -n \"$PERFPILOT_TEST_SECRET\" ]; then\n"
+        "  printf 'sensitive environment inherited'\n"
+        "  exit 1\n"
+        "fi\n"
+        "printf \"package: name='dev.perfpilot.demo' versionCode='42'\\n\"\n"
+        "printf \"launchable-activity: name='.MainActivity'\\n\"\n",
+        encoding="utf-8",
+    )
+    binary.chmod(0o700)
+    apk = tmp_path / "demo.apk"
+    apk.write_bytes(b"apk")
+    monkeypatch.setenv("GIT_ASKPASS", "secret-helper")
+    monkeypatch.setenv("PERFPILOT_TEST_SECRET", "secret-value")
+
+    metadata = await Aapt2LocalApkInspector(binary=binary).inspect(apk)
+
+    assert metadata.package_name == "dev.perfpilot.demo"
 
 
 @pytest.mark.asyncio

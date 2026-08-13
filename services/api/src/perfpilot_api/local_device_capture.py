@@ -5,15 +5,17 @@ from __future__ import annotations
 import asyncio
 import os
 import re
+import signal
 import shutil
 import sys
+import tempfile
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Protocol
 
-from perfpilot_agent.adb import ProcessRunner, run_process
+from perfpilot_agent.adb import ProcessResult, ProcessRunner, process_group_options
 from perfpilot_agent.capture import CaptureAdbDevice, CaptureDevice, write_memory_archive
 
 
@@ -29,6 +31,83 @@ _TARGET_SDK_LINE = re.compile(r"^targetSdkVersion:'([0-9]+)'", re.MULTILINE)
 _NATIVE_CODE_LINE = re.compile(r"^native-code:\s*(.+)$", re.MULTILINE)
 _QUOTED_VALUE = re.compile(r"'([A-Za-z0-9_.-]{1,64})'")
 _MAX_BADGING_BYTES = 256 * 1024
+
+
+async def _run_aapt2_process(
+    argv: list[str],
+    *,
+    timeout_seconds: float,
+    maximum_output_bytes: int,
+) -> ProcessResult:
+    if (
+        not argv
+        or timeout_seconds <= 0
+        or maximum_output_bytes < 1
+        or any(not isinstance(item, str) or "\x00" in item for item in argv)
+    ):
+        raise LocalDeviceCaptureError("apk_metadata_invalid")
+    environment = {
+        "HOME": os.devnull,
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "PATH": "/usr/bin:/bin",
+        "TMPDIR": tempfile.gettempdir(),
+    }
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=environment,
+            **process_group_options(),
+        )
+    except OSError:
+        raise LocalDeviceCaptureError("apk_metadata_invalid") from None
+
+    total = [0]
+
+    async def read(stream: asyncio.StreamReader | None) -> bytes:
+        if stream is None:
+            return b""
+        output = bytearray()
+        while True:
+            chunk = await stream.read(64 * 1024)
+            if not chunk:
+                return bytes(output)
+            total[0] += len(chunk)
+            if total[0] > maximum_output_bytes:
+                raise LocalDeviceCaptureError("apk_metadata_invalid")
+            output.extend(chunk)
+
+    readers = (asyncio.create_task(read(process.stdout)), asyncio.create_task(read(process.stderr)))
+
+    async def stop_process() -> None:
+        if process.returncode is None:
+            try:
+                if sys.platform == "win32":
+                    process.kill()
+                else:
+                    os.killpg(process.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        await process.wait()
+
+    try:
+        async with asyncio.timeout(timeout_seconds):
+            stdout, stderr = await asyncio.gather(*readers)
+            return ProcessResult(await process.wait(), stdout, stderr)
+    except TimeoutError:
+        await stop_process()
+        raise LocalDeviceCaptureError("apk_metadata_invalid") from None
+    except BaseException:
+        await stop_process()
+        raise
+    finally:
+        for reader in readers:
+            if not reader.done():
+                reader.cancel()
+        await asyncio.gather(*readers, return_exceptions=True)
 
 
 class LocalDeviceCaptureError(RuntimeError):
@@ -180,13 +259,13 @@ def resolve_local_adb(
     return adb
 
 
-def resolve_local_android_toolchain(
+def resolve_local_aapt2(
     *,
     environ: Mapping[str, str] | None = None,
     which: Callable[[str], str | None] = shutil.which,
     home: Path | None = None,
     platform_name: str = sys.platform,
-) -> LocalAndroidToolchain:
+) -> Path:
     values = os.environ if environ is None else environ
     home_directory = Path.home() if home is None else Path(home)
     windows = platform_name == "win32"
@@ -196,6 +275,37 @@ def resolve_local_android_toolchain(
         home=home_directory,
         platform_name=platform_name,
     )
+    explicit_aapt2 = values.get("PERFPILOT_LOCAL_AAPT2")
+    if explicit_aapt2 is not None:
+        aapt2 = _executable(Path(explicit_aapt2))
+        if aapt2 is None:
+            raise LocalDeviceCaptureError("android_toolchain_unavailable")
+        return aapt2
+    aapt2 = next(
+        (
+            candidate
+            for root in roots
+            if (candidate := _sdk_aapt2(root, aapt2_name)) is not None
+        ),
+        None,
+    )
+    if aapt2 is None:
+        located = which(aapt2_name)
+        aapt2 = _executable(Path(located)) if located else None
+    if aapt2 is None:
+        raise LocalDeviceCaptureError("android_toolchain_unavailable")
+    return aapt2
+
+
+def resolve_local_android_toolchain(
+    *,
+    environ: Mapping[str, str] | None = None,
+    which: Callable[[str], str | None] = shutil.which,
+    home: Path | None = None,
+    platform_name: str = sys.platform,
+) -> LocalAndroidToolchain:
+    values = os.environ if environ is None else environ
+    home_directory = Path.home() if home is None else Path(home)
     adb = resolve_local_adb(
         environ=values,
         which=which,
@@ -203,26 +313,12 @@ def resolve_local_android_toolchain(
         platform_name=platform_name,
     )
 
-    explicit_aapt2 = values.get("PERFPILOT_LOCAL_AAPT2")
-    if explicit_aapt2 is not None:
-        aapt2 = _executable(Path(explicit_aapt2))
-        if aapt2 is None:
-            raise LocalDeviceCaptureError("android_toolchain_unavailable")
-    else:
-        aapt2 = next(
-            (
-                candidate
-                for root in roots
-                if (candidate := _sdk_aapt2(root, aapt2_name)) is not None
-            ),
-            None,
-        )
-        if aapt2 is None:
-            located = which(aapt2_name)
-            aapt2 = _executable(Path(located)) if located else None
-
-    if aapt2 is None:
-        raise LocalDeviceCaptureError("android_toolchain_unavailable")
+    aapt2 = resolve_local_aapt2(
+        environ=values,
+        which=which,
+        home=home_directory,
+        platform_name=platform_name,
+    )
     return LocalAndroidToolchain(adb_binary=adb, aapt2_binary=aapt2)
 
 
@@ -294,7 +390,7 @@ class Aapt2LocalApkInspector:
         self,
         *,
         binary: Path,
-        runner: ProcessRunner = run_process,
+        runner: ProcessRunner = _run_aapt2_process,
     ) -> None:
         resolved = Path(binary).resolve(strict=True)
         if not resolved.is_file() or not os.access(resolved, os.X_OK):
@@ -448,6 +544,7 @@ __all__ = [
     "LocalDeviceCaptureGateway",
     "LocalDeviceCaptureError",
     "build_local_device_capture_gateway",
+    "resolve_local_aapt2",
     "resolve_local_adb",
     "resolve_local_android_toolchain",
 ]

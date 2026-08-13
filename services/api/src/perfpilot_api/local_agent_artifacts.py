@@ -15,7 +15,15 @@ import secrets
 import stat
 import sys
 import threading
-from collections.abc import AsyncIterable, Callable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncIterable,
+    Awaitable,
+    Callable,
+    Iterable,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -193,6 +201,15 @@ class LocalAgentArtifactService:
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         uuid_source: Callable[[], UUID] = uuid4,
         token_source: Callable[[], str] = lambda: secrets.token_urlsafe(32),
+        completion_observer: Callable[
+            [AgentExecutionAccess, ValidatedAgentExecutionManifest, datetime],
+            Awaitable[None],
+        ]
+        | None = None,
+        cancellation_observer: Callable[
+            [AgentExecutionAccess, datetime], Awaitable[None]
+        ]
+        | None = None,
     ) -> None:
         if not isinstance(root, Path):
             raise TypeError("root must be a Path")
@@ -203,6 +220,8 @@ class LocalAgentArtifactService:
         self._clock = clock
         self._uuid_source = uuid_source
         self._token_source = token_source
+        self._completion_observer = completion_observer
+        self._cancellation_observer = cancellation_observer
         self._inputs: dict[UUID, _Input] = {}
         self._uploads: dict[UUID, _Upload] = {}
         self._artifacts: dict[UUID, _Upload] = {}
@@ -442,6 +461,21 @@ class LocalAgentArtifactService:
         if existing is not None and existing != item:
             raise AgentUploadMismatch("input artifact metadata does not match")
         self._inputs[artifact_id] = item
+        self._save_state(team_id, analysis_id)
+
+    def unregister_input(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        artifact_id: UUID,
+    ) -> None:
+        existing = self._inputs.get(artifact_id)
+        if existing is None:
+            return
+        if existing.team_id != team_id or existing.analysis_id != analysis_id:
+            raise AgentUploadNotFound("input artifact was not found")
+        self._inputs.pop(artifact_id)
         self._save_state(team_id, analysis_id)
 
     async def _authorize(
@@ -1657,8 +1691,15 @@ class LocalAgentArtifactService:
             ):
                 raise AgentUploadMismatch("execution artifacts do not match finalized uploads")
 
-    async def project_completion(self, **kwargs: object) -> None:
-        del kwargs
+    async def project_completion(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None:
+        if self._completion_observer is not None:
+            await self._completion_observer(access, manifest, now)
 
     async def abort_execution(self, *, access: AgentExecutionAccess, now: datetime) -> None:
         del now
@@ -1696,9 +1737,17 @@ class LocalAgentArtifactService:
                     self._upload_locks.pop(upload.upload_id, None)
         self._save_state(access.team_id, access.analysis_id)
 
-    async def project_cancellation(self, **kwargs: object) -> None:
-        if kwargs.get("reason_code") != "analysis_canceled":
+    async def project_cancellation(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        if reason_code != "analysis_canceled":
             raise AgentUploadInvalidRequest("cancellation reason is invalid")
+        if self._cancellation_observer is not None:
+            await self._cancellation_observer(access, now)
 
 
 __all__ = ["LocalAgentArtifactService", "LocalArtifactBody"]
