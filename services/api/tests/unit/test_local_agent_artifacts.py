@@ -8,6 +8,7 @@ import os
 import stat
 import subprocess
 import sys
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -276,6 +277,63 @@ async def test_input_validation_does_not_block_event_loop(
     opened = await opened_task
     assert elapsed < 0.1
     assert b"".join(opened.body) == payload
+
+
+@pytest.mark.asyncio
+async def test_cancelled_input_validation_closes_worker_descriptors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"private apk bytes"
+    source = _input_path(tmp_path)
+    source.parent.mkdir(mode=0o700, parents=True)
+    source.write_bytes(payload)
+    source.chmod(0o600)
+    service = _service(tmp_path)
+    service.register_input(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=INPUT_ID,
+        upload_id=INPUT_UPLOAD_ID,
+        mime="application/vnd.android.package-archive",
+        size=len(payload),
+        sha256_b64=_checksum(payload),
+    )
+    slot = await service.authorize_input(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_id=INPUT_ID,
+    )
+    original_open = service._open_verified_input
+    opened = threading.Event()
+    release = threading.Event()
+    descriptors: list[int] = []
+
+    def gated_open(*args: object):
+        result = original_open(*args)  # type: ignore[arg-type]
+        descriptors.extend((result.descriptor, result.directory))
+        opened.set()
+        assert release.wait(timeout=2)
+        return result
+
+    monkeypatch.setattr(service, "_open_verified_input", gated_open)
+    task = asyncio.create_task(
+        service.open_input(urlsplit(slot.url).path.rsplit("/", 1)[-1])
+    )
+    assert await asyncio.to_thread(opened.wait, 2)
+    task.cancel()
+    await asyncio.sleep(0)
+    task.cancel()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.05)
+
+    assert len(descriptors) == 2
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as raised:
+            os.fstat(descriptor)
+        assert raised.value.errno == 9
 
 
 @pytest.mark.asyncio

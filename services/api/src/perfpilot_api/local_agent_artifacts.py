@@ -66,6 +66,27 @@ class LocalArtifactBody:
     etag: str = field(repr=False)
 
 
+@dataclass(slots=True)
+class _OwnedInputDescriptors:
+    descriptor: int
+    directory: int
+    digest: bytes
+    claimed: bool = False
+
+    def claim(self) -> tuple[int, int, bytes]:
+        if self.claimed:
+            raise RuntimeError
+        self.claimed = True
+        return self.descriptor, self.directory, self.digest
+
+    def close_if_unclaimed(self) -> None:
+        if self.claimed:
+            return
+        self.claimed = True
+        os.close(self.descriptor)
+        os.close(self.directory)
+
+
 class AgentUploadCommittedError(AgentUploadUnavailable):
     """The state replacement committed, but directory durability is uncertain."""
 
@@ -507,12 +528,24 @@ class LocalAgentArtifactService:
             or grant.artifact_id not in access.input_artifact_ids
         ):
             raise AgentUploadNotFound("input artifact was not found")
+        ownership = {"abandoned": False}
+        worker = asyncio.create_task(asyncio.to_thread(self._open_verified_input, item))
+
+        def close_if_abandoned(done: asyncio.Task[_OwnedInputDescriptors]) -> None:
+            if ownership["abandoned"]:
+                self._close_abandoned_input(done)
+
+        worker.add_done_callback(close_if_abandoned)
         try:
-            descriptor, directory, digest_bytes = await asyncio.to_thread(
-                self._open_verified_input, item
-            )
+            opened = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            ownership["abandoned"] = True
+            if worker.done():
+                self._close_abandoned_input(worker)
+            raise
         except OSError:
             raise AgentUploadNotFound("input artifact was not found") from None
+        descriptor, directory, digest_bytes = opened.claim()
         return LocalArtifactBody(
             body=self._stream_descriptor(descriptor, directory),
             mime=item.mime,
@@ -520,7 +553,17 @@ class LocalAgentArtifactService:
             etag=f'"{base64.b16encode(digest_bytes).decode("ascii").lower()}"',
         )
 
-    def _open_verified_input(self, item: _Input) -> tuple[int, int, bytes]:
+    @staticmethod
+    def _close_abandoned_input(worker: asyncio.Task[_OwnedInputDescriptors]) -> None:
+        if worker.cancelled():
+            return
+        try:
+            opened = worker.result()
+        except Exception:
+            return
+        opened.close_if_unclaimed()
+
+    def _open_verified_input(self, item: _Input) -> _OwnedInputDescriptors:
         directory = self._subdir_fd(item.team_id, item.analysis_id, "uploads", create=False)
         descriptor = -1
         try:
@@ -540,7 +583,7 @@ class LocalAgentArtifactService:
             ):
                 raise OSError
             os.lseek(descriptor, 0, os.SEEK_SET)
-            return descriptor, directory, digest.digest()
+            return _OwnedInputDescriptors(descriptor, directory, digest.digest())
         except OSError:
             if descriptor >= 0:
                 os.close(descriptor)
