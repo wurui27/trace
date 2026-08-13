@@ -236,6 +236,49 @@ async def test_agent_input_get_revalidates_active_lease_after_grant(tmp_path: Pa
 
 
 @pytest.mark.asyncio
+async def test_input_validation_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = b"private apk bytes"
+    source = _input_path(tmp_path)
+    source.parent.mkdir(mode=0o700, parents=True)
+    source.write_bytes(payload)
+    source.chmod(0o600)
+    service = _service(tmp_path)
+    service.register_input(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=INPUT_ID,
+        upload_id=INPUT_UPLOAD_ID,
+        mime="application/vnd.android.package-archive",
+        size=len(payload),
+        sha256_b64=_checksum(payload),
+    )
+    slot = await service.authorize_input(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_id=INPUT_ID,
+    )
+    original_read = os.read
+
+    def slow_read(descriptor: int, size: int) -> bytes:
+        time.sleep(0.2)
+        return original_read(descriptor, size)
+
+    monkeypatch.setattr(os, "read", slow_read)
+    started = asyncio.get_running_loop().time()
+    opened_task = asyncio.create_task(
+        service.open_input(urlsplit(slot.url).path.rsplit("/", 1)[-1])
+    )
+    await asyncio.sleep(0.02)
+    elapsed = asyncio.get_running_loop().time() - started
+    opened = await opened_task
+    assert elapsed < 0.1
+    assert b"".join(opened.body) == payload
+
+
+@pytest.mark.asyncio
 async def test_agent_multipart_create_put_complete_publishes_exact_artifact(
     tmp_path: Path,
 ) -> None:
@@ -669,6 +712,44 @@ async def test_concurrent_exact_completion_is_idempotent(tmp_path: Path) -> None
     )
 
     assert first == second
+
+
+@pytest.mark.asyncio
+async def test_finalized_exact_completion_verify_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, token = await _pending_upload(tmp_path)
+    etag = await service.put_part(token, (b"x",))
+    receipt = (MultipartPart(part_number=1, etag=etag),)
+    await service.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=UPLOAD_ID,
+        parts=receipt,
+    )
+    original_verify = service._verify_completed
+
+    def slow_verify(*args: object) -> None:
+        time.sleep(0.2)
+        original_verify(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_verify_completed", slow_verify)
+    started = asyncio.get_running_loop().time()
+    completed_task = asyncio.create_task(
+        service.complete_upload(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=3,
+            upload_id=UPLOAD_ID,
+            parts=receipt,
+        )
+    )
+    await asyncio.sleep(0.02)
+    elapsed = asyncio.get_running_loop().time() - started
+    completed = await completed_task
+    assert elapsed < 0.1
+    assert completed.state == "finalized"
 
 
 @pytest.mark.asyncio

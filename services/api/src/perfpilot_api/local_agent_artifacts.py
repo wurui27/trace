@@ -507,6 +507,20 @@ class LocalAgentArtifactService:
             or grant.artifact_id not in access.input_artifact_ids
         ):
             raise AgentUploadNotFound("input artifact was not found")
+        try:
+            descriptor, directory, digest_bytes = await asyncio.to_thread(
+                self._open_verified_input, item
+            )
+        except OSError:
+            raise AgentUploadNotFound("input artifact was not found") from None
+        return LocalArtifactBody(
+            body=self._stream_descriptor(descriptor, directory),
+            mime=item.mime,
+            size=item.size,
+            etag=f'"{base64.b16encode(digest_bytes).decode("ascii").lower()}"',
+        )
+
+    def _open_verified_input(self, item: _Input) -> tuple[int, int, bytes]:
         directory = self._subdir_fd(item.team_id, item.analysis_id, "uploads", create=False)
         descriptor = -1
         try:
@@ -526,12 +540,7 @@ class LocalAgentArtifactService:
             ):
                 raise OSError
             os.lseek(descriptor, 0, os.SEEK_SET)
-            return LocalArtifactBody(
-                body=self._stream_descriptor(descriptor, directory),
-                mime=item.mime,
-                size=item.size,
-                etag=f'"{base64.b16encode(digest.digest()).decode("ascii").lower()}"',
-            )
+            return descriptor, directory, digest.digest()
         except OSError:
             if descriptor >= 0:
                 os.close(descriptor)
@@ -855,7 +864,7 @@ class LocalAgentArtifactService:
         ):
             raise AgentUploadInvalidRequest("multipart completion is invalid")
         if upload.finalized_at is not None:
-            self._verify_completed(upload)
+            await asyncio.to_thread(self._verify_completed, upload)
             return self._slot(upload)
         if upload.expires_at <= now:
             raise AgentUploadExpired("upload has expired")
