@@ -88,9 +88,15 @@ class _ManagedInputStream(Iterator[bytes]):
             return
         self._closed = True
         try:
-            os.close(self._descriptor)
+            try:
+                os.close(self._descriptor)
+            except OSError:
+                pass
         finally:
-            os.close(self._directory)
+            try:
+                os.close(self._directory)
+            except OSError:
+                pass
 
 
 @dataclass(frozen=True, slots=True)

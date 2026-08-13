@@ -5,6 +5,7 @@ import base64
 import copy
 import hashlib
 import json
+import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -16,6 +17,8 @@ from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient as _RawTestClient
+from starlette.requests import Request
+from starlette.requests import ClientDisconnect
 
 from perfpilot_api.ai.local_report import LocalReportSynthesizer
 from perfpilot_api.ai.openai_compatible import SynthesisCandidate
@@ -259,6 +262,133 @@ def test_local_remote_artifact_urls_stream_private_input_and_multipart_part(
         uploaded = client.put(urlsplit(part.url).path, content=trace_payload)
         assert uploaded.status_code == 200
         assert uploaded.headers["etag"].startswith('"')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("termination", ("disconnect", "cancel"))
+async def test_local_agent_input_response_closes_descriptors_on_termination(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, termination: str
+) -> None:
+    now = datetime.now(UTC)
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    agent_id = UUID("71000000-0000-4000-8000-000000000001")
+    execution_id = UUID("73000000-0000-4000-8000-000000000001")
+    input_id = UUID("50000000-0000-4000-8000-000000000001")
+    input_upload_id = UUID("51000000-0000-4000-8000-000000000001")
+    payload = b"private local apk"
+
+    class Authorizer:
+        async def authorize_execution(self, **_kwargs: object) -> AgentExecutionAccess:
+            return AgentExecutionAccess(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                agent_id=agent_id,
+                execution_id=execution_id,
+                lease_version=1,
+                lease_expires_at=now + timedelta(minutes=5),
+                allowed_uploads=("startup_trace",),
+                scenario_types=("startup",),
+                input_artifact_ids=(input_id,),
+            )
+
+    data_root = tmp_path / "data"
+    source = (
+        data_root
+        / "teams"
+        / str(team_id)
+        / "analyses"
+        / str(analysis_id)
+        / "uploads"
+        / f"{input_upload_id}.bin"
+    )
+    source.parent.mkdir(mode=0o700, parents=True)
+    source.write_bytes(payload)
+    source.chmod(0o600)
+    service = LocalAgentArtifactService(
+        root=data_root,
+        public_origin="http://testserver",
+        execution_authorizer=Authorizer(),
+        clock=lambda: now,
+        token_source=lambda: "disconnect-input-grant",
+    )
+    service.register_input(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        artifact_id=input_id,
+        upload_id=input_upload_id,
+        mime="application/vnd.android.package-archive",
+        size=len(payload),
+        sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode(),
+    )
+    slot = await service.authorize_input(
+        agent_id=agent_id,
+        execution_id=execution_id,
+        lease_version=1,
+        artifact_id=input_id,
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=data_root,
+        state_root=tmp_path / "state",
+    )
+    app.state.agent_upload_service = service
+    descriptors: list[int] = []
+    original_open = service._open_verified_input
+
+    def observed_open(*args: object):
+        result = original_open(*args)  # type: ignore[arg-type]
+        descriptors.extend((result.descriptor, result.directory))
+        return result
+
+    monkeypatch.setattr(service, "_open_verified_input", observed_open)
+    route = next(
+        route
+        for route in app.routes
+        if getattr(route, "path", None) == "/local/v1/agent-inputs/{grant}"
+    )
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "path": urlsplit(slot.url).path,
+            "headers": [],
+            "query_string": b"",
+            "server": ("testserver", 80),
+            "client": ("127.0.0.1", 1),
+            "scheme": "http",
+            "root_path": "",
+            "http_version": "1.1",
+        }
+    )
+    response = await route.endpoint(request.path_params.get("grant", "disconnect-input-grant"))
+    first_body = asyncio.Event()
+
+    async def receive() -> dict[str, object]:
+        await asyncio.sleep(3600)
+        return {"type": "http.disconnect"}
+
+    async def send(message: dict[str, object]) -> None:
+        if message["type"] == "http.response.body":
+            first_body.set()
+            if termination == "disconnect":
+                raise OSError("client disconnected")
+
+    response_task = asyncio.create_task(
+        response(
+            {"type": "http", "asgi": {"spec_version": "2.4"}}, receive, send
+        )
+    )
+    await first_body.wait()
+    if termination == "cancel":
+        response_task.cancel()
+    with pytest.raises((ClientDisconnect, asyncio.CancelledError)):
+        await response_task
+
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as raised:
+            os.fstat(descriptor)
+        assert raised.value.errno == 9
 
 
 def test_local_app_persists_team_owned_agents_and_source_workspaces(tmp_path: Path) -> None:

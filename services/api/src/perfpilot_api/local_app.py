@@ -4122,9 +4122,16 @@ def create_local_app(
                         break
                     yield chunk
             finally:
-                await asyncio.to_thread(opened.close)
+                opened.close()
 
-        return StreamingResponse(
+        class AgentInputStreamingResponse(StreamingResponse):
+            async def __call__(self, scope, receive, send) -> None:
+                try:
+                    await super().__call__(scope, receive, send)
+                finally:
+                    opened.close()
+
+        return AgentInputStreamingResponse(
             stream_input(),
             media_type=opened.mime,
             background=BackgroundTask(opened.close),
