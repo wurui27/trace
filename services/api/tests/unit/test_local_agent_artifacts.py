@@ -637,6 +637,64 @@ async def test_recovery_rejects_oversized_state_without_unbounded_read(tmp_path:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "unsafe_target", ("state", "part", "finalized", "input", "stale_temp")
+)
+async def test_recovery_rejects_world_readable_private_files(
+    tmp_path: Path, unsafe_target: str
+) -> None:
+    if unsafe_target in {"state", "part", "stale_temp"}:
+        await _persisted_part(tmp_path)
+        if unsafe_target == "state":
+            target = _state_path(tmp_path)
+        elif unsafe_target == "part":
+            target = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID) / "1.part"
+        else:
+            target = (
+                _state_path(tmp_path).parent
+                / "parts"
+                / str(UPLOAD_ID)
+                / ".1.12345678123442348123456789abcdef.tmp"
+            )
+            target.write_bytes(b"interrupted")
+    elif unsafe_target == "finalized":
+        service, token = await _pending_upload(tmp_path)
+        etag = await service.put_part(token, (b"x",))
+        await service.complete_upload(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=3,
+            upload_id=UPLOAD_ID,
+            parts=(MultipartPart(part_number=1, etag=etag),),
+        )
+        service.close()
+        target = _completed_path(tmp_path, ARTIFACT_ID)
+    else:
+        payload = b"private apk bytes"
+        target = _input_path(tmp_path)
+        target.parent.mkdir(mode=0o700, parents=True)
+        target.write_bytes(payload)
+        target.chmod(0o600)
+        service = _service(tmp_path)
+        service.register_input(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            artifact_id=INPUT_ID,
+            upload_id=INPUT_UPLOAD_ID,
+            mime="application/vnd.android.package-archive",
+            size=len(payload),
+            sha256_b64=_checksum(payload),
+        )
+        service.close()
+    target.chmod(0o644)
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+
+@pytest.mark.asyncio
 async def test_recovery_rejects_uuid_named_directory_symlink_without_reading_outside(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -768,6 +826,7 @@ async def test_recovery_removes_only_owned_stale_part_temp(tmp_path: Path) -> No
     upload_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
     owned_temp = upload_dir / ".1.12345678123442348123456789abcdef.tmp"
     owned_temp.write_bytes(b"interrupted")
+    owned_temp.chmod(0o600)
 
     reopened = _reopen(tmp_path)
 

@@ -299,15 +299,19 @@ class LocalAgentArtifactService:
     @staticmethod
     def _file_metadata(directory_fd: int, name: str) -> os.stat_result:
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-        if not stat.S_ISREG(metadata.st_mode):
+        if not LocalAgentArtifactService._is_private_regular(metadata):
             raise OSError
         return metadata
+
+    @staticmethod
+    def _is_private_regular(metadata: os.stat_result) -> bool:
+        return stat.S_ISREG(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o600
 
     @staticmethod
     def _stream_descriptor(descriptor: int, directory_fd: int) -> Iterable[bytes]:
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
+            if not LocalAgentArtifactService._is_private_regular(metadata):
                 raise OSError
             with os.fdopen(descriptor, "rb", closefd=True) as source:
                 descriptor = -1
@@ -502,7 +506,7 @@ class LocalAgentArtifactService:
             name = f"{item.upload_id}.bin"
             descriptor = os.open(name, os.O_RDONLY | _NOFOLLOW | _CLOEXEC, dir_fd=directory)
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
+            if not self._is_private_regular(metadata):
                 raise OSError
             if metadata.st_size != item.size:
                 raise OSError
@@ -842,7 +846,7 @@ class LocalAgentArtifactService:
                             dir_fd=parts_fd,
                         )
                         with os.fdopen(part_fd, "rb", closefd=True) as source:
-                            if not stat.S_ISREG(os.fstat(source.fileno()).st_mode):
+                            if not self._is_private_regular(os.fstat(source.fileno())):
                                 raise OSError
                             while chunk := source.read(1024 * 1024):
                                 size += len(chunk)
@@ -998,7 +1002,7 @@ class LocalAgentArtifactService:
                 state_status = os.stat("state.json", dir_fd=directory, follow_symlinks=False)
             except FileNotFoundError:
                 state_status = None
-            if state_status is not None and not stat.S_ISREG(state_status.st_mode):
+            if state_status is not None and not self._is_private_regular(state_status):
                 raise OSError
             descriptor = os.open(
                 temporary,
@@ -1062,7 +1066,10 @@ class LocalAgentArtifactService:
         )
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= limit:
+            if (
+                not LocalAgentArtifactService._is_private_regular(metadata)
+                or not 0 < metadata.st_size <= limit
+            ):
                 raise OSError
             payload = b""
             while len(payload) <= limit:
@@ -1328,7 +1335,7 @@ class LocalAgentArtifactService:
             held = os.fstat(descriptor)
             current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             if (
-                not stat.S_ISREG(held.st_mode)
+                not LocalAgentArtifactService._is_private_regular(held)
                 or not stat.S_ISREG(current.st_mode)
                 or (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino)
             ):
@@ -1354,7 +1361,10 @@ class LocalAgentArtifactService:
         )
         try:
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected_size:
+            if (
+                not LocalAgentArtifactService._is_private_regular(metadata)
+                or metadata.st_size != expected_size
+            ):
                 raise OSError
             digest = hashlib.sha256()
             size = 0
