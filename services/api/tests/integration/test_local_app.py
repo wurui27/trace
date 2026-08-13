@@ -64,7 +64,11 @@ from perfpilot_api.security.task_snapshots import (
 )
 from perfpilot_agent.capture import CaptureError, CaptureTaskRunner, ThermalReading
 from perfpilot_agent.config import AgentConfig
-from perfpilot_agent.control_client import ControlClient, TaskExecuteResponse
+from perfpilot_agent.control_client import (
+    ControlClient,
+    SourceTaskExecuteResponse,
+    TaskExecuteResponse,
+)
 from perfpilot_agent.credentials import AgentCredentials, TaskSigningKey
 from perfpilot_agent.executor import TaskExecutor
 from perfpilot_agent.service import TaskLoop
@@ -168,16 +172,115 @@ class _FakeSmartPerfettoGateway:
         return None
 
 
-def _authenticated_client(client: TestClient, username: str, password: str) -> dict[str, str]:
+class _ScenarioFailingSmartPerfettoGateway(_FakeSmartPerfettoGateway):
+    def __init__(self, result: EngineResult, *, failed_profile: str) -> None:
+        super().__init__(result)
+        self.failed_profile = failed_profile
+        self._runs: dict[str, str] = {}
+
+    async def submit(
+        self,
+        *,
+        trace_path: Path,
+        profile: str,
+        question: str | None,
+    ) -> LocalEngineRun:
+        self.submissions.append((trace_path.read_bytes(), profile, question))
+        run = LocalEngineRun(
+            session_id=f"session-{profile}",
+            run_id=f"run-{profile}",
+        )
+        self._runs[run.run_id] = profile
+        return run
+
+    async def status(self, run: LocalEngineRun) -> str:
+        return (
+            "failed"
+            if self.failed_profile == "all"
+            or self._runs[run.run_id] == self.failed_profile
+            else "completed"
+        )
+
+    async def fetch_result(self, run: LocalEngineRun) -> EngineResult:
+        assert self._runs[run.run_id] != self.failed_profile
+        return self.result
+
+
+class _ScenarioOriginalSmartPerfettoGateway(_FakeSmartPerfettoGateway):
+    def __init__(
+        self,
+        result: EngineResult,
+        *,
+        original_report_bytes: dict[str, bytes],
+    ) -> None:
+        super().__init__(result)
+        self.original_report_bytes_by_profile = original_report_bytes
+        self._runs: dict[str, str] = {}
+
+    async def submit(
+        self,
+        *,
+        trace_path: Path,
+        profile: str,
+        question: str | None,
+    ) -> LocalEngineRun:
+        self.submissions.append((trace_path.read_bytes(), profile, question))
+        run = LocalEngineRun(
+            session_id=f"session-{profile}",
+            run_id=f"run-{profile}",
+        )
+        self._runs[run.run_id] = profile
+        return run
+
+    async def status(self, run: LocalEngineRun) -> str:
+        assert run.run_id in self._runs
+        return "completed"
+
+    async def fetch_result(self, run: LocalEngineRun) -> EngineResult:
+        profile = self._runs[run.run_id]
+        return EngineResult(
+            contract=self.result.contract,
+            state=self.result.state,
+            payload=self.result.payload,
+            original_report_bytes=self.original_report_bytes_by_profile[profile],
+        )
+
+
+class _BlockingRemoteSmartPerfettoGateway(_FakeSmartPerfettoGateway):
+    def __init__(self, result: EngineResult) -> None:
+        super().__init__(result)
+        self.status_entered = threading.Event()
+        self.cancelled = threading.Event()
+
+    async def status(self, run: LocalEngineRun) -> str:
+        self.status_entered.set()
+        while not self.cancelled.is_set():
+            await asyncio.sleep(0.01)
+        return "cancelled"
+
+    async def cancel(self, run: LocalEngineRun) -> None:
+        self.cancel_calls.append(run)
+        self.cancelled.set()
+
+
+def _authenticated_client(
+    client: TestClient, username: str, password: str
+) -> dict[str, str]:
     csrf = client.get("/v1/auth/csrf")
     assert csrf.status_code == 200
     login = client.post(
         "/v1/auth/login",
-        headers={"Origin": "http://localhost:3000", "x-csrf-token": csrf.json()["csrf_token"]},
+        headers={
+            "Origin": "http://localhost:3000",
+            "x-csrf-token": csrf.json()["csrf_token"],
+        },
         json={"username": username, "password": password},
     )
     assert login.status_code == 200, login.text
-    return {"Origin": "http://localhost:3000", "x-csrf-token": login.json()["csrf_token"]}
+    return {
+        "Origin": "http://localhost:3000",
+        "x-csrf-token": login.json()["csrf_token"],
+    }
 
 
 def test_local_remote_artifact_urls_stream_private_input_and_multipart_part(
@@ -261,7 +364,10 @@ def test_local_remote_artifact_urls_stream_private_input_and_multipart_part(
         downloaded = client.get(urlsplit(input_slot.url).path)
         assert downloaded.status_code == 200
         assert downloaded.content == input_payload
-        assert downloaded.headers["content-type"] == "application/vnd.android.package-archive"
+        assert (
+            downloaded.headers["content-type"]
+            == "application/vnd.android.package-archive"
+        )
 
         upload = asyncio.run(
             service.create_upload(
@@ -415,7 +521,9 @@ async def test_local_agent_input_response_closes_descriptors_on_termination(
         assert raised.value.errno == 9
 
 
-def test_local_app_persists_team_owned_agents_and_source_workspaces(tmp_path: Path) -> None:
+def test_local_app_persists_team_owned_agents_and_source_workspaces(
+    tmp_path: Path,
+) -> None:
     control = LocalControlStore(tmp_path / "control")
     first = control.ensure_user("user01", "initial user password", False).principal
     second = control.ensure_user("user02", "initial user password", False).principal
@@ -492,7 +600,12 @@ def test_local_app_persists_team_owned_agents_and_source_workspaces(tmp_path: Pa
             },
         )
         assert heartbeat.status_code == 200, heartbeat.text
-        assert first_client.get(f"/v1/teams/{first.team_id}/agents").json()["agents"][0]["state"] == "online"
+        assert (
+            first_client.get(f"/v1/teams/{first.team_id}/agents").json()["agents"][0][
+                "state"
+            ]
+            == "online"
+        )
         workspaces = first_client.get(f"/v1/teams/{first.team_id}/source-workspaces")
         assert workspaces.status_code == 200
         assert workspaces.json()["workspaces"][0]["workspace_id"] == str(workspace_id)
@@ -522,7 +635,10 @@ def test_local_app_persists_team_owned_agents_and_source_workspaces(tmp_path: Pa
         )
         assert foreign_binding.status_code == 404
         assert second_client.get(f"/v1/teams/{first.team_id}/agents").status_code == 404
-        assert second_client.get(f"/v1/teams/{second.team_id}/agents").json()["agents"] == []
+        assert (
+            second_client.get(f"/v1/teams/{second.team_id}/agents").json()["agents"]
+            == []
+        )
 
     payload = (state_root / "agents" / "agents.json").read_text(encoding="utf-8")
     assert credentials["access_token"] not in payload
@@ -538,11 +654,23 @@ def test_local_app_persists_team_owned_agents_and_source_workspaces(tmp_path: Pa
     )
     with _RawTestClient(restarted) as client:
         headers = _authenticated_client(client, "user01", "established user password")
-        assert client.get(f"/v1/teams/{first.team_id}/agents", headers=headers).json()["agents"][0]["name"] == "Renamed Mac"
-        assert client.get(f"/v1/teams/{first.team_id}/source-workspaces", headers=headers).json()["workspaces"][0]["name"] == "RivotekMedia"
+        assert (
+            client.get(f"/v1/teams/{first.team_id}/agents", headers=headers).json()[
+                "agents"
+            ][0]["name"]
+            == "Renamed Mac"
+        )
+        assert (
+            client.get(
+                f"/v1/teams/{first.team_id}/source-workspaces", headers=headers
+            ).json()["workspaces"][0]["name"]
+            == "RivotekMedia"
+        )
 
 
-def test_local_agent_control_refresh_unregister_and_team_devices(tmp_path: Path) -> None:
+def test_local_agent_control_refresh_unregister_and_team_devices(
+    tmp_path: Path,
+) -> None:
     control = LocalControlStore(tmp_path / "control")
     first = control.ensure_user("user01", "initial user password", False).principal
     second = control.ensure_user("user02", "initial user password", False).principal
@@ -590,26 +718,43 @@ def test_local_agent_control_refresh_unregister_and_team_devices(tmp_path: Path)
             "execution_slot": {"state": "idle", "execution_id": None},
             "devices": [{
                 "client_ref": "74000000-0000-4000-8000-000000000001",
-                "serial": "emulator-5554", "manufacturer": "Google", "model": "Pixel",
-                "android_release": "16", "api_level": 36, "connection_type": "usb",
-                "adb_state": "device", "battery_percent": 80, "temperature_c": None,
-                "storage_available_bytes": 1024, "property_error_code": None,
-            }],
+                    "serial": "emulator-5554",
+                    "manufacturer": "Google",
+                    "model": "Pixel",
+                    "android_release": "16",
+                    "api_level": 36,
+                    "connection_type": "usb",
+                    "adb_state": "device",
+                    "battery_percent": 80,
+                    "temperature_c": None,
+                    "storage_available_bytes": 1024,
+                    "property_error_code": None,
         }
-        assert first_client.post(
+            ],
+        }
+        assert (
+            first_client.post(
             "/v1/agent/heartbeat",
             headers={"Authorization": f"Bearer {registered['access_token']}"},
             json=heartbeat_payload,
-        ).status_code == 401
-        assert first_client.post(
+            ).status_code
+            == 401
+        )
+        assert (
+            first_client.post(
             "/v1/agent/heartbeat",
             headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
             json=heartbeat_payload,
-        ).status_code == 200
+            ).status_code
+            == 200
+        )
         devices = first_client.get(f"/v1/teams/{first.team_id}/devices")
         assert devices.status_code == 200
         assert devices.json()["devices"][0]["serial_suffix"] == "5554"
-        assert second_client.get(f"/v1/teams/{second.team_id}/devices").json()["devices"] == []
+        assert (
+            second_client.get(f"/v1/teams/{second.team_id}/devices").json()["devices"]
+            == []
+        )
         accepted = first_client.post(
             f"/v1/teams/{first.team_id}/analyses",
             headers=first_headers,
@@ -628,20 +773,26 @@ def test_local_agent_control_refresh_unregister_and_team_devices(tmp_path: Path)
         assert accepted.status_code == 201, accepted.text
         assert accepted.json()["state"] == "uploading"
         first_client.cookies.clear()
-        assert first_client.get(
+        assert (
+            first_client.get(
             "/v1/agent/tasks/next?wait_seconds=0",
             headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
-        ).json()["action"] == "wait"
+            ).json()["action"]
+            == "wait"
+        )
         revoked = first_client.post(
             "/v1/agent/unregister",
             headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
         )
         assert revoked.status_code == 200
-        assert first_client.post(
+        assert (
+            first_client.post(
             "/v1/agent/heartbeat",
             headers={"Authorization": f"Bearer {refreshed.json()['access_token']}"},
             json=heartbeat_payload,
-        ).status_code == 401
+            ).status_code
+            == 401
+        )
 
 
 @pytest.mark.parametrize("value", ["/tmp/agent", r"C:\\agent", r"\\\\server\\agent", "~/agent", "../agent"])
@@ -852,10 +1003,9 @@ def test_local_analyses_are_isolated_between_logged_in_user_teams(
     assert not (data_root / "analyses" / analysis_id).exists()
 
 
-
-
-
-def test_local_auth_requires_login_and_exposes_current_principal(tmp_path: Path) -> None:
+def test_local_auth_requires_login_and_exposes_current_principal(
+    tmp_path: Path,
+) -> None:
     control = LocalControlStore(tmp_path / "control")
     admin = control.ensure_user("ray_wu", "initial admin password", True).principal
     ordinary = control.ensure_user("user01", "initial user password", False).principal
@@ -874,7 +1024,10 @@ def test_local_auth_requires_login_and_exposes_current_principal(tmp_path: Path)
         assert "Secure" not in csrf.headers["set-cookie"]
         logged_in = client.post(
             "/v1/auth/login",
-            headers={"Origin": "http://localhost:3000", "x-csrf-token": csrf.json()["csrf_token"]},
+            headers={
+                "Origin": "http://localhost:3000",
+                "x-csrf-token": csrf.json()["csrf_token"],
+            },
             json={"username": "user01", "password": "initial user password"},
         )
         assert logged_in.status_code == 200
@@ -888,7 +1041,11 @@ def test_local_auth_requires_login_and_exposes_current_principal(tmp_path: Path)
             "must_change_password": True,
         }
         assert me.json()["memberships"] == [
-            {"id": str(ordinary.team_id), "team": {"id": str(ordinary.team_id), "name": "user01 local team"}, "role": "owner"}
+            {
+                "id": str(ordinary.team_id),
+                "team": {"id": str(ordinary.team_id), "name": "user01 local team"},
+                "role": "owner",
+            }
         ]
         blocked = client.get(f"/v1/teams/{ordinary.team_id}/devices")
         assert blocked.status_code == 403
@@ -896,7 +1053,9 @@ def test_local_auth_requires_login_and_exposes_current_principal(tmp_path: Path)
         assert client.get(f"/v1/teams/{admin.team_id}/devices").status_code == 404
 
 
-def test_local_auth_changes_initial_password_and_invalidates_old_session(tmp_path: Path) -> None:
+def test_local_auth_changes_initial_password_and_invalidates_old_session(
+    tmp_path: Path,
+) -> None:
     control = LocalControlStore(tmp_path / "control")
     user = control.ensure_user("user01", "initial user password", False).principal
     app = create_local_app(
@@ -910,14 +1069,23 @@ def test_local_auth_changes_initial_password_and_invalidates_old_session(tmp_pat
         changed = client.post(
             "/v1/auth/change-password",
             headers=headers,
-            json={"current_password": "initial user password", "new_password": "changed user password"},
+            json={
+                "current_password": "initial user password",
+                "new_password": "changed user password",
+            },
         )
         assert changed.status_code == 200
         assert set(changed.json()) == {"schema_version", "csrf_token"}
         assert client.get("/v1/me").json()["user"]["must_change_password"] is False
         devices = client.get(f"/v1/teams/{user.team_id}/devices")
         assert devices.status_code == 200
-        logout = client.post("/v1/auth/logout", headers={"Origin": "http://localhost:3000", "x-csrf-token": changed.json()["csrf_token"]})
+        logout = client.post(
+            "/v1/auth/logout",
+            headers={
+                "Origin": "http://localhost:3000",
+                "x-csrf-token": changed.json()["csrf_token"],
+            },
+        )
         assert logout.status_code == 204
         assert client.get("/v1/me").status_code == 401
 
@@ -952,13 +1120,20 @@ def test_local_login_rejects_malformed_bodies_as_redacted_invalid_credentials(
 
     assert response.status_code == 401
     assert set(response.json()) == {"schema_version", "error"}
-    assert set(response.json()["error"]) == {"code", "message", "retryable", "request_id"}
+    assert set(response.json()["error"]) == {
+        "code",
+        "message",
+        "retryable",
+        "request_id",
+    }
     assert response.json()["error"]["code"] == "invalid_credentials"
     assert "user01" not in response.text
     assert "initial user password" not in response.text
 
 
-def test_local_device_requires_a_changed_authenticated_principal(tmp_path: Path) -> None:
+def test_local_device_requires_a_changed_authenticated_principal(
+    tmp_path: Path,
+) -> None:
     control = LocalControlStore(tmp_path / "control")
     user = control.ensure_user("user01", "initial user password", False).principal
     app = create_local_app(
@@ -983,10 +1158,17 @@ def test_local_device_requires_a_changed_authenticated_principal(tmp_path: Path)
         )
         assert changed.status_code == 200
         assert client.get("/v1/device").status_code == 200
-        assert control.resolve_session(client.cookies.get("perfpilot_local_session", "")).username == user.username
+        assert (
+            control.resolve_session(
+                client.cookies.get("perfpilot_local_session", "")
+            ).username
+            == user.username
+        )
 
 
-def test_concurrent_authenticated_csrf_bootstraps_keep_the_same_session(tmp_path: Path) -> None:
+def test_concurrent_authenticated_csrf_bootstraps_keep_the_same_session(
+    tmp_path: Path,
+) -> None:
     control = LocalControlStore(tmp_path / "control")
     seeded = control.ensure_user("user01", "initial user password", False).principal
     control.change_password(
@@ -1045,7 +1227,12 @@ def test_change_password_validation_is_a_closed_redacted_422(
 
     assert response.status_code == 422
     assert set(response.json()) == {"schema_version", "error"}
-    assert set(response.json()["error"]) == {"code", "message", "retryable", "request_id"}
+    assert set(response.json()["error"]) == {
+        "code",
+        "message",
+        "retryable",
+        "request_id",
+    }
     assert response.json()["error"]["code"] == "credential_validation_failed"
     assert "secret-marker" not in response.text
     assert "initial user password" not in response.text
@@ -1479,13 +1666,22 @@ def test_local_restart_degrades_waiting_source_and_finishes_persisted_report(
     prepared = _prepare_local_report(analysis, source_result)
     store = LocalAnalysisStore(data_root)
     store.save_document(
-        user.team_id, analysis.analysis_id, "normalized-core.json", prepared.core_document
+        user.team_id,
+        analysis.analysis_id,
+        "normalized-core.json",
+        prepared.core_document,
     )
     store.save_document(
-        user.team_id, analysis.analysis_id, "smartperfetto-report.json", prepared.source_report
+        user.team_id,
+        analysis.analysis_id,
+        "smartperfetto-report.json",
+        prepared.source_report,
     )
     store.save_document(
-        user.team_id, analysis.analysis_id, "projection.json", prepared.projection.document
+        user.team_id,
+        analysis.analysis_id,
+        "projection.json",
+        prepared.projection.document,
     )
     analysis.evidence_format_version = _LOCAL_EVIDENCE_FORMAT_VERSION
     analysis.evidence_manifest = _evidence_manifest(
@@ -1724,13 +1920,20 @@ class _InvalidLocalApkInspector:
 
 
 class _EndToEndCaptureDevice:
-    def __init__(self, *, block_capture: bool = False, fail_capture: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        block_capture: bool = False,
+        fail_capture: bool = False,
+        fail_scenario: str | None = None,
+    ) -> None:
         self.installed: list[bytes] = []
         self.captured: list[str] = []
         self.cleaned = 0
         self.capture_started = asyncio.Event()
         self._block_capture = block_capture
         self._fail_capture = fail_capture
+        self._fail_scenario = fail_scenario
 
     async def adb_version(self) -> str:
         return "Android Debug Bridge version 1.0.41"
@@ -1748,7 +1951,7 @@ class _EndToEndCaptureDevice:
         self.capture_started.set()
         if self._block_capture:
             await asyncio.Event().wait()
-        if self._fail_capture:
+        if self._fail_capture or self._fail_scenario == scenario_type:
             raise CaptureError("trace_capture_failed")
         output.write_bytes(f"{scenario_type}-trace".encode())
 
@@ -1773,9 +1976,14 @@ async def _run_real_remote_agent_capture(
     device_digest: str,
     block_capture: bool = False,
     fail_capture: bool = False,
+    fail_scenario: str | None = None,
     cancel_analysis_id: str | None = None,
     browser_cookies: dict[str, str] | None = None,
     csrf_token: str | None = None,
+    wait_for_report: bool = False,
+    analysis_id: UUID | None = None,
+    complete_strong_source: bool = False,
+    cancel_during_analysis: bool = False,
 ) -> _EndToEndCaptureDevice:
     ca = tmp_path / "ca.crt"
     ca.write_text("test", encoding="utf-8")
@@ -1835,6 +2043,7 @@ async def _run_real_remote_agent_capture(
     device = _EndToEndCaptureDevice(
         block_capture=block_capture,
         fail_capture=fail_capture,
+        fail_scenario=fail_scenario,
     )
     runner = CaptureTaskRunner(
         config=config,
@@ -1912,6 +2121,106 @@ async def _run_real_remote_agent_capture(
             assert completion_responses and completion_responses[-1][1] == 200, (
                 observed_responses
             )
+            if complete_strong_source:
+                source_delivery = None
+                for _ in range(100):
+                    candidate = await control.poll_task(wait_seconds=0)
+                    if isinstance(candidate, SourceTaskExecuteResponse):
+                        source_delivery = candidate
+                        break
+                    await asyncio.sleep(0.01)
+                source_repository = app.state.source_task_service._repository
+                capture_repository = app.state.agent_task_service._repository
+                assert source_delivery is not None, {
+                    "source_tasks": [
+                        (str(item.analysis_id), item.state)
+                        for item in source_repository.tasks.values()
+                    ],
+                    "capture_leases": [
+                        (str(item.definition.analysis_id), item.state)
+                        for item in capture_repository._leases.values()
+                    ],
+                    "analysis_stage": app.state.local_runtime.analyses[
+                        (team_id, analysis_id)
+                    ].stages,
+                }
+                snapshot = source_delivery.snapshot
+                hints = snapshot["finding_hints"]
+                assert isinstance(hints, list) and hints
+                hint = hints[0]
+                assert isinstance(hint, dict)
+                content = "fun init() = loadNow()"
+                await control.complete_source_task(
+                    execution_id=UUID(str(snapshot["execution_id"])),
+                    lease_version=int(snapshot["lease_version"]),
+                    lease_token=source_delivery.lease_token,
+                    completion={
+                        "schema_version": "1.0",
+                        "task_type": "source_context",
+                        "execution_id": str(snapshot["execution_id"]),
+                        "analysis_id": str(snapshot["analysis_id"]),
+                        "workspace_id": str(snapshot["workspace_id"]),
+                        "lease_version": int(snapshot["lease_version"]),
+                        "state": "completed",
+                        "result": {
+                            "snapshot_id": "94000000-0000-4000-8000-000000000001",
+                            "snapshot_hash": "b" * 64,
+                            "git_head": "a" * 40,
+                            "tracked_dirty_count": 0,
+                            "fragments": [
+                                {
+                                    "source_ref_id": "97000000-0000-4000-8000-000000000001",
+                                    "relative_path": "app/src/main/java/demo/Startup.kt",
+                                    "language": "kotlin",
+                                    "symbol": "demo.Startup.init",
+                                    "start_line": 1,
+                                    "end_line": 1,
+                                    "content": content,
+                                    "content_sha256": hashlib.sha256(
+                                        content.encode()
+                                    ).hexdigest(),
+                                    "snapshot_hash": "b" * 64,
+                                    "finding_ids": [hint["finding_id"]],
+                                    "evidence_ids": hint["evidence_ids"],
+                                    "rule_ids": [
+                                        "android.startup.eager_initialization"
+                                    ],
+                                    "match_signals": ["trace_symbol"],
+                                }
+                            ],
+                            "exclusions": [],
+                            "truncated": False,
+                        },
+                    },
+                )
+            if wait_for_report:
+                assert analysis_id is not None
+                analysis = app.state.local_runtime.analyses[(team_id, analysis_id)]
+                assert analysis.task is not None
+                await asyncio.wait_for(asyncio.shield(analysis.task), timeout=2)
+            elif cancel_during_analysis:
+                assert analysis_id is not None
+                gateway = app.state.local_runtime.gateway
+                assert isinstance(gateway, _BlockingRemoteSmartPerfettoGateway)
+                for _ in range(200):
+                    if gateway.status_entered.is_set():
+                        break
+                    await asyncio.sleep(0.01)
+                assert gateway.status_entered.is_set()
+                assert browser_cookies is not None and csrf_token is not None
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="https://testserver",
+                    cookies=browser_cookies,
+                ) as browser:
+                    canceled = await browser.post(
+                        f"/v1/teams/{team_id}/analyses/{analysis_id}/cancel",
+                        headers={
+                            "origin": "http://localhost:3000",
+                            "x-csrf-token": csrf_token,
+                        },
+                    )
+                assert canceled.status_code == 202, canceled.text
         else:
             assert completion_responses == []
     finally:
@@ -2197,7 +2506,11 @@ def _live_smartperfetto_result() -> EngineResult:
                             "display": {
                                 "title": "检测到的启动事件",
                                 "columns": [
-                                    {"name": "dur_ms", "label": "启动耗时", "unit": "ms"},
+                                    {
+                                        "name": "dur_ms",
+                                        "label": "启动耗时",
+                                        "unit": "ms",
+                                    },
                                     {"name": "ttid_ms", "label": "TTID", "unit": "ms"},
                                 ],
                             },
@@ -2347,12 +2660,16 @@ def _upload_and_finalize_trace(
     assert slot_response.status_code == 201
     slot = slot_response.json()["upload"]
     put = urlsplit(slot["put_url"])
-    assert client.put(
+    assert (
+        client.put(
         f"{put.path}?{put.query}",
         content=trace,
         headers=slot["required_headers"],
-    ).status_code == 200
-    assert client.post(
+        ).status_code
+        == 200
+    )
+    assert (
+        client.post(
         f"/v1/teams/{team_id}/analyses/{analysis_id}/finalize-upload",
         headers=headers,
         json={
@@ -2360,7 +2677,9 @@ def _upload_and_finalize_trace(
             "sha256_b64": checksum,
             "size": len(trace),
         },
-    ).status_code == 200
+        ).status_code
+        == 200
+    )
 
 
 def _persist_created_trace_analysis(
@@ -2618,7 +2937,9 @@ def test_local_app_requires_a_strict_evidence_marker_manifest_pair_after_restart
             pass
 
 
-def test_local_app_reports_the_device_currently_connected_over_adb(tmp_path: Path) -> None:
+def test_local_app_reports_the_device_currently_connected_over_adb(
+    tmp_path: Path,
+) -> None:
     device_probe = _FakeDeviceProbe(
         _FakeDeviceStatus(
             state="connected",
@@ -2863,11 +3184,14 @@ def test_local_remote_capture_finalizes_apk_and_publishes_agent_task(
         analysis_id = created.json()["analysis_id"]
         slot = created.json()["apk_upload"]
         put = urlsplit(slot["put_url"])
-        assert client.put(
+        assert (
+            client.put(
             f"{put.path}?{put.query}",
             content=apk,
             headers=slot["required_headers"],
-        ).status_code == 200
+            ).status_code
+            == 200
+        )
         finalized = client.post(
             f"/v1/teams/{user.team_id}/analyses/{analysis_id}/finalize-upload",
             headers=browser_headers,
@@ -2888,8 +3212,9 @@ def test_local_remote_capture_finalizes_apk_and_publishes_agent_task(
             },
         )
         assert replayed.status_code == 200, replayed.text
-        assert replayed.json()["upload"]["artifact_id"] == (
-            finalized.json()["upload"]["artifact_id"]
+        assert (
+            replayed.json()["upload"]["artifact_id"]
+            == (finalized.json()["upload"]["artifact_id"])
         )
         analysis = client.get(
             f"/v1/teams/{user.team_id}/analyses/{analysis_id}"
@@ -3111,15 +3436,17 @@ def test_local_remote_capture_rejects_invalid_apk_without_agent_task(
         ).json()
         slot = created["apk_upload"]
         put = urlsplit(slot["put_url"])
-        assert client.put(
+        assert (
+            client.put(
             f"{put.path}?{put.query}",
             content=apk,
             headers=slot["required_headers"],
-        ).status_code == 200
+            ).status_code
+            == 200
+        )
         finalized = client.post(
             (
-                f"/v1/teams/{user.team_id}/analyses/"
-                f"{created['analysis_id']}/finalize-upload"
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/finalize-upload"
             ),
             headers=browser_headers,
             json={
@@ -3597,6 +3924,11 @@ async def test_remote_terminal_observer_replay_persists_after_first_failure(
     "outcome",
     [
         "completed",
+        "source_strong",
+        "smartperfetto_partial",
+        "smartperfetto_all_failed",
+        "analyzing_canceled",
+        "accepted_restart_resumed",
         "failed",
         "canceled",
         "enqueue_failed",
@@ -3606,7 +3938,7 @@ async def test_remote_terminal_observer_replay_persists_after_first_failure(
         "published_restart_reconciled",
     ],
 )
-def test_local_remote_capture_runs_real_agent_lifecycle(
+def test_local_remote_capture_report_runs_real_agent_lifecycle(
     tmp_path: Path,
     outcome: str,
 ) -> None:
@@ -3617,18 +3949,55 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
     control.change_password(
         user.user_id, "initial user password", "established user password"
     )
-    host_probe = _FakeDeviceProbe(
-        _FakeDeviceStatus(state="disconnected", device=None)
-    )
+    host_probe = _FakeDeviceProbe(_FakeDeviceStatus(state="disconnected", device=None))
     inspector = _FakeLocalApkInspector()
+    smartperfetto_result = _smartperfetto_result()
+    if outcome == "source_strong":
+        smartperfetto_result.payload["report"]["dataEnvelopes"][0]["evidence"][0][
+            "fields"
+        ]["mapped_symbol"] = "demo.Startup.init"
+    scenario_originals = {
+        scenario_type: json.dumps(
+            {
+                **smartperfetto_result.payload["report"],
+                "analysisNotes": [f"{scenario_type} original"],
+            },
+            ensure_ascii=True,
+            indent=2,
+        ).encode("utf-8")
+        + b"\n"
+        for scenario_type in ("startup", "scroll")
+    }
+    smartperfetto = (
+        _ScenarioFailingSmartPerfettoGateway(
+            smartperfetto_result,
+            failed_profile=("scroll" if outcome == "smartperfetto_partial" else "all"),
+    )
+        if outcome in {"smartperfetto_partial", "smartperfetto_all_failed"}
+        else None
+    )
+    if smartperfetto is None:
+        smartperfetto = (
+            _ScenarioOriginalSmartPerfettoGateway(
+                smartperfetto_result,
+                original_report_bytes=scenario_originals,
+            )
+            if outcome == "completed"
+            else _BlockingRemoteSmartPerfettoGateway(smartperfetto_result)
+            if outcome in {"analyzing_canceled", "accepted_restart_resumed"}
+            else _FakeSmartPerfettoGateway(smartperfetto_result)
+        )
+    provider = _CountingProjectionReportProvider()
     app = create_local_app(
-        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        gateway=smartperfetto,
+        synthesizer=LocalReportSynthesizer(provider=provider),
         data_root=tmp_path / "data",
         state_root=tmp_path / "state",
         control_store=control,
         apk_inspector=inspector,
         device_probe=host_probe,
         public_origin="https://testserver",
+        source_code_analysis_enabled=outcome == "source_strong",
     )
     private_key = Ed25519PrivateKey.generate()
     apk = b"real agent remote apk"
@@ -3680,12 +4049,33 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                     "temperature_c": None,
                     "storage_available_bytes": 1024,
                     "property_error_code": None,
-                }],
-                "workspaces": [],
+                    }
+                ],
+                "workspaces": (
+                    [
+                        {
+                            "workspace_id": "92000000-0000-4000-8000-000000000001",
+                            "name": "RivotekMedia",
+                            "state": "ready",
+                            "git_branch": "main",
+                            "git_head": "a" * 40,
+                            "tracked_dirty_count": 0,
+                            "snapshot_policy": "tracked_worktree",
+                            "validation_profiles": [
+                                {
+                                    "profile_id": "96000000-0000-4000-8000-000000000001",
+                                    "name": "Unit tests",
+                                }
+                            ],
+                        }
+                    ]
+                    if outcome == "source_strong"
+                    else []
+                ),
             },
         ).json()
         device = heartbeat["devices"][0]
-        created = client.post(
+        created_response = client.post(
             f"/v1/teams/{user.team_id}/analyses",
             headers=browser_headers,
             json={
@@ -3699,18 +4089,37 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                     "size": len(apk),
                     "sha256_b64": checksum,
                 },
+                **(
+                    {
+                        "source_binding": {
+                            "provider_kind": "agent_workspace",
+                            "agent_id": credentials["agent_id"],
+                            "workspace_id": "92000000-0000-4000-8000-000000000001",
+                            "snapshot_policy": "tracked_worktree",
+                            "validation_profile_id": "96000000-0000-4000-8000-000000000001",
+                        }
+                    }
+                    if outcome == "source_strong"
+                    else {}
+                ),
             },
-        ).json()
+        )
+        assert created_response.status_code == 201, created_response.text
+        created = created_response.json()
         slot = created["apk_upload"]
         put = urlsplit(slot["put_url"])
-        assert client.put(
+        assert (
+            client.put(
             f"{put.path}?{put.query}",
             content=apk,
             headers=slot["required_headers"],
-        ).status_code == 200
+            ).status_code
+            == 200
+        )
         original_enqueue = app.state.local_runtime.agent_tasks.enqueue
         original_persist = app.state.local_runtime._persist
         if outcome in {"enqueue_failed", "restart_reconciled"}:
+
             async def fail_enqueue(_definition: object) -> bool:
                 raise RuntimeError("injected enqueue failure")
 
@@ -3729,11 +4138,11 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                 await original_persist(analysis)
 
             app.state.local_runtime._persist = fail_selected_persist
+
         def finalize_request():
             return client.post(
                 (
-                    f"/v1/teams/{user.team_id}/analyses/"
-                    f"{created['analysis_id']}/finalize-upload"
+                    f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/finalize-upload"
                 ),
                 headers=browser_headers,
                 json={
@@ -3742,6 +4151,7 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                     "size": len(apk),
                 },
             )
+
         if outcome in {
             "enqueue_failed",
             "intent_persist_failed",
@@ -3813,21 +4223,114 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                     ),
                     browser_cookies=(
                         {cookie.name: cookie.value for cookie in client.cookies.jar}
-                        if outcome == "canceled"
+                        if outcome in {"canceled", "analyzing_canceled"}
                         else None
                     ),
                     csrf_token=(
                         browser_headers["x-csrf-token"]
-                        if outcome == "canceled"
+                        if outcome in {"canceled", "analyzing_canceled"}
                         else None
                     ),
+                    wait_for_report=outcome
+                    in {
+                        "completed",
+                        "source_strong",
+                        "smartperfetto_partial",
+                        "smartperfetto_all_failed",
+                    },
+                    analysis_id=UUID(created["analysis_id"]),
+                    complete_strong_source=outcome == "source_strong",
+                    cancel_during_analysis=outcome == "analyzing_canceled",
                 )
             )
             projected = client.get(
                 f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
             ).json()
+            if outcome in {
+                "completed",
+                "source_strong",
+                "smartperfetto_partial",
+                "smartperfetto_all_failed",
+            }:
+                for _ in range(200):
+                    report_response = client.get(
+                        (
+                            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/report"
+                        )
+                    )
+                    if report_response.status_code == 200:
+                        break
+                    time.sleep(0.01)
+            projected = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            ).json()
 
-    if outcome in {"restart_reconciled", "published_restart_reconciled"}:
+    if outcome == "accepted_restart_resumed":
+        restart_gateway = _FakeSmartPerfettoGateway(_smartperfetto_result())
+        restart_provider = _CountingProjectionReportProvider()
+        restarted = create_local_app(
+            gateway=restart_gateway,
+            synthesizer=LocalReportSynthesizer(provider=restart_provider),
+            data_root=tmp_path / "data",
+            state_root=tmp_path / "state",
+            control_store=control,
+            apk_inspector=inspector,
+            device_probe=host_probe,
+            public_origin="https://testserver",
+        )
+        with _RawTestClient(restarted) as client:
+            browser_headers = _authenticated_client(
+                client, "user01", "established user password"
+            )
+            for _ in range(200):
+                report_response = client.get(
+                    f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/report",
+                    headers=browser_headers,
+                )
+                if report_response.status_code == 200:
+                    break
+                time.sleep(0.01)
+            projected = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}",
+                headers=browser_headers,
+            ).json()
+            client.cookies.clear()
+            delivery = client.get(
+                "/v1/agent/tasks/next?wait_seconds=0",
+                headers={"Authorization": f"Bearer {credentials['access_token']}"},
+            )
+        assert report_response.status_code == 200, report_response.text
+        assert projected["state"] == "completed"
+        assert restart_gateway.submissions == [
+            (b"startup-trace", "startup", None),
+            (b"scroll-trace", "scroll", None),
+        ]
+        assert restart_provider.calls == 1
+        assert delivery.json()["action"] == "wait"
+        converged_gateway = _FakeSmartPerfettoGateway(_smartperfetto_result())
+        converged_provider = _CountingProjectionReportProvider()
+        converged = create_local_app(
+            gateway=converged_gateway,
+            synthesizer=LocalReportSynthesizer(provider=converged_provider),
+            data_root=tmp_path / "data",
+            state_root=tmp_path / "state",
+            control_store=control,
+            apk_inspector=inspector,
+            device_probe=host_probe,
+            public_origin="https://testserver",
+        )
+        with _RawTestClient(converged) as client:
+            browser_headers = _authenticated_client(
+                client, "user01", "established user password"
+            )
+            converged_report = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/report",
+                headers=browser_headers,
+            )
+        assert converged_report.status_code == 200
+        assert converged_gateway.submissions == []
+        assert converged_provider.calls == 0
+    elif outcome in {"restart_reconciled", "published_restart_reconciled"}:
         restarted = create_local_app(
             gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
             data_root=tmp_path / "data",
@@ -3870,8 +4373,114 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
         assert captured.installed == [apk]
         assert captured.captured == ["startup", "scroll"]
         assert captured.cleaned >= 1
-        assert projected["state"] == "analyzing"
+        assert report_response.status_code == 200, report_response.text
+        report = report_response.json()
+        assert report["schema_version"] == "1.2"
+        assert [item["scenario_type"] for item in report["scenario_reports"]] == [
+            "startup",
+            "scroll",
+        ]
+        assert smartperfetto.submissions == [
+            (b"startup-trace", "startup", None),
+            (b"scroll-trace", "scroll", None),
+        ]
+        assert provider.calls == 1
+        assert projected["state"] == "completed"
         assert projected["failure"] is None
+        original_metadata = report["smartperfetto_original"]
+        assert original_metadata["mode"] == "scenario_collection"
+        assert [item["scenario_type"] for item in original_metadata["reports"]] == [
+            "startup",
+            "scroll",
+        ]
+        originals = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/smartperfetto-original"
+        )
+        assert originals.status_code == 200, originals.text
+        assert [item["scenario_type"] for item in originals.json()["reports"]] == [
+            "startup",
+            "scroll",
+        ]
+        for scenario_type in ("startup", "scroll"):
+            downloaded = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+                f"/smartperfetto-original?scenario={scenario_type}&download=true"
+            )
+            assert downloaded.status_code == 200, downloaded.text
+            assert downloaded.content == scenario_originals[scenario_type]
+            assert downloaded.headers["content-disposition"] == (
+                f'attachment; filename="smartperfetto-{created["analysis_id"]}-'
+                f'{scenario_type}.json"'
+            )
+    elif outcome == "source_strong":
+        assert report_response.status_code == 200, report_response.text
+        report = report_response.json()
+        assert report["state"] == "completed"
+        assert [item["scenario_type"] for item in report["scenario_reports"]] == [
+            "startup",
+            "scroll",
+        ]
+        assert report["source_code"]["context_state"] == "available"
+        assert report["source_code"]["match_summary"] == "strong"
+        fix = report["source_code"]["fixes"][0]
+        assert fix["relative_path"] == "app/src/main/java/demo/Startup.kt"
+        assert fix["symbol"] == "demo.Startup.init"
+        assert fix["diff"].startswith("diff --git a/app/")
+        assert provider.calls == 1
+    elif outcome == "smartperfetto_partial":
+        assert report_response.status_code == 200, report_response.text
+        report = report_response.json()
+        assert report["state"] == "partially_completed"
+        assert [item["scenario_type"] for item in report["scenario_reports"]] == [
+            "startup",
+            "scroll",
+        ]
+        assert report["scenario_reports"][0]["result_state"] == "completed"
+        assert report["scenario_reports"][1]["result_state"] == "failed"
+        assert smartperfetto.submissions == [
+            (b"startup-trace", "startup", None),
+            (b"scroll-trace", "scroll", None),
+        ]
+        assert provider.calls == 1
+        assert projected["state"] == "partially_completed"
+        assert projected["scenarios"][2]["state"] == "not_requested"
+        original_metadata = report["smartperfetto_original"]
+        assert original_metadata["mode"] == "scenario_collection"
+        assert [item["scenario_type"] for item in original_metadata["reports"]] == [
+            "startup"
+        ]
+        missing_original = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            "/smartperfetto-original?scenario=scroll"
+        )
+        assert missing_original.status_code == 404
+        assert "path" not in missing_original.text.lower()
+    elif outcome == "smartperfetto_all_failed":
+        assert projected["state"] == "failed"
+        assert projected["failure"]["code"] == "smartperfetto_all_failed"
+        assert projected["report_available"] is False
+        assert smartperfetto.submissions == [
+            (b"startup-trace", "startup", None),
+            (b"scroll-trace", "scroll", None),
+        ]
+        assert provider.calls == 0
+        assert report_response.status_code == 404
+        original = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/smartperfetto-original"
+        )
+        assert original.status_code == 404
+    elif outcome == "analyzing_canceled":
+        assert projected["state"] == "canceled"
+        assert provider.calls == 0
+        assert len(smartperfetto.cancel_calls) == 1
+        assert (
+            client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/report"
+            ).status_code
+            == 404
+        )
+    elif outcome == "accepted_restart_resumed":
+        assert report_response.status_code == 200
     elif outcome == "failed":
         assert projected["scenarios"][2]["state"] == "not_requested"
         assert captured is not None
@@ -3957,7 +4566,162 @@ def test_local_remote_device_response_marks_memory_cycle_not_requested(
     assert response["scenarios"][2]["failure"] is None
 
 
-@pytest.mark.skip(reason="remote device capture is not wired in the local control plane")
+def test_local_remote_report_preserves_completed_startup_when_scroll_capture_fails(
+    tmp_path: Path,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user("user01", "initial user password", False).principal
+    control.change_password(
+        user.user_id, "initial user password", "established user password"
+    )
+    inspector = _FakeLocalApkInspector()
+    smartperfetto = _FakeSmartPerfettoGateway(_smartperfetto_result())
+    provider = _CountingProjectionReportProvider()
+    app = create_local_app(
+        gateway=smartperfetto,
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+        apk_inspector=inspector,
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+        public_origin="https://testserver",
+    )
+    private_key = Ed25519PrivateKey.generate()
+    apk = b"partial remote agent apk"
+    checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
+
+    with _RawTestClient(app) as client:
+        browser_headers = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        registration = client.post(
+            f"/v1/teams/{user.team_id}/agents/registration-codes",
+            headers=browser_headers,
+            json={"schema_version": "1.0", "name": "Partial Capture Mac"},
+        ).json()
+        credentials = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1",
+                "registration_code": registration["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "partial-capture-mac",
+                "os_version": "macOS 15",
+            },
+        ).json()
+        heartbeat = client.post(
+            "/v1/agent/heartbeat",
+            headers={"Authorization": f"Bearer {credentials['access_token']}"},
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "partial-capture-mac",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [
+                    {
+                        "client_ref": "74000000-0000-4000-8000-000000000001",
+                        "serial": "emulator-5554",
+                        "manufacturer": "Google",
+                        "model": "Pixel",
+                        "android_release": "16",
+                        "api_level": 36,
+                        "connection_type": "usb",
+                        "adb_state": "device",
+                        "battery_percent": 80,
+                        "temperature_c": None,
+                        "storage_available_bytes": 1024,
+                        "property_error_code": None,
+                    }
+                ],
+                "workspaces": [],
+            },
+        ).json()
+        device = heartbeat["devices"][0]
+        created = client.post(
+            f"/v1/teams/{user.team_id}/analyses",
+            headers=browser_headers,
+            json={
+                "schema_version": "1.1",
+                "analysis_mode": "device",
+                "device_id": device["device_id"],
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": len(apk),
+                    "sha256_b64": checksum,
+                },
+            },
+        ).json()
+        slot = created["apk_upload"]
+        put = urlsplit(slot["put_url"])
+        assert (
+            client.put(
+                f"{put.path}?{put.query}",
+                content=apk,
+                headers=slot["required_headers"],
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/finalize-upload",
+                headers=browser_headers,
+                json={
+                    "upload_id": slot["upload_id"],
+                    "sha256_b64": checksum,
+                    "size": len(apk),
+                },
+            ).status_code
+            == 200
+        )
+        asyncio.run(
+            _run_real_remote_agent_capture(
+                app=app,
+                tmp_path=tmp_path,
+                private_key=private_key,
+                credentials=credentials,
+                team_id=user.team_id,
+                device_id=UUID(device["device_id"]),
+                device_digest=device["device_digest"],
+                fail_scenario="scroll",
+                wait_for_report=True,
+                analysis_id=UUID(created["analysis_id"]),
+            )
+        )
+        response = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+        ).json()
+        report_response = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/report"
+        )
+
+    assert report_response.status_code == 200, report_response.text
+    report = report_response.json()
+    assert report["state"] == "partially_completed"
+    assert [item["scenario_type"] for item in report["scenario_reports"]] == [
+        "startup",
+        "scroll",
+    ]
+    assert report["scenario_reports"][0]["result_state"] == "completed"
+    assert report["scenario_reports"][1]["result_state"] == "failed"
+    assert smartperfetto.submissions == [(b"startup-trace", "startup", None)]
+    assert provider.calls == 1
+    assert response["scenarios"][2]["state"] == "not_requested"
+
+
+@pytest.mark.skip(
+    reason="remote device capture is not wired in the local control plane"
+)
 def test_local_device_analysis_captures_in_background_and_publishes_report(
     tmp_path: Path,
 ) -> None:
@@ -4015,10 +4779,14 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
         analysis_id = created["analysis_id"]
         slot = created["apk_upload"]
         put = urlsplit(slot["put_url"])
-        assert client.put(
+        assert (
+            client.put(
             f"{put.path}?{put.query}", content=apk, headers=slot["required_headers"]
-        ).status_code == 200
-        assert client.post(
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/finalize-upload",
             headers=headers,
             json={
@@ -4026,7 +4794,9 @@ def test_local_device_analysis_captures_in_background_and_publishes_report(
                 "sha256_b64": checksum,
                 "size": len(apk),
             },
-        ).status_code == 200
+            ).status_code
+            == 200
+        )
 
         terminal = None
         for _ in range(200):
@@ -4323,11 +5093,14 @@ def test_local_app_does_not_launch_finalize_task_before_persistence(
             },
         ).json()["upload"]
         put = urlsplit(slot["put_url"])
-        assert client.put(
+        assert (
+            client.put(
             f"{put.path}?{put.query}",
             content=b"background-local-trace",
             headers=slot["required_headers"],
-        ).status_code == 200
+            ).status_code
+            == 200
+        )
         original_save_state = runtime.store.save_state
 
         def fail_save_state(*_args) -> None:
@@ -4389,11 +5162,14 @@ def test_local_app_keeps_committed_finalize_state_when_durability_is_uncertain(
             },
         ).json()["upload"]
         put = urlsplit(slot["put_url"])
-        assert client.put(
+        assert (
+            client.put(
             f"{put.path}?{put.query}",
             content=b"background-local-trace",
             headers=slot["required_headers"],
-        ).status_code == 200
+            ).status_code
+            == 200
+        )
         original_persist = runtime._persist
 
         async def persist_then_report_uncertain(analysis) -> None:
@@ -4463,9 +5239,12 @@ def test_local_app_cancel_stops_smartperfetto_and_persists_the_terminal_state(
         assert running is not None
         assert running["state"] == "analyzing"
 
-        assert client.post(
+        assert (
+            client.post(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/cancel"
-        ).status_code == 403
+            ).status_code
+            == 403
+        )
         canceled = client.post(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/cancel",
             headers=headers,
@@ -4489,9 +5268,9 @@ def test_local_app_cancel_stops_smartperfetto_and_persists_the_terminal_state(
         for stage in canceled.json()["stages"]
     )
     assert repeated.status_code == 200
-    assert repeated.json()["cancel_requested_at"] == canceled.json()[
-        "cancel_requested_at"
-    ]
+    assert (
+        repeated.json()["cancel_requested_at"] == canceled.json()["cancel_requested_at"]
+    )
     assert after.json()["state"] == "canceled"
     assert active.json()["analyses"] == []
     assert gateway.cancel_calls == [
@@ -4508,9 +5287,9 @@ def test_local_app_cancel_stops_smartperfetto_and_persists_the_terminal_state(
         )
     assert restored.status_code == 200
     assert restored.json()["state"] == "canceled"
-    assert restored.json()["cancel_requested_at"] == canceled.json()[
-        "cancel_requested_at"
-    ]
+    assert (
+        restored.json()["cancel_requested_at"] == canceled.json()["cancel_requested_at"]
+    )
 
 
 @pytest.mark.parametrize(
@@ -4606,7 +5385,11 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
                 f"/v1/teams/{team_id}/analyses/{analysis_id}",
                 headers=headers,
             )
-            if terminal.json()["state"] in {"completed", "partially_completed", "failed"}:
+            if terminal.json()["state"] in {
+                "completed",
+                "partially_completed",
+                "failed",
+            }:
                 break
             time.sleep(0.01)
 
@@ -4967,14 +5750,26 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
             },
         ).json()["upload"]
         put = urlsplit(slot["put_url"])
-        assert client.put(
-            f"{put.path}?{put.query}", content=trace, headers=slot["required_headers"]
-        ).status_code == 200
-        assert client.post(
+        assert (
+            client.put(
+                f"{put.path}?{put.query}",
+                content=trace,
+                headers=slot["required_headers"],
+            ).status_code
+            == 200
+        )
+        assert (
+            client.post(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/finalize-upload",
             headers=headers,
-            json={"upload_id": slot["upload_id"], "sha256_b64": checksum, "size": len(trace)},
-        ).status_code == 200
+                json={
+                    "upload_id": slot["upload_id"],
+                    "sha256_b64": checksum,
+                    "size": len(trace),
+                },
+            ).status_code
+            == 200
+        )
         for _ in range(100):
             state = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}").json()
             if state["report_available"]:
@@ -5083,9 +5878,10 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         assert datetime.fromisoformat(restored.json()["created_at"]) == datetime.fromisoformat(
             expected_report["generated_at"].replace("Z", "+00:00")
         )
-        assert client.get(
-            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
-        ).json() == expected_report
+        assert (
+            client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}/report").json()
+            == expected_report
+        )
         latest = client.get(
             f"/v1/teams/{team_id}/analyses?report_available=true&limit=1"
         )
@@ -5098,8 +5894,14 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         legacy = client.get(f"/v1/teams/{team_id}/analyses/{legacy_id}")
         assert legacy.status_code == 200
         assert legacy.json()["ai_rounds"] == expected_legacy_rounds
-        assert store.load_document(parsed_team_id, legacy_id, "round-2.json") == legacy_round_2
-        assert store.load_document(parsed_team_id, legacy_id, "round-3.json") == legacy_round_3
+        assert (
+            store.load_document(parsed_team_id, legacy_id, "round-2.json")
+            == legacy_round_2
+        )
+        assert (
+            store.load_document(parsed_team_id, legacy_id, "round-3.json")
+            == legacy_round_3
+        )
         assert (legacy_directory / "round-2.json").read_bytes() == legacy_round_2_bytes
         assert (legacy_directory / "round-3.json").read_bytes() == legacy_round_3_bytes
 
@@ -5133,9 +5935,17 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
         )
         assert rerun_report.status_code == 200
         assert rerun_report.json()["report_version"] == 2
-        assert store.load_document(parsed_team_id, legacy_id, "round-1.json") is not None
-        assert store.load_document(parsed_team_id, legacy_id, "round-2.json") == legacy_round_2
-        assert store.load_document(parsed_team_id, legacy_id, "round-3.json") == legacy_round_3
+        assert (
+            store.load_document(parsed_team_id, legacy_id, "round-1.json") is not None
+        )
+        assert (
+            store.load_document(parsed_team_id, legacy_id, "round-2.json")
+            == legacy_round_2
+        )
+        assert (
+            store.load_document(parsed_team_id, legacy_id, "round-3.json")
+            == legacy_round_3
+        )
         assert (legacy_directory / "round-2.json").read_bytes() == legacy_round_2_bytes
         assert (legacy_directory / "round-3.json").read_bytes() == legacy_round_3_bytes
 
@@ -5231,12 +6041,16 @@ def test_local_app_reruns_ai_from_persisted_evidence_after_restart(
         "normalized-core.json",
     )
     assert migrated_core is not None
-    assert validate_contract("normalized-trace-report", migrated_core)[
-        "analysis_id"
-    ] == analysis_id
-    assert LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), UUID(analysis_id))][
+    assert (
+        validate_contract("normalized-trace-report", migrated_core)["analysis_id"]
+        == analysis_id
+    )
+    assert (
+        LocalAnalysisStore(tmp_path).load_states()[(UUID(team_id), UUID(analysis_id))][
         "evidence_format_version"
-    ] == "normalized-core-v1"
+        ]
+        == "normalized-core-v1"
+    )
 
     store = LocalAnalysisStore(tmp_path)
     parsed_analysis_id = UUID(analysis_id)

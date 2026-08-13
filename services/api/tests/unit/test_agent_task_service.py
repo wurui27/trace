@@ -158,7 +158,9 @@ async def test_remote_device_enqueue_is_replay_safe_and_oldest_first() -> None:
     second = _remote_definition(analysis_id=OTHER_ANALYSIS_ID)
     repository = InMemoryAgentTaskRepository()
 
-    assert await repository.enqueue(second, queued_at=NOW + timedelta(seconds=1)) is True
+    assert (
+        await repository.enqueue(second, queued_at=NOW + timedelta(seconds=1)) is True
+    )
     assert await repository.enqueue(first, queued_at=NOW) is True
     assert await repository.enqueue(first, queued_at=NOW) is False
     assert await repository.oldest_queued(agent_id=AGENT_ID, now=NOW) == (
@@ -219,14 +221,19 @@ async def test_queued_remote_device_cancellation_prevents_future_lease() -> None
     )
 
     assert cancellation.analysis_state == "canceled"
-    assert await repository.schedule(
+    assert (
+        await repository.schedule(
         analysis_id=ANALYSIS_ID,
         now=NOW + timedelta(seconds=2),
-    ) is None
+        )
+        is None
+    )
 
 
 @pytest.mark.asyncio
-async def test_capture_lease_projection_tracks_acquire_renew_and_terminal_release() -> None:
+async def test_capture_lease_projection_tracks_acquire_renew_and_terminal_release() -> (
+    None
+):
     projection = RecordingCaptureLeaseProjection()
     repository = InMemoryAgentTaskRepository(
         (_remote_definition(),),
@@ -415,13 +422,14 @@ class FailingOnceCompletionArtifacts:
             raise RuntimeError("injected completion projection failure")
 
 
-def _completion_manifest() -> dict[str, object]:
+def _completion_manifest(*, state: str = "completed") -> dict[str, object]:
     completed = NOW + timedelta(seconds=2)
+    scenario_completed = state == "completed"
     return {
         "schema_version": "1.0",
         "execution_id": str(EXECUTION_ID),
         "lease_version": 1,
-        "state": "completed",
+        "state": state,
         "started_at": NOW.isoformat(),
         "completed_at": completed.isoformat(),
         "agent_version": "1.2.3",
@@ -429,7 +437,7 @@ def _completion_manifest() -> dict[str, object]:
         "artifacts": [
             {
                 "artifact_id": str(ARTIFACT_ID),
-                "kind": "startup_trace",
+                "kind": "startup_trace" if scenario_completed else "agent_log",
                 "mime": "application/x-perfetto-trace",
                 "size": 4,
                 "sha256_b64": base64.b64encode(b"a" * 32).decode("ascii"),
@@ -438,25 +446,34 @@ def _completion_manifest() -> dict[str, object]:
         "scenarios": [
             {
                 "scenario_type": "startup",
-                "state": "completed",
+                "state": "completed" if scenario_completed else "failed",
                 "started_at": NOW.isoformat(),
                 "completed_at": completed.isoformat(),
                 "temperature_start_c": None,
                 "temperature_end_c": None,
-                "artifact_ids": [str(ARTIFACT_ID)],
-                "diagnostic_code": None,
+                "artifact_ids": [str(ARTIFACT_ID)] if scenario_completed else [],
+                "diagnostic_code": None
+                if scenario_completed
+                else "startup_capture_failed",
             }
         ],
-        "diagnostic_code": None,
+        "diagnostic_code": None if scenario_completed else "agent_execution_failed",
     }
 
 
 @pytest.mark.asyncio
-async def test_exact_completion_retries_projection_after_terminal_commit_failure() -> None:
+@pytest.mark.parametrize(
+    ("manifest_state", "analysis_state"),
+    (("completed", "analyzing"), ("failed", "failed")),
+)
+async def test_exact_completion_retries_projection_after_terminal_commit_failure(
+    manifest_state: str,
+    analysis_state: str,
+) -> None:
     service, _repository, _public_key = _service()
     await service.schedule(analysis_id=ANALYSIS_ID)
     artifacts = FailingOnceCompletionArtifacts()
-    manifest = _completion_manifest()
+    manifest = _completion_manifest(state=manifest_state)
 
     with pytest.raises(RuntimeError, match="projection failure"):
         await service.complete(
@@ -466,6 +483,7 @@ async def test_exact_completion_retries_projection_after_terminal_commit_failure
             manifest_document=manifest,
             artifact_validator=artifacts,
         )
+    assert await _repository.oldest_queued(agent_id=AGENT_ID, now=NOW) is None
     replayed = await service.complete(
         agent_id=AGENT_ID,
         execution_id=EXECUTION_ID,
@@ -474,12 +492,15 @@ async def test_exact_completion_retries_projection_after_terminal_commit_failure
         artifact_validator=artifacts,
     )
 
-    assert replayed.analysis_state == "analyzing"
+    assert replayed.analysis_state == analysis_state
     assert artifacts.projected == 2
+    assert await _repository.schedule(analysis_id=ANALYSIS_ID, now=NOW) is None
 
 
 @pytest.mark.asyncio
-async def test_exact_cancel_ack_retries_projection_after_terminal_commit_failure() -> None:
+async def test_exact_cancel_ack_retries_projection_after_terminal_commit_failure() -> (
+    None
+):
     service, _repository, _public_key = _service()
     await service.schedule(analysis_id=ANALYSIS_ID)
     await service.request_cancel(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
@@ -493,6 +514,7 @@ async def test_exact_cancel_ack_retries_projection_after_terminal_commit_failure
             reason_code="analysis_canceled",
             artifact_coordinator=artifacts,
         )
+    assert await _repository.oldest_queued(agent_id=AGENT_ID, now=NOW) is None
     replayed = await service.acknowledge_cancellation(
         agent_id=AGENT_ID,
         execution_id=EXECUTION_ID,
@@ -503,6 +525,7 @@ async def test_exact_cancel_ack_retries_projection_after_terminal_commit_failure
 
     assert replayed.analysis_id == ANALYSIS_ID
     assert artifacts.projected[-1][1] == "analysis_canceled"
+    assert await _repository.schedule(analysis_id=ANALYSIS_ID, now=NOW) is None
 
 
 @pytest.mark.asyncio
@@ -543,11 +566,15 @@ async def test_cancel_is_delivered_by_poll_and_renew_then_acknowledged() -> None
         artifact_coordinator=artifacts,
     )
 
-    assert acknowledged == repeated == AgentCancellationAcknowledgement(
+    assert (
+        acknowledged
+        == repeated
+        == AgentCancellationAcknowledgement(
         execution_id=EXECUTION_ID,
         analysis_id=ANALYSIS_ID,
         lease_version=1,
         acknowledged_at=NOW,
+        )
     )
     assert await service.poll(agent_id=AGENT_ID, wait_seconds=0) is None
     assert artifacts.projected[-1][1] == "analysis_canceled"

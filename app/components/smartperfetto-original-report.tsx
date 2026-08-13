@@ -2,7 +2,11 @@
 
 import { useEffect, useMemo, useState } from "react";
 
-import type { PerfPilotClient, SmartPerfettoOriginal } from "../lib/perfpilot-api";
+import type {
+  PerfPilotClient,
+  SmartPerfettoOriginal,
+  SmartPerfettoScenarioOriginal,
+} from "../lib/perfpilot-api";
 
 function text(value: unknown): string | null {
   if (typeof value === "string" && value.trim()) return value;
@@ -17,6 +21,70 @@ function text(value: unknown): string | null {
 
 function array(value: unknown): readonly unknown[] {
   return Array.isArray(value) ? value : [];
+}
+
+function scenarioCollection(
+  value: SmartPerfettoOriginal | null,
+): readonly SmartPerfettoScenarioOriginal[] | null {
+  if (
+    value === null ||
+    value.mode !== "scenario_collection" ||
+    !Array.isArray(value.reports)
+  ) {
+    return null;
+  }
+  return value.reports as readonly SmartPerfettoScenarioOriginal[];
+}
+
+function OriginalDocument({
+  analysisId,
+  client,
+  document,
+  scenario,
+  teamId,
+  title,
+}: {
+  readonly analysisId: string;
+  readonly client: PerfPilotClient;
+  readonly document: Readonly<Record<string, unknown>>;
+  readonly scenario?: "startup" | "scroll";
+  readonly teamId: string;
+  readonly title?: string;
+}) {
+  const summary = text(document.summary);
+  const findings = array(document.findings);
+  const verification = text(
+    document.claimVerificationResult ?? document.claimSupport ?? document.verification,
+  );
+  return (
+    <section className="smartperfetto-original-document">
+      {title ? <h2>{title}</h2> : null}
+      <header className="analysis-report-section">
+        <h3>原始摘要</h3>
+        <p>{summary ?? "原始报告未提供文本摘要。"}</p>
+        <a
+          href={client.smartPerfettoOriginalDownloadUrl(teamId, analysisId, scenario)}
+          download={`smartperfetto-${analysisId}${scenario ? `-${scenario}` : ""}.json`}
+        >
+          下载原始报告
+        </a>
+      </header>
+      <section className="analysis-report-section">
+        <h3>原始发现</h3>
+        {findings.length ? (
+          <ol>{findings.map((finding, index) => <li key={index}>{text(finding) ?? `发现 ${index + 1}`}</li>)}</ol>
+        ) : <p>原始报告未列出独立发现。</p>}
+      </section>
+      <section className="analysis-report-section">
+        <h3>验证结果</h3>
+        <p>{verification ?? "原始报告未提供独立验证摘要。"}</p>
+      </section>
+      <details className="smartperfetto-full-json">
+        <summary>查看完整 JSON</summary>
+        <pre>{JSON.stringify(document, null, 2)}</pre>
+      </details>
+    </section>
+  );
 }
 
 export function SmartPerfettoOriginalReport({
@@ -51,12 +119,7 @@ export function SmartPerfettoOriginalReport({
   }, [active, analysisId, attempt, client, document, preloadedDocument, teamId]);
 
   const visibleDocument = preloadedDocument ?? document;
-  const summary = useMemo(() => text(visibleDocument?.summary), [visibleDocument]);
-  const findings = useMemo(() => array(visibleDocument?.findings), [visibleDocument]);
-  const verification = useMemo(
-    () => text(visibleDocument?.claimVerificationResult ?? visibleDocument?.claimSupport ?? visibleDocument?.verification),
-    [visibleDocument],
-  );
+  const collection = useMemo(() => scenarioCollection(visibleDocument), [visibleDocument]);
 
   if (!teamId) {
     return <p role="status">当前页面缺少团队上下文，无法读取原始报告。</p>;
@@ -71,32 +134,32 @@ export function SmartPerfettoOriginalReport({
   }
   if (visibleDocument === null) return <p role="status">正在读取 SmartPerfetto 原始报告…</p>;
 
+  if (collection !== null) {
+    return (
+      <section className="smartperfetto-original-report" aria-label="SmartPerfetto 原始报告内容">
+        {collection.map((item) => (
+          <OriginalDocument
+            key={item.scenario_type}
+            analysisId={analysisId}
+            client={client}
+            document={item.document}
+            scenario={item.scenario_type}
+            teamId={teamId}
+            title={`${item.label}原始报告`}
+          />
+        ))}
+      </section>
+    );
+  }
+
   return (
     <section className="smartperfetto-original-report" aria-label="SmartPerfetto 原始报告内容">
-      <header className="analysis-report-section">
-        <h2>原始摘要</h2>
-        <p>{summary ?? "原始报告未提供文本摘要。"}</p>
-        <a
-          href={client.smartPerfettoOriginalDownloadUrl(teamId, analysisId)}
-          download={`smartperfetto-${analysisId}.json`}
-        >
-          下载原始报告
-        </a>
-      </header>
-      <section className="analysis-report-section">
-        <h2>原始发现</h2>
-        {findings.length ? (
-          <ol>{findings.map((finding, index) => <li key={index}>{text(finding) ?? `发现 ${index + 1}`}</li>)}</ol>
-        ) : <p>原始报告未列出独立发现。</p>}
-      </section>
-      <section className="analysis-report-section">
-        <h2>验证结果</h2>
-        <p>{verification ?? "原始报告未提供独立验证摘要。"}</p>
-      </section>
-      <details className="smartperfetto-full-json">
-        <summary>查看完整 JSON</summary>
-        <pre>{JSON.stringify(visibleDocument, null, 2)}</pre>
-      </details>
+      <OriginalDocument
+        analysisId={analysisId}
+        client={client}
+        document={visibleDocument}
+        teamId={teamId}
+      />
     </section>
   );
 }

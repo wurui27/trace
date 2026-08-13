@@ -1694,6 +1694,74 @@ class LocalAgentArtifactService:
             ):
                 raise AgentUploadMismatch("execution artifacts do not match finalized uploads")
 
+    async def read_completed_artifact(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        agent_id: UUID,
+        execution_id: UUID,
+        lease_version: int,
+        artifact_id: UUID,
+        artifact_kind: str,
+        mime: str,
+        size: int,
+        sha256_b64: str,
+    ) -> bytes:
+        """Read an immutable Agent artifact only through its complete ownership binding."""
+
+        item = self._artifacts.get(artifact_id)
+        if (
+            item is None
+            or item.finalized_at is None
+            or item.team_id != team_id
+            or item.analysis_id != analysis_id
+            or item.agent_id != agent_id
+            or item.execution_id != execution_id
+            or item.lease_version != lease_version
+            or item.artifact_kind != artifact_kind
+            or item.mime != mime
+            or item.size != size
+            or not hmac.compare_digest(item.sha256_b64, sha256_b64)
+        ):
+            raise AgentUploadNotFound("completed artifact was not found")
+        return await asyncio.to_thread(self._read_completed_artifact, item)
+
+    def _read_completed_artifact(self, item: _Upload) -> bytes:
+        directory = self._completed_fd(item, create=False)
+        descriptor = -1
+        try:
+            name = f"{item.artifact_kind}-{item.artifact_id}.bin"
+            descriptor = os.open(
+                name,
+                os.O_RDONLY | _NOFOLLOW | _CLOEXEC | _NONBLOCK,
+                dir_fd=directory,
+            )
+            metadata = os.fstat(descriptor)
+            if not self._is_private_regular(metadata) or metadata.st_size != item.size:
+                raise OSError
+            digest = hashlib.sha256()
+            chunks: list[bytes] = []
+            observed_size = 0
+            while chunk := os.read(descriptor, 1024 * 1024):
+                observed_size += len(chunk)
+                if observed_size > item.size:
+                    raise OSError
+                digest.update(chunk)
+                chunks.append(chunk)
+            if observed_size != item.size or not hmac.compare_digest(
+                base64.b64encode(digest.digest()).decode("ascii"),
+                item.sha256_b64,
+            ):
+                raise OSError
+            return b"".join(chunks)
+        except OSError:
+            raise AgentUploadMismatch("completed artifact does not match") from None
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            os.close(directory)
+
     async def project_completion(
         self,
         *,

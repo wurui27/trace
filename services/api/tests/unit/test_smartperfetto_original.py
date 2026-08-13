@@ -1,16 +1,22 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 
 from perfpilot_api.reports.smartperfetto_original import (
+    MAX_SMARTPERFETTO_ORIGINAL_BYTES,
+    SmartPerfettoOriginalCollectionBinding,
     SmartPerfettoOriginalInvalid,
     SmartPerfettoOriginalNotFound,
     persist_smartperfetto_original,
+    persist_smartperfetto_scenario_original,
     read_smartperfetto_original,
+    read_smartperfetto_original_collection,
+    read_smartperfetto_scenario_original,
 )
 
 
@@ -37,7 +43,9 @@ def test_original_report_is_bound_to_team_analysis_size_hash_and_version(
     assert binding.version == 1
     assert binding.size == len(payload)
     assert binding.sha256 == hashlib.sha256(payload).hexdigest()
-    with pytest.raises(SmartPerfettoOriginalNotFound, match="^smartperfetto_original_not_found$"):
+    with pytest.raises(
+        SmartPerfettoOriginalNotFound, match="^smartperfetto_original_not_found$"
+    ):
         read_smartperfetto_original(
             root=tmp_path,
             binding=binding,
@@ -77,7 +85,9 @@ def test_original_report_rejects_mutated_private_artifact(
         artifact.unlink()
         artifact.symlink_to(replacement)
 
-    with pytest.raises(SmartPerfettoOriginalInvalid, match="^smartperfetto_original_invalid$") as error:
+    with pytest.raises(
+        SmartPerfettoOriginalInvalid, match="^smartperfetto_original_invalid$"
+    ) as error:
         read_smartperfetto_original(
             root=tmp_path,
             binding=binding,
@@ -116,7 +126,9 @@ def test_original_report_rejects_oversized_file(tmp_path: Path) -> None:
         )
 
 
-def test_original_report_preserves_valid_noncanonical_json_bytes(tmp_path: Path) -> None:
+def test_original_report_preserves_valid_noncanonical_json_bytes(
+    tmp_path: Path,
+) -> None:
     team_id = uuid4()
     analysis_id = uuid4()
     payload = b'{ "findings": [ ], "summary": "\\u539f\\u59cb" }\n'
@@ -130,9 +142,86 @@ def test_original_report_preserves_valid_noncanonical_json_bytes(tmp_path: Path)
 
     assert binding.size == len(payload)
     assert binding.sha256 == hashlib.sha256(payload).hexdigest()
-    assert read_smartperfetto_original(
+    assert (
+        read_smartperfetto_original(
         root=tmp_path,
         binding=binding,
         team_id=team_id,
         analysis_id=analysis_id,
-    ) == payload
+        )
+        == payload
+    )
+
+
+def test_scenario_collection_is_ordered_team_bound_and_byte_faithful(
+    tmp_path: Path,
+) -> None:
+    team_id = uuid4()
+    analysis_id = uuid4()
+    startup = b'{ "summary": "startup" }\n'
+    scroll = b'{ "summary": "scroll" }\n'
+    entries = tuple(
+        persist_smartperfetto_scenario_original(
+            root=tmp_path,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            scenario_type=scenario_type,
+            payload=payload,
+        )
+        for scenario_type, payload in (("startup", startup), ("scroll", scroll))
+    )
+    collection = SmartPerfettoOriginalCollectionBinding(reports=entries)
+
+    assert [
+        item["scenario_type"] for item in collection.public_document()["reports"]
+    ] == [
+        "startup",
+        "scroll",
+    ]
+    assert (
+        read_smartperfetto_scenario_original(
+            root=tmp_path,
+            entry=entries[0],
+            team_id=team_id,
+            analysis_id=analysis_id,
+        )
+        == startup
+    )
+    with pytest.raises(SmartPerfettoOriginalNotFound):
+        read_smartperfetto_scenario_original(
+            root=tmp_path,
+            entry=entries[0],
+            team_id=uuid4(),
+            analysis_id=analysis_id,
+        )
+    with pytest.raises(SmartPerfettoOriginalInvalid):
+        SmartPerfettoOriginalCollectionBinding(reports=tuple(reversed(entries)))
+
+
+def test_collection_payload_can_exceed_the_bounded_combined_response(
+    tmp_path: Path,
+) -> None:
+    team_id = uuid4()
+    analysis_id = uuid4()
+    payload = json.dumps(
+        {"value": "x" * (MAX_SMARTPERFETTO_ORIGINAL_BYTES // 2)}
+    ).encode()
+    entries = tuple(
+        persist_smartperfetto_scenario_original(
+            root=tmp_path,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            scenario_type=scenario_type,
+            payload=payload,
+        )
+        for scenario_type in ("startup", "scroll")
+    )
+
+    assert sum(item.binding.size for item in entries) > MAX_SMARTPERFETTO_ORIGINAL_BYTES
+    with pytest.raises(SmartPerfettoOriginalInvalid):
+        read_smartperfetto_original_collection(
+            root=tmp_path,
+            binding=SmartPerfettoOriginalCollectionBinding(reports=entries),
+            team_id=team_id,
+            analysis_id=analysis_id,
+        )

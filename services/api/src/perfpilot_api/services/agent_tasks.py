@@ -974,6 +974,8 @@ class InMemoryAgentTaskRepository:
                 state="released",
                 cancel_acknowledged_at=acknowledged_at,
             )
+            self._definitions.pop(access.analysis_id, None)
+            self._queued_at.pop(access.analysis_id, None)
             if self._capture_lease_projection is not None:
                 await self._capture_lease_projection.release_capture_lease(
                     device_id=lease.definition.device_id,
@@ -1089,6 +1091,8 @@ class InMemoryAgentTaskRepository:
             completion_manifest_digest=manifest.document_hash,
             completion=completion,
         )
+        self._definitions.pop(access.analysis_id, None)
+        self._queued_at.pop(access.analysis_id, None)
         if self._capture_lease_projection is not None:
             await self._capture_lease_projection.release_capture_lease(
                 device_id=lease.definition.device_id,

@@ -1278,6 +1278,50 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("accepts ordered remote original metadata and rejects private or reordered entries", async () => {
+    const item = {
+      scenario_type: "startup",
+      label: "启动",
+      available: true,
+      artifact_id: "98000000-0000-4000-8000-000000000001",
+      version: 1,
+      mime: "application/json",
+      size: 42,
+      sha256: "a".repeat(64),
+    };
+    const valid = sourceAwareReportPayload();
+    valid.smartperfetto_original = {
+      available: true,
+      mode: "scenario_collection",
+      reports: [item, {
+        ...item,
+        scenario_type: "scroll",
+        label: "滑动",
+        artifact_id: "98000000-0000-4000-8000-000000000002",
+      }],
+    };
+    const reordered = structuredClone(valid);
+    (reordered.smartperfetto_original as { reports: unknown[] }).reports.reverse();
+    const privateEntry = structuredClone(valid);
+    ((privateEntry.smartperfetto_original as { reports: Record<string, unknown>[] }).reports[0]).path = "/private/report.json";
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(valid))
+      .mockResolvedValueOnce(Response.json(reordered))
+      .mockResolvedValueOnce(Response.json(privateEntry));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      smartperfetto_original: { mode: "scenario_collection" },
+    });
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
   it("loads a bounded SmartPerfetto original document and builds its same-origin download URL", async () => {
     const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(
       Response.json({ summary: { conclusion: "原始结论" }, findings: [] }),
@@ -1290,6 +1334,41 @@ describe("PerfPilot browser API", () => {
     expect(client.smartPerfettoOriginalDownloadUrl(TEAM_ID, ANALYSIS_ID)).toBe(
       `/api/v1/teams/${TEAM_ID}/analyses/${ANALYSIS_ID}/smartperfetto-original?download=true`,
     );
+    expect(client.smartPerfettoOriginalDownloadUrl(TEAM_ID, ANALYSIS_ID, "scroll")).toBe(
+      `/api/v1/teams/${TEAM_ID}/analyses/${ANALYSIS_ID}/smartperfetto-original?scenario=scroll&download=true`,
+    );
+  });
+
+  it("accepts only the closed ordered SmartPerfetto scenario collection", async () => {
+    const valid = {
+      mode: "scenario_collection",
+      reports: [
+        { scenario_type: "startup", label: "启动", document: { summary: "启动" } },
+        { scenario_type: "scroll", label: "滑动", document: { summary: "滑动" } },
+      ],
+    };
+    const reordered = {
+      ...valid,
+      reports: [...valid.reports].reverse(),
+    };
+    const privateValue = {
+      ...valid,
+      reports: [{ ...valid.reports[0], path: "/private/startup.json" }],
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(valid))
+      .mockResolvedValueOnce(Response.json(reordered))
+      .mockResolvedValueOnce(Response.json(privateValue));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.smartPerfettoOriginal(TEAM_ID, ANALYSIS_ID)).resolves.toEqual(valid);
+    await expect(client.smartPerfettoOriginal(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(client.smartPerfettoOriginal(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
   });
 
   it("rejects source refs for none and fixes for weak source matches", async () => {

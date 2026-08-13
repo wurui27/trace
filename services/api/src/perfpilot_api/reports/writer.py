@@ -348,15 +348,7 @@ def compose_analysis_report(
         ),
     )
     scenario_reports: list[dict[str, object]] = []
-    partial_core = core.get("core_state") == "partial" or (
-        analysis_mode == "device"
-        and {
-            value.get("scenario_type")
-            for value in ordered
-            if isinstance(value, Mapping)
-        }
-        != set(_SCENARIO_ORDER)
-    )
+    partial_core = core.get("core_state") == "partial"
     for index, value in enumerate(ordered):
         if not isinstance(value, Mapping):
             raise ReportSourceError("report source is invalid")
@@ -455,6 +447,12 @@ def compose_analysis_report(
     )
     if request.source_code_document is not None and not report_v12:
         raise ReportSourceError("report source is invalid")
+    if not report_v12 and analysis_mode == "device" and {
+        value.get("scenario_type")
+        for value in ordered
+        if isinstance(value, Mapping)
+    } != set(_SCENARIO_ORDER):
+        partial_core = True
     source_code = (
         _source_code_v12(request.source_code_document, synthesis_output)
         if report_v12

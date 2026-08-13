@@ -374,14 +374,7 @@ export interface LegacyAnalysisReport extends AnalysisReportBase {
 export interface SourceAwareAnalysisReport extends AnalysisReportBase {
   readonly schema_version: "1.2";
   readonly source_code: SourceCodeReport;
-  readonly smartperfetto_original?: Readonly<{
-    readonly available: true;
-    readonly artifact_id: string;
-    readonly version: 1;
-    readonly mime: "application/json";
-    readonly size: number;
-    readonly sha256: string;
-  }>;
+  readonly smartperfetto_original?: SmartPerfettoOriginalMetadata;
   readonly synthesis:
     | {
         readonly state: "completed";
@@ -401,7 +394,39 @@ export interface SourceAwareAnalysisReport extends AnalysisReportBase {
 
 export type AnalysisReport = LegacyAnalysisReport | SourceAwareAnalysisReport;
 
-export type SmartPerfettoOriginal = Readonly<Record<string, unknown>>;
+export interface SmartPerfettoOriginalMetadataItem {
+  readonly scenario_type: SmartPerfettoScenario;
+  readonly label: "启动" | "滑动";
+  readonly available: true;
+  readonly artifact_id: string;
+  readonly version: 1;
+  readonly mime: "application/json";
+  readonly size: number;
+  readonly sha256: string;
+}
+
+export type SmartPerfettoOriginalMetadata =
+  | Omit<SmartPerfettoOriginalMetadataItem, "scenario_type" | "label">
+  | Readonly<{
+      readonly available: true;
+      readonly mode: "scenario_collection";
+      readonly reports: readonly SmartPerfettoOriginalMetadataItem[];
+    }>;
+
+export type SmartPerfettoScenario = "startup" | "scroll";
+
+export interface SmartPerfettoScenarioOriginal {
+  readonly scenario_type: SmartPerfettoScenario;
+  readonly label: "启动" | "滑动";
+  readonly document: Readonly<Record<string, unknown>>;
+}
+
+export type SmartPerfettoOriginal =
+  | Readonly<Record<string, unknown>>
+  | Readonly<{
+      readonly mode: "scenario_collection";
+      readonly reports: readonly SmartPerfettoScenarioOriginal[];
+    }>;
 
 export interface SynthesisRunResponse {
   readonly schema_version: "1.0";
@@ -726,7 +751,11 @@ export interface PerfPilotClient {
     analysisId: string,
     signal?: AbortSignal,
   ): Promise<SmartPerfettoOriginal>;
-  smartPerfettoOriginalDownloadUrl(teamId: string, analysisId: string): string;
+  smartPerfettoOriginalDownloadUrl(
+    teamId: string,
+    analysisId: string,
+    scenario?: SmartPerfettoScenario,
+  ): string;
   createSynthesisRun(
     teamId: string,
     analysisId: string,
@@ -940,6 +969,62 @@ export function validUploadUrl(
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   const allowedKeys = new Set(allowed);
   return Object.keys(value).every((key) => allowedKeys.has(key));
+}
+
+function smartPerfettoOriginalResponse(value: unknown): SmartPerfettoOriginal {
+  if (!object(value) || !safeJsonTree(value)) {
+    throw new PerfPilotApiError(
+      "invalid_api_response",
+      "SmartPerfetto 原始报告无效",
+      false,
+      null,
+    );
+  }
+  if (value.mode !== "scenario_collection") return value;
+  if (
+    !exactKeys(value, ["mode", "reports"]) ||
+    !Array.isArray(value.reports) ||
+    value.reports.length < 1 ||
+    value.reports.length > 2
+  ) {
+    throw new PerfPilotApiError(
+      "invalid_api_response",
+      "SmartPerfetto 原始报告无效",
+      false,
+      null,
+    );
+  }
+  const scenarios: string[] = [];
+  for (const item of value.reports) {
+    if (
+      !object(item) ||
+      !exactKeys(item, ["scenario_type", "label", "document"]) ||
+      !["startup", "scroll"].includes(String(item.scenario_type)) ||
+      item.label !== (item.scenario_type === "startup" ? "启动" : "滑动") ||
+      !object(item.document) ||
+      !safeJsonTree(item.document)
+    ) {
+      throw new PerfPilotApiError(
+        "invalid_api_response",
+        "SmartPerfetto 原始报告无效",
+        false,
+        null,
+      );
+    }
+    scenarios.push(String(item.scenario_type));
+  }
+  if (
+    new Set(scenarios).size !== scenarios.length ||
+    scenarios.join(",") !== ["startup", "scroll"].filter((item) => scenarios.includes(item)).join(",")
+  ) {
+    throw new PerfPilotApiError(
+      "invalid_api_response",
+      "SmartPerfetto 原始报告无效",
+      false,
+      null,
+    );
+  }
+  return value as unknown as SmartPerfettoOriginal;
 }
 
 function validSourceWorkspace(value: unknown): value is SourceWorkspaceView {
@@ -1653,6 +1738,48 @@ function validSynthesisProvenance(value: unknown): value is SynthesisProvenance 
   );
 }
 
+function validOriginalMetadataItem(
+  value: unknown,
+  scenarioQualified: boolean,
+): value is SmartPerfettoOriginalMetadataItem {
+  return object(value) &&
+    exactKeys(value, [
+      ...(scenarioQualified ? ["scenario_type", "label"] : []),
+      "available", "artifact_id", "version", "mime", "size", "sha256",
+    ]) &&
+    (!scenarioQualified ||
+      (["startup", "scroll"].includes(String(value.scenario_type)) &&
+        value.label === (value.scenario_type === "startup" ? "启动" : "滑动"))) &&
+    value.available === true &&
+    typeof value.artifact_id === "string" &&
+    CANONICAL_UUID.test(value.artifact_id) &&
+    value.version === 1 &&
+    value.mime === "application/json" &&
+    Number.isSafeInteger(value.size) &&
+    Number(value.size) >= 1 &&
+    Number(value.size) <= MAX_SMARTPERFETTO_ORIGINAL_BYTES &&
+    typeof value.sha256 === "string" &&
+    /^[0-9a-f]{64}$/.test(value.sha256);
+}
+
+function validOriginalMetadata(value: unknown): value is SmartPerfettoOriginalMetadata {
+  if (!object(value)) return false;
+  if (value.mode !== "scenario_collection") {
+    return validOriginalMetadataItem(value, false);
+  }
+  if (
+    !exactKeys(value, ["available", "mode", "reports"]) ||
+    value.available !== true ||
+    !Array.isArray(value.reports) ||
+    value.reports.length < 1 ||
+    value.reports.length > 2 ||
+    !value.reports.every((item) => validOriginalMetadataItem(item, true))
+  ) return false;
+  const scenarios = value.reports.map((item) => item.scenario_type);
+  return new Set(scenarios).size === scenarios.length &&
+    scenarios.join(",") === ["startup", "scroll"].filter((item) => scenarios.includes(item)).join(",");
+}
+
 function analysisReportResponse(value: unknown): AnalysisReport {
   const sourceAware = object(value) && value.schema_version === "1.2";
   if (
@@ -1698,19 +1825,7 @@ function analysisReportResponse(value: unknown): AnalysisReport {
     }
     if (
       value.smartperfetto_original !== undefined &&
-      (!object(value.smartperfetto_original) ||
-        !exactKeys(value.smartperfetto_original, [
-          "available", "artifact_id", "version", "mime", "size", "sha256",
-        ]) ||
-        value.smartperfetto_original.available !== true ||
-        typeof value.smartperfetto_original.artifact_id !== "string" ||
-        value.smartperfetto_original.version !== 1 ||
-        value.smartperfetto_original.mime !== "application/json" ||
-        !Number.isSafeInteger(value.smartperfetto_original.size) ||
-        Number(value.smartperfetto_original.size) < 1 ||
-        Number(value.smartperfetto_original.size) > MAX_SMARTPERFETTO_ORIGINAL_BYTES ||
-        typeof value.smartperfetto_original.sha256 !== "string" ||
-        !/^[0-9a-f]{64}$/.test(value.smartperfetto_original.sha256))
+      !validOriginalMetadata(value.smartperfetto_original)
     ) {
       throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
     }
@@ -2809,13 +2924,16 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         throw new PerfPilotApiError("network_unavailable", "网络连接不可用", true, null, { cause: error });
       }
       const payload = await readJson(response, MAX_SMARTPERFETTO_ORIGINAL_BYTES);
-      if (!response.ok || !object(payload) || !safeJsonTree(payload)) {
+      if (!response.ok) {
         throw new PerfPilotApiError("invalid_api_response", "SmartPerfetto 原始报告无效", false, null);
       }
-      return payload;
+      return smartPerfettoOriginalResponse(payload);
     },
-    smartPerfettoOriginalDownloadUrl(teamId, analysisId) {
-      return `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/smartperfetto-original?download=true`;
+    smartPerfettoOriginalDownloadUrl(teamId, analysisId, scenario) {
+      const query = scenario === undefined
+        ? "download=true"
+        : `scenario=${encodeURIComponent(scenario)}&download=true`;
+      return `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/smartperfetto-original?${query}`;
     },
     async createSynthesisRun(teamId, analysisId, idempotencyKey, signal) {
       const run = synthesisRunResponse(

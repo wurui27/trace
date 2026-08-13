@@ -299,6 +299,54 @@ describe("AnalysisReportView", () => {
     expect(screen.getByText("辅助指标 4")).toBeVisible();
   });
 
+  it("lazily renders remote SmartPerfetto originals by scenario with independent downloads", async () => {
+    const user = userEvent.setup();
+    const original = {
+      mode: "scenario_collection" as const,
+      reports: [
+        {
+          scenario_type: "startup" as const,
+          label: "启动",
+          document: { summary: "启动原始结论" },
+        },
+        {
+          scenario_type: "scroll" as const,
+          label: "滑动",
+          document: { summary: "滑动原始结论" },
+        },
+      ],
+    };
+    const originalLoader = vi.fn().mockResolvedValue(original);
+    const downloadUrl = vi.fn(
+      (_teamId: string, _analysisId: string, scenario?: "startup" | "scroll") =>
+        `/original?scenario=${scenario}`,
+    );
+    const client = {
+      smartPerfettoOriginal: originalLoader,
+      smartPerfettoOriginalDownloadUrl: downloadUrl,
+    } as unknown as import("../app/lib/perfpilot-api").PerfPilotClient;
+    render(
+      <AnalysisReportView
+        report={sourceAwareReport()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+        teamId="team-1"
+        client={client}
+      />,
+    );
+
+    expect(originalLoader).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("tab", { name: "SmartPerfetto 原始报告" }));
+    expect(originalLoader).toHaveBeenCalledOnce();
+    expect(await screen.findByRole("heading", { name: "启动原始报告" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "滑动原始报告" })).toBeVisible();
+    expect(screen.getByText("启动原始结论")).toBeVisible();
+    expect(screen.getByText("滑动原始结论")).toBeVisible();
+    expect(screen.getAllByRole("link", { name: "下载原始报告" })).toHaveLength(2);
+    expect(downloadUrl).toHaveBeenCalledWith("team-1", ANALYSIS_ID, "startup");
+    expect(downloadUrl).toHaveBeenCalledWith("team-1", ANALYSIS_ID, "scroll");
+  });
+
   it("does not render source paths for weak source matches", async () => {
     const user = userEvent.setup();
     const base = sourceAwareReport();

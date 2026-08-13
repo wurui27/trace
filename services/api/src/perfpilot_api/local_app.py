@@ -101,11 +101,16 @@ from perfpilot_api.reports.smartperfetto_live_normalizer import (
     normalize_live_smartperfetto_result,
 )
 from perfpilot_api.reports.smartperfetto_original import (
-    SmartPerfettoOriginalBinding,
+    SmartPerfettoOriginalCollectionBinding,
     SmartPerfettoOriginalInvalid,
     SmartPerfettoOriginalNotFound,
+    SmartPerfettoOriginalReference,
     persist_smartperfetto_original,
+    persist_smartperfetto_scenario_original,
     read_smartperfetto_original,
+    read_smartperfetto_original_collection,
+    read_smartperfetto_scenario_original,
+    restore_smartperfetto_original,
 )
 from perfpilot_api.reports.projection import (
     AIProjection,
@@ -150,6 +155,7 @@ from perfpilot_api.services.source_workspaces import (
 )
 from perfpilot_api.services.agent_tasks import (
     AgentExecutionAccess,
+    AgentTaskError,
     AgentTaskDefinition,
     AgentTaskNotFound,
     AgentTaskService,
@@ -158,6 +164,7 @@ from perfpilot_api.services.agent_tasks import (
     TaskInputArtifact,
     TaskScenario,
     ValidatedAgentExecutionManifest,
+    validate_agent_execution_manifest,
 )
 from perfpilot_api.services.source_artifacts import (
     SourceArtifactError,
@@ -815,7 +822,7 @@ class _LocalAnalysis:
     source_context: dict[str, object] | None = field(default=None, repr=False)
     evidence_format_version: Literal["normalized-core-v1"] | None = None
     evidence_manifest: dict[str, str] | None = None
-    smartperfetto_original: SmartPerfettoOriginalBinding | None = None
+    smartperfetto_original: SmartPerfettoOriginalReference | None = None
     ai_rounds: list[_LocalAIRound] = field(default_factory=_default_ai_rounds)
     stages: dict[str, str] = field(
         default_factory=lambda: {
@@ -837,6 +844,9 @@ class _PreparedLocalReport:
     normalizer_version: str
     source_report: dict[str, object]
     original_report_bytes: bytes | None = field(default=None, repr=False)
+    scenario_original_reports: tuple[
+        tuple[Literal["startup", "scroll"], dict[str, object], bytes | None], ...
+    ] = field(default=(), repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -990,9 +1000,7 @@ def _validate_persisted_state_shape(document: Mapping[str, object]) -> None:
     ):
         raise ValueError
     if "smartperfetto_original" in document:
-        SmartPerfettoOriginalBinding.from_private_document(
-            document["smartperfetto_original"]
-        )
+        restore_smartperfetto_original(document["smartperfetto_original"])
 
 
 def _parse_utc_datetime(value: object) -> datetime | None:
@@ -1357,6 +1365,147 @@ def _missing_scroll_scenario(
     )
 
 
+def _missing_remote_capture_scenario(
+    team_id: UUID,
+    analysis_id: UUID,
+    scenario_type: Literal["startup", "scroll"],
+    *,
+    reason: Literal["capture_failed", "smartperfetto_failed"] = "capture_failed",
+) -> tuple[dict[str, object], dict[str, object]]:
+    scenario_id = str(
+        uuid5(
+            _LOCAL_RECOVERY_NAMESPACE,
+            f"{team_id}:{analysis_id}:{scenario_type}-capture-unavailable",
+        )
+    )
+    limitation_id = str(
+        uuid5(
+            _LOCAL_RECOVERY_NAMESPACE,
+            f"{team_id}:{analysis_id}:{scenario_type}-capture-failed",
+        )
+    )
+    label = "冷启动" if scenario_type == "startup" else "滑动"
+    capability = (
+        f"remote_{scenario_type}_capture"
+        if reason == "capture_failed"
+        else f"smartperfetto_{scenario_type}_result"
+    )
+    reason_text = (
+        f"Remote {scenario_type} capture did not complete."
+        if reason == "capture_failed"
+        else f"SmartPerfetto could not analyze the {scenario_type} trace."
+    )
+    limitation_code = (
+        f"remote_capture.{scenario_type}_unavailable"
+        if reason == "capture_failed"
+        else f"smartperfetto.{scenario_type}_result_unavailable"
+    )
+    limitation_summary = (
+        f"{label}采集未完成，本报告仅保留已成功场景的分析证据。"
+        if reason == "capture_failed"
+        else f"{label} Trace 已采集，但 SmartPerfetto 未返回可用结果；本报告保留其他场景证据。"
+    )
+    return (
+        {
+            "scenario_id": scenario_id,
+            "scenario_type": scenario_type,
+            "core_state": "partial",
+            "metrics": [],
+            "findings": [],
+            "evidence": [],
+            "trace_health": {
+                "parse_status": "failed",
+                "trace_start_ns": None,
+                "trace_end_ns": None,
+                "target_resolution": {
+                    "package_name": None,
+                    "process_name": None,
+                    "upid": None,
+                    "pid": None,
+                    "main_thread_id": None,
+                },
+                "measurement_window": {
+                    "start_ns": None,
+                    "end_ns": None,
+                    "coverage": "missing",
+                },
+                "data_loss": {
+                    "buffer_overruns": 0,
+                    "ftrace_events_lost": 0,
+                    "traced_buf_patches_failed": 0,
+                    "incomplete_slices": 0,
+                    "boundary_truncations": 0,
+                },
+                "frame_timeline_coverage": "unavailable",
+                "target_display_coverage": "unavailable",
+                "refresh_mode_coverage": "unavailable",
+            },
+            "trace_capabilities": [
+                {
+                    "name": capability,
+                    "required": True,
+                    "status": "unavailable",
+                    "reason": reason_text,
+                }
+            ],
+        },
+        {
+            "limitation_id": limitation_id,
+            "code": limitation_code,
+            "summary": limitation_summary,
+            "evidence_ids": [],
+        },
+    )
+
+
+def _project_remote_capture_scenarios(
+    team_id: UUID,
+    report: NormalizedTraceReport,
+    completed_scenarios: frozenset[str],
+    failures: Mapping[str, Literal["capture_failed", "smartperfetto_failed"]]
+    | None = None,
+) -> NormalizedTraceReport:
+    document = validate_contract("normalized-trace-report", report.document)
+    selected = {
+        str(item["scenario_type"]): dict(item)
+        for item in document["scenario_reports"]
+        if isinstance(item, Mapping)
+        and item.get("scenario_type") in completed_scenarios
+        and item.get("scenario_type") in {"startup", "scroll"}
+    }
+    limitations = [
+        dict(item) for item in document["limitations"] if isinstance(item, Mapping)
+    ]
+    for scenario_type in ("startup", "scroll"):
+        if scenario_type not in completed_scenarios:
+            scenario, limitation = _missing_remote_capture_scenario(
+                team_id,
+                UUID(str(document["analysis_id"])),
+                scenario_type,
+                reason=(failures or {}).get(scenario_type, "capture_failed"),
+            )
+            selected[scenario_type] = scenario
+            limitations.append(limitation)
+    scenarios = [selected[item] for item in ("startup", "scroll") if item in selected]
+    projected = {
+        **document,
+        "core_state": (
+            "partial"
+            if completed_scenarios != {"startup", "scroll"}
+            or any(item.get("core_state") == "partial" for item in scenarios)
+            else "complete"
+        ),
+        "scenario_reports": scenarios,
+        "limitations": limitations[:20],
+    }
+    validated = validate_contract("normalized-trace-report", projected)
+    payload = canonical_json_bytes(validated)
+    return NormalizedTraceReport(
+        canonical_bytes=payload,
+        sha256_b64=_sha256_b64(payload),
+    )
+
+
 def _merge_local_smartperfetto_reports(
     team_id: UUID,
     primary: NormalizedTraceReport,
@@ -1466,12 +1615,19 @@ def _prepare_local_report(
     memory_result: EngineResult | None = None,
     memory_engine_commit_sha: str | None = None,
     source_context: Mapping[str, object] | None = None,
+    include_memory: bool = True,
+    remote_completed_scenarios: frozenset[str] | None = None,
+    remote_scenario_failures: Mapping[
+        str, Literal["capture_failed", "smartperfetto_failed"]
+    ]
+    | None = None,
 ) -> _PreparedLocalReport:
     primary = _normalize_local_smartperfetto_result(
         analysis,
         result,
         profile=analysis.profile,
     )
+    scroll: _NormalizedLocalResult | None = None
     normalized = primary.report
     if analysis.analysis_mode == "device":
         if scroll_result is not None:
@@ -1487,7 +1643,16 @@ def _prepare_local_report(
             normalized = _merge_local_smartperfetto_reports(
                 analysis.team_id, normalized, normalized
             )
-        if memory_result is not None and memory_engine_commit_sha is not None:
+        if remote_completed_scenarios is not None:
+            normalized = _project_remote_capture_scenarios(
+                analysis.team_id,
+                normalized,
+                remote_completed_scenarios,
+                remote_scenario_failures,
+            )
+        elif not include_memory:
+            pass
+        elif memory_result is not None and memory_engine_commit_sha is not None:
             try:
                 normalized = join_android_memory_result(
                     normalized,
@@ -1551,6 +1716,27 @@ def _prepare_local_report(
         normalizer_version=normalizer_version,
         source_report=primary.source_report,
         original_report_bytes=primary.original_report_bytes,
+        scenario_original_reports=(
+            tuple(
+                (
+                    scenario_type,  # type: ignore[misc]
+                    item.source_report,
+                    item.original_report_bytes,
+                )
+                for scenario_type, item in (
+                    (
+                        "startup"
+                        if "startup" in remote_completed_scenarios
+                        else "scroll",
+                        primary,
+                    ),
+                    ("scroll", scroll),
+                )
+                if scenario_type in remote_completed_scenarios and item is not None
+            )
+            if remote_completed_scenarios is not None
+            else ()
+        ),
     )
 
 
@@ -1563,7 +1749,7 @@ def _compose_local_report(
     synthesis_failure_code: str | None,
     rounds: tuple[LocalReportUsage, ...],
     synthesizer: LocalReportSynthesizer | None,
-    smartperfetto_original: SmartPerfettoOriginalBinding | None = None,
+    smartperfetto_original: SmartPerfettoOriginalReference | None = None,
 ) -> dict[str, object]:
     synthesis_document = synthesis.document if synthesis is not None else None
     synthesis_bytes = synthesis.canonical_bytes if synthesis is not None else None
@@ -1679,9 +1865,7 @@ def _local_source_code_document(analysis: _LocalAnalysis) -> dict[str, object]:
         if available
         else None
     )
-    exclusions = (
-        list(context.get("exclusions", [])) if available else []
-    )
+    exclusions = list(context.get("exclusions", [])) if available else []
     return {
         "requested": True,
         **_source_binding_document(binding),
@@ -1923,7 +2107,11 @@ def _prepared_from_persisted_documents(
                 analysis_profile=analysis.profile,  # type: ignore[arg-type]
                 question=analysis.question,
             )
-        except (ProjectionPrivacyError, ProjectionQuestionError, ProjectionSizeError) as error:
+        except (
+            ProjectionPrivacyError,
+            ProjectionQuestionError,
+            ProjectionSizeError,
+        ) as error:
             projection_failure_code = {
                 ProjectionPrivacyError: "ai_projection_private_data",
                 ProjectionQuestionError: "ai_projection_invalid_question",
@@ -2212,14 +2400,187 @@ class _LocalRuntime:
                 analysis.stages["smartperfetto"] = (
                     "pending" if completed else "not_requested"
                 )
-                analysis.stages["report"] = (
-                    "pending" if completed else "not_requested"
-                )
+                analysis.stages["report"] = "pending" if completed else "not_requested"
                 analysis.version += 1
                 should_persist = True
         if not should_persist:
             return
         await self._persist(analysis)
+        if completed:
+            self._schedule_remote_analysis(analysis, access, manifest)
+
+    def _schedule_remote_analysis(
+        self,
+        analysis: _LocalAnalysis,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+    ) -> None:
+        if analysis.task is not None and not analysis.task.done():
+            return
+        generation = analysis.generation
+        task = asyncio.create_task(
+            self._execute_remote_capture(
+                analysis,
+                access=access,
+                manifest=manifest,
+                generation=generation,
+            )
+        )
+        analysis.task = task
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def _execute_remote_capture(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        generation: int,
+    ) -> None:
+        try:
+            async with self.lock:
+                if analysis.cancel_requested_at is not None:
+                    raise asyncio.CancelledError
+                if analysis.generation != generation:
+                    raise _StaleLocalGeneration
+                analysis.stages["smartperfetto"] = "running"
+                analysis.version += 1
+            await self._persist(analysis)
+            results: dict[str, EngineResult] = {}
+            failures: dict[str, Literal["capture_failed", "smartperfetto_failed"]] = {}
+            artifacts = {item.artifact_id: item for item in manifest.artifacts}
+            for scenario_type in ("startup", "scroll"):
+                scenario = next(
+                    (
+                        item
+                        for item in manifest.scenarios
+                        if item.scenario_type == scenario_type
+                    ),
+                    None,
+                )
+                if scenario is None or scenario.state != "completed":
+                    failures[scenario_type] = "capture_failed"
+                    continue
+                expected_kind = f"{scenario_type}_trace"
+                artifact = next(
+                    (
+                        artifacts[artifact_id]
+                        for artifact_id in scenario.artifact_ids
+                        if artifact_id in artifacts
+                        and artifacts[artifact_id].kind == expected_kind
+                    ),
+                    None,
+                )
+                if artifact is None:
+                    failures[scenario_type] = "capture_failed"
+                    continue
+                trace = await self.agent_artifacts.read_completed_artifact(
+                    team_id=analysis.team_id,
+                    analysis_id=analysis.analysis_id,
+                    agent_id=access.agent_id,
+                    execution_id=access.execution_id,
+                    lease_version=access.lease_version,
+                    artifact_id=artifact.artifact_id,
+                    artifact_kind=artifact.kind,
+                    mime=artifact.mime,
+                    size=artifact.size,
+                    sha256_b64=artifact.sha256_b64,
+                )
+                temporary = (
+                    self.store.analysis_subdirectory(
+                        analysis.team_id,
+                        analysis.analysis_id,
+                        "device-captures",
+                    )
+                    / f".{scenario_type}-{uuid4().hex}.trace"
+                )
+                descriptor = os.open(
+                    temporary,
+                    os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                    0o600,
+                )
+                try:
+                    with os.fdopen(descriptor, "wb") as stream:
+                        descriptor = -1
+                        stream.write(trace)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    run = await self.gateway.submit(
+                        trace_path=temporary,
+                        profile=scenario_type,
+                        question=None,
+                    )
+                finally:
+                    if descriptor >= 0:
+                        os.close(descriptor)
+                    temporary.unlink(missing_ok=True)
+                await self._register_source_run(analysis, run)
+                try:
+                    results[scenario_type] = await self._wait_engine_result(
+                        analysis,
+                        run,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    failures[scenario_type] = "smartperfetto_failed"
+                    _LOGGER.warning(
+                        "Remote SmartPerfetto scenario unavailable scenario=%s type=%s",
+                        scenario_type,
+                        type(error).__name__,
+                    )
+            if not results:
+                await self._fail_analysis(
+                    analysis,
+                    generation=generation,
+                    failure_code="smartperfetto_all_failed",
+                )
+                return
+            await self._mark_smartperfetto_completed(
+                analysis,
+                generation=generation,
+            )
+            startup = results.get("startup") or results["scroll"]
+            prepared = _prepare_local_report(
+                analysis,
+                startup,
+                scroll_result=results.get("scroll") if "startup" in results else None,
+                include_memory=False,
+                remote_completed_scenarios=frozenset(results),
+                remote_scenario_failures=failures,
+            )
+            source_context = await self._await_source_context_for_core(
+                analysis,
+                prepared.core_document,
+            )
+            if source_context is not None:
+                prepared = _prepare_local_report(
+                    analysis,
+                    startup,
+                    scroll_result=(
+                        results.get("scroll") if "startup" in results else None
+                    ),
+                    source_context=source_context,
+                    include_memory=False,
+                    remote_completed_scenarios=frozenset(results),
+                    remote_scenario_failures=failures,
+                )
+            await self._publish_prepared(
+                analysis,
+                prepared,
+                generation=generation,
+            )
+        except asyncio.CancelledError:
+            raise
+        except _StaleLocalGeneration:
+            return
+        except Exception as error:
+            _LOGGER.exception(
+                "Remote trace report execution failed type=%s",
+                type(error).__name__,
+            )
+            await self._fail_analysis(analysis, generation=generation)
 
     async def observe_agent_cancellation(
         self,
@@ -2406,9 +2767,7 @@ class _LocalRuntime:
             evidence_format_version=evidence_format_version,  # type: ignore[arg-type]
             evidence_manifest=evidence_manifest,
             smartperfetto_original=(
-                SmartPerfettoOriginalBinding.from_private_document(
-                    document["smartperfetto_original"]
-                )
+                restore_smartperfetto_original(document["smartperfetto_original"])
                 if document.get("smartperfetto_original") is not None
                 else None
             ),
@@ -2420,6 +2779,9 @@ class _LocalRuntime:
     async def start(self) -> None:
         persisted = await asyncio.to_thread(self.store.load_states)
         pending_remote_publications: list[tuple[_LocalAnalysis, _LocalUpload]] = []
+        pending_remote_analyses: list[
+            tuple[_LocalAnalysis, AgentExecutionAccess, ValidatedAgentExecutionManifest]
+        ] = []
         for (team_id, analysis_id), document in persisted.items():
             analysis = self._restore_analysis(document)
             migrate_created_at = document.get("created_at") is None
@@ -2549,6 +2911,43 @@ class _LocalRuntime:
                     )
                     if upload is not None and upload.bytes_ready:
                         pending_remote_publications.append((analysis, upload))
+            if (
+                analysis.analysis_mode == "device"
+                and analysis.remote_publication == "published"
+                and analysis.state == "analyzing"
+                and analysis.cancel_requested_at is None
+                and analysis.stages.get("smartperfetto") in {"pending", "running"}
+                and analysis.report is None
+            ):
+                manifest_document = await asyncio.to_thread(
+                    self.store.load_document,
+                    analysis.team_id,
+                    analysis.analysis_id,
+                    "agent-capture-manifest.json",
+                )
+                if manifest_document is not None:
+                    try:
+                        access, manifest = self._restore_remote_capture(
+                            analysis, manifest_document
+                        )
+                    except (ValueError, AgentTaskError):
+                        analysis.state = "failed"
+                        analysis.failure = {
+                            "code": "remote_capture_manifest_invalid",
+                            "message": "Remote capture manifest could not be restored",
+                            "retryable": False,
+                        }
+                        analysis.stages["smartperfetto"] = "failed"
+                        analysis.stages["report"] = "not_requested"
+                        analysis.version += 1
+                        await self._persist(analysis)
+                    else:
+                        pending_remote_analyses.append((analysis, access, manifest))
+                        pending_remote_publications[:] = [
+                            item
+                            for item in pending_remote_publications
+                            if item[0] is not analysis
+                        ]
         for analysis, upload in pending_remote_publications:
             try:
                 async with self._remote_publication_lock(analysis):
@@ -2563,6 +2962,44 @@ class _LocalRuntime:
                 )
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)
+        for analysis, access, manifest in pending_remote_analyses:
+            self._schedule_remote_analysis(analysis, access, manifest)
+
+    def _restore_remote_capture(
+        self,
+        analysis: _LocalAnalysis,
+        value: Mapping[str, object],
+    ) -> tuple[AgentExecutionAccess, ValidatedAgentExecutionManifest]:
+        if analysis.device_agent_id is None:
+            raise ValueError
+        allowed_uploads = ("startup_trace", "scroll_trace", "agent_log")
+        try:
+            execution_id = UUID(str(value["execution_id"]))
+            lease_version = int(value["lease_version"])
+            manifest_document = {
+                key: item for key, item in value.items() if key != "accepted_at"
+            }
+        except (KeyError, TypeError, ValueError, AttributeError):
+            raise ValueError from None
+        manifest = validate_agent_execution_manifest(
+            manifest_document,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            expected_scenarios=("startup", "scroll"),
+            allowed_uploads=allowed_uploads,
+            now=datetime.now(UTC),
+        )
+        access = AgentExecutionAccess(
+            team_id=analysis.team_id,
+            analysis_id=analysis.analysis_id,
+            agent_id=analysis.device_agent_id,
+            execution_id=execution_id,
+            lease_version=lease_version,
+            lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+            allowed_uploads=allowed_uploads,
+            scenario_types=("startup", "scroll"),
+        )
+        return access, manifest
 
     async def _retry_remote_publication(
         self,
@@ -3087,7 +3524,11 @@ class _LocalRuntime:
                         "SmartPerfetto cancellation failed",
                     ) from error
 
-            if task is not None and task is not asyncio.current_task() and not task.done():
+            if (
+                task is not None
+                and task is not asyncio.current_task()
+                and not task.done()
+            ):
                 task.cancel()
                 await asyncio.gather(task, return_exceptions=True)
 
@@ -3830,7 +4271,24 @@ class _LocalRuntime:
                 result,
                 profile=analysis.profile,
             ).report
-            authority = derive_source_authority(normalized.document)
+        except ValueError:
+            await self._degrade_source(analysis, "source_agent_unavailable")
+            return None
+        return await self._await_source_context_for_core(
+            analysis,
+            normalized.document,
+        )
+
+    async def _await_source_context_for_core(
+        self,
+        analysis: _LocalAnalysis,
+        core_document: Mapping[str, object],
+    ) -> dict[str, object] | None:
+        binding = analysis.source_binding
+        if binding is None:
+            return None
+        try:
+            authority = derive_source_authority(core_document)
             await self.source_tasks.create_context_task(
                 team_id=analysis.team_id,
                 analysis_id=analysis.analysis_id,
@@ -3961,6 +4419,30 @@ class _LocalRuntime:
         )
         if analysis.smartperfetto_original is not None:
             original_binding = analysis.smartperfetto_original
+        elif prepared.scenario_original_reports:
+            scenario_bindings = []
+            for (
+                scenario_type,
+                source_report,
+                original_bytes,
+            ) in prepared.scenario_original_reports:
+                scenario_bindings.append(
+                    await asyncio.to_thread(
+                        persist_smartperfetto_scenario_original,
+                        root=self.data_root,
+                        team_id=analysis.team_id,
+                        analysis_id=analysis.analysis_id,
+                        scenario_type=scenario_type,
+                        **(
+                            {"payload": original_bytes}
+                            if original_bytes is not None
+                            else {"document": source_report}
+                        ),
+                    )
+                )
+            original_binding = SmartPerfettoOriginalCollectionBinding(
+                reports=tuple(scenario_bindings)
+            )
         else:
             original_binding = await asyncio.to_thread(
                 persist_smartperfetto_original,
@@ -4152,9 +4634,10 @@ class _LocalRuntime:
         analysis: _LocalAnalysis,
         *,
         generation: int,
+        failure_code: str = "local_analysis_failed",
     ) -> None:
         failure = {
-            "code": "local_analysis_failed",
+            "code": failure_code,
             "message": "本地 SmartPerfetto 分析未能完成",
             "retryable": True,
         }
@@ -4228,7 +4711,9 @@ class _LocalRuntime:
                         "completed_at": None,
                         "failure": None,
                     }
-                report_type = "startup" if scenario_type == "cold_start" else scenario_type
+                report_type = (
+                    "startup" if scenario_type == "cold_start" else scenario_type
+                )
                 reported = report_scenarios.get(report_type)
                 reported_state = (
                     str(reported["result_state"])
@@ -4315,7 +4800,13 @@ class _LocalRuntime:
         stage_failure = analysis.failure
         input_uploads: list[dict[str, object]] = []
         for item in analysis.inputs.values():
-            state = "finalized" if item.finalized else "pending" if item.upload_id else "awaiting_upload"
+            state = (
+                "finalized"
+                if item.finalized
+                else "pending"
+                if item.upload_id
+                else "awaiting_upload"
+            )
             rendered: dict[str, object] = {
                 "state": state,
                 "artifact_kind": item.descriptor.kind,
@@ -4688,7 +5179,12 @@ def create_local_app(
         if len(values) != 1:
             raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False)
         scheme, separator, token = values[0].partition(" ")
-        if separator != " " or scheme.casefold() != "bearer" or not token or " " in token:
+        if (
+            separator != " "
+            or scheme.casefold() != "bearer"
+            or not token
+            or " " in token
+        ):
             raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False)
         return token
 
@@ -4864,7 +5360,9 @@ def create_local_app(
             }
         connected = detected.device
         name_parts = [connected.manufacturer, connected.model]
-        display_name = " ".join(part for part in name_parts if part).strip() or connected.serial
+        display_name = (
+            " ".join(part for part in name_parts if part).strip() or connected.serial
+        )
         os_name = (
             f"Android {connected.android_version}"
             if connected.android_version
@@ -5029,7 +5527,11 @@ def create_local_app(
         except (AgentAuthenticationRejected, AgentNotFoundError):
             raise ApiError("agent_authentication_failed", "Agent 认证失败", 401, False) from None
         response.headers["cache-control"] = "no-store"
-        return {"schema_version": "1.0", "agent_id": str(agent.agent_id), "state": "revoked"}
+        return {
+            "schema_version": "1.0",
+            "agent_id": str(agent.agent_id),
+            "state": "revoked",
+        }
 
     @app.post("/v1/agent/heartbeat")
     async def heartbeat_local_agent(
@@ -5069,7 +5571,14 @@ def create_local_app(
             "schema_version": "1.0",
             "accepted_at": receipt.accepted_at.isoformat(),
             "next_heartbeat_seconds": receipt.next_heartbeat_seconds,
-            "devices": [{"client_ref": str(item.client_ref), "device_id": str(item.device_id), "device_digest": item.device_digest} for item in receipt.devices],
+            "devices": [
+                {
+                    "client_ref": str(item.client_ref),
+                    "device_id": str(item.device_id),
+                    "device_digest": item.device_digest,
+                }
+                for item in receipt.devices
+            ],
         }
 
     @app.get("/v1/teams/{team_id}/source-workspaces")
@@ -5082,8 +5591,14 @@ def create_local_app(
             "name": workspace.name, "state": workspace.state, "git_branch": workspace.git_branch,
             "git_head": workspace.git_head, "tracked_dirty_count": workspace.tracked_dirty_count,
             "snapshot_policy": workspace.snapshot_policy,
-            "validation_profiles": [{"profile_id": str(profile.profile_id), "name": profile.name} for profile in workspace.validation_profiles],
-        } for workspace in workspaces]}
+                    "validation_profiles": [
+                        {"profile_id": str(profile.profile_id), "name": profile.name}
+                        for profile in workspace.validation_profiles
+                    ],
+                }
+                for workspace in workspaces
+            ],
+        }
 
     @app.post("/v1/teams/{team_id}/analyses", status_code=status.HTTP_201_CREATED)
     async def create_analysis(
@@ -5269,6 +5784,7 @@ def create_local_app(
         team_id: UUID,
         analysis_id: UUID,
         download: Annotated[Literal["true"] | None, Query()] = None,
+        scenario: Annotated[Literal["startup", "scroll"] | None, Query()] = None,
     ) -> Response:
         authorize_team(request, team_id)
         analysis = await runtime.analysis(team_id, analysis_id)
@@ -5281,13 +5797,34 @@ def create_local_app(
                 False,
             )
         try:
-            payload = await asyncio.to_thread(
-                read_smartperfetto_original,
-                root=runtime.data_root,
-                binding=binding,
-                team_id=team_id,
-                analysis_id=analysis_id,
-            )
+            if isinstance(binding, SmartPerfettoOriginalCollectionBinding):
+                if scenario is not None:
+                    entry = binding.for_scenario(scenario)
+                    payload = await asyncio.to_thread(
+                        read_smartperfetto_scenario_original,
+                        root=runtime.data_root,
+                        entry=entry,
+                        team_id=team_id,
+                        analysis_id=analysis_id,
+                    )
+                else:
+                    payload = await asyncio.to_thread(
+                        read_smartperfetto_original_collection,
+                        root=runtime.data_root,
+                        binding=binding,
+                        team_id=team_id,
+                        analysis_id=analysis_id,
+                    )
+            else:
+                if scenario is not None:
+                    raise SmartPerfettoOriginalNotFound
+                payload = await asyncio.to_thread(
+                    read_smartperfetto_original,
+                    root=runtime.data_root,
+                    binding=binding,
+                    team_id=team_id,
+                    analysis_id=analysis_id,
+                )
         except SmartPerfettoOriginalNotFound:
             raise ApiError(
                 "smartperfetto_original_not_found",
@@ -5307,9 +5844,12 @@ def create_local_app(
             "x-content-type-options": "nosniff",
         }
         if download == "true":
-            headers["content-disposition"] = (
-                f'attachment; filename="smartperfetto-{analysis_id}.json"'
+            filename = (
+                f"smartperfetto-{analysis_id}-{scenario}.json"
+                if scenario is not None
+                else f"smartperfetto-{analysis_id}.json"
             )
+            headers["content-disposition"] = f'attachment; filename="{filename}"'
         return Response(payload, media_type="application/json", headers=headers)
 
     @app.post(
