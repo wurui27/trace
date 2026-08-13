@@ -25,11 +25,12 @@ TEAM_B = UUID("81000000-0000-4000-8000-000000000002")
 USER_A = UUID("80000000-0000-4000-8000-000000000001")
 AGENT_A = UUID("71000000-0000-4000-8000-000000000001")
 DEVICE_A = UUID("72000000-0000-4000-8000-000000000001")
+DEVICE_B = UUID("72000000-0000-4000-8000-000000000002")
 WORKSPACE_A = UUID("73000000-0000-4000-8000-000000000001")
 
 
 async def _registered_store(tmp_path: Path) -> LocalAgentStore:
-    identifiers = iter((AGENT_A, DEVICE_A))
+    identifiers = iter((AGENT_A, DEVICE_A, DEVICE_B))
     store = LocalAgentStore(tmp_path, uuid_factory=lambda: next(identifiers))
     await store.create_pending(
         team_id=TEAM_A,
@@ -275,7 +276,7 @@ async def test_private_task_target_is_exact_team_agent_device_and_ready_only(
         devices=(observation,),
         now=NOW,
     )
-    assert (await repository.list_team(TEAM_A))[0].state == "busy"
+    assert (await repository.list_team(TEAM_A))[0].state == "ready"
     assert await directory.get_task_target(
         team_id=TEAM_A, agent_id=AGENT_A, device_id=DEVICE_A
     ) is None
@@ -284,3 +285,86 @@ async def test_private_task_target_is_exact_team_agent_device_and_ready_only(
     assert await directory.get_task_target(
         team_id=TEAM_A, agent_id=AGENT_A, device_id=DEVICE_A
     ) is None
+
+
+@pytest.mark.asyncio
+async def test_capture_lease_projects_only_exact_device_and_is_not_persisted(
+    tmp_path: Path,
+) -> None:
+    store = await _registered_store(tmp_path)
+    repository = LocalDeviceDirectoryRepository(store)
+    directory = DeviceDirectory(
+        repository=repository,
+        serial_hmac_key=b"device-directory-test-key".ljust(32, b"!"),
+        clock=lambda: NOW,
+    )
+    heartbeat = AgentHeartbeat(
+        agent_version="1.2.3",
+        platform="macos",
+        hostname="developer-mac",
+        observed_at=NOW,
+        clock_skew_ms=0,
+        disk_available_bytes=1024,
+        execution_state="idle",
+        execution_id=None,
+        source_workspaces=None,
+    )
+    await repository.replace_snapshot(
+        agent_id=AGENT_A,
+        heartbeat=heartbeat,
+        devices=(
+            SanitizedDeviceObservation(
+                client_ref=UUID("74000000-0000-4000-8000-000000000001"),
+                serial_digest="d" * 64,
+                serial_suffix="1234",
+                manufacturer="Google",
+                model="Pixel",
+                android_release="16",
+                api_level=36,
+                connection_type="usb",
+                adb_state="device",
+                battery_percent=80,
+                temperature_c=None,
+                storage_available_bytes=100,
+                property_error_code=None,
+            ),
+            SanitizedDeviceObservation(
+                client_ref=UUID("74000000-0000-4000-8000-000000000002"),
+                serial_digest="e" * 64,
+                serial_suffix="5678",
+                manufacturer="Google",
+                model="Pixel 2",
+                android_release="16",
+                api_level=36,
+                connection_type="usb",
+                adb_state="device",
+                battery_percent=70,
+                temperature_c=None,
+                storage_available_bytes=200,
+                property_error_code=None,
+            ),
+        ),
+        now=NOW,
+    )
+
+    assert await store.project_capture_lease(
+        team_id=TEAM_A,
+        agent_id=AGENT_A,
+        device_id=DEVICE_A,
+        execution_id=UUID("73000000-0000-4000-8000-000000000099"),
+        expires_at=NOW + timedelta(minutes=1),
+    )
+    states = {device.device_id: device.state for device in await directory.list_devices(team_id=TEAM_A)}
+    assert states == {DEVICE_A: "busy", DEVICE_B: "ready"}
+
+    reopened = LocalAgentStore(tmp_path)
+    reopened_directory = DeviceDirectory(
+        repository=LocalDeviceDirectoryRepository(reopened),
+        serial_hmac_key=b"device-directory-test-key".ljust(32, b"!"),
+        clock=lambda: NOW,
+    )
+    reopened_states = {
+        device.device_id: device.state
+        for device in await reopened_directory.list_devices(team_id=TEAM_A)
+    }
+    assert reopened_states == {DEVICE_A: "ready", DEVICE_B: "ready"}

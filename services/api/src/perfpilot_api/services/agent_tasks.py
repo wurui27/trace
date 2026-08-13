@@ -251,6 +251,21 @@ class AgentCompletionArtifactValidator(Protocol):
     ) -> None: ...
 
 
+class CaptureLeaseProjection(Protocol):
+    async def project_capture_lease(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+        execution_id: UUID,
+        expires_at: datetime,
+    ) -> bool: ...
+
+    async def release_capture_lease(
+        self, *, device_id: UUID, execution_id: UUID
+    ) -> None: ...
+
 class AgentCancellationArtifactCoordinator(Protocol):
     async def abort_execution(
         self,
@@ -296,6 +311,7 @@ def validate_agent_execution_manifest(
     execution_id: UUID,
     lease_version: int,
     expected_scenarios: tuple[TaskScenarioType, ...],
+    allowed_uploads: Sequence[str],
     now: datetime,
 ) -> ValidatedAgentExecutionManifest:
     if not isinstance(document, Mapping):
@@ -335,11 +351,14 @@ def validate_agent_execution_manifest(
     artifacts: list[AgentExecutionArtifact] = []
     artifact_ids: set[UUID] = set()
     artifact_kinds: set[str] = set()
+    allowed_upload_kinds = frozenset(allowed_uploads)
     for item in cast(list[dict[str, object]], normalized["artifacts"]):
         artifact_id = UUID(cast(str, item["artifact_id"]))
         kind = cast(str, item["kind"])
         if artifact_id in artifact_ids or kind in artifact_kinds:
             raise AgentTaskConflict("Execution artifacts are duplicated")
+        if kind not in allowed_upload_kinds:
+            raise AgentTaskConflict("Execution artifact kind is not allowed")
         artifact_ids.add(artifact_id)
         artifact_kinds.add(kind)
         artifacts.append(
@@ -376,12 +395,17 @@ def validate_agent_execution_manifest(
         ):
             raise AgentTaskConflict("Execution scenario timestamps are invalid")
         ids = tuple(UUID(value) for value in cast(list[str], item["artifact_ids"]))
-        if any(artifact_id not in artifact_ids for artifact_id in ids):
+        scenario_artifact_kind = expected_kind[scenario_type]
+        if scenario_artifact_kind not in allowed_upload_kinds or any(
+            artifact_id not in artifact_ids
+            or by_artifact_id[artifact_id].kind != scenario_artifact_kind
+            for artifact_id in ids
+        ):
             raise AgentTaskConflict("Execution scenario artifacts are invalid")
         diagnostic_code = cast(str | None, item["diagnostic_code"])
         if state == "completed":
             if diagnostic_code is not None or not any(
-                by_artifact_id[artifact_id].kind == expected_kind[scenario_type]
+                by_artifact_id[artifact_id].kind == scenario_artifact_kind
                 for artifact_id in ids
             ):
                 raise AgentTaskConflict("Completed scenario evidence is invalid")
@@ -567,6 +591,7 @@ def _allowed_uploads(
 class InMemoryAgentTaskRepository:
     __slots__ = (
         "_definitions",
+        "_capture_lease_projection",
         "_execution_id_source",
         "_lease_id_source",
         "_leases",
@@ -580,6 +605,7 @@ class InMemoryAgentTaskRepository:
         *,
         lease_id_source: Callable[[], UUID] = uuid4,
         execution_id_source: Callable[[], UUID] = uuid4,
+        capture_lease_projection: CaptureLeaseProjection | None = None,
     ) -> None:
         self._definitions: dict[UUID, AgentTaskDefinition] = {}
         self._queued_at: dict[UUID, datetime] = {}
@@ -592,6 +618,7 @@ class InMemoryAgentTaskRepository:
             self._queued_at.setdefault(item.analysis_id, baseline + timedelta(microseconds=position))
         self._lease_id_source = lease_id_source
         self._execution_id_source = execution_id_source
+        self._capture_lease_projection = capture_lease_projection
         self._leases: dict[UUID, _MemoryLease] = {}
         self._lock = asyncio.Lock()
 
@@ -679,6 +706,17 @@ class InMemoryAgentTaskRepository:
                 expires_at=now + _LEASE_TTL,
             )
             self._leases[lease.execution_id] = lease
+            if self._capture_lease_projection is not None:
+                projected = await self._capture_lease_projection.project_capture_lease(
+                    team_id=definition.team_id,
+                    agent_id=definition.agent_id,
+                    device_id=definition.device_id,
+                    execution_id=lease.execution_id,
+                    expires_at=lease.expires_at,
+                )
+                if not projected:
+                    self._leases.pop(lease.execution_id, None)
+                    continue
             return _scheduled(lease)
         return None
 
@@ -788,6 +826,16 @@ class InMemoryAgentTaskRepository:
             raise AgentTaskNotFound
         expires_at = max(lease.expires_at, now + _LEASE_TTL)
         self._leases[execution_id] = replace(lease, expires_at=expires_at)
+        if self._capture_lease_projection is not None:
+            projected = await self._capture_lease_projection.project_capture_lease(
+                team_id=lease.definition.team_id,
+                agent_id=lease.definition.agent_id,
+                device_id=lease.definition.device_id,
+                execution_id=lease.execution_id,
+                expires_at=expires_at,
+            )
+            if not projected:
+                raise AgentTaskUnavailable("Capture lease projection is unavailable")
         return LeaseRenewal(
             execution_id=execution_id,
             lease_version=lease_version,
@@ -906,6 +954,11 @@ class InMemoryAgentTaskRepository:
                 state="released",
                 cancel_acknowledged_at=acknowledged_at,
             )
+            if self._capture_lease_projection is not None:
+                await self._capture_lease_projection.release_capture_lease(
+                    device_id=lease.definition.device_id,
+                    execution_id=lease.execution_id,
+                )
         else:
             raise AgentTaskNotFound
         return AgentCancellationAcknowledgement(
@@ -1016,6 +1069,11 @@ class InMemoryAgentTaskRepository:
             completion_manifest_digest=manifest.document_hash,
             completion=completion,
         )
+        if self._capture_lease_projection is not None:
+            await self._capture_lease_projection.release_capture_lease(
+                device_id=lease.definition.device_id,
+                execution_id=lease.execution_id,
+            )
         return completion
 
     def snapshot_digest(self, execution_id: UUID) -> str | None:
@@ -1268,6 +1326,7 @@ class AgentTaskService:
             execution_id=execution_id,
             lease_version=lease_version,
             expected_scenarios=(),
+            allowed_uploads=tuple((*_SCENARIO_UPLOADS.values(), "agent_log")),
             now=now,
         )
         access = await self._repository.authorize_completion(
@@ -1282,6 +1341,7 @@ class AgentTaskService:
             execution_id=execution_id,
             lease_version=lease_version,
             expected_scenarios=access.scenario_types,
+            allowed_uploads=access.allowed_uploads,
             now=now,
         )
         await artifact_validator.validate_completion(

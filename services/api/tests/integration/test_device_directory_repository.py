@@ -298,6 +298,58 @@ async def test_sql_snapshot_replacement_and_stale_expiry(
 
 
 @pytest.mark.asyncio
+async def test_sql_busy_projection_uses_only_exact_active_capture_lease(
+    device_database: DeviceDatabase,
+) -> None:
+    agent_id = await _register(
+        device_database,
+        team_id=TEAM_A_ID,
+        name="Capture Agent",
+    )
+    receipt = await device_database.directory.replace_heartbeat(
+        agent_id=agent_id,
+        heartbeat=_heartbeat(hostname="Capture Agent"),
+        devices=(
+            _observation(device_database, serial="CAPTURE001"),
+            _observation(device_database, serial="CAPTURE002"),
+        ),
+    )
+    leased_device_id = receipt.devices[0].device_id
+    async with device_database.sessions.begin() as session:
+        job = GlobalJob(
+            team_id=TEAM_A_ID,
+            idempotency_key="exact-device-busy",
+            analysis_mode="device",
+            state="running",
+            selected_device_id=leased_device_id,
+        )
+        session.add(job)
+        await session.flush()
+        session.add(
+            AgentLease(
+                device_id=leased_device_id,
+                agent_id=agent_id,
+                global_job_id=job.id,
+                execution_id=uuid4(),
+                lease_token_digest="a" * 64,
+                state="active",
+                acquired_at=NOW,
+                renewed_at=NOW,
+                expires_at=NOW + timedelta(minutes=1),
+            )
+        )
+
+    states = {
+        device.device_id: device.state
+        for device in await device_database.directory.list_devices(team_id=TEAM_A_ID)
+    }
+    assert states == {
+        receipt.devices[0].device_id: "busy",
+        receipt.devices[1].device_id: "ready",
+    }
+
+
+@pytest.mark.asyncio
 async def test_device_movement_is_fenced_by_active_lease(
     device_database: DeviceDatabase,
 ) -> None:

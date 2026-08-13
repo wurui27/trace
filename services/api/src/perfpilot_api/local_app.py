@@ -3900,7 +3900,9 @@ def create_local_app(
     )
     resolved_source_artifacts = SourceArtifactService.in_memory()
     resolved_agent_task_service = AgentTaskService(
-        repository=InMemoryAgentTaskRepository(),
+        repository=InMemoryAgentTaskRepository(
+            capture_lease_projection=resolved_agent_store,
+        ),
         signer=TaskSnapshotSigner(
             private_key=task_key,
             kid="local-agent-v1",

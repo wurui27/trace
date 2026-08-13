@@ -35,6 +35,29 @@ LEASE_ID = UUID("75000000-0000-4000-8000-000000000001")
 OTHER_ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000002")
 
 
+class RecordingCaptureLeaseProjection:
+    def __init__(self) -> None:
+        self.projected: list[tuple[UUID, UUID, UUID, UUID, datetime]] = []
+        self.released: list[tuple[UUID, UUID]] = []
+
+    async def project_capture_lease(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+        execution_id: UUID,
+        expires_at: datetime,
+    ) -> bool:
+        self.projected.append((team_id, agent_id, device_id, execution_id, expires_at))
+        return True
+
+    async def release_capture_lease(
+        self, *, device_id: UUID, execution_id: UUID
+    ) -> None:
+        self.released.append((device_id, execution_id))
+
+
 def _definition() -> AgentTaskDefinition:
     return AgentTaskDefinition(
         analysis_id=ANALYSIS_ID,
@@ -156,6 +179,47 @@ async def test_remote_device_enqueue_is_replay_safe_and_oldest_first() -> None:
     )
     with pytest.raises(AgentTaskConflict):
         await repository.enqueue(conflicting, queued_at=NOW)
+
+
+@pytest.mark.asyncio
+async def test_capture_lease_projection_tracks_acquire_renew_and_terminal_release() -> None:
+    projection = RecordingCaptureLeaseProjection()
+    repository = InMemoryAgentTaskRepository(
+        (_remote_definition(),),
+        lease_id_source=lambda: LEASE_ID,
+        execution_id_source=lambda: EXECUTION_ID,
+        capture_lease_projection=projection,
+    )
+
+    scheduled = await repository.schedule(analysis_id=ANALYSIS_ID, now=NOW)
+    assert scheduled is not None
+    await repository.renew(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        now=NOW + timedelta(seconds=30),
+    )
+    await repository.request_cancel(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=NOW + timedelta(seconds=31),
+    )
+    access = await repository.authorize_cancellation(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        now=NOW + timedelta(seconds=31),
+    )
+    await repository.acknowledge_cancellation(
+        access=access,
+        now=NOW + timedelta(seconds=31),
+    )
+
+    assert projection.projected == [
+        (TEAM_ID, AGENT_ID, DEVICE_ID, EXECUTION_ID, NOW + timedelta(seconds=60)),
+        (TEAM_ID, AGENT_ID, DEVICE_ID, EXECUTION_ID, NOW + timedelta(seconds=90)),
+    ]
+    assert projection.released == [(DEVICE_ID, EXECUTION_ID)]
 
 
 @pytest.mark.asyncio

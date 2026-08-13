@@ -161,6 +161,10 @@ class DeviceDirectoryRepository(Protocol):
 
     async def list_team(self, team_id: UUID) -> tuple[StoredDevice, ...]: ...
 
+    async def active_capture_device_ids(
+        self, *, team_id: UUID, now: datetime
+    ) -> frozenset[UUID]: ...
+
     async def get_task_target(
         self,
         *,
@@ -197,6 +201,7 @@ class InMemoryDeviceDirectoryRepository:
         self._devices: dict[UUID, StoredDevice] = {}
         self._agent_heartbeats: dict[UUID, datetime] = {}
         self._agent_capabilities: dict[UUID, dict[str, object]] = {}
+        self._capture_leases: dict[UUID, tuple[UUID, UUID, UUID, datetime]] = {}
         self._lock = asyncio.Lock()
 
     async def replace_snapshot(
@@ -235,7 +240,6 @@ class InMemoryDeviceDirectoryRepository:
                     adb_state=observation.adb_state,
                     state=_state_from_observation(
                         observation,
-                        leased=heartbeat.execution_state == "busy",
                     ),
                     battery_percent=observation.battery_percent,
                     temperature_c=observation.temperature_c,
@@ -302,6 +306,52 @@ class InMemoryDeviceDirectoryRepository:
                 )[:_MAXIMUM_BROWSER_DEVICES]
             )
 
+    async def project_capture_lease(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+        execution_id: UUID,
+        expires_at: datetime,
+    ) -> bool:
+        async with self._lock:
+            device = self._devices.get(device_id)
+            if (
+                device is None
+                or device.team_id != team_id
+                or device.agent_id != agent_id
+            ):
+                return False
+            self._capture_leases[device_id] = (
+                team_id,
+                agent_id,
+                execution_id,
+                expires_at,
+            )
+            return True
+
+    async def release_capture_lease(
+        self, *, device_id: UUID, execution_id: UUID
+    ) -> None:
+        async with self._lock:
+            lease = self._capture_leases.get(device_id)
+            if lease is not None and lease[2] == execution_id:
+                self._capture_leases.pop(device_id, None)
+
+    async def active_capture_device_ids(
+        self, *, team_id: UUID, now: datetime
+    ) -> frozenset[UUID]:
+        async with self._lock:
+            for device_id, (_, _, _, expires_at) in tuple(self._capture_leases.items()):
+                if expires_at <= now:
+                    self._capture_leases.pop(device_id, None)
+            return frozenset(
+                device_id
+                for device_id, (lease_team_id, _, _, _) in self._capture_leases.items()
+                if lease_team_id == team_id
+            )
+
     async def get_task_target(
         self,
         *,
@@ -323,7 +373,7 @@ class InMemoryDeviceDirectoryRepository:
                 or device is None
                 or device.team_id != team_id
                 or device.agent_id != agent_id
-                or device.state != "ready"
+                or device.state not in {"ready", "busy"}
                 or device.adb_state != "device"
             ):
                 return None
@@ -453,10 +503,7 @@ class SQLAlchemyDeviceDirectoryRepository:
                     stored.adb_state = observation.adb_state
                     stored.state = _state_from_observation(
                         observation,
-                        leased=(
-                            heartbeat.execution_state == "busy"
-                            or stored.id in leased_device_ids
-                        ),
+                        leased=stored.id in leased_device_ids,
                     )
                     stored.battery_percent = observation.battery_percent
                     stored.temperature_c = observation.temperature_c
@@ -517,6 +564,24 @@ class SQLAlchemyDeviceDirectoryRepository:
                 _stored_device_record(stored, agent_name=agent_name) for stored, agent_name in rows
             )
 
+    async def active_capture_device_ids(
+        self, *, team_id: UUID, now: datetime
+    ) -> frozenset[UUID]:
+        async with self._session_factory() as session:
+            return frozenset(
+                (
+                    await session.scalars(
+                        select(AgentLease.device_id)
+                        .join(StoredDeviceModel, StoredDeviceModel.id == AgentLease.device_id)
+                        .where(
+                            StoredDeviceModel.team_id == team_id,
+                            AgentLease.state.in_(("active", "cancel_requested")),
+                            AgentLease.expires_at > now,
+                        )
+                    )
+                ).all()
+            )
+
     async def get_task_target(
         self,
         *,
@@ -533,7 +598,7 @@ class SQLAlchemyDeviceDirectoryRepository:
                         StoredDeviceModel.id == device_id,
                         StoredDeviceModel.team_id == team_id,
                         StoredDeviceModel.agent_id == agent_id,
-                        StoredDeviceModel.state == "ready",
+                        StoredDeviceModel.state.in_(("ready", "busy")),
                         StoredDeviceModel.adb_state == "device",
                         StoredAgent.team_id == team_id,
                         StoredAgent.state == "online",
@@ -763,6 +828,10 @@ class DeviceDirectory:
             cutoff=now - _STALE_AFTER,
             now=now,
         )
+        active_capture_device_ids = await self._repository.active_capture_device_ids(
+            team_id=team_id,
+            now=now,
+        )
         return tuple(
             DeviceView(
                 device_id=device.device_id,
@@ -775,7 +844,14 @@ class DeviceDirectory:
                 api_level=device.api_level,
                 connection_type=device.connection_type,
                 adb_state=device.adb_state,
-                state=device.state,
+                state=(
+                    "busy"
+                    if device.device_id in active_capture_device_ids
+                    and device.state in {"ready", "busy"}
+                    else "ready"
+                    if device.state == "busy"
+                    else device.state
+                ),
                 last_seen_at=device.last_seen_at,
             )
             for device in await self._repository.list_team(team_id)
@@ -789,6 +865,12 @@ class DeviceDirectory:
         device_id: UUID,
     ) -> DeviceTaskTarget | None:
         await self.expire_stale()
+        now = _aware_utc(self._clock())
+        if device_id in await self._repository.active_capture_device_ids(
+            team_id=team_id,
+            now=now,
+        ):
+            return None
         return await self._repository.get_task_target(
             team_id=team_id,
             agent_id=agent_id,

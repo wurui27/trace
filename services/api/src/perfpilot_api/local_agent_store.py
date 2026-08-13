@@ -176,6 +176,7 @@ class LocalAgentStore:
             self.close()
             raise LocalAgentStoreError("unsafe local agent path") from None
         self._uuid_factory = uuid_factory
+        self._capture_leases: dict[UUID, tuple[UUID, UUID, UUID, datetime]] = {}
 
     def close(self) -> None:
         if self._root_fd >= 0:
@@ -424,6 +425,62 @@ class LocalAgentStore:
             ]
             return tuple(sorted(devices, key=lambda item: (item.agent_name.casefold(), str(item.device_id))))
 
+    async def project_capture_lease(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+        execution_id: UUID,
+        expires_at: datetime,
+    ) -> bool:
+        if expires_at.tzinfo is None:
+            raise ValueError("Capture lease expiry must be timezone-aware")
+        with self._exclusive_lock():
+            device = next(
+                (
+                    item
+                    for item in self._read_document()["devices"]
+                    if item["device_id"] == str(device_id)
+                ),
+                None,
+            )
+            if (
+                device is None
+                or device["team_id"] != str(team_id)
+                or device["agent_id"] != str(agent_id)
+            ):
+                return False
+        self._capture_leases[device_id] = (
+            team_id,
+            agent_id,
+            execution_id,
+            expires_at.astimezone(UTC),
+        )
+        return True
+
+    async def release_capture_lease(
+        self, *, device_id: UUID, execution_id: UUID
+    ) -> None:
+        lease = self._capture_leases.get(device_id)
+        if lease is not None and lease[2] == execution_id:
+            self._capture_leases.pop(device_id, None)
+
+    async def active_capture_device_ids(
+        self, *, team_id: UUID, now: datetime
+    ) -> frozenset[UUID]:
+        if now.tzinfo is None:
+            raise ValueError("Capture lease clock must be timezone-aware")
+        current = now.astimezone(UTC)
+        for device_id, (_, _, _, expires_at) in tuple(self._capture_leases.items()):
+            if expires_at <= current:
+                self._capture_leases.pop(device_id, None)
+        return frozenset(
+            device_id
+            for device_id, (lease_team_id, _, _, _) in self._capture_leases.items()
+            if lease_team_id == team_id
+        )
+
     async def get_task_target(
         self,
         *,
@@ -454,7 +511,7 @@ class LocalAgentStore:
             if (
                 device.team_id != team_id
                 or device.agent_id != agent_id
-                or device.state != "ready"
+                or device.state not in {"ready", "busy"}
                 or device.adb_state != "device"
             ):
                 return None
@@ -559,10 +616,7 @@ class LocalAgentStore:
                     api_level=observation.api_level,
                     connection_type=observation.connection_type,
                     adb_state=observation.adb_state,
-                    state=_state_from_observation(
-                        observation,
-                        leased=heartbeat.execution_state == "busy",
-                    ),
+                    state=_state_from_observation(observation),
                     battery_percent=observation.battery_percent,
                     temperature_c=observation.temperature_c,
                     storage_available_bytes=observation.storage_available_bytes,
@@ -940,6 +994,11 @@ class LocalDeviceDirectoryRepository:
 
     async def list_team(self, team_id: UUID) -> tuple[StoredDevice, ...]:
         return await self._store.list_devices_team(team_id)
+
+    async def active_capture_device_ids(
+        self, *, team_id: UUID, now: datetime
+    ) -> frozenset[UUID]:
+        return await self._store.active_capture_device_ids(team_id=team_id, now=now)
 
     async def get_task_target(self, **kwargs: Any) -> DeviceTaskTarget | None:
         return await self._store.get_task_target(**kwargs)
