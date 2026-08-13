@@ -7,6 +7,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -397,6 +398,202 @@ async def test_part_put_cleans_temp_and_reraises_cancellation(tmp_path: Path) ->
 
     part_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
     assert list(part_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_part_publish_rolls_back_when_state_save_fails_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, token = await _pending_upload(tmp_path)
+    original_save = service._save_state
+    failed = False
+
+    def fail_once(team_id: UUID, analysis_id: UUID) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise AgentUploadUnavailable("local artifact storage is unavailable")
+        original_save(team_id, analysis_id)
+
+    monkeypatch.setattr(service, "_save_state", fail_once)
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        await service.put_part(token, (b"x",))
+
+    part_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
+    assert list(part_dir.iterdir()) == []
+    etag = await service.put_part(token, (b"x",))
+    service.close()
+    reopened = _reopen(tmp_path)
+    resumed = await reopened.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=1,
+        sha256_b64=_checksum(b"x"),
+    )
+    assert resumed.upload_id == UPLOAD_ID
+    assert resumed.state == "pending"
+    assert etag.startswith('"')
+
+
+@pytest.mark.asyncio
+async def test_final_publish_rolls_back_when_state_save_fails_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, token = await _pending_upload(tmp_path)
+    etag = await service.put_part(token, (b"x",))
+    receipt = (MultipartPart(part_number=1, etag=etag),)
+    original_save = service._save_state
+    failed = False
+
+    def fail_once(team_id: UUID, analysis_id: UUID) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise AgentUploadUnavailable("local artifact storage is unavailable")
+        original_save(team_id, analysis_id)
+
+    monkeypatch.setattr(service, "_save_state", fail_once)
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        await service.complete_upload(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=3,
+            upload_id=UPLOAD_ID,
+            parts=receipt,
+        )
+
+    assert not _completed_path(tmp_path, ARTIFACT_ID).exists()
+    completed = await service.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=UPLOAD_ID,
+        parts=receipt,
+    )
+    service.close()
+    reopened = _reopen(tmp_path)
+    repeated = await reopened.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=UPLOAD_ID,
+        parts=receipt,
+    )
+    assert completed.state == repeated.state == "finalized"
+
+
+@pytest.mark.asyncio
+async def test_slow_part_stream_does_not_block_independent_upload(
+    tmp_path: Path,
+) -> None:
+    service = LocalAgentArtifactService(
+        root=tmp_path,
+        public_origin="http://testserver",
+        execution_authorizer=FixedExecutionAuthorizer(),
+        clock=lambda: NOW,
+        uuid_source=iter(
+            (
+                ARTIFACT_ID,
+                UPLOAD_ID,
+                UUID("76000000-0000-4000-8000-000000000002"),
+                UUID("77000000-0000-4000-8000-000000000002"),
+            )
+        ).__next__,
+        token_source=lambda: "slow-part-grant",
+    )
+    first = await service.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=2,
+        sha256_b64=_checksum(b"xy"),
+    )
+    part = await service.authorize_part(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=first.upload_id,
+        part_number=1,
+    )
+    paused = asyncio.Event()
+    resume = asyncio.Event()
+
+    async def slow_body():
+        yield b"x"
+        paused.set()
+        await resume.wait()
+        yield b"y"
+
+    put = asyncio.create_task(
+        service.put_part(urlsplit(part.url).path.rsplit("/", 1)[-1], slow_body())
+    )
+    await paused.wait()
+    second = await asyncio.wait_for(
+        service.create_upload(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=3,
+            artifact_kind="scroll_trace",
+            mime="application/x-perfetto-trace",
+            size=1,
+            sha256_b64=_checksum(b"z"),
+        ),
+        timeout=0.2,
+    )
+    resume.set()
+    await put
+    assert second.artifact_kind == "scroll_trace"
+
+
+@pytest.mark.asyncio
+async def test_part_disk_work_does_not_block_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, token = await _pending_upload(tmp_path)
+    original_write = service._write_chunk
+
+    def slow_write(*args: object) -> int:
+        time.sleep(0.2)
+        return original_write(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_write_chunk", slow_write)
+    started = asyncio.get_running_loop().time()
+    put = asyncio.create_task(service.put_part(token, (b"x",)))
+    await asyncio.sleep(0.02)
+    elapsed = asyncio.get_running_loop().time() - started
+    await put
+    assert elapsed < 0.1
+
+
+@pytest.mark.asyncio
+async def test_concurrent_exact_completion_is_idempotent(tmp_path: Path) -> None:
+    service, token = await _pending_upload(tmp_path)
+    etag = await service.put_part(token, (b"x",))
+    receipt = (MultipartPart(part_number=1, etag=etag),)
+
+    first, second = await asyncio.gather(
+        *(
+            service.complete_upload(
+                agent_id=AGENT_ID,
+                execution_id=EXECUTION_ID,
+                lease_version=3,
+                upload_id=UPLOAD_ID,
+                parts=receipt,
+            )
+            for _ in range(2)
+        )
+    )
+
+    assert first == second
 
 
 @pytest.mark.asyncio

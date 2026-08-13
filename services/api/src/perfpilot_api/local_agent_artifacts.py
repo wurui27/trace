@@ -137,6 +137,7 @@ class LocalAgentArtifactService:
         self._artifacts: dict[UUID, _Upload] = {}
         self._grants: dict[str, _Grant] = {}
         self._lock = asyncio.Lock()
+        self._upload_locks: dict[UUID, asyncio.Lock] = {}
         self._closed = False
         try:
             self._root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -623,6 +624,7 @@ class LocalAgentArtifactService:
                 os.close(analysis)
             self._uploads[upload_id] = upload
             self._artifacts[artifact_id] = upload
+            self._upload_locks[upload_id] = asyncio.Lock()
             self._save_state(access.team_id, access.analysis_id)
             return self._slot(upload)
 
@@ -698,7 +700,8 @@ class LocalAgentArtifactService:
             _PART_BYTES,
             upload.size - (grant.part_number - 1) * _PART_BYTES,
         )
-        async with self._lock:
+        upload_lock = self._upload_locks.setdefault(upload.upload_id, asyncio.Lock())
+        async with upload_lock:
             directory = self._upload_parts_fd(upload, create=False)
             temporary = f".{grant.part_number}.{uuid4().hex}.tmp"
             size = 0
@@ -715,12 +718,25 @@ class LocalAgentArtifactService:
                         descriptor = -1
                         if hasattr(chunks, "__aiter__"):
                             async for chunk in chunks:  # type: ignore[union-attr]
-                                size = self._write_chunk(output, digest, chunk, size, expected)
+                                size = await asyncio.to_thread(
+                                    self._write_chunk,
+                                    output,
+                                    digest,
+                                    chunk,
+                                    size,
+                                    expected,
+                                )
                         else:
                             for chunk in chunks:  # type: ignore[union-attr]
-                                size = self._write_chunk(output, digest, chunk, size, expected)
-                        output.flush()
-                        os.fsync(output.fileno())
+                                size = await asyncio.to_thread(
+                                    self._write_chunk,
+                                    output,
+                                    digest,
+                                    chunk,
+                                    size,
+                                    expected,
+                                )
+                        await asyncio.to_thread(self._flush_file, output)
                 finally:
                     if descriptor >= 0:
                         os.close(descriptor)
@@ -755,7 +771,13 @@ class LocalAgentArtifactService:
                 os.unlink(temporary, dir_fd=directory)
                 os.fsync(directory)
                 upload.parts[grant.part_number] = etag
-                self._save_state(upload.team_id, upload.analysis_id)
+                try:
+                    self._save_state(upload.team_id, upload.analysis_id)
+                except AgentUploadError:
+                    upload.parts.pop(grant.part_number, None)
+                    os.unlink(name, dir_fd=directory)
+                    os.fsync(directory)
+                    raise
                 return etag
             except AgentUploadError:
                 raise
@@ -776,6 +798,11 @@ class LocalAgentArtifactService:
                         ) from None
                 finally:
                     os.close(directory)
+
+    @staticmethod
+    def _flush_file(output: object) -> None:
+        output.flush()  # type: ignore[attr-defined]
+        os.fsync(output.fileno())  # type: ignore[attr-defined]
 
     @staticmethod
     def _write_chunk(
@@ -824,39 +851,25 @@ class LocalAgentArtifactService:
             return self._slot(upload)
         if upload.expires_at <= now:
             raise AgentUploadExpired("upload has expired")
-        async with self._lock:
+        upload_lock = self._upload_locks.setdefault(upload.upload_id, asyncio.Lock())
+        async with upload_lock:
+            if upload.finalized_at is not None:
+                await asyncio.to_thread(self._verify_completed, upload)
+                return self._slot(upload)
+            if upload.expires_at <= self._now():
+                raise AgentUploadExpired("upload has expired")
             parts_fd = self._upload_parts_fd(upload, create=False)
             completed_fd = self._completed_fd(upload, create=False)
             temporary = f".{upload.artifact_id}.{uuid4().hex}.tmp"
             final_name = f"{upload.artifact_kind}-{upload.artifact_id}.bin"
-            digest = hashlib.sha256()
-            size = 0
             try:
-                descriptor = os.open(
+                size, checksum = await asyncio.to_thread(
+                    self._assemble_upload,
+                    parts_fd,
+                    completed_fd,
                     temporary,
-                    os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC,
-                    0o600,
-                    dir_fd=completed_fd,
+                    upload,
                 )
-                with os.fdopen(descriptor, "wb", closefd=True) as output:
-                    for number in range(1, upload.part_count + 1):
-                        part_fd = os.open(
-                            f"{number}.part",
-                            os.O_RDONLY | _NOFOLLOW | _CLOEXEC,
-                            dir_fd=parts_fd,
-                        )
-                        with os.fdopen(part_fd, "rb", closefd=True) as source:
-                            if not self._is_private_regular(os.fstat(source.fileno())):
-                                raise OSError
-                            while chunk := source.read(1024 * 1024):
-                                size += len(chunk)
-                                if size > upload.size:
-                                    raise AgentUploadMismatch("uploaded artifact does not match")
-                                digest.update(chunk)
-                                output.write(chunk)
-                    output.flush()
-                    os.fsync(output.fileno())
-                checksum = base64.b64encode(digest.digest()).decode("ascii")
                 if size != upload.size or not hmac.compare_digest(checksum, upload.sha256_b64):
                     raise AgentUploadMismatch("uploaded artifact does not match")
                 try:
@@ -872,7 +885,13 @@ class LocalAgentArtifactService:
                 os.unlink(temporary, dir_fd=completed_fd)
                 os.fsync(completed_fd)
                 upload.finalized_at = now
-                self._save_state(upload.team_id, upload.analysis_id)
+                try:
+                    self._save_state(upload.team_id, upload.analysis_id)
+                except AgentUploadError:
+                    upload.finalized_at = None
+                    os.unlink(final_name, dir_fd=completed_fd)
+                    os.fsync(completed_fd)
+                    raise
                 return self._slot(upload)
             except (AgentUploadInvalidRequest, AgentUploadMismatch):
                 try:
@@ -889,6 +908,41 @@ class LocalAgentArtifactService:
             finally:
                 os.close(parts_fd)
                 os.close(completed_fd)
+
+    def _assemble_upload(
+        self,
+        parts_fd: int,
+        completed_fd: int,
+        temporary: str,
+        upload: _Upload,
+    ) -> tuple[int, str]:
+        digest = hashlib.sha256()
+        size = 0
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | _CLOEXEC,
+            0o600,
+            dir_fd=completed_fd,
+        )
+        with os.fdopen(descriptor, "wb", closefd=True) as output:
+            for number in range(1, upload.part_count + 1):
+                part_fd = os.open(
+                    f"{number}.part",
+                    os.O_RDONLY | _NOFOLLOW | _CLOEXEC,
+                    dir_fd=parts_fd,
+                )
+                with os.fdopen(part_fd, "rb", closefd=True) as source:
+                    if not self._is_private_regular(os.fstat(source.fileno())):
+                        raise OSError
+                    while chunk := source.read(1024 * 1024):
+                        size += len(chunk)
+                        if size > upload.size:
+                            raise AgentUploadMismatch("uploaded artifact does not match")
+                        digest.update(chunk)
+                        output.write(chunk)
+            output.flush()
+            os.fsync(output.fileno())
+        return size, base64.b64encode(digest.digest()).decode("ascii")
 
     def _verify_completed(self, upload: _Upload) -> None:
         directory = self._completed_fd(upload, create=False)
@@ -1468,6 +1522,9 @@ class LocalAgentArtifactService:
         self._inputs.update(recovered_inputs)
         self._uploads.update(recovered_uploads)
         self._artifacts.update(recovered_artifacts)
+        self._upload_locks.update(
+            (upload_id, asyncio.Lock()) for upload_id in recovered_uploads
+        )
         for team_id, analysis_id in cleaned_analyses:
             self._save_state(team_id, analysis_id)
 
@@ -1508,15 +1565,18 @@ class LocalAgentArtifactService:
 
     async def abort_execution(self, *, access: AgentExecutionAccess, now: datetime) -> None:
         del now
-        async with self._lock:
-            for upload in tuple(self._uploads.values()):
-                if (
-                    upload.execution_id == access.execution_id
-                    and upload.team_id == access.team_id
-                    and upload.analysis_id == access.analysis_id
-                    and upload.agent_id == access.agent_id
-                    and upload.finalized_at is None
-                ):
+        candidates = tuple(
+            upload
+            for upload in self._uploads.values()
+            if upload.execution_id == access.execution_id
+            and upload.team_id == access.team_id
+            and upload.analysis_id == access.analysis_id
+            and upload.agent_id == access.agent_id
+        )
+        for upload in candidates:
+            lock = self._upload_locks.setdefault(upload.upload_id, asyncio.Lock())
+            async with lock:
+                if upload.finalized_at is None and self._uploads.get(upload.upload_id) is upload:
                     directory = self._upload_parts_fd(upload, create=False)
                     try:
                         for name in os.listdir(directory):
@@ -1536,7 +1596,8 @@ class LocalAgentArtifactService:
                         os.close(parts)
                     self._uploads.pop(upload.upload_id, None)
                     self._artifacts.pop(upload.artifact_id, None)
-            self._save_state(access.team_id, access.analysis_id)
+                    self._upload_locks.pop(upload.upload_id, None)
+        self._save_state(access.team_id, access.analysis_id)
 
     async def project_cancellation(self, **kwargs: object) -> None:
         if kwargs.get("reason_code") != "analysis_canceled":
