@@ -337,6 +337,56 @@ async def test_cancelled_input_validation_closes_worker_descriptors(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("consumption", ("none", "partial", "full"))
+async def test_input_stream_close_owns_descriptors_before_iteration(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, consumption: str
+) -> None:
+    payload = b"private apk bytes"
+    source = _input_path(tmp_path)
+    source.parent.mkdir(mode=0o700, parents=True)
+    source.write_bytes(payload)
+    source.chmod(0o600)
+    service = _service(tmp_path)
+    service.register_input(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        artifact_id=INPUT_ID,
+        upload_id=INPUT_UPLOAD_ID,
+        mime="application/vnd.android.package-archive",
+        size=len(payload),
+        sha256_b64=_checksum(payload),
+    )
+    slot = await service.authorize_input(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_id=INPUT_ID,
+    )
+    original_open = service._open_verified_input
+    descriptors: list[int] = []
+
+    def observed_open(*args: object):
+        result = original_open(*args)  # type: ignore[arg-type]
+        descriptors.extend((result.descriptor, result.directory))
+        return result
+
+    monkeypatch.setattr(service, "_open_verified_input", observed_open)
+    opened = await service.open_input(urlsplit(slot.url).path.rsplit("/", 1)[-1])
+    iterator = iter(opened.body)
+    if consumption == "partial":
+        assert next(iterator) == payload
+    elif consumption == "full":
+        assert b"".join(iterator) == payload
+    opened.close()
+    opened.close()
+
+    for descriptor in descriptors:
+        with pytest.raises(OSError) as raised:
+            os.fstat(descriptor)
+        assert raised.value.errno == 9
+
+
+@pytest.mark.asyncio
 async def test_agent_multipart_create_put_complete_publishes_exact_artifact(
     tmp_path: Path,
 ) -> None:

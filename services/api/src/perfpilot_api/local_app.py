@@ -32,6 +32,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from starlette.background import BackgroundTask
 
 from perfpilot_api.ai.local_report import (
     LocalReportSynthesizer,
@@ -4104,9 +4105,29 @@ def create_local_app(
             if not isinstance(error, AgentUploadError):
                 raise
             raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact not found") from None
+
+        async def stream_input():
+            iterator = iter(opened.body)
+
+            def next_input() -> bytes | None:
+                try:
+                    return next(iterator)
+                except StopIteration:
+                    return None
+
+            try:
+                while True:
+                    chunk = await asyncio.to_thread(next_input)
+                    if chunk is None:
+                        break
+                    yield chunk
+            finally:
+                await asyncio.to_thread(opened.close)
+
         return StreamingResponse(
-            opened.body,
+            stream_input(),
             media_type=opened.mime,
+            background=BackgroundTask(opened.close),
             headers={
                 "content-length": str(opened.size),
                 "etag": opened.etag,

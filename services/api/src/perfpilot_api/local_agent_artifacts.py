@@ -14,7 +14,8 @@ import re
 import secrets
 import stat
 import sys
-from collections.abc import AsyncIterable, Callable, Iterable, Mapping, Sequence
+import threading
+from collections.abc import AsyncIterable, Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -58,12 +59,49 @@ _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
+class _ManagedInputStream(Iterator[bytes]):
+    def __init__(self, descriptor: int, directory: int) -> None:
+        self._descriptor = descriptor
+        self._directory = directory
+        self._closed = False
+        self._lock = threading.Lock()
+
+    def __iter__(self) -> _ManagedInputStream:
+        return self
+
+    def __next__(self) -> bytes:
+        with self._lock:
+            if self._closed:
+                raise StopIteration
+            chunk = os.read(self._descriptor, 1024 * 1024)
+            if chunk:
+                return chunk
+            self._close_locked()
+            raise StopIteration
+
+    def close(self) -> None:
+        with self._lock:
+            self._close_locked()
+
+    def _close_locked(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            os.close(self._descriptor)
+        finally:
+            os.close(self._directory)
+
+
 @dataclass(frozen=True, slots=True)
 class LocalArtifactBody:
-    body: Iterable[bytes] = field(repr=False)
+    body: _ManagedInputStream = field(repr=False)
     mime: str
     size: int
     etag: str = field(repr=False)
+
+    def close(self) -> None:
+        self.body.close()
 
 
 @dataclass(slots=True)
@@ -335,21 +373,6 @@ class LocalAgentArtifactService:
     def _is_private_regular(metadata: os.stat_result) -> bool:
         return stat.S_ISREG(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o600
 
-    @staticmethod
-    def _stream_descriptor(descriptor: int, directory_fd: int) -> Iterable[bytes]:
-        try:
-            metadata = os.fstat(descriptor)
-            if not LocalAgentArtifactService._is_private_regular(metadata):
-                raise OSError
-            with os.fdopen(descriptor, "rb", closefd=True) as source:
-                descriptor = -1
-                while chunk := source.read(1024 * 1024):
-                    yield chunk
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
-            os.close(directory_fd)
-
     def register_input(
         self,
         *,
@@ -547,7 +570,7 @@ class LocalAgentArtifactService:
             raise AgentUploadNotFound("input artifact was not found") from None
         descriptor, directory, digest_bytes = opened.claim()
         return LocalArtifactBody(
-            body=self._stream_descriptor(descriptor, directory),
+            body=_ManagedInputStream(descriptor, directory),
             mime=item.mime,
             size=item.size,
             etag=f'"{base64.b16encode(digest_bytes).decode("ascii").lower()}"',
