@@ -16,6 +16,7 @@ from urllib.parse import urlsplit
 from uuid import UUID
 
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient as _RawTestClient
 from starlette.requests import Request
 from starlette.requests import ClientDisconnect
@@ -70,7 +71,11 @@ from perfpilot_agent.service import TaskLoop
 from perfpilot_agent.security import TaskVerifier
 from perfpilot_agent.state import AgentRuntimeState, DeviceBinding
 from perfpilot_agent.uploads import InputDownloader, MultipartUploader
-from perfpilot_api.services.agent_tasks import AgentExecutionAccess
+from perfpilot_api.services.agent_tasks import (
+    AgentExecutionAccess,
+    AgentExecutionScenario,
+    ValidatedAgentExecutionManifest,
+)
 from perfpilot_api.services.source_workspaces import SourceBinding
 from perfpilot_api.security.agent_signatures import (
     encode_ed25519_public_key,
@@ -3386,6 +3391,208 @@ async def test_cancelled_remote_finalize_releases_analysis_lock_for_retry(
     assert list(app.state.agent_task_service._repository._definitions) == [analysis_id]
 
 
+@pytest.mark.asyncio
+async def test_analysis_cancel_wins_race_with_remote_apk_inspection(
+    tmp_path: Path,
+) -> None:
+    inspector = _GatedLocalApkInspector()
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        apk_inspector=inspector,
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+    )
+    runtime = app.state.local_runtime
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    analysis, _, request = await _prepare_remote_finalize(
+        runtime,
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=analysis_id,
+        upload_id="51000000-0000-4000-8000-000000000001",
+        apk=b"cancel race apk",
+    )
+    finalize = asyncio.create_task(runtime._finalize_remote_device(analysis, request))
+    await inspector.first_entered.wait()
+    cancellation = asyncio.create_task(runtime.cancel(analysis))
+    for _ in range(100):
+        if analysis.cancel_requested_at is not None:
+            break
+        await asyncio.sleep(0.001)
+    assert analysis.cancel_requested_at is not None
+    inspector.release.set()
+    result = await asyncio.gather(finalize, return_exceptions=True)
+    canceled, accepted = await cancellation
+    await runtime.close()
+    app.state.agent_upload_service.close()
+    app.state.local_agent_store.close()
+
+    assert accepted is True
+    assert canceled.state == "canceled"
+    assert canceled.cancel_requested_at is not None
+    assert isinstance(result[0], HTTPException)
+    assert result[0].status_code == 409
+    assert app.state.agent_upload_service._inputs == {}
+    assert app.state.agent_task_service._repository._definitions == {}
+
+
+@pytest.mark.asyncio
+async def test_analysis_cancel_after_enqueue_wins_before_published_persist(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        apk_inspector=_FakeLocalApkInspector(),
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+    )
+    runtime = app.state.local_runtime
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    analysis, _, request = await _prepare_remote_finalize(
+        runtime,
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=analysis_id,
+        upload_id="51000000-0000-4000-8000-000000000001",
+        apk=b"cancel after enqueue apk",
+    )
+    original_persist = runtime._persist
+    published_entered = asyncio.Event()
+    release_published = asyncio.Event()
+
+    async def gate_published(current: _LocalAnalysis) -> None:
+        if current.remote_publication == "published":
+            published_entered.set()
+            await release_published.wait()
+        await original_persist(current)
+
+    runtime._persist = gate_published
+    finalize = asyncio.create_task(runtime._finalize_remote_device(analysis, request))
+    await published_entered.wait()
+    cancellation = asyncio.create_task(runtime.cancel(analysis))
+    for _ in range(100):
+        if analysis.cancel_requested_at is not None:
+            break
+        await asyncio.sleep(0.001)
+    assert analysis.cancel_requested_at is not None
+    release_published.set()
+    finalize_result = await asyncio.gather(finalize, return_exceptions=True)
+    canceled, accepted = await cancellation
+    await runtime.close()
+    app.state.agent_upload_service.close()
+    app.state.local_agent_store.close()
+
+    assert accepted is True
+    assert canceled.state == "canceled"
+    assert isinstance(finalize_result[0], HTTPException)
+    assert finalize_result[0].status_code == 409
+    assert app.state.agent_upload_service._inputs == {}
+    assert app.state.agent_task_service._repository._definitions == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("observer", ["completion", "cancellation"])
+async def test_remote_terminal_observer_replay_persists_after_first_failure(
+    tmp_path: Path,
+    observer: str,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        apk_inspector=_FakeLocalApkInspector(),
+        device_probe=_FakeDeviceProbe(
+            _FakeDeviceStatus(state="disconnected", device=None)
+        ),
+    )
+    runtime = app.state.local_runtime
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    analysis, _, _ = await _prepare_remote_finalize(
+        runtime,
+        team_id=team_id,
+        analysis_id=analysis_id,
+        upload_id="51000000-0000-4000-8000-000000000001",
+        apk=b"observer replay apk",
+    )
+    access = AgentExecutionAccess(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        agent_id=analysis.device_agent_id,
+        execution_id=UUID("73000000-0000-4000-8000-000000000001"),
+        lease_version=1,
+        lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
+        scenario_types=("startup", "scroll"),
+    )
+    now = datetime.now(UTC)
+    original_persist = runtime._persist
+    failed = False
+
+    async def fail_once(current: _LocalAnalysis) -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise LocalAnalysisStoreError("injected observer persistence failure")
+        await original_persist(current)
+
+    runtime._persist = fail_once
+    if observer == "completion":
+        manifest = ValidatedAgentExecutionManifest(
+            execution_id=access.execution_id,
+            lease_version=1,
+            state="failed",
+            started_at=now,
+            completed_at=now + timedelta(seconds=1),
+            agent_version="1.2.3",
+            adb_version="Android Debug Bridge version 1.0.41",
+            artifacts=(),
+            scenarios=(
+                AgentExecutionScenario(
+                    scenario_type="startup",
+                    state="failed",
+                    started_at=now,
+                    completed_at=now + timedelta(seconds=1),
+                    temperature_start_c=None,
+                    temperature_end_c=None,
+                    artifact_ids=(),
+                    diagnostic_code="startup_capture_failed",
+                ),
+                AgentExecutionScenario(
+                    scenario_type="scroll",
+                    state="failed",
+                    started_at=now,
+                    completed_at=now + timedelta(seconds=1),
+                    temperature_start_c=None,
+                    temperature_end_c=None,
+                    artifact_ids=(),
+                    diagnostic_code="scroll_capture_failed",
+                ),
+            ),
+            diagnostic_code="capture_failed",
+            document_hash="a" * 64,
+        )
+        with pytest.raises(LocalAnalysisStoreError):
+            await runtime.observe_agent_completion(access, manifest, now)
+        await runtime.observe_agent_completion(access, manifest, now)
+        expected_state = "failed"
+    else:
+        with pytest.raises(LocalAnalysisStoreError):
+            await runtime.observe_agent_cancellation(access, now)
+        await runtime.observe_agent_cancellation(access, now)
+        expected_state = "canceled"
+    persisted = runtime.store.load_states()[(team_id, analysis_id)]
+    await runtime.close()
+    app.state.agent_upload_service.close()
+    app.state.local_agent_store.close()
+
+    assert analysis.state == expected_state
+    assert persisted["state"] == expected_state
+
+
 @pytest.mark.parametrize(
     "outcome",
     [
@@ -3396,6 +3603,7 @@ async def test_cancelled_remote_finalize_releases_analysis_lock_for_retry(
         "intent_persist_failed",
         "published_persist_failed",
         "restart_reconciled",
+        "published_restart_reconciled",
     ],
 )
 def test_local_remote_capture_runs_real_agent_lifecycle(
@@ -3581,6 +3789,12 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                     f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
                 ).json()
             captured = None
+        elif outcome == "published_restart_reconciled":
+            assert finalize_request().status_code == 200
+            projected = client.get(
+                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            ).json()
+            captured = None
         else:
             assert finalize_request().status_code == 200
             captured = asyncio.run(
@@ -3613,7 +3827,7 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
                 f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
             ).json()
 
-    if outcome == "restart_reconciled":
+    if outcome in {"restart_reconciled", "published_restart_reconciled"}:
         restarted = create_local_app(
             gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
             data_root=tmp_path / "data",
@@ -3647,6 +3861,7 @@ def test_local_remote_capture_runs_real_agent_lifecycle(
         "intent_persist_failed",
         "published_persist_failed",
         "restart_reconciled",
+        "published_restart_reconciled",
     }:
         assert projected["state"] == "queued"
     elif outcome == "completed":

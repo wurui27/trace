@@ -379,6 +379,132 @@ class RecordingCancellationArtifacts:
         self.projected.append((access, reason_code))
 
 
+class FailingOnceCancellationArtifacts(RecordingCancellationArtifacts):
+    def __init__(self) -> None:
+        super().__init__()
+        self.failures = 0
+
+    async def project_cancellation(
+        self,
+        *,
+        access: AgentExecutionAccess,
+        reason_code: str,
+        now: datetime,
+    ) -> None:
+        if self.failures == 0:
+            self.failures += 1
+            raise RuntimeError("injected cancellation projection failure")
+        await super().project_cancellation(
+            access=access,
+            reason_code=reason_code,
+            now=now,
+        )
+
+
+class FailingOnceCompletionArtifacts:
+    def __init__(self) -> None:
+        self.validated = 0
+        self.projected = 0
+
+    async def validate_completion(self, **_kwargs: object) -> None:
+        self.validated += 1
+
+    async def project_completion(self, **_kwargs: object) -> None:
+        self.projected += 1
+        if self.projected == 1:
+            raise RuntimeError("injected completion projection failure")
+
+
+def _completion_manifest() -> dict[str, object]:
+    completed = NOW + timedelta(seconds=2)
+    return {
+        "schema_version": "1.0",
+        "execution_id": str(EXECUTION_ID),
+        "lease_version": 1,
+        "state": "completed",
+        "started_at": NOW.isoformat(),
+        "completed_at": completed.isoformat(),
+        "agent_version": "1.2.3",
+        "adb_version": "Android Debug Bridge version 1.0.41",
+        "artifacts": [
+            {
+                "artifact_id": str(ARTIFACT_ID),
+                "kind": "startup_trace",
+                "mime": "application/x-perfetto-trace",
+                "size": 4,
+                "sha256_b64": base64.b64encode(b"a" * 32).decode("ascii"),
+            }
+        ],
+        "scenarios": [
+            {
+                "scenario_type": "startup",
+                "state": "completed",
+                "started_at": NOW.isoformat(),
+                "completed_at": completed.isoformat(),
+                "temperature_start_c": None,
+                "temperature_end_c": None,
+                "artifact_ids": [str(ARTIFACT_ID)],
+                "diagnostic_code": None,
+            }
+        ],
+        "diagnostic_code": None,
+    }
+
+
+@pytest.mark.asyncio
+async def test_exact_completion_retries_projection_after_terminal_commit_failure() -> None:
+    service, _repository, _public_key = _service()
+    await service.schedule(analysis_id=ANALYSIS_ID)
+    artifacts = FailingOnceCompletionArtifacts()
+    manifest = _completion_manifest()
+
+    with pytest.raises(RuntimeError, match="projection failure"):
+        await service.complete(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=1,
+            manifest_document=manifest,
+            artifact_validator=artifacts,
+        )
+    replayed = await service.complete(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        manifest_document=manifest,
+        artifact_validator=artifacts,
+    )
+
+    assert replayed.analysis_state == "analyzing"
+    assert artifacts.projected == 2
+
+
+@pytest.mark.asyncio
+async def test_exact_cancel_ack_retries_projection_after_terminal_commit_failure() -> None:
+    service, _repository, _public_key = _service()
+    await service.schedule(analysis_id=ANALYSIS_ID)
+    await service.request_cancel(team_id=TEAM_ID, analysis_id=ANALYSIS_ID)
+    artifacts = FailingOnceCancellationArtifacts()
+
+    with pytest.raises(RuntimeError, match="projection failure"):
+        await service.acknowledge_cancellation(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=1,
+            reason_code="analysis_canceled",
+            artifact_coordinator=artifacts,
+        )
+    replayed = await service.acknowledge_cancellation(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        reason_code="analysis_canceled",
+        artifact_coordinator=artifacts,
+    )
+
+    assert replayed.analysis_id == ANALYSIS_ID
+    assert artifacts.projected[-1][1] == "analysis_canceled"
+
+
 @pytest.mark.asyncio
 async def test_cancel_is_delivered_by_poll_and_renew_then_acknowledged() -> None:
     service, _repository, _public_key = _service()

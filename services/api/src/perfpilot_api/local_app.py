@@ -151,6 +151,7 @@ from perfpilot_api.services.source_workspaces import (
 from perfpilot_api.services.agent_tasks import (
     AgentExecutionAccess,
     AgentTaskDefinition,
+    AgentTaskNotFound,
     AgentTaskService,
     InMemoryAgentTaskRepository,
     InMemoryAgentTaskWakeup,
@@ -2186,24 +2187,38 @@ class _LocalRuntime:
             manifest_document,
         )
         completed = any(item.state == "completed" for item in manifest.scenarios)
+        should_persist = False
         async with self.lock:
             if analysis.state in _TERMINAL_ANALYSIS_STATES:
-                return
-            analysis.started_at = analysis.started_at or manifest.started_at
-            analysis.completed_at = manifest.completed_at if not completed else None
-            analysis.state = "analyzing" if completed else "failed"
-            analysis.failure = (
-                None
-                if completed
-                else {
-                    "code": "remote_capture_failed",
-                    "message": "Remote Android capture failed",
-                    "retryable": False,
-                }
-            )
-            analysis.stages["smartperfetto"] = "pending" if completed else "not_requested"
-            analysis.stages["report"] = "pending" if completed else "not_requested"
-            analysis.version += 1
+                should_persist = (
+                    not completed
+                    and analysis.state == "failed"
+                    and analysis.failure is not None
+                    and analysis.failure.get("code") == "remote_capture_failed"
+                )
+            else:
+                analysis.started_at = analysis.started_at or manifest.started_at
+                analysis.completed_at = manifest.completed_at if not completed else None
+                analysis.state = "analyzing" if completed else "failed"
+                analysis.failure = (
+                    None
+                    if completed
+                    else {
+                        "code": "remote_capture_failed",
+                        "message": "Remote Android capture failed",
+                        "retryable": False,
+                    }
+                )
+                analysis.stages["smartperfetto"] = (
+                    "pending" if completed else "not_requested"
+                )
+                analysis.stages["report"] = (
+                    "pending" if completed else "not_requested"
+                )
+                analysis.version += 1
+                should_persist = True
+        if not should_persist:
+            return
         await self._persist(analysis)
 
     async def observe_agent_cancellation(
@@ -2212,16 +2227,21 @@ class _LocalRuntime:
         now: datetime,
     ) -> None:
         analysis = await self.analysis(access.team_id, access.analysis_id)
+        should_persist = False
         async with self.lock:
             if analysis.state in _TERMINAL_ANALYSIS_STATES:
-                return
-            analysis.state = "canceled"
-            analysis.failure = None
-            analysis.completed_at = now
-            for stage_name, stage_state in analysis.stages.items():
-                if stage_state not in {"completed", "failed", "not_requested"}:
-                    analysis.stages[stage_name] = "canceled"
-            analysis.version += 1
+                should_persist = analysis.state == "canceled"
+            else:
+                analysis.state = "canceled"
+                analysis.failure = None
+                analysis.completed_at = now
+                for stage_name, stage_state in analysis.stages.items():
+                    if stage_state not in {"completed", "failed", "not_requested"}:
+                        analysis.stages[stage_name] = "canceled"
+                analysis.version += 1
+                should_persist = True
+        if not should_persist:
+            return
         await self._persist(analysis)
 
     def _restore_analysis(self, document: Mapping[str, object]) -> _LocalAnalysis:
@@ -2518,7 +2538,7 @@ class _LocalRuntime:
             if resume_gate is not None:
                 resume_gate.set()
             if (
-                analysis.remote_publication == "publishing"
+                analysis.remote_publication in {"publishing", "published"}
                 and analysis.cancel_requested_at is None
                 and analysis.state not in _TERMINAL_ANALYSIS_STATES
             ):
@@ -2538,6 +2558,38 @@ class _LocalRuntime:
                     "Remote capture publication recovery deferred type=%s",
                     type(error).__name__,
                 )
+                task = asyncio.create_task(
+                    self._retry_remote_publication(analysis, upload)
+                )
+                self.tasks.add(task)
+                task.add_done_callback(self.tasks.discard)
+
+    async def _retry_remote_publication(
+        self,
+        analysis: _LocalAnalysis,
+        upload: _LocalUpload,
+    ) -> None:
+        delay = 0.1
+        while True:
+            await asyncio.sleep(delay)
+            async with self.lock:
+                if (
+                    analysis.cancel_requested_at is not None
+                    or analysis.state in _TERMINAL_ANALYSIS_STATES
+                ):
+                    return
+            try:
+                async with self._remote_publication_lock(analysis):
+                    await self._publish_remote_device(analysis, upload)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _LOGGER.warning(
+                    "Remote capture publication recovery retry type=%s",
+                    type(error).__name__,
+                )
+                delay = min(delay * 2, 5.0)
 
     async def close(self) -> None:
         tasks = tuple(self.tasks)
@@ -2984,61 +3036,75 @@ class _LocalRuntime:
             )
         await self._persist(analysis)
 
-        if analysis.analysis_mode == "device" and analysis.inputs["apk"].finalized:
-            try:
-                cancellation = await self.agent_tasks.request_cancel(
-                    team_id=analysis.team_id,
-                    analysis_id=analysis.analysis_id,
-                )
-            except Exception:
-                raise HTTPException(
-                    status.HTTP_503_SERVICE_UNAVAILABLE,
-                    "Remote capture cancellation failed",
-                ) from None
-            if cancellation.execution_id is not None:
-                return analysis, True
+        publication_lock = (
+            self._remote_publication_lock(analysis)
+            if analysis.analysis_mode == "device"
+            else None
+        )
+        if publication_lock is not None:
+            await publication_lock.acquire()
 
-        if analysis.source_binding is not None:
-            try:
-                await self.source_tasks.request_cancel(
-                    team_id=analysis.team_id,
-                    analysis_id=analysis.analysis_id,
-                )
-            except SourceTaskError:
-                pass
+        try:
+            if analysis.analysis_mode == "device" and analysis.inputs["apk"].finalized:
+                try:
+                    cancellation = await self.agent_tasks.request_cancel(
+                        team_id=analysis.team_id,
+                        analysis_id=analysis.analysis_id,
+                    )
+                except AgentTaskNotFound:
+                    cancellation = None
+                except Exception:
+                    raise HTTPException(
+                        status.HTTP_503_SERVICE_UNAVAILABLE,
+                        "Remote capture cancellation failed",
+                    ) from None
+                if cancellation is not None and cancellation.execution_id is not None:
+                    return analysis, True
 
-        if run is not None:
-            try:
-                await self.gateway.cancel(run)
-            except Exception as error:
-                async with self.lock:
-                    if (
-                        analysis.state in _ACTIVE_ANALYSIS_STATES
-                        and analysis.cancel_requested_at == requested_at
-                    ):
-                        analysis.cancel_requested_at = None
-                        analysis.version += 1
-                await self._persist(analysis)
-                raise HTTPException(
-                    status.HTTP_502_BAD_GATEWAY,
-                    "SmartPerfetto cancellation failed",
-                ) from error
+            if analysis.source_binding is not None:
+                try:
+                    await self.source_tasks.request_cancel(
+                        team_id=analysis.team_id,
+                        analysis_id=analysis.analysis_id,
+                    )
+                except SourceTaskError:
+                    pass
 
-        if task is not None and task is not asyncio.current_task() and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            if run is not None:
+                try:
+                    await self.gateway.cancel(run)
+                except Exception as error:
+                    async with self.lock:
+                        if (
+                            analysis.state in _ACTIVE_ANALYSIS_STATES
+                            and analysis.cancel_requested_at == requested_at
+                        ):
+                            analysis.cancel_requested_at = None
+                            analysis.version += 1
+                    await self._persist(analysis)
+                    raise HTTPException(
+                        status.HTTP_502_BAD_GATEWAY,
+                        "SmartPerfetto cancellation failed",
+                    ) from error
 
-        async with self.lock:
-            if analysis.state in _TERMINAL_ANALYSIS_STATES:
-                return analysis, False
-            analysis.state = "canceled"
-            analysis.failure = None
-            for stage_name, stage_state in analysis.stages.items():
-                if stage_state not in {"completed", "failed", "not_requested"}:
-                    analysis.stages[stage_name] = "canceled"
-            analysis.version += 1
-        await self._persist(analysis)
-        return analysis, True
+            if task is not None and task is not asyncio.current_task() and not task.done():
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+
+            async with self.lock:
+                if analysis.state in _TERMINAL_ANALYSIS_STATES:
+                    return analysis, False
+                analysis.state = "canceled"
+                analysis.failure = None
+                for stage_name, stage_state in analysis.stages.items():
+                    if stage_state not in {"completed", "failed", "not_requested"}:
+                        analysis.stages[stage_name] = "canceled"
+                analysis.version += 1
+            await self._persist(analysis)
+            return analysis, True
+        finally:
+            if publication_lock is not None:
+                publication_lock.release()
 
     async def reserve(
         self,
@@ -3278,6 +3344,8 @@ class _LocalRuntime:
                 False,
             ) from None
 
+        await self._reject_canceled_remote_publication(analysis)
+
         artifact_id = uuid5(
             _LOCAL_APPLICATION_NAMESPACE,
             f"apk\0{analysis.team_id}\0{analysis.analysis_id}\0{upload.upload_id}",
@@ -3411,6 +3479,7 @@ class _LocalRuntime:
         artifact = definition.input_artifacts[0]
         registered = False
         try:
+            await self._reject_canceled_remote_publication(analysis)
             registered = self.agent_artifacts.register_input(
                 team_id=analysis.team_id,
                 analysis_id=analysis.analysis_id,
@@ -3421,6 +3490,11 @@ class _LocalRuntime:
                 sha256_b64=artifact.sha256_b64,
             )
             await self.agent_tasks.enqueue(definition)
+            await self._reject_canceled_remote_publication(
+                analysis,
+                definition=definition,
+                registered=registered,
+            )
         except BaseException:
             if registered:
                 self.agent_artifacts.unregister_input(
@@ -3430,13 +3504,28 @@ class _LocalRuntime:
                 )
             raise
         async with self.lock:
-            if analysis.remote_publication == "published":
+            canceled = (
+                analysis.cancel_requested_at is not None
+                or analysis.state in _TERMINAL_ANALYSIS_STATES
+            )
+            if canceled:
+                previous_state = analysis.state
+                previous_version = analysis.version
+            elif analysis.remote_publication == "published":
                 return
-            previous_state = analysis.state
-            previous_version = analysis.version
-            analysis.remote_publication = "published"
-            analysis.state = "queued"
-            analysis.version += 1
+            else:
+                previous_state = analysis.state
+                previous_version = analysis.version
+                analysis.remote_publication = "published"
+                analysis.state = "queued"
+                analysis.version += 1
+        if canceled:
+            await self._cancel_remote_publication(
+                analysis,
+                definition=definition,
+                registered=registered,
+            )
+            raise HTTPException(status.HTTP_409_CONFLICT, "analysis is canceled")
         try:
             await self._persist(analysis)
         except LocalAnalysisStoreDurabilityError:
@@ -3447,6 +3536,50 @@ class _LocalRuntime:
                 analysis.state = previous_state
                 analysis.version = previous_version
             raise
+        await self._reject_canceled_remote_publication(
+            analysis,
+            definition=definition,
+            registered=registered,
+        )
+
+    async def _reject_canceled_remote_publication(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        definition: AgentTaskDefinition | None = None,
+        registered: bool = False,
+    ) -> None:
+        async with self.lock:
+            canceled = (
+                analysis.cancel_requested_at is not None
+                or analysis.state in _TERMINAL_ANALYSIS_STATES
+            )
+        if not canceled:
+            return
+        if definition is not None:
+            await self._cancel_remote_publication(
+                analysis,
+                definition=definition,
+                registered=registered,
+            )
+        raise HTTPException(status.HTTP_409_CONFLICT, "analysis is canceled")
+
+    async def _cancel_remote_publication(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        definition: AgentTaskDefinition,
+        registered: bool,
+    ) -> None:
+        await self.agent_tasks.request_cancel(
+            team_id=analysis.team_id,
+            analysis_id=analysis.analysis_id,
+        )
+        self.agent_artifacts.unregister_input(
+            team_id=analysis.team_id,
+            analysis_id=analysis.analysis_id,
+            artifact_id=definition.input_artifacts[0].artifact_id,
+        )
 
     async def _execute(self, analysis: _LocalAnalysis) -> None:
         generation = analysis.generation
