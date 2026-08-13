@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
 import os
+import subprocess
+import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -94,6 +97,61 @@ def _completed_path(tmp_path: Path, artifact_id: UUID, kind: str = "startup_trac
         / "agent-artifacts"
         / "completed"
         / f"{kind}-{artifact_id}.bin"
+    )
+
+
+def _state_path(tmp_path: Path) -> Path:
+    return (
+        tmp_path
+        / "teams"
+        / str(TEAM_ID)
+        / "analyses"
+        / str(ANALYSIS_ID)
+        / "agent-artifacts"
+        / "state.json"
+    )
+
+
+async def _pending_upload(tmp_path: Path) -> tuple[LocalAgentArtifactService, str]:
+    service = _service(tmp_path)
+    slot = await service.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=1,
+        sha256_b64=_checksum(b"x"),
+    )
+    part = await service.authorize_part(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=slot.upload_id,
+        part_number=1,
+    )
+    return service, urlsplit(part.url).path.rsplit("/", 1)[-1]
+
+
+async def _persisted_part(tmp_path: Path) -> dict[str, object]:
+    service, token = await _pending_upload(tmp_path)
+    await service.put_part(token, (b"x",))
+    service.close()
+    return json.loads(_state_path(tmp_path).read_text())
+
+
+def _write_state(tmp_path: Path, document: dict[str, object]) -> None:
+    _state_path(tmp_path).write_text(
+        json.dumps(document, separators=(",", ":"), sort_keys=True)
+    )
+
+
+def _reopen(tmp_path: Path) -> LocalAgentArtifactService:
+    return LocalAgentArtifactService(
+        root=tmp_path,
+        public_origin="http://testserver",
+        execution_authorizer=FixedExecutionAuthorizer(),
+        clock=lambda: NOW,
     )
 
 
@@ -220,6 +278,83 @@ async def test_wrong_lease_is_rejected_before_upload_filesystem_write(tmp_path: 
         )
 
     assert not any((tmp_path / "teams").iterdir())
+
+
+@pytest.mark.asyncio
+async def test_part_put_revalidates_lease_before_creating_bytes(tmp_path: Path) -> None:
+    authorizer = FixedExecutionAuthorizer()
+    service = LocalAgentArtifactService(
+        root=tmp_path,
+        public_origin="http://testserver",
+        execution_authorizer=authorizer,
+        clock=lambda: NOW,
+        uuid_source=iter((ARTIFACT_ID, UPLOAD_ID)).__next__,
+        token_source=lambda: "revocable-part-grant",
+    )
+    slot = await service.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=1,
+        sha256_b64=_checksum(b"x"),
+    )
+    part = await service.authorize_part(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=slot.upload_id,
+        part_number=1,
+    )
+    authorizer.active = False
+
+    with pytest.raises(AgentUploadNotFound, match="execution was not found"):
+        await service.put_part(urlsplit(part.url).path.rsplit("/", 1)[-1], (b"x",))
+
+    part_dir = _state_path(tmp_path).parent / "parts" / str(slot.upload_id)
+    assert list(part_dir.iterdir()) == []
+
+
+@pytest.mark.asyncio
+async def test_part_put_revalidates_lease_before_atomic_publish(tmp_path: Path) -> None:
+    authorizer = FixedExecutionAuthorizer()
+    service = LocalAgentArtifactService(
+        root=tmp_path,
+        public_origin="http://testserver",
+        execution_authorizer=authorizer,
+        clock=lambda: NOW,
+        uuid_source=iter((ARTIFACT_ID, UPLOAD_ID)).__next__,
+        token_source=lambda: "streaming-part-grant",
+    )
+    slot = await service.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=1,
+        sha256_b64=_checksum(b"x"),
+    )
+    part = await service.authorize_part(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=slot.upload_id,
+        part_number=1,
+    )
+
+    async def revoke_during_stream():
+        yield b"x"
+        authorizer.active = False
+
+    with pytest.raises(AgentUploadNotFound, match="execution was not found"):
+        await service.put_part(
+            urlsplit(part.url).path.rsplit("/", 1)[-1], revoke_during_stream()
+        )
+
+    part_dir = _state_path(tmp_path).parent / "parts" / str(slot.upload_id)
+    assert list(part_dir.iterdir()) == []
 
 
 @pytest.mark.asyncio
@@ -446,3 +581,238 @@ async def test_restart_resumes_parts_and_abort_only_removes_incomplete(tmp_path:
 
     assert resumed.upload_id == first.upload_id
     assert _completed_path(tmp_path, completed.artifact_id).read_bytes() == b"x"
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_oversized_state_without_unbounded_read(tmp_path: Path) -> None:
+    await _persisted_part(tmp_path)
+    _state_path(tmp_path).write_bytes(b" " * (1024 * 1024 + 1))
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_uuid_named_directory_symlink_without_reading_outside(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "teams"
+    root.mkdir(mode=0o700)
+    outside = tmp_path / "outside" / "team"
+    state = outside / "analyses" / str(ANALYSIS_ID) / "agent-artifacts" / "state.json"
+    state.parent.mkdir(mode=0o700, parents=True)
+    state.write_text('{"schema_version":"1.0","inputs":[],"uploads":[]}')
+    (root / str(TEAM_ID)).symlink_to(outside, target_is_directory=True)
+    outside_read = False
+    original = Path.read_bytes
+
+    def guarded_read(path: Path) -> bytes:
+        nonlocal outside_read
+        if path == state:
+            outside_read = True
+        return original(path)
+
+    monkeypatch.setattr(Path, "read_bytes", guarded_read)
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+    assert outside_read is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(("entry_level", "entry_kind"), (("analysis", "symlink"), ("analysis", "fifo"), ("upload", "fifo")))
+async def test_recovery_rejects_uuid_named_non_directory_entries(
+    tmp_path: Path, entry_level: str, entry_kind: str
+) -> None:
+    if entry_level == "upload":
+        await _persisted_part(tmp_path)
+        target = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
+        (target / "1.part").unlink()
+        target.rmdir()
+    else:
+        analyses = tmp_path / "teams" / str(TEAM_ID) / "analyses"
+        analyses.mkdir(mode=0o700, parents=True)
+        target = analyses / str(ANALYSIS_ID)
+    if entry_kind == "symlink":
+        outside = tmp_path / "outside-analysis"
+        outside.mkdir(mode=0o700)
+        target.symlink_to(outside, target_is_directory=True)
+    else:
+        os.mkfifo(target, 0o600)
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_recovery_rejects_upload_symlink_and_missing_part(tmp_path: Path) -> None:
+    document = await _persisted_part(tmp_path)
+    upload_dir = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID)
+    outside = tmp_path / "outside-parts"
+    outside.mkdir(mode=0o700)
+    (outside / "1.part").write_bytes(b"x")
+    (upload_dir / "1.part").unlink()
+    upload_dir.rmdir()
+    upload_dir.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+    upload_dir.unlink()
+    upload_dir.mkdir(mode=0o700)
+    _write_state(tmp_path, document)
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fifo_target", ("state", "part"))
+async def test_recovery_rejects_fifo_files_promptly(
+    tmp_path: Path, fifo_target: str
+) -> None:
+    await _persisted_part(tmp_path)
+    target = (
+        _state_path(tmp_path)
+        if fifo_target == "state"
+        else _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID) / "1.part"
+    )
+    target.unlink()
+    os.mkfifo(target, 0o600)
+    script = """
+from pathlib import Path
+import sys
+from perfpilot_api.local_agent_artifacts import LocalAgentArtifactService
+from perfpilot_api.services.agent_uploads import AgentUploadUnavailable
+
+try:
+    LocalAgentArtifactService(
+        root=Path(sys.argv[1]),
+        public_origin="http://testserver",
+        execution_authorizer=object(),
+    )
+except AgentUploadUnavailable as error:
+    assert str(error) == "local artifact storage is unavailable"
+    raise SystemExit(0)
+raise SystemExit(2)
+"""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path)],
+            capture_output=True,
+            check=False,
+            text=True,
+            timeout=2,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("recovery blocked while opening a FIFO")
+
+    assert result.returncode == 0, result.stderr
+    assert str(tmp_path) not in result.stdout + result.stderr
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("size", 512 * 1024 * 1024 + 1),
+        ("part_count", 33),
+        ("agent_id", "71000000-0000-4000-8000-00000000000A"),
+        ("mime", "Invalid Mime"),
+        ("lease_version", 0),
+        ("expires_at", "2026-08-13T08:59:59+00:00"),
+        ("expires_at", "2026-08-13T09:05:00"),
+        ("parts", [{"part_number": 1, "etag": "bad\nvalue"}]),
+    ),
+)
+async def test_recovery_rejects_invalid_persisted_upload_fields(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    document = await _persisted_part(tmp_path)
+    upload = document["uploads"][0]
+    upload[field] = value
+    if field == "size":
+        upload["part_count"] = 9
+    _write_state(tmp_path, document)
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("replacement", (b"y", b"xx"))
+async def test_recovery_rejects_part_digest_or_size_mismatch(
+    tmp_path: Path, replacement: bytes
+) -> None:
+    await _persisted_part(tmp_path)
+    part = _state_path(tmp_path).parent / "parts" / str(UPLOAD_ID) / "1.part"
+    part.write_bytes(replacement)
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ("missing", "tampered"))
+async def test_recovery_rejects_missing_or_tampered_finalized_file(
+    tmp_path: Path, mode: str
+) -> None:
+    service, token = await _pending_upload(tmp_path)
+    etag = await service.put_part(token, (b"x",))
+    await service.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=UPLOAD_ID,
+        parts=(MultipartPart(part_number=1, etag=etag),),
+    )
+    service.close()
+    completed = _completed_path(tmp_path, ARTIFACT_ID)
+    if mode == "missing":
+        completed.unlink()
+    else:
+        completed.write_bytes(b"y")
+
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ):
+        _reopen(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_valid_finalized_artifact_reopens_idempotently(tmp_path: Path) -> None:
+    service, token = await _pending_upload(tmp_path)
+    etag = await service.put_part(token, (b"x",))
+    receipt = (MultipartPart(part_number=1, etag=etag),)
+    await service.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=UPLOAD_ID,
+        parts=receipt,
+    )
+    service.close()
+
+    reopened = _reopen(tmp_path)
+    completed = await reopened.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=UPLOAD_ID,
+        parts=receipt,
+    )
+
+    assert completed.state == "finalized"

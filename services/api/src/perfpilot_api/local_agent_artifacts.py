@@ -29,6 +29,7 @@ from perfpilot_api.services.agent_tasks import (
 )
 from perfpilot_api.services.agent_uploads import (
     AgentInputSlot,
+    AgentUploadError,
     AgentUploadExpired,
     AgentUploadInvalidRequest,
     AgentUploadMismatch,
@@ -44,12 +45,15 @@ from perfpilot_api.storage.base import MultipartPart
 _MAX_BYTES = 512 * 1024 * 1024
 _PART_BYTES = 64 * 1024 * 1024
 _MAX_PARTS = 32
+_MAX_STATE_BYTES = 1024 * 1024
 _MIME = re.compile(
     r"[a-z0-9][a-z0-9!#$&^_.+-]{0,126}/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\Z"
 )
 _ALLOWED_KINDS = frozenset({"startup_trace", "scroll_trace", "agent_log"})
+_ETAG = re.compile(r'"[0-9a-f]{64}"\Z')
 _NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
 _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
+_NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,6 +187,15 @@ class LocalAgentArtifactService:
         return value
 
     @staticmethod
+    def _document_uuid(value: object) -> UUID:
+        if not isinstance(value, str):
+            raise ValueError
+        parsed = UUID(value)
+        if str(parsed) != value or parsed.version not in range(1, 6):
+            raise ValueError
+        return parsed
+
+    @staticmethod
     def _open_directory(parent_fd: int, name: str, *, create: bool) -> int:
         if create:
             try:
@@ -238,6 +251,49 @@ class LocalAgentArtifactService:
             raise AgentUploadInvalidRequest("artifact request is invalid")
         return value
 
+    @classmethod
+    def _artifact_metadata(
+        cls, *, mime: object, size: object, sha256_b64: object
+    ) -> tuple[str, int, str]:
+        if (
+            not isinstance(mime, str)
+            or _MIME.fullmatch(mime) is None
+            or isinstance(size, bool)
+            or not isinstance(size, int)
+            or not 1 <= size <= _MAX_BYTES
+            or not isinstance(sha256_b64, str)
+        ):
+            raise AgentUploadInvalidRequest("artifact request is invalid")
+        return mime, size, cls._canonical_checksum(sha256_b64)
+
+    @classmethod
+    def _upload_metadata(
+        cls,
+        *,
+        artifact_kind: object,
+        mime: object,
+        size: object,
+        sha256_b64: object,
+    ) -> tuple[str, str, int, str, int]:
+        if not isinstance(artifact_kind, str) or artifact_kind not in _ALLOWED_KINDS:
+            raise AgentUploadInvalidRequest("upload request is invalid")
+        valid_mime, valid_size, checksum = cls._artifact_metadata(
+            mime=mime, size=size, sha256_b64=sha256_b64
+        )
+        part_count = math.ceil(valid_size / _PART_BYTES)
+        if not 1 <= part_count <= _MAX_PARTS:
+            raise AgentUploadInvalidRequest("upload request is invalid")
+        return artifact_kind, valid_mime, valid_size, checksum, part_count
+
+    @staticmethod
+    def _aware_document_time(value: object) -> datetime:
+        if not isinstance(value, str):
+            raise ValueError
+        parsed = datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            raise ValueError
+        return parsed.astimezone(UTC)
+
     @staticmethod
     def _file_metadata(directory_fd: int, name: str) -> os.stat_result:
         metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
@@ -278,18 +334,15 @@ class LocalAgentArtifactService:
             (upload_id, "upload_id"),
         ):
             self._uuid(value, name)
-        if (
-            _MIME.fullmatch(mime) is None
-            or isinstance(size, bool)
-            or not isinstance(size, int)
-            or not 1 <= size <= _MAX_BYTES
-        ):
+        valid_mime, valid_size, checksum = self._artifact_metadata(
+            mime=mime, size=size, sha256_b64=sha256_b64
+        )
+        if valid_mime != "application/vnd.android.package-archive":
             raise AgentUploadInvalidRequest("artifact request is invalid")
-        checksum = self._canonical_checksum(sha256_b64)
         directory = self._subdir_fd(team_id, analysis_id, "uploads", create=False)
         try:
             metadata = self._file_metadata(directory, f"{upload_id}.bin")
-            if metadata.st_size != size:
+            if metadata.st_size != valid_size:
                 raise AgentUploadMismatch("input artifact metadata does not match")
             observed = hashlib.sha256()
             descriptor = os.open(
@@ -314,7 +367,15 @@ class LocalAgentArtifactService:
         finally:
             os.close(directory)
         existing = self._inputs.get(artifact_id)
-        item = _Input(team_id, analysis_id, artifact_id, upload_id, mime, size, checksum)
+        item = _Input(
+            team_id,
+            analysis_id,
+            artifact_id,
+            upload_id,
+            valid_mime,
+            valid_size,
+            checksum,
+        )
         if existing is not None and existing != item:
             raise AgentUploadMismatch("input artifact metadata does not match")
         self._inputs[artifact_id] = item
@@ -475,15 +536,12 @@ class LocalAgentArtifactService:
         size: int,
         sha256_b64: str,
     ) -> AgentUploadSlot:
-        if (
-            artifact_kind not in _ALLOWED_KINDS
-            or _MIME.fullmatch(mime) is None
-            or isinstance(size, bool)
-            or not isinstance(size, int)
-            or not 1 <= size <= _MAX_BYTES
-        ):
-            raise AgentUploadInvalidRequest("upload request is invalid")
-        checksum = self._canonical_checksum(sha256_b64)
+        valid_kind, valid_mime, valid_size, checksum, part_count = self._upload_metadata(
+            artifact_kind=artifact_kind,
+            mime=mime,
+            size=size,
+            sha256_b64=sha256_b64,
+        )
         now = self._now()
         access = await self._authorize(
             agent_id=agent_id,
@@ -491,7 +549,7 @@ class LocalAgentArtifactService:
             lease_version=lease_version,
             now=now,
         )
-        if artifact_kind not in access.allowed_uploads:
+        if valid_kind not in access.allowed_uploads:
             raise AgentUploadInvalidRequest("artifact kind is not allowed by this task")
         async with self._lock:
             existing = next(
@@ -499,7 +557,7 @@ class LocalAgentArtifactService:
                     item
                     for item in self._uploads.values()
                     if item.execution_id == execution_id
-                    and item.artifact_kind == artifact_kind
+                    and item.artifact_kind == valid_kind
                 ),
                 None,
             )
@@ -509,8 +567,8 @@ class LocalAgentArtifactService:
                     or existing.analysis_id != access.analysis_id
                     or existing.agent_id != agent_id
                     or existing.lease_version != lease_version
-                    or existing.mime != mime
-                    or existing.size != size
+                    or existing.mime != valid_mime
+                    or existing.size != valid_size
                     or not hmac.compare_digest(existing.sha256_b64, checksum)
                 ):
                     raise AgentUploadInvalidRequest(
@@ -521,9 +579,6 @@ class LocalAgentArtifactService:
             upload_id = self._uuid_source()
             self._uuid(artifact_id, "artifact_id")
             self._uuid(upload_id, "upload_id")
-            part_count = math.ceil(size / _PART_BYTES)
-            if part_count > _MAX_PARTS:
-                raise AgentUploadInvalidRequest("upload request is invalid")
             expires_at = min(now + timedelta(minutes=15), access.lease_expires_at)
             upload = _Upload(
                 access.team_id,
@@ -533,9 +588,9 @@ class LocalAgentArtifactService:
                 lease_version,
                 artifact_id,
                 upload_id,
-                artifact_kind,
-                mime,
-                size,
+                valid_kind,
+                valid_mime,
+                valid_size,
                 checksum,
                 part_count,
                 expires_at,
@@ -614,6 +669,12 @@ class LocalAgentArtifactService:
 
     async def put_part(self, token: str, chunks: AsyncIterable[bytes] | Iterable[bytes]) -> str:
         grant = self._load_grant(token, "part")
+        access = await self._authorize(
+            agent_id=grant.agent_id,
+            execution_id=grant.execution_id,
+            lease_version=grant.lease_version,
+            now=self._now(),
+        )
         upload = self._uploads.get(grant.upload_id)
         if (
             upload is None
@@ -623,6 +684,8 @@ class LocalAgentArtifactService:
             or upload.execution_id != grant.execution_id
             or upload.lease_version != grant.lease_version
             or grant.part_number is None
+            or access.team_id != grant.team_id
+            or access.analysis_id != grant.analysis_id
         ):
             raise AgentUploadNotFound("upload part was not found")
         expected = min(
@@ -658,6 +721,13 @@ class LocalAgentArtifactService:
                 if size != expected:
                     raise AgentUploadMismatch("upload part size does not match")
                 etag = f'"{digest.hexdigest()}"'
+                publish_access = await self._authorize(
+                    agent_id=grant.agent_id,
+                    execution_id=grant.execution_id,
+                    lease_version=grant.lease_version,
+                    now=self._now(),
+                )
+                self._owned_upload(publish_access, upload.upload_id)
                 name = f"{grant.part_number}.part"
                 try:
                     existing = self._file_metadata(directory, name)
@@ -681,7 +751,7 @@ class LocalAgentArtifactService:
                 upload.parts[grant.part_number] = etag
                 self._save_state(upload.team_id, upload.analysis_id)
                 return etag
-            except (AgentUploadMismatch, AgentUploadNotFound):
+            except AgentUploadError:
                 try:
                     os.unlink(temporary, dir_fd=directory)
                 except FileNotFoundError:
@@ -969,63 +1039,366 @@ class LocalAgentArtifactService:
             ),
         }
 
-    def _recover(self) -> None:
-        # State is analysis-private. A malformed or path-shaped entry rejects startup.
-        root = Path(self._root)
-        for state in root.glob("*/analyses/*/agent-artifacts/state.json"):
-            if state.is_symlink() or not state.is_file():
+    @staticmethod
+    def _directory_entries(directory_fd: int) -> tuple[str, ...]:
+        entries = os.listdir(directory_fd)
+        if any(not isinstance(name, str) or name in {".", ".."} for name in entries):
+            raise OSError
+        return tuple(sorted(entries))
+
+    @staticmethod
+    def _read_bounded_regular(directory_fd: int, name: str, limit: int) -> bytes:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _NOFOLLOW | _CLOEXEC | _NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or not 0 < metadata.st_size <= limit:
                 raise OSError
-            team_id = UUID(state.parents[3].name)
-            analysis_id = UUID(state.parents[1].name)
-            if str(team_id) != state.parents[3].name or str(analysis_id) != state.parents[1].name:
-                raise ValueError
-            document = json.loads(state.read_bytes())
-            if not isinstance(document, Mapping) or document.get("schema_version") != "1.0":
-                raise ValueError
-            for raw in document.get("inputs", []):
-                item = _Input(
-                    UUID(raw["team_id"]),
-                    UUID(raw["analysis_id"]),
-                    UUID(raw["artifact_id"]),
-                    UUID(raw["upload_id"]),
-                    raw["mime"],
-                    raw["size"],
-                    self._canonical_checksum(raw["sha256_b64"]),
-                )
-                if item.team_id != team_id or item.analysis_id != analysis_id:
+            payload = b""
+            while len(payload) <= limit:
+                chunk = os.read(descriptor, min(64 * 1024, limit + 1 - len(payload)))
+                if not chunk:
+                    break
+                payload += chunk
+            if not payload or len(payload) > limit:
+                raise OSError
+            return payload
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _parse_state(payload: bytes) -> Mapping[str, object]:
+        def reject_constant(_value: str) -> object:
+            raise ValueError
+
+        def unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+            result: dict[str, object] = {}
+            for key, value in pairs:
+                if key in result:
                     raise ValueError
-                self._inputs[item.artifact_id] = item
-            for raw in document.get("uploads", []):
-                item = _Upload(
-                    UUID(raw["team_id"]),
-                    UUID(raw["analysis_id"]),
-                    UUID(raw["agent_id"]),
-                    UUID(raw["execution_id"]),
-                    raw["lease_version"],
-                    UUID(raw["artifact_id"]),
-                    UUID(raw["upload_id"]),
-                    raw["artifact_kind"],
-                    raw["mime"],
-                    raw["size"],
-                    self._canonical_checksum(raw["sha256_b64"]),
-                    raw["part_count"],
-                    datetime.fromisoformat(raw["expires_at"]),
-                    {part["part_number"]: part["etag"] for part in raw["parts"]},
-                    (
-                        None
-                        if raw["finalized_at"] is None
-                        else datetime.fromisoformat(raw["finalized_at"])
-                    ),
-                )
-                if (
-                    item.team_id != team_id
-                    or item.analysis_id != analysis_id
-                    or item.artifact_kind not in _ALLOWED_KINDS
-                    or item.part_count != math.ceil(item.size / _PART_BYTES)
-                ):
+                result[key] = value
+            return result
+
+        document = json.loads(
+            payload,
+            parse_constant=reject_constant,
+            object_pairs_hook=unique_object,
+        )
+        if (
+            not isinstance(document, Mapping)
+            or set(document) != {"schema_version", "inputs", "uploads"}
+            or document.get("schema_version") != "1.0"
+            or not isinstance(document.get("inputs"), list)
+            or not isinstance(document.get("uploads"), list)
+        ):
+            raise ValueError
+        return document
+
+    def _recover_input(
+        self,
+        raw: object,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        analysis_fd: int,
+    ) -> _Input:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "team_id",
+            "analysis_id",
+            "artifact_id",
+            "upload_id",
+            "mime",
+            "size",
+            "sha256_b64",
+        }:
+            raise ValueError
+        item_team = self._document_uuid(raw["team_id"])
+        item_analysis = self._document_uuid(raw["analysis_id"])
+        artifact_id = self._document_uuid(raw["artifact_id"])
+        upload_id = self._document_uuid(raw["upload_id"])
+        mime, size, checksum = self._artifact_metadata(
+            mime=raw["mime"], size=raw["size"], sha256_b64=raw["sha256_b64"]
+        )
+        if (
+            item_team != team_id
+            or item_analysis != analysis_id
+            or mime != "application/vnd.android.package-archive"
+        ):
+            raise ValueError
+        uploads_fd = self._open_directory(analysis_fd, "uploads", create=False)
+        try:
+            self._verify_file(
+                uploads_fd,
+                f"{upload_id}.bin",
+                expected_size=size,
+                expected_sha256_b64=checksum,
+            )
+        finally:
+            os.close(uploads_fd)
+        return _Input(
+            item_team,
+            item_analysis,
+            artifact_id,
+            upload_id,
+            mime,
+            size,
+            checksum,
+        )
+
+    def _recover_upload(
+        self,
+        raw: object,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+        artifacts_fd: int,
+    ) -> _Upload:
+        if not isinstance(raw, Mapping) or set(raw) != {
+            "team_id",
+            "analysis_id",
+            "agent_id",
+            "execution_id",
+            "lease_version",
+            "artifact_id",
+            "upload_id",
+            "artifact_kind",
+            "mime",
+            "size",
+            "sha256_b64",
+            "part_count",
+            "expires_at",
+            "parts",
+            "finalized_at",
+        }:
+            raise ValueError
+        item_team = self._document_uuid(raw["team_id"])
+        item_analysis = self._document_uuid(raw["analysis_id"])
+        agent_id = self._document_uuid(raw["agent_id"])
+        execution_id = self._document_uuid(raw["execution_id"])
+        artifact_id = self._document_uuid(raw["artifact_id"])
+        upload_id = self._document_uuid(raw["upload_id"])
+        kind, mime, size, checksum, expected_count = self._upload_metadata(
+            artifact_kind=raw["artifact_kind"],
+            mime=raw["mime"],
+            size=raw["size"],
+            sha256_b64=raw["sha256_b64"],
+        )
+        lease_version = raw["lease_version"]
+        part_count = raw["part_count"]
+        expires_at = self._aware_document_time(raw["expires_at"])
+        if (
+            item_team != team_id
+            or item_analysis != analysis_id
+            or isinstance(lease_version, bool)
+            or not isinstance(lease_version, int)
+            or lease_version < 1
+            or isinstance(part_count, bool)
+            or not isinstance(part_count, int)
+            or part_count != expected_count
+            or not 1 <= part_count <= _MAX_PARTS
+            or expires_at <= self._now()
+        ):
+            raise ValueError
+        finalized_raw = raw["finalized_at"]
+        finalized_at = (
+            None
+            if finalized_raw is None
+            else self._aware_document_time(finalized_raw)
+        )
+        if finalized_at is not None and finalized_at > self._now():
+            raise ValueError
+        parts_raw = raw["parts"]
+        if not isinstance(parts_raw, list) or len(parts_raw) > part_count:
+            raise ValueError
+        parts: dict[int, str] = {}
+        for number, part in enumerate(parts_raw, start=1):
+            if (
+                not isinstance(part, Mapping)
+                or set(part) != {"part_number", "etag"}
+                or part.get("part_number") != number
+                or not isinstance(part.get("etag"), str)
+                or _ETAG.fullmatch(part["etag"]) is None
+            ):
+                raise ValueError
+            parts[number] = part["etag"]
+        upload = _Upload(
+            item_team,
+            item_analysis,
+            agent_id,
+            execution_id,
+            lease_version,
+            artifact_id,
+            upload_id,
+            kind,
+            mime,
+            size,
+            checksum,
+            part_count,
+            expires_at,
+            parts,
+            finalized_at,
+        )
+        parts_fd = self._open_directory(artifacts_fd, "parts", create=False)
+        try:
+            upload_fd = self._open_directory(parts_fd, str(upload_id), create=False)
+            try:
+                actual_entries = self._directory_entries(upload_fd)
+                expected_entries = tuple(f"{number}.part" for number in parts)
+                if actual_entries != expected_entries:
                     raise ValueError
-                self._uploads[item.upload_id] = item
-                self._artifacts[item.artifact_id] = item
+                for number, etag in parts.items():
+                    self._verify_file(
+                        upload_fd,
+                        f"{number}.part",
+                        expected_size=min(
+                            _PART_BYTES, size - (number - 1) * _PART_BYTES
+                        ),
+                        expected_hex_digest=etag[1:-1],
+                    )
+            finally:
+                os.close(upload_fd)
+        finally:
+            os.close(parts_fd)
+        completed_fd = self._open_directory(artifacts_fd, "completed", create=False)
+        try:
+            completed_name = f"{kind}-{artifact_id}.bin"
+            if finalized_at is None:
+                try:
+                    os.stat(completed_name, dir_fd=completed_fd, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    raise ValueError
+            else:
+                self._verify_file(
+                    completed_fd,
+                    completed_name,
+                    expected_size=size,
+                    expected_sha256_b64=checksum,
+                )
+        finally:
+            os.close(completed_fd)
+        return upload
+
+    @staticmethod
+    def _verify_file(
+        directory_fd: int,
+        name: str,
+        *,
+        expected_size: int,
+        expected_sha256_b64: str | None = None,
+        expected_hex_digest: str | None = None,
+    ) -> None:
+        descriptor = os.open(
+            name,
+            os.O_RDONLY | _NOFOLLOW | _CLOEXEC | _NONBLOCK,
+            dir_fd=directory_fd,
+        )
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size != expected_size:
+                raise OSError
+            digest = hashlib.sha256()
+            size = 0
+            while chunk := os.read(descriptor, 1024 * 1024):
+                size += len(chunk)
+                if size > expected_size:
+                    raise OSError
+                digest.update(chunk)
+            if size != expected_size:
+                raise OSError
+            if expected_sha256_b64 is not None and not hmac.compare_digest(
+                base64.b64encode(digest.digest()).decode("ascii"), expected_sha256_b64
+            ):
+                raise OSError
+            if expected_hex_digest is not None and not hmac.compare_digest(
+                digest.hexdigest(), expected_hex_digest
+            ):
+                raise OSError
+        finally:
+            os.close(descriptor)
+
+    def _recover(self) -> None:
+        self._verify_root()
+        recovered_inputs: dict[UUID, _Input] = {}
+        recovered_uploads: dict[UUID, _Upload] = {}
+        recovered_artifacts: dict[UUID, _Upload] = {}
+        for team_name in self._directory_entries(self._root_fd):
+            team_id = self._document_uuid(team_name)
+            team_fd = self._open_directory(self._root_fd, team_name, create=False)
+            try:
+                if self._directory_entries(team_fd) != ("analyses",):
+                    raise ValueError
+                analyses_fd = self._open_directory(team_fd, "analyses", create=False)
+                try:
+                    for analysis_name in self._directory_entries(analyses_fd):
+                        analysis_id = self._document_uuid(analysis_name)
+                        analysis_fd = self._open_directory(
+                            analyses_fd, analysis_name, create=False
+                        )
+                        try:
+                            entries = self._directory_entries(analysis_fd)
+                            if "agent-artifacts" not in entries:
+                                continue
+                            artifacts_fd = self._open_directory(
+                                analysis_fd, "agent-artifacts", create=False
+                            )
+                            try:
+                                artifact_entries = self._directory_entries(artifacts_fd)
+                                if (
+                                    "state.json" not in artifact_entries
+                                    or not set(artifact_entries).issubset(
+                                        {"completed", "parts", "state.json"}
+                                    )
+                                ):
+                                    raise ValueError
+                                payload = self._read_bounded_regular(
+                                    artifacts_fd, "state.json", _MAX_STATE_BYTES
+                                )
+                                document = self._parse_state(payload)
+                                if document["uploads"] and not {
+                                    "completed",
+                                    "parts",
+                                }.issubset(artifact_entries):
+                                    raise ValueError
+                                for raw in document["inputs"]:
+                                    item = self._recover_input(
+                                        raw,
+                                        team_id=team_id,
+                                        analysis_id=analysis_id,
+                                        analysis_fd=analysis_fd,
+                                    )
+                                    if item.artifact_id in recovered_inputs:
+                                        raise ValueError
+                                    recovered_inputs[item.artifact_id] = item
+                                for raw in document["uploads"]:
+                                    item = self._recover_upload(
+                                        raw,
+                                        team_id=team_id,
+                                        analysis_id=analysis_id,
+                                        artifacts_fd=artifacts_fd,
+                                    )
+                                    if (
+                                        item.upload_id in recovered_uploads
+                                        or item.artifact_id in recovered_artifacts
+                                    ):
+                                        raise ValueError
+                                    recovered_uploads[item.upload_id] = item
+                                    recovered_artifacts[item.artifact_id] = item
+                            finally:
+                                os.close(artifacts_fd)
+                        finally:
+                            os.close(analysis_fd)
+                finally:
+                    os.close(analyses_fd)
+            finally:
+                os.close(team_fd)
+        self._inputs.update(recovered_inputs)
+        self._uploads.update(recovered_uploads)
+        self._artifacts.update(recovered_artifacts)
 
     async def validate_completion(
         self,
