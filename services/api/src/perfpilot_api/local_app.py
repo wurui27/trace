@@ -3651,6 +3651,18 @@ class _LocalRuntime:
                     }
 
             def render_scenario(scenario_type: str) -> dict[str, object]:
+                if scenario_type == "memory_cycle" and analysis.source_binding is not None:
+                    return {
+                        "scenario_job_id": None,
+                        "scenario_type": "memory_cycle",
+                        "state": "not_requested",
+                        "version": None,
+                        "device_group_id": None,
+                        "sample_verdict_counts": dict(verdicts),
+                        "started_at": None,
+                        "completed_at": None,
+                        "failure": None,
+                    }
                 report_type = "startup" if scenario_type == "cold_start" else scenario_type
                 reported = report_scenarios.get(report_type)
                 reported_state = (

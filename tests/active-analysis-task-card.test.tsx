@@ -98,7 +98,7 @@ function activeDeviceAnalysis(): AnalysisResponse {
       {
         scenario_job_id: null,
         scenario_type: "memory_cycle",
-        state: "queued",
+        state: "not_requested",
         version: null,
         device_group_id: null,
         sample_verdict_counts: {
@@ -174,7 +174,13 @@ describe("ActiveAnalysisTaskCard", () => {
     expect(screen.getByText("等待设备 Agent 接收任务")).toBeInTheDocument();
     expect(screen.getByText("冷启动采集")).toBeInTheDocument();
     expect(screen.getByText("滑动采集")).toBeInTheDocument();
-    expect(screen.getByText("内存循环采集")).toBeInTheDocument();
+    expect(screen.getByText("内存分析暂未执行")).toBeInTheDocument();
+    expect(screen.getByText("内存分析暂未执行").closest("li")).toHaveClass(
+      "is-not_requested",
+    );
+    expect(screen.getByText("内存分析暂未执行").closest("li")).not.toHaveClass(
+      "is-failed",
+    );
   });
 
   it("shows a truthful single-pass final-report label", () => {

@@ -506,7 +506,8 @@ export interface AnalysisScenario {
     | "analyzing"
     | "completed"
     | "failed"
-    | "canceled";
+    | "canceled"
+    | "not_requested";
   readonly version: number | null;
   readonly device_group_id: string | null;
   readonly sample_verdict_counts: SampleVerdictCounts;
@@ -2096,10 +2097,14 @@ function validUploadPayload(value: unknown): value is UploadPayload {
   );
 }
 
-function validAnalysisScenario(value: unknown, expectedType: string): value is AnalysisScenario {
-  return (
-    object(value) &&
-    exactKeys(value, [
+function validAnalysisScenario(
+  value: unknown,
+  expectedType: string,
+  allowNotRequested = false,
+): value is AnalysisScenario {
+  if (
+    !object(value) ||
+    !exactKeys(value, [
       "scenario_job_id",
       "scenario_type",
       "state",
@@ -2109,9 +2114,27 @@ function validAnalysisScenario(value: unknown, expectedType: string): value is A
       "started_at",
       "completed_at",
       "failure",
-    ]) &&
+    ]) ||
+    value.scenario_type !== expectedType
+  ) {
+    return false;
+  }
+  if (value.state === "not_requested") {
+    return (
+      allowNotRequested &&
+      value.scenario_job_id === null &&
+      value.version === null &&
+      value.device_group_id === null &&
+      validVerdictCounts(value.sample_verdict_counts) &&
+      Object.values(value.sample_verdict_counts).every((count) => count === 0) &&
+      value.started_at === null &&
+      value.completed_at === null &&
+      value.failure === null
+    );
+  }
+  return (
+    object(value) &&
     (value.scenario_job_id === null || typeof value.scenario_job_id === "string") &&
-    value.scenario_type === expectedType &&
     [
       "awaiting_input",
       "queued",
@@ -2233,7 +2256,11 @@ function analysisResponse(value: unknown): AnalysisResponse {
       !Array.isArray(value.scenarios) ||
       value.scenarios.length !== scenarioTypes.length ||
       !value.scenarios.every((scenario, index) =>
-        validAnalysisScenario(scenario, scenarioTypes[index]),
+        validAnalysisScenario(
+          scenario,
+          scenarioTypes[index],
+          value.schema_version === "1.1" && scenarioTypes[index] === "memory_cycle",
+        ),
       ) ||
       !validVerdictCounts(value.sample_verdict_counts) ||
       (value.active_lease !== null && !validActiveLease(value.active_lease)) ||

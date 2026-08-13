@@ -142,6 +142,36 @@ def _pending_analysis_response(*, include_authorization: bool) -> dict[str, obje
     }
 
 
+def _remote_device_analysis_response() -> dict[str, object]:
+    payload = _pending_analysis_response(include_authorization=False)
+    payload["schema_version"] = "1.1"
+    payload["source_code_analysis"] = {
+        "requested": False,
+        "provider_kind": None,
+        "agent_id": None,
+        "workspace_id": None,
+        "snapshot_policy": None,
+        "validation_profile_id": None,
+        "context_state": "not_requested",
+        "match_summary": "none",
+        "verification_state": "not_requested",
+        "failure_code": None,
+    }
+    memory = payload["scenarios"][2]  # type: ignore[index]
+    memory.update(  # type: ignore[union-attr]
+        {
+            "state": "not_requested",
+            "scenario_job_id": None,
+            "version": None,
+            "device_group_id": None,
+            "started_at": None,
+            "completed_at": None,
+            "failure": None,
+        }
+    )
+    return payload
+
+
 def _memory_analysis_response(*, question: str | None = None) -> dict[str, object]:
     return {
         "schema_version": "1.0",
@@ -413,6 +443,32 @@ def test_pending_analysis_query_may_omit_but_not_split_upload_authorization() ->
         {**_pending_analysis_response(include_authorization=False), "apk_upload": None},
         {**_pending_analysis_response(include_authorization=False), "scenarios": []},
     ):
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(mutation)
+
+
+def test_only_device_1_1_memory_cycle_may_be_not_requested() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/analysis-response.schema.json", schemas)
+    payload = _remote_device_analysis_response()
+    validator.validate(payload)
+
+    for scenario in payload["scenarios"][:2]:  # type: ignore[index]
+        assert scenario["state"] == "awaiting_input"  # type: ignore[index]
+    memory = payload["scenarios"][2]  # type: ignore[index]
+    assert memory["state"] == "not_requested"  # type: ignore[index]
+    assert memory["sample_verdict_counts"]["total"] == 0  # type: ignore[index]
+    assert memory["failure"] is None  # type: ignore[index]
+
+    legacy = _pending_analysis_response(include_authorization=False)
+    legacy["scenarios"][2]["state"] = "not_requested"  # type: ignore[index]
+    wrong_active = _remote_device_analysis_response()
+    wrong_active["scenarios"][0]["state"] = "not_requested"  # type: ignore[index]
+    private_memory = _remote_device_analysis_response()
+    private_memory["scenarios"][2]["progress"] = 0  # type: ignore[index]
+    trace = _trace_analysis_response(input_state="pending")
+    trace["scenarios"] = [payload["scenarios"][2]]  # type: ignore[index]
+    for mutation in (legacy, wrong_active, private_memory, trace):
         with pytest.raises(jsonschema.ValidationError):
             validator.validate(mutation)
 

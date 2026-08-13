@@ -68,7 +68,12 @@
     "scenarios": {
       "type": "array",
       "maxItems": 3,
-      "items": {"$ref": "#/$defs/scenarioProgress"}
+      "items": {
+        "oneOf": [
+          {"$ref": "#/$defs/scenarioProgress"},
+          {"$ref": "#/$defs/notRequestedMemoryScenario"}
+        ]
+      }
     },
     "sample_verdict_counts": {"$ref": "#/$defs/verdictCounts"},
     "active_lease": {
@@ -171,6 +176,18 @@
       }
     },
     {
+      "if": {
+        "properties": {
+          "schema_version": {"const": "1.0"},
+          "analysis_mode": {"const": "device"}
+        },
+        "required": ["schema_version", "analysis_mode"]
+      },
+      "then": {
+        "properties": {"scenarios": {"$ref": "#/$defs/deviceScenarios"}}
+      }
+    },
+    {
       "oneOf": [
         {
           "properties": {
@@ -181,7 +198,7 @@
                 {"$ref": "#/$defs/finalizedApkUpload"}
               ]
             },
-            "scenarios": {"$ref": "#/$defs/deviceScenarios"}
+            "scenarios": {"$ref": "#/$defs/compatibleDeviceScenarios"}
           },
           "required": ["analysis_mode", "device_id"],
           "not": {
@@ -736,6 +753,59 @@
         }
       ],
       "items": false
+    },
+    "remoteDeviceScenarios": {
+      "type": "array",
+      "minItems": 3,
+      "maxItems": 3,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scenarioProgress"},
+            {"properties": {"scenario_type": {"const": "cold_start"}}}
+          ]
+        },
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scenarioProgress"},
+            {"properties": {"scenario_type": {"const": "scroll"}}}
+          ]
+        },
+        {"$ref": "#/$defs/notRequestedMemoryScenario"}
+      ],
+      "items": false
+    },
+    "compatibleDeviceScenarios": {
+      "oneOf": [
+        {"$ref": "#/$defs/deviceScenarios"},
+        {"$ref": "#/$defs/remoteDeviceScenarios"}
+      ]
+    },
+    "notRequestedMemoryScenario": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_job_id",
+        "scenario_type",
+        "state",
+        "version",
+        "device_group_id",
+        "sample_verdict_counts",
+        "started_at",
+        "completed_at",
+        "failure"
+      ],
+      "properties": {
+        "scenario_job_id": {"type": "null"},
+        "scenario_type": {"const": "memory_cycle"},
+        "state": {"const": "not_requested"},
+        "version": {"type": "null"},
+        "device_group_id": {"type": "null"},
+        "sample_verdict_counts": {"$ref": "#/$defs/zeroVerdictCounts"},
+        "started_at": {"type": "null"},
+        "completed_at": {"type": "null"},
+        "failure": {"type": "null"}
+      }
     },
     "scenarioProgress": {
       "type": "object",

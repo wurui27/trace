@@ -52,6 +52,7 @@ const scenarioStates = {
   completed: "已完成",
   failed: "失败",
   canceled: "已取消",
+  not_requested: "未执行",
 } as const;
 
 export function activeAnalysisStageLabel(analysis: AnalysisResponse): string {
@@ -191,7 +192,11 @@ export function ActiveAnalysisTaskCard({
             {analysis.analysis_mode === "device"
               ? analysis.scenarios?.map((item) => (
                   <li key={item.scenario_type} className={`is-${item.state}`}>
-                    <span>{scenarioNames[item.scenario_type]}</span>
+                    <span>
+                      {item.state === "not_requested"
+                        ? "内存分析暂未执行"
+                        : scenarioNames[item.scenario_type]}
+                    </span>
                     <strong>{scenarioStates[item.state]}</strong>
                   </li>
                 ))

@@ -26,6 +26,7 @@ from perfpilot_api.local_app import (
     _InputDescriptor,
     _LocalAnalysis,
     _LocalInput,
+    _LocalUpload,
     _compose_local_report,
     _evidence_manifest,
     _prepare_local_report,
@@ -2231,6 +2232,73 @@ def test_local_app_rejects_host_device_analysis_without_remote_capture(
 
     assert created.status_code == 409
     assert created.json()["error"]["code"] == "remote_device_capture_unavailable"
+
+
+def test_local_remote_device_response_marks_memory_cycle_not_requested(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+    runtime = app.state.local_runtime
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("82000000-0000-4000-8000-000000000001")
+    upload_id = "85000000-0000-4000-8000-000000000001"
+    binding = SourceBinding(
+        provider_kind="agent_workspace",
+        agent_id=UUID("91000000-0000-4000-8000-000000000001"),
+        workspace_id=UUID("92000000-0000-4000-8000-000000000001"),
+        snapshot_policy="tracked_worktree",
+        validation_profile_id=None,
+    )
+    analysis = _LocalAnalysis(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        profile="startup",
+        question=None,
+        inputs={
+            "apk": _LocalInput(
+                _InputDescriptor(
+                    kind="apk",
+                    mime="application/vnd.android.package-archive",
+                    size=1,
+                    sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+                ),
+                upload_id=upload_id,
+            )
+        },
+        analysis_mode="device",
+        device_id=UUID("72000000-0000-4000-8000-000000000001"),
+        source_binding=binding,
+        source_code_analysis=_source_code_analysis_document(binding),
+        state="queued",
+    )
+    runtime.analyses[(team_id, analysis_id)] = analysis
+    runtime._register_upload(
+        _LocalUpload(
+            upload_id=upload_id,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            kind="apk",
+            mime="application/vnd.android.package-archive",
+            size=1,
+            sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+            token="remote-device-upload-token",
+            path=tmp_path / "apk",
+        )
+    )
+
+    response = runtime.response(analysis)
+
+    assert response["schema_version"] == "1.1"
+    assert [item["state"] for item in response["scenarios"]] == [
+        "queued",
+        "queued",
+        "not_requested",
+    ]
+    assert response["scenarios"][2]["sample_verdict_counts"]["total"] == 0
+    assert response["scenarios"][2]["failure"] is None
 
 
 @pytest.mark.skip(reason="remote device capture is not wired in the local control plane")
