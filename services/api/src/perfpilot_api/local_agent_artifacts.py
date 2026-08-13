@@ -66,6 +66,12 @@ class LocalArtifactBody:
     etag: str = field(repr=False)
 
 
+class AgentUploadCommittedError(AgentUploadUnavailable):
+    """The state replacement committed, but directory durability is uncertain."""
+
+    committed = True
+
+
 @dataclass(slots=True)
 class _Input:
     team_id: UUID
@@ -773,6 +779,8 @@ class LocalAgentArtifactService:
                 upload.parts[grant.part_number] = etag
                 try:
                     self._save_state(upload.team_id, upload.analysis_id)
+                except AgentUploadCommittedError:
+                    raise
                 except AgentUploadError:
                     upload.parts.pop(grant.part_number, None)
                     os.unlink(name, dir_fd=directory)
@@ -887,6 +895,8 @@ class LocalAgentArtifactService:
                 upload.finalized_at = now
                 try:
                     self._save_state(upload.team_id, upload.analysis_id)
+                except AgentUploadCommittedError:
+                    raise
                 except AgentUploadError:
                     upload.finalized_at = None
                     os.unlink(final_name, dir_fd=completed_fd)
@@ -1051,6 +1061,7 @@ class LocalAgentArtifactService:
         )
         directory = self._subdir_fd(team_id, analysis_id, "agent-artifacts", create=True)
         temporary = f".state.{uuid4().hex}.tmp"
+        committed = False
         try:
             try:
                 state_status = os.stat("state.json", dir_fd=directory, follow_symlinks=False)
@@ -1069,8 +1080,13 @@ class LocalAgentArtifactService:
                 output.flush()
                 os.fsync(output.fileno())
             os.replace(temporary, "state.json", src_dir_fd=directory, dst_dir_fd=directory)
+            committed = True
             os.fsync(directory)
         except OSError:
+            if committed:
+                raise AgentUploadCommittedError(
+                    "local artifact storage is unavailable"
+                ) from None
             try:
                 os.unlink(temporary, dir_fd=directory)
             except OSError:

@@ -5,6 +5,7 @@ import base64
 import hashlib
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -487,6 +488,80 @@ async def test_final_publish_rolls_back_when_state_save_fails_once(
         parts=receipt,
     )
     assert completed.state == repeated.state == "finalized"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("publication", ("part", "final"))
+async def test_post_replace_state_failure_keeps_publication_consistent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    publication: str,
+) -> None:
+    service, token = await _pending_upload(tmp_path)
+    etag: str | None = None
+    if publication == "final":
+        etag = await service.put_part(token, (b"x",))
+    original_replace = os.replace
+    original_fsync = os.fsync
+    state_replaced = False
+
+    def observe_replace(*args: object, **kwargs: object) -> None:
+        nonlocal state_replaced
+        original_replace(*args, **kwargs)  # type: ignore[arg-type]
+        state_replaced = True
+
+    def fail_state_directory_fsync(descriptor: int) -> None:
+        nonlocal state_replaced
+        if state_replaced and stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            state_replaced = False
+            raise OSError("private durability detail")
+        original_fsync(descriptor)
+
+    monkeypatch.setattr(os, "replace", observe_replace)
+    monkeypatch.setattr(os, "fsync", fail_state_directory_fsync)
+    with pytest.raises(
+        AgentUploadUnavailable, match="local artifact storage is unavailable"
+    ) as raised:
+        if publication == "part":
+            await service.put_part(token, (b"x",))
+        else:
+            await service.complete_upload(
+                agent_id=AGENT_ID,
+                execution_id=EXECUTION_ID,
+                lease_version=3,
+                upload_id=UPLOAD_ID,
+                parts=(MultipartPart(part_number=1, etag=etag),),  # type: ignore[arg-type]
+            )
+    assert "private durability detail" not in str(raised.value)
+    assert getattr(raised.value, "committed", False) is True
+    monkeypatch.setattr(os, "replace", original_replace)
+    monkeypatch.setattr(os, "fsync", original_fsync)
+
+    if publication == "part":
+        retried = await service.put_part(token, (b"x",))
+        assert retried.startswith('"')
+    else:
+        retried_slot = await service.complete_upload(
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=3,
+            upload_id=UPLOAD_ID,
+            parts=(MultipartPart(part_number=1, etag=etag),),  # type: ignore[arg-type]
+        )
+        assert retried_slot.state == "finalized"
+    service.close()
+    reopened = _reopen(tmp_path)
+    resumed = await reopened.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=1,
+        sha256_b64=_checksum(b"x"),
+    )
+    assert resumed.upload_id == UPLOAD_ID
+    assert resumed.state == ("pending" if publication == "part" else "finalized")
 
 
 @pytest.mark.asyncio
