@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
 from uuid import UUID
@@ -42,12 +42,14 @@ from perfpilot_api.local_analysis_store import (
     LocalAnalysisStoreDurabilityError,
     LocalAnalysisStoreError,
 )
+from perfpilot_api.local_agent_artifacts import LocalAgentArtifactService
 from perfpilot_api.local_control_store import LocalControlStore
 from perfpilot_api.local_device_capture import LocalApkMetadata, LocalDeviceCapture
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
 from perfpilot_api.security.task_snapshots import validate_source_task_snapshot
+from perfpilot_api.services.agent_tasks import AgentExecutionAccess
 from perfpilot_api.services.source_workspaces import SourceBinding
 from perfpilot_api.security.agent_signatures import (
     encode_ed25519_public_key,
@@ -149,6 +151,114 @@ def _authenticated_client(client: TestClient, username: str, password: str) -> d
     )
     assert login.status_code == 200, login.text
     return {"Origin": "http://localhost:3000", "x-csrf-token": login.json()["csrf_token"]}
+
+
+def test_local_remote_artifact_urls_stream_private_input_and_multipart_part(
+    tmp_path: Path,
+) -> None:
+    now = datetime.now(UTC)
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    agent_id = UUID("71000000-0000-4000-8000-000000000001")
+    execution_id = UUID("73000000-0000-4000-8000-000000000001")
+    input_id = UUID("50000000-0000-4000-8000-000000000001")
+    input_upload_id = UUID("51000000-0000-4000-8000-000000000001")
+    artifact_id = UUID("76000000-0000-4000-8000-000000000001")
+    upload_id = UUID("77000000-0000-4000-8000-000000000001")
+    input_payload = b"private local apk"
+    trace_payload = b"private local trace"
+
+    class Authorizer:
+        async def authorize_execution(self, **kwargs: object) -> AgentExecutionAccess:
+            assert kwargs["agent_id"] == agent_id
+            assert kwargs["execution_id"] == execution_id
+            assert kwargs["lease_version"] == 1
+            return AgentExecutionAccess(
+                team_id=team_id,
+                analysis_id=analysis_id,
+                agent_id=agent_id,
+                execution_id=execution_id,
+                lease_version=1,
+                lease_expires_at=now + timedelta(minutes=5),
+                allowed_uploads=("startup_trace", "scroll_trace", "agent_log"),
+                scenario_types=("startup", "scroll"),
+                input_artifact_ids=(input_id,),
+            )
+
+    data_root = tmp_path / "data"
+    source = (
+        data_root
+        / "teams"
+        / str(team_id)
+        / "analyses"
+        / str(analysis_id)
+        / "uploads"
+        / f"{input_upload_id}.bin"
+    )
+    source.parent.mkdir(mode=0o700, parents=True)
+    source.write_bytes(input_payload)
+    source.chmod(0o600)
+    service = LocalAgentArtifactService(
+        root=data_root,
+        public_origin="http://testserver",
+        execution_authorizer=Authorizer(),
+        clock=lambda: now,
+        uuid_source=iter((artifact_id, upload_id)).__next__,
+        token_source=iter(("private-input-grant", "private-part-grant")).__next__,
+    )
+    service.register_input(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        artifact_id=input_id,
+        upload_id=input_upload_id,
+        mime="application/vnd.android.package-archive",
+        size=len(input_payload),
+        sha256_b64=base64.b64encode(hashlib.sha256(input_payload).digest()).decode(),
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=data_root,
+        state_root=tmp_path / "state",
+    )
+    app.state.agent_upload_service = service
+
+    with _RawTestClient(app) as client:
+        input_slot = asyncio.run(
+            service.authorize_input(
+                agent_id=agent_id,
+                execution_id=execution_id,
+                lease_version=1,
+                artifact_id=input_id,
+            )
+        )
+        downloaded = client.get(urlsplit(input_slot.url).path)
+        assert downloaded.status_code == 200
+        assert downloaded.content == input_payload
+        assert downloaded.headers["content-type"] == "application/vnd.android.package-archive"
+
+        upload = asyncio.run(
+            service.create_upload(
+                agent_id=agent_id,
+                execution_id=execution_id,
+                lease_version=1,
+                artifact_kind="startup_trace",
+                mime="application/x-perfetto-trace",
+                size=len(trace_payload),
+                sha256_b64=base64.b64encode(hashlib.sha256(trace_payload).digest()).decode(),
+            )
+        )
+        part = asyncio.run(
+            service.authorize_part(
+                agent_id=agent_id,
+                execution_id=execution_id,
+                lease_version=1,
+                upload_id=upload.upload_id,
+                part_number=1,
+            )
+        )
+        uploaded = client.put(urlsplit(part.url).path, content=trace_payload)
+        assert uploaded.status_code == 200
+        assert uploaded.headers["etag"].startswith('"')
 
 
 def test_local_app_persists_team_owned_agents_and_source_workspaces(tmp_path: Path) -> None:

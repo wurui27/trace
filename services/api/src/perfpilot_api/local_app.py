@@ -30,7 +30,7 @@ from fastapi import FastAPI, Header, HTTPException, Query, Request, status
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
 from perfpilot_api.ai.local_report import (
@@ -62,6 +62,7 @@ from perfpilot_api.local_analysis_store import (
     LocalAnalysisStoreError,
 )
 from perfpilot_api.local_agent_store import LocalAgentStore, LocalDeviceDirectoryRepository
+from perfpilot_api.local_agent_artifacts import LocalAgentArtifactService
 from perfpilot_api.local_control_store import (
     LOCAL_SESSION_TTL,
     LocalControlStore,
@@ -3909,6 +3910,12 @@ def create_local_app(
         ),
         wakeup=InMemoryAgentTaskWakeup(),
     )
+    resolved_agent_artifacts = LocalAgentArtifactService(
+        root=resolved_data_root,
+        public_origin=public_origin
+        or os.getenv("PERFPILOT_LOCAL_API_ORIGIN", "http://localhost:8000"),
+        execution_authorizer=resolved_agent_task_service,
+    )
     resolved_device_probe = device_probe
     if resolved_device_probe is None:
         try:
@@ -3960,6 +3967,7 @@ def create_local_app(
             yield
         finally:
             await runtime.close()
+            resolved_agent_artifacts.close()
             resolved_agent_store.close()
 
     app = FastAPI(lifespan=lifespan)
@@ -4004,9 +4012,7 @@ def create_local_app(
     app.state.agent_task_service = resolved_agent_task_service
     app.state.source_task_service = resolved_source_task_service
     app.state.source_task_completion_recorder = resolved_source_artifacts
-    # Source routes declare the device-upload dependency, but never call it for
-    # a source execution. Local device execution remains deliberately disabled.
-    app.state.agent_upload_service = object()
+    app.state.agent_upload_service = resolved_agent_artifacts
     allowed_web_origins = ["http://localhost:3000", "http://127.0.0.1:3000"]
     configured_web_origin = os.getenv("PERFPILOT_LOCAL_WEB_ORIGIN")
     if configured_web_origin:
@@ -4087,6 +4093,48 @@ def create_local_app(
     @app.get("/v1/health")
     async def health() -> dict[str, object]:
         return {"schema_version": "1.0", "status": "ready", "runtime": "local"}
+
+    @app.get("/local/v1/agent-inputs/{grant}")
+    async def get_local_agent_input(grant: str):
+        try:
+            opened = await app.state.agent_upload_service.open_input(grant)
+        except Exception as error:
+            from perfpilot_api.services.agent_uploads import AgentUploadError
+
+            if not isinstance(error, AgentUploadError):
+                raise
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "artifact not found") from None
+        return StreamingResponse(
+            opened.body,
+            media_type=opened.mime,
+            headers={
+                "content-length": str(opened.size),
+                "etag": opened.etag,
+                "cache-control": "no-store",
+            },
+        )
+
+    @app.put("/local/v1/agent-upload-parts/{grant}")
+    async def put_local_agent_upload_part(grant: str, request: Request) -> Response:
+        try:
+            etag = await app.state.agent_upload_service.put_part(
+                grant, request.stream()
+            )
+        except Exception as error:
+            from perfpilot_api.services.agent_uploads import (
+                AgentUploadError,
+                AgentUploadMismatch,
+            )
+
+            if not isinstance(error, AgentUploadError):
+                raise
+            code = (
+                status.HTTP_409_CONFLICT
+                if isinstance(error, AgentUploadMismatch)
+                else status.HTTP_404_NOT_FOUND
+            )
+            raise HTTPException(code, "artifact not found") from None
+        return Response(status_code=200, headers={"etag": etag, "cache-control": "no-store"})
 
     @app.get("/v1/auth/csrf")
     async def csrf(request: Request, response: Response) -> dict[str, str]:
