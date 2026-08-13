@@ -64,8 +64,9 @@ class TaskScenario(BaseModel):
 class TaskSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1.0"]
+    schema_version: Literal["1.0", "1.1"]
     aud: Literal["perfpilot-agent"]
+    team_id: UUID | None = None
     agent_id: UUID
     device_digest: HexDigest
     execution_id: UUID
@@ -107,6 +108,16 @@ class TaskSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def validate_unique_items(self) -> Self:
+        if (self.schema_version == "1.1") != (self.team_id is not None):
+            raise ValueError("task team binding does not match schema version")
+        if self.schema_version == "1.1" and (
+            tuple(item.kind for item in self.input_artifacts) != ("apk",)
+            or tuple(item.scenario_type for item in self.scenarios)
+            != ("startup", "scroll")
+            or self.allowed_uploads
+            != ("startup_trace", "scroll_trace", "agent_log")
+        ):
+            raise ValueError("remote capture task shape is invalid")
         if len({item.artifact_id for item in self.input_artifacts}) != len(self.input_artifacts):
             raise ValueError("task input artifacts must be unique")
         if len({item.scenario_type for item in self.scenarios}) != len(self.scenarios):
@@ -285,6 +296,7 @@ class TaskVerifier:
         compact: str,
         *,
         expected_agent_id: UUID,
+        expected_team_id: UUID | None = None,
         expected_lease_version: int | None,
         known_device_digests: Collection[str],
     ) -> TaskSnapshot:
@@ -323,6 +335,10 @@ class TaskVerifier:
                 or task.issued_at > normalized_now + _MAXIMUM_ISSUED_AT_SKEW
                 or task.expires_at <= normalized_now
                 or task.agent_id != expected_agent_id
+                or (
+                    task.schema_version == "1.1"
+                    and (expected_team_id is None or task.team_id != expected_team_id)
+                )
                 or (
                     expected_lease_version is not None
                     and task.lease_version != expected_lease_version

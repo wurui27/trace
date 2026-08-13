@@ -13,6 +13,7 @@ from perfpilot_api.services.agent_tasks import (
     AgentCancellationAcknowledgement,
     AgentExecutionAccess,
     AgentTaskCancellation,
+    AgentTaskConflict,
     AgentTaskDefinition,
     AgentTaskService,
     InMemoryAgentTaskRepository,
@@ -31,6 +32,7 @@ OTHER_AGENT_ID = UUID("71000000-0000-4000-8000-000000000002")
 DEVICE_ID = UUID("72000000-0000-4000-8000-000000000001")
 EXECUTION_ID = UUID("73000000-0000-4000-8000-000000000001")
 LEASE_ID = UUID("75000000-0000-4000-8000-000000000001")
+OTHER_ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000002")
 
 
 def _definition() -> AgentTaskDefinition:
@@ -62,6 +64,30 @@ def _definition() -> AgentTaskDefinition:
                 swipe_count=0,
             ),
         ),
+    )
+
+
+def _remote_definition(
+    *, analysis_id: UUID = ANALYSIS_ID,
+) -> AgentTaskDefinition:
+    definition = _definition()
+    return AgentTaskDefinition(
+        **{
+            **{field: getattr(definition, field) for field in definition.__dataclass_fields__},
+            "analysis_id": analysis_id,
+            "schema_version": "1.1",
+            "scenarios": (
+                definition.scenarios[0],
+                TaskScenario(
+                    scenario_type="scroll",
+                    recipe_version=1,
+                    recipe_hash="c" * 64,
+                    duration_seconds=15,
+                    memory_rounds=0,
+                    swipe_count=3,
+                ),
+            ),
+        }
     )
 
 
@@ -101,6 +127,88 @@ async def test_only_selected_agent_can_poll_signed_task() -> None:
     assert claims["execution_id"] == str(EXECUTION_ID)
     assert repository.snapshot_digest(EXECUTION_ID) is not None
     assert task.snapshot_jws not in repr(repository)
+
+
+@pytest.mark.asyncio
+async def test_remote_device_enqueue_is_replay_safe_and_oldest_first() -> None:
+    first = _remote_definition()
+    second = _remote_definition(analysis_id=OTHER_ANALYSIS_ID)
+    repository = InMemoryAgentTaskRepository()
+
+    assert await repository.enqueue(second, queued_at=NOW + timedelta(seconds=1)) is True
+    assert await repository.enqueue(first, queued_at=NOW) is True
+    assert await repository.enqueue(first, queued_at=NOW) is False
+    assert await repository.oldest_queued(agent_id=AGENT_ID, now=NOW) == (
+        NOW,
+        ANALYSIS_ID,
+    )
+    assert await repository.schedule(analysis_id=ANALYSIS_ID, now=NOW) is not None
+    assert await repository.oldest_queued(agent_id=AGENT_ID, now=NOW) == (
+        NOW + timedelta(seconds=1),
+        OTHER_ANALYSIS_ID,
+    )
+
+    conflicting = AgentTaskDefinition(
+        **{
+            **{field: getattr(first, field) for field in first.__dataclass_fields__},
+            "package_name": "com.example.conflict",
+        }
+    )
+    with pytest.raises(AgentTaskConflict):
+        await repository.enqueue(conflicting, queued_at=NOW)
+
+
+@pytest.mark.asyncio
+async def test_startup_scroll_task_binds_claims_and_derives_upload_allowlist() -> None:
+    definition = _remote_definition()
+    private_key = Ed25519PrivateKey.generate()
+    repository = InMemoryAgentTaskRepository(
+        (definition,),
+        lease_id_source=lambda: LEASE_ID,
+        execution_id_source=lambda: EXECUTION_ID,
+    )
+    service = AgentTaskService(
+        repository=repository,
+        signer=TaskSnapshotSigner(private_key=private_key, kid="lan-test", clock=lambda: NOW),
+        wakeup=InMemoryAgentTaskWakeup(),
+        clock=lambda: NOW,
+    )
+
+    await service.schedule(analysis_id=ANALYSIS_ID)
+    delivery = await service.poll(agent_id=AGENT_ID, wait_seconds=0)
+    assert delivery is not None
+    claims = verify_task_jws(
+        delivery.snapshot_jws,
+        encode_ed25519_public_key(private_key.public_key()),
+        now=NOW,
+        expected_team_id=TEAM_ID,
+    )
+    access = await repository.authorize_execution(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=1,
+        now=NOW,
+    )
+
+    assert claims["team_id"] == str(TEAM_ID)
+    assert claims["analysis_id"] == str(ANALYSIS_ID)
+    assert claims["agent_id"] == str(AGENT_ID)
+    assert claims["device_digest"] == "a" * 64
+    assert claims["input_artifacts"] == [
+        {
+            "artifact_id": str(ARTIFACT_ID),
+            "kind": "apk",
+            "mime": "application/vnd.android.package-archive",
+            "size": 4,
+            "sha256_b64": base64.b64encode(b"a" * 32).decode("ascii"),
+        }
+    ]
+    assert [item["scenario_type"] for item in claims["scenarios"]] == [
+        "startup",
+        "scroll",
+    ]
+    assert claims["allowed_uploads"] == ["startup_trace", "scroll_trace", "agent_log"]
+    assert access.allowed_uploads == ("startup_trace", "scroll_trace", "agent_log")
 
 
 @pytest.mark.asyncio

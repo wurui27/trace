@@ -176,12 +176,48 @@ def test_task_snapshot_binds_agent_device_execution_and_lease() -> None:
 
     assert set(payload) >= {
         "agent_id",
+        "team_id",
         "device_digest",
         "execution_id",
         "lease_version",
         "expires_at",
     }
     validator("agents/task-snapshot.schema.json").validate(payload)
+
+
+def test_task_snapshot_v11_team_binding_preserves_exact_legacy_v10() -> None:
+    contract = validator("agents/task-snapshot.schema.json")
+    current = example("agent-task-snapshot.valid.json")
+    contract.validate(current)
+    legacy = {key: value for key, value in current.items() if key != "team_id"}
+    legacy["schema_version"] = "1.0"
+    contract.validate(legacy)
+
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate({key: value for key, value in current.items() if key != "team_id"})
+    with pytest.raises(jsonschema.ValidationError):
+        contract.validate({**legacy, "team_id": current["team_id"]})
+
+
+def test_task_snapshot_v11_is_apk_startup_scroll_without_memory_upload() -> None:
+    contract = validator("agents/task-snapshot.schema.json")
+    current = example("agent-task-snapshot.valid.json")
+
+    assert [scenario["scenario_type"] for scenario in current["scenarios"]] == [
+        "startup",
+        "scroll",
+    ]
+    assert current["allowed_uploads"] == [
+        "startup_trace",
+        "scroll_trace",
+        "agent_log",
+    ]
+    for invalid in (
+        {**current, "allowed_uploads": [*current["allowed_uploads"], "memory_evidence"]},
+        {**current, "scenarios": list(reversed(current["scenarios"]))},
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            contract.validate(invalid)
 
 
 def test_source_task_is_not_a_device_capture_task() -> None:

@@ -20,6 +20,7 @@ NOW = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
 AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
 EXECUTION_ID = UUID("73000000-0000-4000-8000-000000000001")
 ANALYSIS_ID = UUID("30000000-0000-4000-8000-000000000001")
+TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 ARTIFACT_ID = UUID("40000000-0000-4000-8000-000000000001")
 
 
@@ -98,6 +99,44 @@ def test_rejects_tampering_and_snapshots_longer_than_ninety_seconds() -> None:
         )
     with pytest.raises(TaskSnapshotRejected):
         signer.sign(_claims(expires_at=NOW + timedelta(seconds=91)))
+
+
+def test_v11_snapshot_requires_and_verifies_external_team_binding() -> None:
+    private_key = Ed25519PrivateKey.generate()
+    signer = TaskSnapshotSigner(private_key=private_key, kid="lan-test", clock=lambda: NOW)
+    claims = {**_claims(), "schema_version": "1.1", "team_id": str(TEAM_ID)}
+    claims["scenarios"] = [
+        *claims["scenarios"],
+        {
+            "scenario_type": "scroll",
+            "recipe_version": 1,
+            "recipe_hash": "c" * 64,
+            "duration_seconds": 30,
+            "memory_rounds": 0,
+            "swipe_count": 5,
+        },
+    ]
+    claims["allowed_uploads"] = ["startup_trace", "scroll_trace", "agent_log"]
+    compact = signer.sign(claims)
+    public_key = encode_ed25519_public_key(private_key.public_key())
+
+    assert verify_task_jws(
+        compact,
+        public_key,
+        now=NOW,
+        expected_team_id=TEAM_ID,
+    ) == claims
+    with pytest.raises(TaskSnapshotRejected):
+        verify_task_jws(
+            compact,
+            public_key,
+            now=NOW,
+            expected_team_id=UUID("10000000-0000-4000-8000-000000000002"),
+        )
+    with pytest.raises(TaskSnapshotRejected):
+        verify_task_jws(compact, public_key, now=NOW)
+    with pytest.raises(TaskSnapshotRejected):
+        signer.sign({**_claims(), "team_id": str(TEAM_ID)})
 
 
 def test_signs_source_snapshot_as_detached_canonical_json() -> None:

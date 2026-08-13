@@ -12,7 +12,11 @@ from perfpilot_api.local_agent_store import (
     LocalAgentStoreError,
     LocalDeviceDirectoryRepository,
 )
-from perfpilot_api.services.device_directory import AgentHeartbeat, SanitizedDeviceObservation
+from perfpilot_api.services.device_directory import (
+    AgentHeartbeat,
+    DeviceDirectory,
+    SanitizedDeviceObservation,
+)
 
 
 NOW = datetime(2026, 8, 11, 12, 0, tzinfo=UTC)
@@ -187,3 +191,96 @@ def test_store_rejects_unknown_schema_fifo_and_absolute_path_capabilities(tmp_pa
     )
     with pytest.raises(LocalAgentStoreError, match="invalid local agent state"):
         LocalAgentStore(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_private_task_target_is_exact_team_agent_device_and_ready_only(
+    tmp_path: Path,
+) -> None:
+    store = await _registered_store(tmp_path)
+    repository = LocalDeviceDirectoryRepository(store)
+    directory = DeviceDirectory(
+        repository=repository,
+        serial_hmac_key=b"device-directory-test-key".ljust(32, b"!"),
+        clock=lambda: NOW,
+    )
+    observation = SanitizedDeviceObservation(
+        client_ref=UUID("74000000-0000-4000-8000-000000000001"),
+        serial_digest="d" * 64,
+        serial_suffix="1234",
+        manufacturer="Google",
+        model="Pixel",
+        android_release="16",
+        api_level=36,
+        connection_type="usb",
+        adb_state="device",
+        battery_percent=80,
+        temperature_c=None,
+        storage_available_bytes=100,
+        property_error_code=None,
+    )
+    idle = AgentHeartbeat(
+        agent_version="1.2.3",
+        platform="macos",
+        hostname="developer-mac",
+        observed_at=NOW,
+        clock_skew_ms=0,
+        disk_available_bytes=1024,
+        execution_state="idle",
+        execution_id=None,
+        source_workspaces=None,
+    )
+    await repository.replace_snapshot(
+        agent_id=AGENT_A,
+        heartbeat=idle,
+        devices=(observation,),
+        now=NOW,
+    )
+
+    target = await directory.get_task_target(
+        team_id=TEAM_A,
+        agent_id=AGENT_A,
+        device_id=DEVICE_A,
+    )
+    assert target is not None
+    assert target.team_id == TEAM_A
+    assert target.agent_id == AGENT_A
+    assert target.device_id == DEVICE_A
+    assert target.device_digest == "d" * 64
+    assert "1234" not in repr(target)
+    assert await directory.get_task_target(
+        team_id=TEAM_B, agent_id=AGENT_A, device_id=DEVICE_A
+    ) is None
+    assert await directory.get_task_target(
+        team_id=TEAM_A,
+        agent_id=UUID("71000000-0000-4000-8000-000000000099"),
+        device_id=DEVICE_A,
+    ) is None
+    assert await directory.get_task_target(
+        team_id=TEAM_A,
+        agent_id=AGENT_A,
+        device_id=UUID("72000000-0000-4000-8000-000000000099"),
+    ) is None
+
+    busy = AgentHeartbeat(
+        **{
+            **{field: getattr(idle, field) for field in idle.__dataclass_fields__},
+            "execution_state": "busy",
+            "execution_id": UUID("73000000-0000-4000-8000-000000000099"),
+        }
+    )
+    await repository.replace_snapshot(
+        agent_id=AGENT_A,
+        heartbeat=busy,
+        devices=(observation,),
+        now=NOW,
+    )
+    assert (await repository.list_team(TEAM_A))[0].state == "busy"
+    assert await directory.get_task_target(
+        team_id=TEAM_A, agent_id=AGENT_A, device_id=DEVICE_A
+    ) is None
+
+    await repository.expire_stale(cutoff=NOW, now=NOW + timedelta(seconds=31))
+    assert await directory.get_task_target(
+        team_id=TEAM_A, agent_id=AGENT_A, device_id=DEVICE_A
+    ) is None

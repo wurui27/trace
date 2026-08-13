@@ -3,6 +3,53 @@
   "$id": "https://perfpilot.internal/contracts/v1/agents/task-snapshot.schema.json",
   "type": "object",
   "additionalProperties": false,
+  "oneOf": [
+    {
+      "properties": {"schema_version": {"const": "1.0"}},
+      "not": {"required": ["team_id"]}
+    },
+    {
+      "properties": {"schema_version": {"const": "1.1"}},
+      "required": ["team_id"],
+      "allOf": [
+        {
+          "properties": {
+            "input_artifacts": {
+              "minItems": 1,
+              "maxItems": 1,
+              "items": {
+                "allOf": [
+                  {"$ref": "#/$defs/inputArtifact"},
+                  {"properties": {"kind": {"const": "apk"}}}
+                ]
+              }
+            },
+            "scenarios": {
+              "minItems": 2,
+              "maxItems": 2,
+              "prefixItems": [
+                {
+                  "allOf": [
+                    {"$ref": "#/$defs/scenario"},
+                    {"properties": {"scenario_type": {"const": "startup"}}}
+                  ]
+                },
+                {
+                  "allOf": [
+                    {"$ref": "#/$defs/scenario"},
+                    {"properties": {"scenario_type": {"const": "scroll"}}}
+                  ]
+                }
+              ]
+            },
+            "allowed_uploads": {
+              "const": ["startup_trace", "scroll_trace", "agent_log"]
+            }
+          }
+        }
+      ]
+    }
+  ],
   "required": [
     "schema_version",
     "aud",
@@ -21,8 +68,9 @@
     "allowed_uploads"
   ],
   "properties": {
-    "schema_version": {"const": "1.0"},
+    "schema_version": {"enum": ["1.0", "1.1"]},
     "aud": {"const": "perfpilot-agent"},
+    "team_id": {"$ref": "#/$defs/uuid"},
     "agent_id": {"$ref": "#/$defs/uuid"},
     "device_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
     "execution_id": {"$ref": "#/$defs/uuid"},

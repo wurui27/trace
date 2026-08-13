@@ -9,6 +9,7 @@ from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
 from pathlib import Path
+from uuid import UUID
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import (
     Ed25519PrivateKey,
@@ -251,6 +252,7 @@ def verify_task_jws(
     *,
     now: datetime | None = None,
     expected_kid: str | None = None,
+    expected_team_id: UUID | None = None,
 ) -> dict[str, object]:
     try:
         if not isinstance(compact, str) or len(compact.encode("ascii")) > _MAXIMUM_COMPACT_BYTES:
@@ -277,6 +279,11 @@ def verify_task_jws(
         )
         claims = _closed_json(payload)
         _validate_claims(claims, now=now or datetime.now(UTC))
+        schema_version = claims.get("schema_version")
+        if schema_version == "1.1" and (
+            expected_team_id is None or claims.get("team_id") != str(expected_team_id)
+        ):
+            raise TaskSnapshotRejected
         return claims
     except (
         AgentProofRejected,

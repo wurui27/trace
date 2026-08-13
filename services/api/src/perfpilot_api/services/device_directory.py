@@ -141,6 +141,14 @@ class DeviceView:
     last_seen_at: datetime | None
 
 
+@dataclass(frozen=True, slots=True)
+class DeviceTaskTarget:
+    team_id: UUID
+    agent_id: UUID
+    device_id: UUID
+    device_digest: str = dataclass_field(repr=False)
+
+
 class DeviceDirectoryRepository(Protocol):
     async def replace_snapshot(
         self,
@@ -152,6 +160,14 @@ class DeviceDirectoryRepository(Protocol):
     ) -> tuple[StoredDevice, ...]: ...
 
     async def list_team(self, team_id: UUID) -> tuple[StoredDevice, ...]: ...
+
+    async def get_task_target(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+    ) -> DeviceTaskTarget | None: ...
 
     async def expire_stale(
         self,
@@ -217,7 +233,10 @@ class InMemoryDeviceDirectoryRepository:
                     api_level=observation.api_level,
                     connection_type=observation.connection_type,
                     adb_state=observation.adb_state,
-                    state=_state_from_observation(observation),
+                    state=_state_from_observation(
+                        observation,
+                        leased=heartbeat.execution_state == "busy",
+                    ),
                     battery_percent=observation.battery_percent,
                     temperature_c=observation.temperature_c,
                     storage_available_bytes=observation.storage_available_bytes,
@@ -281,6 +300,38 @@ class InMemoryDeviceDirectoryRepository:
                         str(device.device_id),
                     ),
                 )[:_MAXIMUM_BROWSER_DEVICES]
+            )
+
+    async def get_task_target(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+    ) -> DeviceTaskTarget | None:
+        agent = await self._agent_repository.get_refresh_candidate(agent_id)
+        async with self._lock:
+            device = self._devices.get(device_id)
+            slot = self._agent_capabilities.get(agent_id, {}).get("execution_slot")
+            if (
+                agent is None
+                or agent.team_id != team_id
+                or agent_id not in self._agent_heartbeats
+                or not isinstance(slot, dict)
+                or slot.get("state") != "idle"
+                or slot.get("execution_id") is not None
+                or device is None
+                or device.team_id != team_id
+                or device.agent_id != agent_id
+                or device.state != "ready"
+                or device.adb_state != "device"
+            ):
+                return None
+            return DeviceTaskTarget(
+                team_id=team_id,
+                agent_id=agent_id,
+                device_id=device_id,
+                device_digest=device.serial_digest,
             )
 
     async def expire_stale(
@@ -402,7 +453,10 @@ class SQLAlchemyDeviceDirectoryRepository:
                     stored.adb_state = observation.adb_state
                     stored.state = _state_from_observation(
                         observation,
-                        leased=stored.id in leased_device_ids,
+                        leased=(
+                            heartbeat.execution_state == "busy"
+                            or stored.id in leased_device_ids
+                        ),
                     )
                     stored.battery_percent = observation.battery_percent
                     stored.temperature_c = observation.temperature_c
@@ -462,6 +516,38 @@ class SQLAlchemyDeviceDirectoryRepository:
             return tuple(
                 _stored_device_record(stored, agent_name=agent_name) for stored, agent_name in rows
             )
+
+    async def get_task_target(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+    ) -> DeviceTaskTarget | None:
+        async with self._session_factory() as session:
+            row = (
+                await session.execute(
+                    select(StoredDeviceModel, StoredAgent.capabilities)
+                    .join(StoredAgent, StoredAgent.id == StoredDeviceModel.agent_id)
+                    .where(
+                        StoredDeviceModel.id == device_id,
+                        StoredDeviceModel.team_id == team_id,
+                        StoredDeviceModel.agent_id == agent_id,
+                        StoredDeviceModel.state == "ready",
+                        StoredDeviceModel.adb_state == "device",
+                        StoredAgent.team_id == team_id,
+                        StoredAgent.state == "online",
+                    )
+                )
+            ).one_or_none()
+        if row is None or not _execution_slot_is_idle(row.capabilities):
+            return None
+        return DeviceTaskTarget(
+            team_id=team_id,
+            agent_id=agent_id,
+            device_id=device_id,
+            device_digest=row[0].serial_digest,
+        )
 
     async def expire_stale(
         self,
@@ -695,6 +781,20 @@ class DeviceDirectory:
             for device in await self._repository.list_team(team_id)
         )
 
+    async def get_task_target(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+    ) -> DeviceTaskTarget | None:
+        await self.expire_stale()
+        return await self._repository.get_task_target(
+            team_id=team_id,
+            agent_id=agent_id,
+            device_id=device_id,
+        )
+
     async def expire_stale(self) -> int:
         now = _aware_utc(self._clock())
         return await self._repository.expire_stale(
@@ -765,6 +865,17 @@ def _heartbeat_capabilities(heartbeat: AgentHeartbeat) -> dict[str, object]:
             dict(workspace) for workspace in heartbeat.source_workspaces
         ]
     return capabilities
+
+
+def _execution_slot_is_idle(capabilities: object) -> bool:
+    if not isinstance(capabilities, dict):
+        return False
+    slot = capabilities.get("execution_slot")
+    return (
+        isinstance(slot, dict)
+        and slot.get("state") == "idle"
+        and slot.get("execution_id") is None
+    )
 
 
 def _validate_source_workspaces(

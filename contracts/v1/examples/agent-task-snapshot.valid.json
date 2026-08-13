@@ -1,6 +1,7 @@
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "aud": "perfpilot-agent",
+  "team_id": "10000000-0000-4000-8000-000000000001",
   "agent_id": "71000000-0000-4000-8000-000000000001",
   "device_digest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
   "execution_id": "73000000-0000-4000-8000-000000000001",
@@ -36,20 +37,11 @@
       "duration_seconds": 30,
       "memory_rounds": 0,
       "swipe_count": 20
-    },
-    {
-      "scenario_type": "memory_cycle",
-      "recipe_version": 1,
-      "recipe_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-      "duration_seconds": 120,
-      "memory_rounds": 10,
-      "swipe_count": 0
     }
   ],
   "allowed_uploads": [
     "startup_trace",
     "scroll_trace",
-    "memory_evidence",
     "agent_log"
   ]
 }

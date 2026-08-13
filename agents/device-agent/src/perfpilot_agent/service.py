@@ -172,6 +172,7 @@ class TaskLoop:
         ).verify(
             response.snapshot_jws,
             expected_agent_id=credentials.agent_id,
+            expected_team_id=credentials.team_id,
             expected_lease_version=None,
             known_device_digests=self._state.known_device_digests(),
         )

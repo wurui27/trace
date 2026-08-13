@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from perfpilot_agent.security import TaskRejected, TaskVerifier, VerifiedSourceTask
 
 AGENT_ID = UUID("71000000-0000-4000-8000-000000000001")
+TEAM_ID = UUID("10000000-0000-4000-8000-000000000001")
 OTHER_AGENT_ID = UUID("71000000-0000-4000-8000-000000000002")
 NOW = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
 DEVICE_DIGEST = "a" * 64
@@ -50,6 +51,94 @@ def test_task_verifier_accepts_the_bound_agent_lease_and_device(
     assert task.agent_id == AGENT_ID
     assert task.device_digest == DEVICE_DIGEST
     assert task.lease_version == 1
+
+
+def test_task_verifier_requires_external_team_match_for_v11(
+    signing_key: Ed25519PrivateKey,
+    task_claims: dict[str, Any],
+    sign_task: Callable[[dict[str, Any], str], str],
+) -> None:
+    task_claims.update(
+        {
+            "schema_version": "1.1",
+            "team_id": str(TEAM_ID),
+            "scenarios": [
+                task_claims["scenarios"][0],
+                {
+                    "scenario_type": "scroll",
+                    "recipe_version": 1,
+                    "recipe_hash": "c" * 64,
+                    "duration_seconds": 30,
+                    "memory_rounds": 0,
+                    "swipe_count": 5,
+                },
+            ],
+            "allowed_uploads": ["startup_trace", "scroll_trace", "agent_log"],
+        }
+    )
+    task = verifier(signing_key).verify(
+        sign_task(task_claims),
+        expected_agent_id=AGENT_ID,
+        expected_team_id=TEAM_ID,
+        expected_lease_version=1,
+        known_device_digests={DEVICE_DIGEST},
+    )
+    assert task.team_id == TEAM_ID
+
+    with pytest.raises(TaskRejected):
+        verifier(signing_key).verify(
+            sign_task(task_claims),
+            expected_agent_id=AGENT_ID,
+            expected_team_id=UUID("10000000-0000-4000-8000-000000000002"),
+            expected_lease_version=1,
+            known_device_digests={DEVICE_DIGEST},
+        )
+    with pytest.raises(TaskRejected):
+        verifier(signing_key).verify(
+            sign_task(task_claims),
+            expected_agent_id=AGENT_ID,
+            expected_lease_version=1,
+            known_device_digests={DEVICE_DIGEST},
+        )
+
+
+def test_task_verifier_rejects_memory_upload_for_v11_capture(
+    signing_key: Ed25519PrivateKey,
+    task_claims: dict[str, Any],
+    sign_task: Callable[[dict[str, Any], str], str],
+) -> None:
+    task_claims.update(
+        {
+            "schema_version": "1.1",
+            "team_id": str(TEAM_ID),
+            "scenarios": [
+                task_claims["scenarios"][0],
+                {
+                    "scenario_type": "scroll",
+                    "recipe_version": 1,
+                    "recipe_hash": "c" * 64,
+                    "duration_seconds": 30,
+                    "memory_rounds": 0,
+                    "swipe_count": 5,
+                },
+            ],
+            "allowed_uploads": [
+                "startup_trace",
+                "scroll_trace",
+                "memory_evidence",
+                "agent_log",
+            ],
+        }
+    )
+
+    with pytest.raises(TaskRejected):
+        verifier(signing_key).verify(
+            sign_task(task_claims),
+            expected_agent_id=AGENT_ID,
+            expected_team_id=TEAM_ID,
+            expected_lease_version=1,
+            known_device_digests={DEVICE_DIGEST},
+        )
 
 
 @pytest.mark.parametrize("failure", ["wrong_agent", "expired"])

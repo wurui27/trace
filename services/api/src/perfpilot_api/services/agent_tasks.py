@@ -38,12 +38,7 @@ from perfpilot_api.services.analyses import trace_analysis_ready_event_id
 _LEASE_TTL = timedelta(seconds=60)
 _FRESHNESS = timedelta(seconds=30)
 _RENEW_AFTER_SECONDS = 20
-_ALLOWED_UPLOADS = (
-    "startup_trace",
-    "scroll_trace",
-    "memory_evidence",
-    "agent_log",
-)
+_SCENARIO_UPLOADS: dict[TaskScenarioType, str]  # Defined after TaskScenarioType.
 _COMPLETION_CONTRACT = (
     Path(__file__).resolve().parents[5]
     / "contracts"
@@ -58,6 +53,11 @@ _MAXIMUM_COMPLETION_SKEW = timedelta(minutes=5)
 TaskScenarioType = Literal["startup", "scroll", "memory_cycle"]
 TaskInputKind = Literal["apk", "scenario_fixture", "dataset"]
 CleanupPolicy = Literal["keep_installed", "uninstall"]
+_SCENARIO_UPLOADS = {
+    "startup": "startup_trace",
+    "scroll": "scroll_trace",
+    "memory_cycle": "memory_evidence",
+}
 
 
 class AgentTaskError(RuntimeError):
@@ -111,6 +111,7 @@ class AgentTaskDefinition:
     cleanup_policy: CleanupPolicy
     input_artifacts: tuple[TaskInputArtifact, ...]
     scenarios: tuple[TaskScenario, ...]
+    schema_version: Literal["1.0", "1.1"] = "1.0"
 
 
 @dataclass(frozen=True, slots=True)
@@ -164,7 +165,7 @@ class AgentExecutionAccess:
     execution_id: UUID
     lease_version: int
     lease_expires_at: datetime
-    allowed_uploads: tuple[str, ...] = _ALLOWED_UPLOADS
+    allowed_uploads: tuple[str, ...] = ("agent_log",)
     scenario_types: tuple[TaskScenarioType, ...] = ()
     input_artifact_ids: tuple[UUID, ...] = ()
 
@@ -557,12 +558,20 @@ class _MemoryLease:
     completion: AgentExecutionCompletion | None = None
 
 
+def _allowed_uploads(
+    scenario_types: Sequence[TaskScenarioType],
+) -> tuple[str, ...]:
+    return tuple(dict.fromkeys((*(_SCENARIO_UPLOADS[item] for item in scenario_types), "agent_log")))
+
+
 class InMemoryAgentTaskRepository:
     __slots__ = (
         "_definitions",
         "_execution_id_source",
         "_lease_id_source",
         "_leases",
+        "_lock",
+        "_queued_at",
     )
 
     def __init__(
@@ -572,13 +581,48 @@ class InMemoryAgentTaskRepository:
         lease_id_source: Callable[[], UUID] = uuid4,
         execution_id_source: Callable[[], UUID] = uuid4,
     ) -> None:
-        self._definitions = {item.analysis_id: item for item in definitions}
+        self._definitions: dict[UUID, AgentTaskDefinition] = {}
+        self._queued_at: dict[UUID, datetime] = {}
+        baseline = datetime.min.replace(tzinfo=UTC)
+        for position, item in enumerate(definitions):
+            existing = self._definitions.get(item.analysis_id)
+            if existing is not None and existing != item:
+                raise AgentTaskConflict("Task identity is already queued with other content")
+            self._definitions[item.analysis_id] = item
+            self._queued_at.setdefault(item.analysis_id, baseline + timedelta(microseconds=position))
         self._lease_id_source = lease_id_source
         self._execution_id_source = execution_id_source
         self._leases: dict[UUID, _MemoryLease] = {}
+        self._lock = asyncio.Lock()
 
     def __repr__(self) -> str:
         return f"InMemoryAgentTaskRepository(definitions={len(self._definitions)})"
+
+    async def enqueue(
+        self,
+        definition: AgentTaskDefinition,
+        *,
+        queued_at: datetime,
+    ) -> bool:
+        _require_aware(queued_at)
+        if definition.schema_version != "1.1" or tuple(
+            item.scenario_type for item in definition.scenarios
+        ) != (
+            "startup",
+            "scroll",
+        ) or tuple(item.kind for item in definition.input_artifacts) != ("apk",):
+            raise AgentTaskConflict("Remote device tasks require startup and scroll scenarios")
+        async with self._lock:
+            existing = self._definitions.get(definition.analysis_id)
+            if existing is not None:
+                if existing != definition:
+                    raise AgentTaskConflict(
+                        "Task identity is already queued with other content"
+                    )
+                return False
+            self._definitions[definition.analysis_id] = definition
+            self._queued_at[definition.analysis_id] = queued_at.astimezone(UTC)
+            return True
 
     async def schedule(
         self,
@@ -591,7 +635,13 @@ class InMemoryAgentTaskRepository:
         candidates = (
             (self._definitions.get(analysis_id),)
             if analysis_id is not None
-            else tuple(self._definitions.values())
+            else tuple(
+                self._definitions[item_id]
+                for item_id in sorted(
+                    self._definitions,
+                    key=lambda item_id: (self._queued_at[item_id], item_id),
+                )
+            )
         )
         for definition in candidates:
             if definition is None:
@@ -635,8 +685,21 @@ class InMemoryAgentTaskRepository:
     async def oldest_queued(
         self, *, agent_id: UUID, now: datetime
     ) -> tuple[datetime, UUID] | None:
-        del agent_id, now
-        return None
+        _require_aware(now)
+        async with self._lock:
+            candidates = (
+                (queued_at, definition.analysis_id)
+                for definition in self._definitions.values()
+                if definition.agent_id == agent_id
+                for queued_at in (self._queued_at[definition.analysis_id],)
+                if not any(
+                    lease.definition.analysis_id == definition.analysis_id
+                    and lease.state in ("active", "cancel_requested")
+                    and lease.expires_at > now
+                    for lease in self._leases.values()
+                )
+            )
+            return min(candidates, default=None)
 
     async def load_cancellation(
         self,
@@ -813,6 +876,9 @@ class InMemoryAgentTaskRepository:
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
+            allowed_uploads=_allowed_uploads(
+                tuple(item.scenario_type for item in lease.definition.scenarios)
+            ),
             scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
             input_artifact_ids=tuple(item.artifact_id for item in lease.definition.input_artifacts),
         )
@@ -875,6 +941,9 @@ class InMemoryAgentTaskRepository:
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
+            allowed_uploads=_allowed_uploads(
+                tuple(item.scenario_type for item in lease.definition.scenarios)
+            ),
             scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
             input_artifact_ids=tuple(item.artifact_id for item in lease.definition.input_artifacts),
         )
@@ -905,6 +974,9 @@ class InMemoryAgentTaskRepository:
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
+            allowed_uploads=_allowed_uploads(
+                tuple(item.scenario_type for item in lease.definition.scenarios)
+            ),
             scenario_types=tuple(item.scenario_type for item in lease.definition.scenarios),
             input_artifact_ids=tuple(item.artifact_id for item in lease.definition.input_artifacts),
         )
@@ -1812,6 +1884,7 @@ class SQLAlchemyAgentTaskRepository:
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
+            allowed_uploads=_allowed_uploads(_control_scenario_types(scenario_rows)),
             scenario_types=_control_scenario_types(scenario_rows),
             input_artifact_ids=(() if job.input_artifact_id is None else (job.input_artifact_id,)),
         )
@@ -1966,6 +2039,7 @@ class SQLAlchemyAgentTaskRepository:
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
+            allowed_uploads=_allowed_uploads(_control_scenario_types(scenario_rows)),
             scenario_types=_control_scenario_types(scenario_rows),
             input_artifact_ids=(() if job.input_artifact_id is None else (job.input_artifact_id,)),
         )
@@ -2028,6 +2102,7 @@ class SQLAlchemyAgentTaskRepository:
             execution_id=execution_id,
             lease_version=lease_version,
             lease_expires_at=lease.expires_at,
+            allowed_uploads=_allowed_uploads(_control_scenario_types(scenario_rows)),
             scenario_types=_control_scenario_types(scenario_rows),
             input_artifact_ids=(() if job.input_artifact_id is None else (job.input_artifact_id,)),
         )
@@ -2201,8 +2276,9 @@ class SQLAlchemyAgentTaskRepository:
 
 def _task_claims(task: ActiveAgentTask, *, issued_at: datetime) -> dict[str, object]:
     definition = task.definition
-    return {
-        "schema_version": "1.0",
+    scenario_types = tuple(item.scenario_type for item in definition.scenarios)
+    claims: dict[str, object] = {
+        "schema_version": definition.schema_version,
         "aud": "perfpilot-agent",
         "agent_id": str(definition.agent_id),
         "device_digest": definition.device_digest,
@@ -2238,8 +2314,11 @@ def _task_claims(task: ActiveAgentTask, *, issued_at: datetime) -> dict[str, obj
             }
             for item in definition.scenarios
         ],
-        "allowed_uploads": list(_ALLOWED_UPLOADS),
+        "allowed_uploads": list(_allowed_uploads(scenario_types)),
     }
+    if definition.schema_version == "1.1":
+        claims["team_id"] = str(definition.team_id)
+    return claims
 
 
 def _scheduled(lease: _MemoryLease) -> ScheduledAgentTask:

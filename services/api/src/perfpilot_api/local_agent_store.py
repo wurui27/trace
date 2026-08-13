@@ -25,9 +25,11 @@ from perfpilot_api.services.agents import (
 )
 from perfpilot_api.services.device_directory import (
     AgentHeartbeat,
+    DeviceTaskTarget,
     DeviceHeartbeatRejected,
     SanitizedDeviceObservation,
     StoredDevice,
+    _execution_slot_is_idle,
     _heartbeat_capabilities,
     _state_from_observation,
     _validate_heartbeat,
@@ -422,6 +424,47 @@ class LocalAgentStore:
             ]
             return tuple(sorted(devices, key=lambda item: (item.agent_name.casefold(), str(item.device_id))))
 
+    async def get_task_target(
+        self,
+        *,
+        team_id: UUID,
+        agent_id: UUID,
+        device_id: UUID,
+    ) -> DeviceTaskTarget | None:
+        with self._exclusive_lock():
+            document = self._read_document()
+            agent = self._find_agent(document, agent_id)
+            device_document = next(
+                (
+                    item
+                    for item in document["devices"]
+                    if item["device_id"] == str(device_id)
+                ),
+                None,
+            )
+            if (
+                agent is None
+                or agent["team_id"] != str(team_id)
+                or agent["state"] != "online"
+                or not _execution_slot_is_idle(agent["capabilities"])
+                or device_document is None
+            ):
+                return None
+            device = self._device_from_document(device_document)
+            if (
+                device.team_id != team_id
+                or device.agent_id != agent_id
+                or device.state != "ready"
+                or device.adb_state != "device"
+            ):
+                return None
+            return DeviceTaskTarget(
+                team_id=team_id,
+                agent_id=agent_id,
+                device_id=device_id,
+                device_digest=device.serial_digest,
+            )
+
     async def rename(
         self, *, team_id: UUID, agent_id: UUID, name: str, now: datetime
     ) -> AgentRecord | None:
@@ -516,7 +559,10 @@ class LocalAgentStore:
                     api_level=observation.api_level,
                     connection_type=observation.connection_type,
                     adb_state=observation.adb_state,
-                    state=_state_from_observation(observation),
+                    state=_state_from_observation(
+                        observation,
+                        leased=heartbeat.execution_state == "busy",
+                    ),
                     battery_percent=observation.battery_percent,
                     temperature_c=observation.temperature_c,
                     storage_available_bytes=observation.storage_available_bytes,
@@ -894,6 +940,9 @@ class LocalDeviceDirectoryRepository:
 
     async def list_team(self, team_id: UUID) -> tuple[StoredDevice, ...]:
         return await self._store.list_devices_team(team_id)
+
+    async def get_task_target(self, **kwargs: Any) -> DeviceTaskTarget | None:
+        return await self._store.get_task_target(**kwargs)
 
     async def expire_stale(self, **kwargs: Any) -> int:
         return await self._store.expire_stale(**kwargs)
