@@ -101,7 +101,10 @@ _ALLOWED_STABLE_REPORT_KEYS = (_ALLOWED_REPORT_KEYS - {"reportUrl", "reportError
 _MAX_REPORT_DEPTH = 12
 _MAX_REPORT_COLLECTION_ITEMS = 512
 _MAX_REPORT_STRING_LENGTH = 16_384
-_MAX_SANITIZED_REPORT_BYTES = 512 * 1024
+# Keep the validated report within the same bound as one canonical engine
+# envelope. Real SmartPerfetto result contracts can exceed 512 KiB while the
+# bounded raw report and canonical persistence layers both allow 2 MiB.
+_MAX_SANITIZED_REPORT_BYTES = 2 * 1024 * 1024
 
 
 class _FrozenConsumerModel(BaseModel):

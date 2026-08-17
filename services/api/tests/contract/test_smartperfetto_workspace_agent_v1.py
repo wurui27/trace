@@ -262,6 +262,31 @@ def test_report_retains_only_the_reviewed_normalization_typed_fields() -> None:
     assert "unknownPrivateField" not in response.sanitized_report
 
 
+def test_report_accepts_bounded_large_result_contract_from_real_analysis() -> None:
+    payload = _json_fixture("report-completed.json")
+    report = payload["report"]
+    assert isinstance(report, dict)
+    report["resultContract"] = {
+        "dataEnvelopes": ["x" * 10_000 for _ in range(120)]
+    }
+
+    response = SmartPerfettoReportResponse.model_validate(payload)
+
+    assert response.sanitized_report["resultContract"] == report["resultContract"]
+
+
+def test_report_rejects_result_contract_larger_than_canonical_envelope() -> None:
+    payload = _json_fixture("report-completed.json")
+    report = payload["report"]
+    assert isinstance(report, dict)
+    report["resultContract"] = {
+        "dataEnvelopes": ["x" * 10_000 for _ in range(220)]
+    }
+
+    with pytest.raises(ValidationError):
+        SmartPerfettoReportResponse.model_validate(payload)
+
+
 def test_report_rejects_arbitrary_absolute_report_url() -> None:
     unsafe_url = "https://objects.invalid/report/private?token=must-not-leak"
     payload = {"success": True, "report": {"reportUrl": unsafe_url}}
