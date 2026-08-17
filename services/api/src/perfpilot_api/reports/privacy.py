@@ -11,7 +11,7 @@ from urllib.parse import unquote
 
 _MAX_DEPTH = 64
 _MAX_NODES = 200_000
-_MAX_STRING_CHARS = 2_000
+_MAX_STRING_CHARS = 16_384
 _PRIVATE_PATTERNS = (
     re.compile(r"https?://", re.IGNORECASE),
     re.compile(r"https?://[^/\s]+@", re.IGNORECASE),

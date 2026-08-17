@@ -103,6 +103,79 @@ def test_v2_projection_copies_only_server_validated_source_refs() -> None:
     assert "git_head" not in json.dumps(document)
 
 
+def test_v2_projection_keeps_bounded_source_and_omits_private_fragments() -> None:
+    safe_content = "".join(
+        f"fun measuredStep{index}() = traceSection(\"startup-{index}\")\n"
+        for index in range(60)
+    )
+    private_content = (
+        'const val endpoint = "https://internal.invalid/v1"\n'
+        'const val checkout = "/Users/example/private/repository"\n'
+    )
+    snapshot_hash = "a" * 64
+    finding_id = "85000000-0000-4000-8000-000000000001"
+    evidence_id = "86000000-0000-4000-8000-000000000001"
+    context = validate_source_context(
+        {
+            "snapshot_id": "95000000-0000-4000-8000-000000000001",
+            "snapshot_hash": snapshot_hash,
+            "git_head": "b" * 40,
+            "tracked_dirty_count": 0,
+            "fragments": [
+                {
+                    "source_ref_id": "97000000-0000-4000-8000-000000000001",
+                    "relative_path": "app/src/main/java/demo/Startup.kt",
+                    "language": "kotlin",
+                    "symbol": "demo.Startup.init",
+                    "start_line": 1,
+                    "end_line": 60,
+                    "content": safe_content,
+                    "content_sha256": hashlib.sha256(safe_content.encode()).hexdigest(),
+                    "snapshot_hash": snapshot_hash,
+                    "finding_ids": [finding_id],
+                    "evidence_ids": [evidence_id],
+                    "rule_ids": ["android.ui.blocking_wait"],
+                    "match_signals": ["trace_symbol"],
+                },
+                {
+                    "source_ref_id": "97000000-0000-4000-8000-000000000002",
+                    "relative_path": "app/src/main/java/demo/PrivateConfig.kt",
+                    "language": "kotlin",
+                    "symbol": "demo.PrivateConfig",
+                    "start_line": 1,
+                    "end_line": 2,
+                    "content": private_content,
+                    "content_sha256": hashlib.sha256(private_content.encode()).hexdigest(),
+                    "snapshot_hash": snapshot_hash,
+                    "finding_ids": [finding_id],
+                    "evidence_ids": [evidence_id],
+                    "rule_ids": ["android.ui.blocking_wait"],
+                    "match_signals": ["trace_symbol"],
+                },
+            ],
+            "exclusions": [],
+            "truncated": False,
+        },
+        direct_identifiers=("demo.Startup.init", "demo.PrivateConfig"),
+        allowed_finding_ids=(finding_id,),
+        allowed_evidence_ids=(evidence_id,),
+    )
+
+    document = build_ai_projection(
+        _core(),
+        analysis_profile="startup",
+        question=None,
+        source_context=context,
+    ).document
+
+    assert len(safe_content) > 2_000
+    assert [
+        fragment["relative_path"]
+        for fragment in document["source_context"]["fragments"]
+    ] == ["app/src/main/java/demo/Startup.kt"]
+    reject_private_json(document)
+
+
 @pytest.mark.parametrize(
     "private_value",
     [
@@ -136,7 +209,7 @@ def test_projection_rejects_private_strings(private_value: str) -> None:
         build_ai_projection(core, analysis_profile="auto", question=None)
 
 
-@pytest.mark.parametrize("value", [{"nested": object()}, {"value": float("nan")}, {"value": "x" * 2001}])
+@pytest.mark.parametrize("value", [{"nested": object()}, {"value": float("nan")}, {"value": "x" * 16_385}])
 def test_recursive_scanner_rejects_non_json_nonfinite_and_overlong_values(value: object) -> None:
     with pytest.raises(ProjectionPrivacyError, match="^projection contains private data$"):
         reject_private_json(value)

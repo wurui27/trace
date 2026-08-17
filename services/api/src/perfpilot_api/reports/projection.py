@@ -143,6 +143,14 @@ def _project_source_context(
             or not set(linked_evidence).issubset(evidence_ids)
         ):
             raise ProjectionPrivacyError
+        try:
+            reject_private_json(content)
+        except ProjectionPrivacyError:
+            # Source snapshots reject credential-shaped content before upload.
+            # Keep the provider projection fail-closed for URL/path-shaped code
+            # by omitting only that fragment instead of blocking every other
+            # validated source fragment in the analysis.
+            continue
         fragments.append(fragment)
     if match_summary == "none":
         fragments = []
