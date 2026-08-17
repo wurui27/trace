@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import os
 import subprocess
 from collections.abc import Callable, Sequence
 
 from perfpilot_agent.credentials import CredentialBackendError
 
 _SECURITY = "/usr/bin/security"
-_KEYCHAIN = "/Library/Keychains/System.keychain"
+_SYSTEM_KEYCHAIN = "/Library/Keychains/System.keychain"
 _SERVICE = "com.perfpilot.agent"
 _ACCOUNT = "credentials"
 _MAXIMUM_CREDENTIAL_BYTES = 64 * 1024
@@ -17,8 +18,19 @@ Runner = Callable[..., subprocess.CompletedProcess[bytes]]
 
 
 class MacOSKeychainCredentialBackend:
-    def __init__(self, runner: Runner = subprocess.run) -> None:
+    def __init__(
+        self,
+        runner: Runner = subprocess.run,
+        *,
+        effective_user_id: int | None = None,
+    ) -> None:
         self._runner = runner
+        self._effective_user_id = os.geteuid() if effective_user_id is None else effective_user_id
+
+    def _keychain_arguments(self) -> list[str]:
+        if self._effective_user_id == 0:
+            return [_SYSTEM_KEYCHAIN]
+        return []
 
     def _run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[bytes]:
         try:
@@ -43,7 +55,7 @@ class MacOSKeychainCredentialBackend:
                 "-a",
                 _ACCOUNT,
                 "-w",
-                _KEYCHAIN,
+                *self._keychain_arguments(),
             ]
         )
         if result.returncode == 44:
@@ -74,7 +86,7 @@ class MacOSKeychainCredentialBackend:
                 _ACCOUNT,
                 "-w",
                 encoded,
-                _KEYCHAIN,
+                *self._keychain_arguments(),
             ]
         )
         if result.returncode != 0:
@@ -89,7 +101,7 @@ class MacOSKeychainCredentialBackend:
                 _SERVICE,
                 "-a",
                 _ACCOUNT,
-                _KEYCHAIN,
+                *self._keychain_arguments(),
             ]
         )
         if result.returncode not in (0, 44):
