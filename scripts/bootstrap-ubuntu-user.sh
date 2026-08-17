@@ -173,6 +173,7 @@ write_initial_environment() {
     printf 'PERFPILOT_LOCAL_SMARTPERFETTO_URL=http://127.0.0.1:3001\n'
     printf 'PERFPILOT_LOCAL_DATA_DIR=%s/local-runtime\n' "$DATA_ROOT"
     printf 'PERFPILOT_LOCAL_STATE_DIR=%s/local-control\n' "$STATE_ROOT"
+    printf 'PERFPILOT_LOCAL_SOURCE_CODE_ANALYSIS_ENABLED=true\n'
     printf 'PERFPILOT_RESET_ANALYSIS_DATA=true\n'
     printf 'PERFPILOT_EXPECTED_ANALYSIS_ROOT=%s/local-runtime\n' "$DATA_ROOT"
     printf 'PERFPILOT_BOOTSTRAP_ADMIN_PASSWORD_FILE=%s\n' "$ADMIN_PASSWORD_FILE"
@@ -194,6 +195,7 @@ configure_deployment_environment() {
   for entry in \
     "PERFPILOT_LOCAL_DATA_DIR=$DATA_ROOT/local-runtime" \
     "PERFPILOT_LOCAL_STATE_DIR=$STATE_ROOT/local-control" \
+    "PERFPILOT_LOCAL_SOURCE_CODE_ANALYSIS_ENABLED=true" \
     "PERFPILOT_RESET_ANALYSIS_DATA=true" \
     "PERFPILOT_EXPECTED_ANALYSIS_ROOT=$DATA_ROOT/local-runtime"; do
     key="${entry%%=*}"

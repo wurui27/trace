@@ -1096,6 +1096,17 @@ def _public_origin(value: str) -> str:
     return value.rstrip("/")
 
 
+def _environment_boolean(name: str, *, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    raise ValueError(f"{name} must be true or false")
+
+
 def _team_device(connected: LocalDevice) -> dict[str, object]:
     serial_suffix = connected.serial[-4:]
     return {
@@ -5011,9 +5022,17 @@ def create_local_app(
     state_root: Path | None = None,
     public_origin: str | None = None,
     poll_interval_seconds: float = 2.0,
-    source_code_analysis_enabled: bool = False,
+    source_code_analysis_enabled: bool | None = None,
     source_wait_seconds: float = 120.0,
 ) -> FastAPI:
+    resolved_source_code_analysis_enabled = (
+        _environment_boolean(
+            "PERFPILOT_LOCAL_SOURCE_CODE_ANALYSIS_ENABLED",
+            default=False,
+        )
+        if source_code_analysis_enabled is None
+        else source_code_analysis_enabled
+    )
     resolved_gateway = gateway or SmartPerfettoLocalGateway(
         base_url=os.getenv("PERFPILOT_LOCAL_SMARTPERFETTO_URL", "http://127.0.0.1:3001")
     )
@@ -5046,7 +5065,7 @@ def create_local_app(
     )
     resolved_source_workspace_service = SourceWorkspaceService(
         repository=resolved_device_directory,
-        enabled=source_code_analysis_enabled,
+        enabled=resolved_source_code_analysis_enabled,
     )
     resolved_source_task_service = SourceTaskService(
         repository=InMemorySourceTaskRepository(),
@@ -5709,7 +5728,10 @@ def create_local_app(
     ) -> dict[str, object]:
         authorize_team(request, team_id)
         _require_csrf(request, x_csrf_token)
-        if body.source_binding is not None and not source_code_analysis_enabled:
+        if (
+            body.source_binding is not None
+            and not resolved_source_code_analysis_enabled
+        ):
             raise ApiError(
                 "source_code_analysis_disabled",
                 "源码分析功能未启用",

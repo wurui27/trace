@@ -2992,6 +2992,60 @@ def test_local_source_binding_disabled_persistence_and_old_json_compatibility(
     assert unavailable.json()["error"]["code"] == "resource_not_found"
 
 
+def test_local_source_code_analysis_environment_enables_factory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PERFPILOT_LOCAL_SOURCE_CODE_ANALYSIS_ENABLED", "true")
+    body = {
+        "schema_version": "1.1",
+        "analysis_mode": "trace_upload",
+        "analysis_profile": "auto",
+        "question": None,
+        "inputs": [
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4,
+                "sha256_b64": base64.b64encode(hashlib.sha256(b"data").digest()).decode(),
+            }
+        ],
+        "source_binding": {
+            "provider_kind": "agent_workspace",
+            "agent_id": "91000000-0000-4000-8000-000000000001",
+            "workspace_id": "92000000-0000-4000-8000-000000000001",
+            "snapshot_policy": "tracked_worktree",
+            "validation_profile_id": None,
+        },
+    }
+    app = create_local_app(data_root=tmp_path)
+
+    with TestClient(app) as client:
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        csrf = client.get("/v1/auth/csrf").json()["csrf_token"]
+        response = client.post(
+            f"/v1/teams/{team_id}/analyses",
+            json=body,
+            headers={"x-csrf-token": csrf},
+        )
+
+    assert response.status_code == 404
+    assert response.json()["error"]["code"] == "resource_not_found"
+
+
+def test_local_source_code_analysis_environment_rejects_unknown_value(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("PERFPILOT_LOCAL_SOURCE_CODE_ANALYSIS_ENABLED", "TRUE")
+
+    with pytest.raises(
+        ValueError,
+        match="^PERFPILOT_LOCAL_SOURCE_CODE_ANALYSIS_ENABLED must be true or false$",
+    ):
+        create_local_app(data_root=tmp_path)
+
+
 def test_local_app_rejects_present_null_persisted_ai_rounds_after_restart(
     tmp_path: Path,
 ) -> None:
