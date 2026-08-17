@@ -28,6 +28,30 @@ function PollingDashboard() {
 }
 
 describe("LocalLogin", () => {
+  it("renders the evidence-focused split login shell while signed out", async () => {
+    const client = {
+      csrf: vi.fn().mockResolvedValue("csrf"),
+      me: vi.fn().mockRejectedValue({ code: "authentication_required" }),
+    } as unknown as PerfPilotClient;
+
+    render(
+      <PerfPilotSessionProvider client={client}>
+        <LocalLogin>
+          <div>dashboard child</div>
+        </LocalLogin>
+      </PerfPilotSessionProvider>,
+    );
+
+    expect(
+      await screen.findByRole("heading", { name: "从 Trace 直达源码优化" }),
+    ).toBeTruthy();
+    expect(screen.getByText("性能证据、问题定位与复测建议统一呈现。"))
+      .toBeTruthy();
+    expect(screen.getByRole("heading", { name: "欢迎回来" })).toBeTruthy();
+    expect(screen.getByText("使用管理员分配的账号登录。"))
+      .toBeTruthy();
+  });
+
   it("keeps all dashboard polling unmounted while signed out", () => {
     const client = {
       csrf: vi.fn().mockResolvedValue("csrf"),
