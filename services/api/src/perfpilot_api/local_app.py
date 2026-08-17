@@ -31,7 +31,15 @@ from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    SecretStr,
+    ValidationError as PydanticValidationError,
+    field_validator,
+    model_validator,
+)
 from starlette.background import BackgroundTask
 
 from perfpilot_api.ai.local_report import (
@@ -42,6 +50,7 @@ from perfpilot_api.ai.local_report import (
 )
 from perfpilot_api.ai.synthesis import AISynthesisOutput
 from perfpilot_api.engines.canonical_results import (
+    EngineResultValidationError,
     EngineResultWrite,
     canonicalize_engine_result,
     result_artifact_id,
@@ -4297,13 +4306,25 @@ class _LocalRuntime:
         analysis: _LocalAnalysis,
         run: LocalEngineRun,
     ) -> EngineResult:
+        completed_fetch_failures = 0
         while True:
             async with self.lock:
                 if analysis.cancel_requested_at is not None:
                     raise asyncio.CancelledError
             current = await self.gateway.status(run)
             if current == "completed":
-                return await self.gateway.fetch_result(run)
+                try:
+                    return await self.gateway.fetch_result(run)
+                except (
+                    EngineResultValidationError,
+                    PydanticValidationError,
+                    RuntimeError,
+                ):
+                    completed_fetch_failures += 1
+                    if completed_fetch_failures >= 5:
+                        raise
+                    await asyncio.sleep(self.poll_interval_seconds)
+                    continue
             if current in {"failed", "cancelled", "quota_exceeded", "awaiting_user"}:
                 raise RuntimeError("SmartPerfetto analysis did not complete")
             await asyncio.sleep(self.poll_interval_seconds)

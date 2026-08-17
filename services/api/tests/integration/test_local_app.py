@@ -24,6 +24,7 @@ import httpx
 
 from perfpilot_api.ai.local_report import LocalReportSynthesizer
 from perfpilot_api.ai.openai_compatible import SynthesisCandidate
+from perfpilot_api.engines.canonical_results import EngineResultValidationError
 from perfpilot_api.engines.contracts import EngineResult
 from perfpilot_api.local_app import (
     LocalEngineRun,
@@ -174,6 +175,92 @@ class _FakeSmartPerfettoGateway:
 
     async def aclose(self) -> None:
         return None
+
+
+class _TransientCompletedReportGateway(_FakeSmartPerfettoGateway):
+    def __init__(self, result: EngineResult) -> None:
+        super().__init__(result)
+        self.fetch_calls = 0
+
+    async def fetch_result(self, run: LocalEngineRun) -> EngineResult:
+        self.fetch_calls += 1
+        if self.fetch_calls == 1:
+            raise EngineResultValidationError
+        return await super().fetch_result(run)
+
+
+class _InvalidCompletedReportGateway(_FakeSmartPerfettoGateway):
+    def __init__(self, result: EngineResult) -> None:
+        super().__init__(result)
+        self.fetch_calls = 0
+
+    async def fetch_result(self, run: LocalEngineRun) -> EngineResult:
+        self.fetch_calls += 1
+        raise EngineResultValidationError
+
+
+@pytest.mark.asyncio
+async def test_completed_smartperfetto_report_retries_transient_publication(
+    tmp_path: Path,
+) -> None:
+    gateway = _TransientCompletedReportGateway(_smartperfetto_result())
+    app = create_local_app(
+        gateway=gateway,
+        data_root=tmp_path,
+        poll_interval_seconds=0,
+    )
+    descriptor = _InputDescriptor(
+        kind="trace",
+        mime="application/octet-stream",
+        size=1,
+        sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+    )
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={"trace": _LocalInput(descriptor)},
+    )
+
+    result = await app.state.local_runtime._wait_engine_result(
+        analysis,
+        LocalEngineRun(session_id="session-local-1", run_id="run-local-1"),
+    )
+
+    assert result == gateway.result
+    assert gateway.fetch_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_completed_smartperfetto_report_retry_is_bounded(tmp_path: Path) -> None:
+    gateway = _InvalidCompletedReportGateway(_smartperfetto_result())
+    app = create_local_app(
+        gateway=gateway,
+        data_root=tmp_path,
+        poll_interval_seconds=0,
+    )
+    descriptor = _InputDescriptor(
+        kind="trace",
+        mime="application/octet-stream",
+        size=1,
+        sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+    )
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={"trace": _LocalInput(descriptor)},
+    )
+
+    with pytest.raises(EngineResultValidationError):
+        await app.state.local_runtime._wait_engine_result(
+            analysis,
+            LocalEngineRun(session_id="session-local-1", run_id="run-local-1"),
+        )
+
+    assert gateway.fetch_calls == 5
 
 
 class _ScenarioFailingSmartPerfettoGateway(_FakeSmartPerfettoGateway):
