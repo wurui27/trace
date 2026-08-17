@@ -29,7 +29,7 @@ from perfpilot_agent.executor import TaskExecutor
 from perfpilot_agent.security import TaskVerifier
 from perfpilot_agent.service import TaskLoop
 from perfpilot_agent.state import AgentRuntimeState, DeviceBinding
-from perfpilot_agent.uploads import InputDownloader, MultipartUploader
+from perfpilot_agent.uploads import InputDownloader, MultipartUploader, describe_artifact
 from perfpilot_api.ai.local_report import LocalReportSynthesizer
 from perfpilot_api.ai.openai_compatible import SynthesisCandidate
 from perfpilot_api.engines.contracts import EngineResult
@@ -929,28 +929,202 @@ def test_remote_agent_full_success_is_isolated_across_two_local_tenants(
         _assert_redacted(response, cross_secrets)
 
 
+def _exercise_public_origin(tmp_path: Path, origin: str) -> tuple[str, ...]:
+    control_store = LocalControlStore(tmp_path / "control")
+    user = control_store.ensure_user(
+        "origin_user", "initial origin password", False
+    ).principal
+    control_store.change_password(
+        user.user_id, "initial origin password", "established origin password"
+    )
+    app = create_local_app(
+        gateway=_ScenarioSmartPerfetto(),
+        synthesizer=LocalReportSynthesizer(provider=_OneRoundChineseProvider()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control_store,
+        apk_inspector=_InjectedAapt2Inspector(),
+        device_probe=_ForbiddenHostProbe(),
+        public_origin=origin,
+    )
+    private_key = Ed25519PrivateKey.generate()
+    apk = b"public-origin-apk"
+    with TestClient(app) as browser:
+        browser_headers = _browser_login(
+            browser, "origin_user", "established origin password"
+        )
+        credentials, device = _register_agent(
+            browser,
+            team_id=user.team_id,
+            browser_headers=browser_headers,
+            private_key=private_key,
+            serial="ORIGIN-DEVICE-SERIAL",
+            workspace_id=TEAM_ONE_WORKSPACE,
+            profile_id=TEAM_ONE_PROFILE,
+        )
+        created_response = browser.post(
+            f"/v1/teams/{user.team_id}/analyses",
+            headers=browser_headers,
+            json={
+                "schema_version": "1.1",
+                "analysis_mode": "device",
+                "device_id": device["device_id"],
+                "scenarios": ["cold_start", "scroll", "memory_cycle"],
+                "apk": {
+                    "artifact_kind": "apk",
+                    "mime": "application/vnd.android.package-archive",
+                    "size": len(apk),
+                    "sha256_b64": _sha(apk),
+                },
+            },
+        )
+        assert created_response.status_code == 201, created_response.text
+        created = created_response.json()
+        apk_slot = created["apk_upload"]
+        put = urlsplit(apk_slot["put_url"])
+        assert browser.put(
+            f"{put.path}?{put.query}",
+            content=apk,
+            headers=apk_slot["required_headers"],
+        ).status_code == 200
+        finalized = browser.post(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            "/finalize-upload",
+            headers=browser_headers,
+            json={
+                "upload_id": apk_slot["upload_id"],
+                "sha256_b64": _sha(apk),
+                "size": len(apk),
+            },
+        )
+        assert finalized.status_code == 200, finalized.text
+
+        async def round_trip() -> tuple[str, ...]:
+            ca = tmp_path / "ca.crt"
+            ca.write_text("test", encoding="utf-8")
+            config = AgentConfig(
+                server_url="https://control.test",
+                ca_bundle=ca,
+                workspace_root=tmp_path / "agent-work",
+            )
+            observed: list[str] = []
+
+            async def record(request: httpx.Request) -> None:
+                observed.append(str(request.url))
+
+            http_client = httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=app),
+                base_url="https://control.test",
+                event_hooks={"request": [record]},
+            )
+            agent_control = ControlClient(
+                config,
+                http_client=http_client,
+                credentials=_bound_credentials(credentials, private_key, user.team_id),
+            )
+            try:
+                delivery = await agent_control.poll_task(wait_seconds=0)
+                assert isinstance(delivery, TaskExecuteResponse)
+                task = TaskVerifier(
+                    public_key_b64=credentials["task_signing_key"]["public_key_b64"],
+                    kid=credentials["task_signing_key"]["kid"],
+                ).verify(
+                    delivery.snapshot_jws,
+                    expected_agent_id=UUID(str(credentials["agent_id"])),
+                    expected_team_id=user.team_id,
+                    expected_lease_version=None,
+                    known_device_digests={str(device["device_digest"])},
+                )
+                downloader = InputDownloader(
+                    control=agent_control,
+                    workspace_root=config.workspace_root,
+                    http_client=http_client,
+                )
+                downloaded = await downloader.download(
+                    execution_id=task.execution_id,
+                    lease_version=task.lease_version,
+                    artifact=task.input_artifacts[0],
+                    target=config.workspace_root / "input.apk",
+                )
+                assert downloaded.read_bytes() == apk
+                trace = config.workspace_root / "startup.perfetto-trace"
+                trace.write_bytes(b"origin-wired-startup-trace")
+                uploader = MultipartUploader(
+                    control=agent_control,
+                    checkpoint_path=config.workspace_root / "upload-checkpoint.json",
+                    http_client=http_client,
+                )
+                uploaded = await uploader.upload(
+                    execution_id=task.execution_id,
+                    lease_version=task.lease_version,
+                    descriptor=describe_artifact(
+                        kind="startup_trace",
+                        mime="application/x-perfetto-trace",
+                        path=trace,
+                    ),
+                )
+                assert uploaded.kind == "startup_trace"
+            finally:
+                await agent_control.aclose()
+                await http_client.aclose()
+            return tuple(
+                value
+                for value in observed
+                if urlsplit(value).path.startswith("/local/v1/agent-")
+            )
+
+        return asyncio.run(round_trip())
+
+
 @pytest.mark.parametrize(
     "origin",
-    ["https://public.example.test", "http://127.0.0.1:3000"],
+    ["https://public.example.test", "http://10.166.0.125:8000"],
 )
-def test_remote_agent_runtime_accepts_only_https_or_private_http_origins(
+def test_public_app_wires_remote_agent_artifact_urls_without_network(
+    tmp_path: Path,
     origin: str,
 ) -> None:
-    # The end-to-end flow above uses HTTPS; this keeps the accepted private HTTP
-    # deployment seam explicit without duplicating that lifecycle fixture.
-    from perfpilot_api.local_app import _public_origin
+    artifact_urls = _exercise_public_origin(tmp_path, origin)
 
-    assert _public_origin(origin) == origin
+    assert len(artifact_urls) == 2
+    assert {
+        f"{parsed.scheme}://{parsed.netloc}"
+        for parsed in map(urlsplit, artifact_urls)
+    } == {origin}
+    assert {urlsplit(value).path.rsplit("/", 1)[0] for value in artifact_urls} == {
+        "/local/v1/agent-inputs",
+        "/local/v1/agent-upload-parts",
+    }
+    assert all(str(tmp_path) not in value for value in artifact_urls)
 
 
 @pytest.mark.parametrize(
     "origin",
-    ["http://public.example.test", "https://user:password@example.test"],
+    [
+        "http://public.example.test",
+        "https://user:password@example.test",
+        "https://public.example.test/path",
+        "https://public.example.test?debug=1",
+        "https://public.example.test#debug",
+    ],
 )
-def test_remote_agent_runtime_rejects_public_http_or_credentialed_origins(
+def test_public_app_rejects_unsafe_remote_agent_origins(
+    tmp_path: Path,
     origin: str,
 ) -> None:
-    from perfpilot_api.local_app import _public_origin
-
-    with pytest.raises(ValueError):
-        _public_origin(origin)
+    control_store = LocalControlStore(tmp_path / "control")
+    with pytest.raises(
+        ValueError,
+        match="^local public origin must be HTTPS or private-network HTTP$",
+    ):
+        create_local_app(
+            gateway=_ScenarioSmartPerfetto(),
+            synthesizer=LocalReportSynthesizer(provider=_OneRoundChineseProvider()),
+            data_root=tmp_path / "data",
+            state_root=tmp_path / "state",
+            control_store=control_store,
+            apk_inspector=_InjectedAapt2Inspector(),
+            device_probe=_ForbiddenHostProbe(),
+            public_origin=origin,
+        )
+    control_store.close()

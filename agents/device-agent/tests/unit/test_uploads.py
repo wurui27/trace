@@ -34,6 +34,49 @@ def _sha(payload: bytes) -> str:
     return base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://127.0.0.1:8000/local/v1/agent-inputs/private-token",
+        "http://10.166.0.125:8000/local/v1/agent-inputs/private-token",
+        "https://objects.example/local/v1/agent-inputs/private-token",
+    ],
+)
+def test_agent_accepts_https_or_private_http_signed_artifact_urls(url: str) -> None:
+    response = InputAuthorizationResponse(
+        schema_version="1.0",
+        artifact_id=INPUT_ID,
+        mime="application/vnd.android.package-archive",
+        size=1,
+        sha256_b64=_sha(b"x"),
+        download_url=url,
+        expires_at=NOW + timedelta(minutes=5),
+    )
+
+    assert response.download_url == url
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://public.example.test/local/v1/agent-inputs/private-token",
+        "http://8.8.8.8/local/v1/agent-inputs/private-token",
+        "http://user:password@10.166.0.125/local/v1/agent-inputs/private-token",
+        "http://10.166.0.125/local/v1/agent-inputs/private-token#fragment",
+    ],
+)
+def test_agent_rejects_unsafe_signed_artifact_urls(url: str) -> None:
+    with pytest.raises(ValueError, match="signed URL is invalid"):
+        UploadPartAuthorizationResponse(
+            schema_version="1.0",
+            upload_id=UPLOAD_ID,
+            part_number=1,
+            put_url=url,
+            required_headers={},
+            expires_at=NOW + timedelta(minutes=5),
+        )
+
+
 class InputControl:
     def __init__(self, payload: bytes) -> None:
         self.payload = payload

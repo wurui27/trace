@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
+import ipaddress
 import json
 import re
 import secrets
@@ -89,15 +90,23 @@ def _require_string_timestamp(value: object) -> object:
     return value
 
 
-def _validate_https_url(value: str) -> str:
+def _validate_signed_url(value: str) -> str:
     try:
         parsed = urlsplit(value)
         _ = parsed.port
     except ValueError:
         raise ValueError("signed URL is invalid") from None
+    hostname = parsed.hostname
+    private_hostname = hostname in {"localhost", "127.0.0.1", "::1"}
+    if hostname is not None and not private_hostname:
+        try:
+            private_hostname = ipaddress.ip_address(hostname).is_private
+        except ValueError:
+            private_hostname = False
     if (
-        parsed.scheme != "https"
-        or not parsed.hostname
+        parsed.scheme not in {"http", "https"}
+        or not hostname
+        or (parsed.scheme == "http" and not private_hostname)
         or parsed.username is not None
         or parsed.password is not None
         or parsed.fragment
@@ -546,7 +555,7 @@ class InputAuthorizationResponse(BaseModel):
     @field_validator("download_url")
     @classmethod
     def validate_download_url(cls, value: str) -> str:
-        return _validate_https_url(value)
+        return _validate_signed_url(value)
 
     @field_validator("expires_at")
     @classmethod
@@ -610,7 +619,7 @@ class UploadPartAuthorizationResponse(BaseModel):
     @field_validator("put_url")
     @classmethod
     def validate_put_url(cls, value: str) -> str:
-        return _validate_https_url(value)
+        return _validate_signed_url(value)
 
     @field_validator("required_headers")
     @classmethod
