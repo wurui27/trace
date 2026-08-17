@@ -231,6 +231,31 @@ async def test_queued_remote_device_cancellation_prevents_future_lease() -> None
 
 
 @pytest.mark.asyncio
+async def test_expired_lease_cancel_terminalizes_task_without_replacement() -> None:
+    repository = InMemoryAgentTaskRepository(
+        lease_id_source=lambda: LEASE_ID,
+        execution_id_source=lambda: EXECUTION_ID,
+    )
+    await repository.enqueue(_remote_definition(), queued_at=NOW)
+    assert await repository.schedule(analysis_id=ANALYSIS_ID, now=NOW) is not None
+    canceled_at = NOW + timedelta(seconds=61)
+
+    cancellation = await repository.request_cancel(
+        team_id=TEAM_ID,
+        analysis_id=ANALYSIS_ID,
+        now=canceled_at,
+    )
+
+    assert cancellation.analysis_state == "canceled"
+    assert cancellation.execution_id is None
+    assert await repository.oldest_queued(agent_id=AGENT_ID, now=canceled_at) is None
+    assert (
+        await repository.schedule(analysis_id=ANALYSIS_ID, now=canceled_at)
+        is None
+    )
+
+
+@pytest.mark.asyncio
 async def test_capture_lease_projection_tracks_acquire_renew_and_terminal_release() -> (
     None
 ):

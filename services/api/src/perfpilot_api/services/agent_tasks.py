@@ -877,6 +877,7 @@ class InMemoryAgentTaskRepository:
                 for item in self._leases.values()
                 if item.definition.analysis_id == analysis_id
                 and item.state in ("active", "cancel_requested")
+                and item.expires_at > now
             ),
             None,
         )
