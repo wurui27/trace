@@ -48,10 +48,27 @@ describe("Ubuntu user deployment", () => {
     const temporaryRoot = await temporaryDirectory("perfpilot-reset-");
     const analysisRoot = path.join(temporaryRoot, "analysis");
     const stateRoot = path.join(temporaryRoot, "state");
-    await mkdir(path.join(analysisRoot, "nested"), { recursive: true });
-    await mkdir(stateRoot);
-    await writeFile(path.join(analysisRoot, "nested", "report.json"), "analysis bytes");
-    await writeFile(path.join(stateRoot, "control.json"), "persistent bytes");
+    const analysisFiles = [
+      "teams/team-1/analyses/analysis-1/uploads/application.apk",
+      "teams/team-1/analyses/analysis-1/device-captures/startup.perfetto-trace",
+      "teams/team-1/analyses/analysis-1/agent-artifacts/completed/agent.log",
+      "teams/team-1/analyses/analysis-1/documents/report.json",
+      "teams/team-1/analyses/analysis-1/documents/smartperfetto-original-startup.json",
+    ];
+    for (const relativePath of analysisFiles) {
+      const target = path.join(analysisRoot, relativePath);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, "analysis bytes");
+    }
+    const preservedState = [
+      "control.json",
+      "agents/agents.json",
+    ];
+    for (const relativePath of preservedState) {
+      const target = path.join(stateRoot, relativePath);
+      await mkdir(path.dirname(target), { recursive: true });
+      await writeFile(target, "persistent bytes");
+    }
 
     await execFile("bash", [path.join(root, "scripts/reset-ubuntu-analysis-data.sh")], {
       env: {
@@ -63,13 +80,19 @@ describe("Ubuntu user deployment", () => {
       },
     });
 
-    expect(await readFile(path.join(stateRoot, "control.json"), "utf8")).toBe(
-      "persistent bytes",
-    );
+    for (const relativePath of preservedState) {
+      expect(await readFile(path.join(stateRoot, relativePath), "utf8")).toBe(
+        "persistent bytes",
+      );
+    }
     expect((await stat(analysisRoot)).mode & 0o777).toBe(0o700);
-    await expect(readFile(path.join(analysisRoot, "nested", "report.json"))).rejects.toThrow();
+    for (const relativePath of analysisFiles) {
+      await expect(readFile(path.join(analysisRoot, relativePath))).rejects.toThrow();
+    }
     const files = await execFile("find", [temporaryRoot, "-type", "f", "-print"]);
-    expect(files.stdout).toBe(`${path.join(stateRoot, "control.json")}\n`);
+    expect(files.stdout.split("\n").filter(Boolean).sort()).toEqual(
+      preservedState.map((relativePath) => path.join(stateRoot, relativePath)).sort(),
+    );
     expect(files.stdout).not.toMatch(/backup|archive|\.tar|\.gz/);
   });
 
