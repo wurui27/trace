@@ -588,15 +588,34 @@ class CaptureExecution:
                 artifact=apk_inputs[0],
                 target=self._workspace / "input.apk",
             )
-            await self._device.install(apk)
-            adb_version = await self._device.adb_version()
-            for scenario in self._signed_task.scenarios:
-                result, descriptor = await self._capture_scenario(scenario, log_lines)
-                scenarios.append(result)
-                if descriptor is not None:
-                    if descriptor.kind not in self._signed_task.allowed_uploads:
-                        raise CaptureError("task_upload_not_allowed")
-                    descriptors.append(descriptor)
+            adb_version = "unavailable"
+            try:
+                adb_version = await self._device.adb_version()
+                await self._device.install(apk)
+            except CaptureError as error:
+                completed_at = self._now()
+                self._log(log_lines, f"preparation state=failed code={error.code}")
+                scenarios.extend(
+                    _ScenarioResult(
+                        scenario_type=scenario.scenario_type,
+                        state="failed",
+                        started_at=started_at,
+                        completed_at=completed_at,
+                        temperature_start_c=None,
+                        temperature_end_c=None,
+                        artifact_kind=None,
+                        diagnostic_code=error.code,
+                    )
+                    for scenario in self._signed_task.scenarios
+                )
+            else:
+                for scenario in self._signed_task.scenarios:
+                    result, descriptor = await self._capture_scenario(scenario, log_lines)
+                    scenarios.append(result)
+                    if descriptor is not None:
+                        if descriptor.kind not in self._signed_task.allowed_uploads:
+                            raise CaptureError("task_upload_not_allowed")
+                        descriptors.append(descriptor)
             log_path = self._workspace / "agent.log"
             log_path.write_text("\n".join(log_lines) + "\n", encoding="utf-8")
             os.chmod(log_path, 0o600)

@@ -10,6 +10,7 @@ import pytest
 from perfpilot_agent.adb import ProcessResult
 from perfpilot_agent.capture import (
     CaptureAdbDevice,
+    CaptureError,
     CaptureTaskRunner,
     ThermalReading,
     write_memory_archive,
@@ -158,6 +159,13 @@ class HotAfterCaptureDevice(FakeDevice):
         return ThermalReading(temperature_c=43.0, thermal_status=2)
 
 
+class InstallFailureDevice(FakeDevice):
+    async def install(self, apk: Path) -> None:
+        assert apk.read_bytes() == b"verified-apk"
+        self.events.append("install")
+        raise CaptureError("apk_install_failed")
+
+
 class FakeUploader:
     def __init__(self, events: list[str]) -> None:
         self.events = events
@@ -264,6 +272,64 @@ async def test_capture_rejects_trace_when_post_measurement_thermal_gate_fails(
     assert outcome.manifest["scenarios"][0]["diagnostic_code"] == "thermal_gate_failed"
     assert outcome.manifest["scenarios"][0]["temperature_end_c"] == 43.0
     assert [item["kind"] for item in outcome.manifest["artifacts"]] == ["agent_log"]
+
+
+@pytest.mark.asyncio
+async def test_capture_install_failure_returns_closed_failed_manifest(
+    tmp_path,
+    task_claims,
+) -> None:
+    ca = tmp_path / "ca.crt"
+    ca.write_text("test", encoding="utf-8")
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    claims = {
+        **task_claims,
+        "schema_version": "1.1",
+        "team_id": "81000000-0000-4000-8000-000000000001",
+        "scenarios": [
+            task_claims["scenarios"][0],
+            {
+                **task_claims["scenarios"][0],
+                "scenario_type": "scroll",
+                "swipe_count": 5,
+            },
+        ],
+        "allowed_uploads": ["startup_trace", "scroll_trace", "agent_log"],
+    }
+    task = TaskSnapshot.model_validate(claims)
+    events: list[str] = []
+    runner = CaptureTaskRunner(
+        config=AgentConfig(
+            server_url="https://control.example.test",
+            ca_bundle=ca,
+            workspace_root=workspace,
+        ),
+        adb_binary=tmp_path / "adb",
+        control=object(),
+        state=AgentRuntimeState(),
+        redactor=None,
+        device_factory=lambda **kwargs: InstallFailureDevice(events),
+        downloader_factory=lambda **kwargs: FakeDownloader(events),
+        uploader_factory=lambda **kwargs: FakeUploader(events),
+        sleep=lambda _: _done(),
+        clock=lambda: datetime(2026, 8, 5, 9, 0, tzinfo=UTC),
+    )
+
+    outcome = await (await runner.start(task, serial="device-under-test")).wait()
+
+    assert outcome.manifest["state"] == "failed"
+    assert outcome.manifest["diagnostic_code"] == "agent_execution_failed"
+    assert [item["kind"] for item in outcome.manifest["artifacts"]] == ["agent_log"]
+    assert [item["scenario_type"] for item in outcome.manifest["scenarios"]] == [
+        "startup",
+        "scroll",
+    ]
+    assert {
+        (item["state"], item["diagnostic_code"])
+        for item in outcome.manifest["scenarios"]
+    } == {("failed", "apk_install_failed")}
+    assert events == ["download", "install", "upload:agent_log", "cleanup", "uninstall"]
 
 
 async def _done() -> None:
