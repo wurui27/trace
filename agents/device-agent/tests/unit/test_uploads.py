@@ -7,6 +7,7 @@ from uuid import UUID
 
 import httpx
 import pytest
+import perfpilot_agent.uploads as uploads_module
 
 from perfpilot_agent.control_client import (
     InputAuthorizationResponse,
@@ -75,6 +76,35 @@ def test_agent_rejects_unsafe_signed_artifact_urls(url: str) -> None:
             required_headers={},
             expires_at=NOW + timedelta(minutes=5),
         )
+
+
+def test_default_artifact_transfer_clients_trust_configured_ca(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ca_bundle = tmp_path / "private-ca.crt"
+    ca_bundle.write_text("private test CA", encoding="utf-8")
+    observed: list[dict[str, object]] = []
+
+    class ObservedAsyncClient:
+        def __init__(self, **kwargs: object) -> None:
+            observed.append(kwargs)
+
+    monkeypatch.setattr(uploads_module.httpx, "AsyncClient", ObservedAsyncClient)
+
+    InputDownloader(
+        control=object(),
+        workspace_root=tmp_path,
+        ca_bundle=ca_bundle,
+    )
+    MultipartUploader(
+        control=object(),
+        checkpoint_path=tmp_path / "upload-state.json",
+        ca_bundle=ca_bundle,
+    )
+
+    assert [item["verify"] for item in observed] == [str(ca_bundle), str(ca_bundle)]
+    assert all(item["trust_env"] is False for item in observed)
 
 
 class InputControl:

@@ -200,12 +200,14 @@ class InputDownloader:
         *,
         control: InputControl,
         workspace_root: Path,
+        ca_bundle: Path | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._control = control
         self._workspace_root = workspace_root.resolve(strict=False)
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
+            verify=True if ca_bundle is None else str(ca_bundle),
             timeout=httpx.Timeout(120.0, connect=5.0),
             follow_redirects=False,
             trust_env=False,
@@ -293,12 +295,14 @@ class MultipartUploader:
         *,
         control: UploadControl,
         checkpoint_path: Path,
+        ca_bundle: Path | None = None,
         http_client: httpx.AsyncClient | None = None,
     ) -> None:
         self._control = control
         self._checkpoint_path = checkpoint_path
         self._owns_client = http_client is None
         self._client = http_client or httpx.AsyncClient(
+            verify=True if ca_bundle is None else str(ca_bundle),
             timeout=httpx.Timeout(120.0, connect=5.0),
             follow_redirects=False,
             trust_env=False,

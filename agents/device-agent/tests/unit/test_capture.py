@@ -6,6 +6,7 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
+import perfpilot_agent.capture as capture_module
 
 from perfpilot_agent.adb import ProcessResult
 from perfpilot_agent.capture import (
@@ -28,6 +29,39 @@ class RecordingRunner:
     async def __call__(self, argv, *, timeout_seconds, maximum_output_bytes):
         self.calls.append(argv)
         return ProcessResult(returncode=0, stdout=b"ok", stderr=b"")
+
+
+def test_capture_runner_passes_configured_ca_to_default_transfers(
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ca_bundle = tmp_path / "private-ca.crt"
+    ca_bundle.write_text("private test CA", encoding="utf-8")
+    workspace = tmp_path / "work"
+    observed: list[dict[str, object]] = []
+
+    def observe(**kwargs: object) -> object:
+        observed.append(kwargs)
+        return object()
+
+    monkeypatch.setattr(capture_module, "InputDownloader", observe)
+    monkeypatch.setattr(capture_module, "MultipartUploader", observe)
+    runner = CaptureTaskRunner(
+        config=AgentConfig(
+            server_url="https://control.example.test",
+            ca_bundle=ca_bundle,
+            workspace_root=workspace,
+        ),
+        adb_binary=tmp_path / "adb",
+        control=object(),
+        state=AgentRuntimeState(),
+        redactor=None,
+    )
+
+    runner._downloader_factory(workspace_root=workspace)
+    runner._uploader_factory(checkpoint_path=workspace / "upload-state.json")
+
+    assert [item["ca_bundle"] for item in observed] == [ca_bundle, ca_bundle]
 
 
 @pytest.mark.asyncio

@@ -759,10 +759,18 @@ class CaptureTaskRunner:
             lambda **kwargs: CaptureAdbDevice(runner=self._runner, **kwargs)
         )
         self._downloader_factory = downloader_factory or (
-            lambda **kwargs: InputDownloader(control=self._control, **kwargs)
+            lambda **kwargs: InputDownloader(
+                control=self._control,
+                ca_bundle=self._config.ca_bundle,
+                **kwargs,
+            )
         )
         self._uploader_factory = uploader_factory or (
-            lambda **kwargs: MultipartUploader(control=self._control, **kwargs)
+            lambda **kwargs: MultipartUploader(
+                control=self._control,
+                ca_bundle=self._config.ca_bundle,
+                **kwargs,
+            )
         )
 
     async def start(self, task: TaskSnapshot, *, serial: str) -> CaptureExecution:
