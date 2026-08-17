@@ -1,0 +1,19 @@
+[Unit]
+Description=PerfPilot HTTPS gateway
+Wants=network-online.target perfpilot-api.service perfpilot-web.service
+Requires=perfpilot-reset-analysis-data.service
+After=network-online.target perfpilot-reset-analysis-data.service perfpilot-api.service perfpilot-web.service
+PartOf=perfpilot.target
+RefuseManualStart=yes
+
+[Service]
+Type=simple
+WorkingDirectory=%h/perfpilot/platform
+EnvironmentFile=%h/perfpilot/config/perfpilot.env
+ExecStart=%h/.local/bin/caddy run --config %h/perfpilot/config/Caddyfile --adapter caddyfile
+ExecReload=%h/.local/bin/caddy reload --config %h/perfpilot/config/Caddyfile --adapter caddyfile --force
+Restart=always
+RestartSec=3
+TimeoutStopSec=30
+KillMode=mixed
+UMask=0077

@@ -25,8 +25,8 @@ describe("Ubuntu user deployment", () => {
     expect(script).toContain("1508f99788bfcf18cc861e4bf4f8b472e84240c3");
     expect(script).toContain("d5514972ced78c3faa7fc17589c1ea9231645056");
     expect(script).toContain("wait_for_url http://127.0.0.1:3001/health");
-    expect(script).toContain('wait_for_url "http://$SERVER_IP:8000/v1/health"');
-    expect(script).toContain('wait_for_url "http://$SERVER_IP:3000"');
+    expect(script).toContain('wait_for_url "https://$SERVER_IP:8443/v1/health"');
+    expect(script).toContain('wait_for_url "https://$SERVER_IP:8443"');
     expect(script).toContain('--editable "$PROJECT_DIR/agents/device-agent"');
     expect(script).toContain("for key in PORT SMARTPERFETTO_BACKEND_PORT");
     expect(script).toContain("printf '%s=3001\\n'");
@@ -215,18 +215,52 @@ describe("Ubuntu user deployment", () => {
 
     expect(target).toContain("Requires=perfpilot-reset-analysis-data.service");
     expect(target).toContain(
-      "Wants=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service",
+      "Wants=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service perfpilot-gateway.service",
     );
     expect(reset).toContain("Type=oneshot");
     expect(reset).toContain(
-      "Before=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service",
+      "Before=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service perfpilot-gateway.service",
     );
     expect(reset).not.toContain("RemainAfterExit=yes");
     expect(bootstrap).toContain("restart-ubuntu-perfpilot.sh");
-    expect(restart).toContain("systemctl --user stop perfpilot.target perfpilot-web.service");
+    expect(restart).toContain("systemctl --user stop perfpilot.target perfpilot-gateway.service");
     expect(restart).toContain("systemctl --user start perfpilot.target");
     expect(bootstrap).not.toContain("systemctl --user restart perfpilot.target");
     expect(restart).not.toContain("systemctl --user restart perfpilot.target");
+  });
+
+  it("terminates all LAN traffic through a pinned HTTPS gateway", async () => {
+    const [bootstrap, caddyfile, gateway, target, reset, api, web, restart] =
+      await Promise.all([
+        source("scripts/bootstrap-ubuntu-user.sh"),
+        source("infra/ubuntu-user/Caddyfile"),
+        source("infra/ubuntu-user/systemd/perfpilot-gateway.service"),
+        source("infra/ubuntu-user/systemd/perfpilot.target"),
+        source("infra/ubuntu-user/systemd/perfpilot-reset-analysis-data.service"),
+        source("infra/ubuntu-user/systemd/perfpilot-api.service"),
+        source("infra/ubuntu-user/systemd/perfpilot-web.service"),
+        source("scripts/restart-ubuntu-perfpilot.sh"),
+      ]);
+
+    expect(bootstrap).toContain("CADDY_VERSION=2.11.4");
+    expect(bootstrap).toContain(
+      "527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9",
+    );
+    expect(bootstrap).toContain("perfpilot-agent-ca.crt");
+    expect(bootstrap).toContain('wait_for_url "https://$SERVER_IP:8443/v1/health"');
+    expect(bootstrap).toContain("--cacert");
+    expect(caddyfile).toContain("https://{$PERFPILOT_SERVER_IP}:8443");
+    expect(caddyfile).toContain("tls {$PERFPILOT_TLS_CERT_FILE} {$PERFPILOT_TLS_KEY_FILE}");
+    expect(caddyfile).toContain("reverse_proxy 127.0.0.1:8000");
+    expect(caddyfile).toContain("reverse_proxy 127.0.0.1:3000");
+    expect(gateway).toContain("ExecStart=%h/.local/bin/caddy run");
+    expect(gateway).toContain("Restart=always");
+    expect(gateway).toContain("PartOf=perfpilot.target");
+    expect(target).toContain("perfpilot-gateway.service");
+    expect(reset).toContain("perfpilot-gateway.service");
+    expect(api).toContain("--host 127.0.0.1 --port 8000");
+    expect(web).toContain("--hostname 127.0.0.1 --port 3000");
+    expect(restart).toContain("perfpilot-gateway.service");
   });
 
   it("bootstraps only missing local users without accepting secrets as arguments", async () => {
@@ -242,8 +276,9 @@ describe("Ubuntu user deployment", () => {
 
   it.each([
     ["perfpilot-smartperfetto.service", "PORT=3001"],
-    ["perfpilot-api.service", "--host 0.0.0.0 --port 8000"],
-    ["perfpilot-web.service", "--port 3000"],
+    ["perfpilot-api.service", "--host 127.0.0.1 --port 8000"],
+    ["perfpilot-web.service", "--hostname 127.0.0.1 --port 3000"],
+    ["perfpilot-gateway.service", "caddy run"],
   ])("keeps %s supervised and bound to its declared port", async (unit, marker) => {
     const service = await source(`infra/ubuntu-user/systemd/${unit}`);
 

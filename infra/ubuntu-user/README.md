@@ -3,8 +3,8 @@
 This deployment runs the current server test stack under the `rivotek` user and
 does not require Docker or `sudo`. Disposable analysis data lives under
 `~/perfpilot/data`; persistent users, Agents, and source workspaces live under
-private `~/perfpilot/state`. SmartPerfetto, the API, and the production web
-server run as user systemd services behind one target.
+private `~/perfpilot/state`. SmartPerfetto, the API, the production web server,
+and the HTTPS gateway run as user systemd services behind one target.
 
 Clone the platform at `~/perfpilot/platform`, copy the SmartPerfetto `.env` to
 `~/perfpilot/engines/SmartPerfetto/backend/.env` when provider configuration is
@@ -15,7 +15,10 @@ cd ~/perfpilot/platform
 bash scripts/bootstrap-ubuntu-user.sh
 ```
 
-Open `http://10.166.0.125:3000`. Every test-stack restart permanently deletes
+Install `~/perfpilot/config/perfpilot-agent-ca.crt` on each browser and Agent
+host after verifying its SHA-256 fingerprint over SSH. Open
+`https://10.166.0.125:8443`; configure Agents with the same origin and CA file.
+The API and web processes listen only on loopback. Every test-stack restart permanently deletes
 all analysis data without creating a backup or archive. Persistent state stays
 unchanged. Always use the wrapper so all services stop before its reset gate reruns:
 
@@ -31,7 +34,7 @@ through `user05` are written once to
 roles, and teams are never overwritten. Every new user must change the password
 on first login.
 
-This is an HTTP server-test deployment for the trusted private network. The
-Docker Compose, HTTPS, PostgreSQL, Redis, object storage, multi-user isolation,
-and distributed Agent production topology remains the production deployment
-described in `docs/superpowers/plans/2026-08-05-perfpilot-ubuntu-lan-deployment.md`.
+This is a private-CA HTTPS server-test deployment for the trusted private
+network. The Docker Compose, PostgreSQL, Redis, object storage, and distributed
+production topology remains the deployment described in
+`docs/superpowers/plans/2026-08-05-perfpilot-ubuntu-lan-deployment.md`.

@@ -2,7 +2,7 @@
 Description=PerfPilot server test stack
 Requires=perfpilot-reset-analysis-data.service
 After=perfpilot-reset-analysis-data.service
-Wants=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service
+Wants=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service perfpilot-gateway.service
 
 [Install]
 WantedBy=default.target

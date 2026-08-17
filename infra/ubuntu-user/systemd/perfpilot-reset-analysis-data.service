@@ -1,6 +1,6 @@
 [Unit]
 Description=Reset PerfPilot isolated analysis data
-Before=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service
+Before=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service perfpilot-gateway.service
 
 [Service]
 Type=oneshot

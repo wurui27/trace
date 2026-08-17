@@ -1,0 +1,17 @@
+{
+    admin off
+    auto_https disable_redirects
+}
+
+https://{$PERFPILOT_SERVER_IP}:8443 {
+    tls {$PERFPILOT_TLS_CERT_FILE} {$PERFPILOT_TLS_KEY_FILE}
+
+    @api path /v1/* /local/v1/*
+    handle @api {
+        reverse_proxy 127.0.0.1:8000
+    }
+
+    handle {
+        reverse_proxy 127.0.0.1:3000
+    }
+}

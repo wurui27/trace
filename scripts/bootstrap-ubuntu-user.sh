@@ -3,6 +3,8 @@
 set -euo pipefail
 
 NODE_VERSION=24.15.0
+CADDY_VERSION=2.11.4
+CADDY_LINUX_AMD64_SHA256=527fbf917c39189a1e3b31d34fa955601680b2d5c8055d2a87b8b9588dec7bb9
 SMARTPERFETTO_COMMIT=1508f99788bfcf18cc861e4bf4f8b472e84240c3
 ANDROID_MEMORY_COMMIT=d5514972ced78c3faa7fc17589c1ea9231645056
 SERVER_IP="${PERFPILOT_SERVER_IP:-10.166.0.125}"
@@ -17,13 +19,18 @@ LOCAL_BIN="$HOME/.local/bin"
 LOCAL_OPT="$HOME/.local/opt"
 NODE_ARCHIVE="node-v$NODE_VERSION-linux-x64.tar.xz"
 NODE_ROOT="$LOCAL_OPT/node-v$NODE_VERSION-linux-x64"
+TLS_ROOT="$STATE_ROOT/tls"
+TLS_CA_CERT_FILE="$TLS_ROOT/ca.crt"
+TLS_CA_KEY_FILE="$TLS_ROOT/ca.key"
+TLS_CERT_FILE="$TLS_ROOT/server.crt"
+TLS_KEY_FILE="$TLS_ROOT/server.key"
 
 if [[ "$(id -u)" -eq 0 ]]; then
   printf '%s\n' '请使用普通 Ubuntu 用户运行，不要使用 root。' >&2
   exit 1
 fi
 
-for command_name in curl git python3 sha256sum tar xz; do
+for command_name in curl git openssl python3 sha256sum tar xz; do
   if ! command -v "$command_name" >/dev/null 2>&1; then
     printf '缺少命令：%s\n' "$command_name" >&2
     exit 1
@@ -33,10 +40,16 @@ done
 wait_for_url() {
   local url="$1"
   local label="$2"
+  local ca_file="${3:-}"
   local attempt
+  local curl_arguments=(--fail --silent --show-error --max-time 2)
+
+  if [[ -n "$ca_file" ]]; then
+    curl_arguments+=(--cacert "$ca_file")
+  fi
 
   for attempt in $(seq 1 120); do
-    if curl --fail --silent --show-error --max-time 2 "$url" >/dev/null 2>&1; then
+    if curl "${curl_arguments[@]}" "$url" >/dev/null 2>&1; then
       printf '%s 已就绪：%s\n' "$label" "$url"
       return 0
     fi
@@ -44,8 +57,79 @@ wait_for_url() {
   done
   printf '%s 启动超时：%s\n' "$label" "$url" >&2
   systemctl --user --no-pager --full status \
-    perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service >&2 || true
+    perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service \
+    perfpilot-gateway.service >&2 || true
   return 1
+}
+
+install_caddy() {
+  local archive="caddy_${CADDY_VERSION}_linux_amd64.tar.gz"
+  local temporary_dir
+
+  if [[ -x "$LOCAL_BIN/caddy" ]] \
+    && [[ "$($LOCAL_BIN/caddy version | awk '{print $1}')" == "v$CADDY_VERSION" ]]; then
+    return 0
+  fi
+  temporary_dir="$(mktemp -d)"
+  trap 'rm -rf -- "$temporary_dir"' RETURN
+  curl --fail --location --silent --show-error \
+    "https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/$archive" \
+    --output "$temporary_dir/$archive"
+  printf '%s  %s\n' "$CADDY_LINUX_AMD64_SHA256" "$temporary_dir/$archive" \
+    | sha256sum --check --strict
+  tar -xzf "$temporary_dir/$archive" -C "$temporary_dir" caddy
+  install -m 0755 "$temporary_dir/caddy" "$LOCAL_BIN/caddy"
+  rm -rf -- "$temporary_dir"
+  trap - RETURN
+  if [[ "$($LOCAL_BIN/caddy version | awk '{print $1}')" != "v$CADDY_VERSION" ]]; then
+    printf '%s\n' 'Caddy 版本校验失败。' >&2
+    exit 1
+  fi
+}
+
+configure_tls() {
+  local certificate_dir
+  local serial
+
+  install -d -m 0700 "$TLS_ROOT"
+  if [[ ! -f "$TLS_CA_CERT_FILE" || ! -f "$TLS_CA_KEY_FILE" ]]; then
+    certificate_dir="$(mktemp -d "$TLS_ROOT/.ca.XXXXXX")"
+    openssl req -x509 -newkey rsa:3072 -sha256 -nodes -days 3650 \
+      -subj '/CN=PerfPilot Local CA' \
+      -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' \
+      -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+      -keyout "$certificate_dir/ca.key" \
+      -out "$certificate_dir/ca.crt" >/dev/null 2>&1
+    install -m 0600 "$certificate_dir/ca.key" "$TLS_CA_KEY_FILE"
+    install -m 0644 "$certificate_dir/ca.crt" "$TLS_CA_CERT_FILE"
+    rm -rf -- "$certificate_dir"
+  fi
+  chmod 0600 "$TLS_CA_KEY_FILE"
+  chmod 0644 "$TLS_CA_CERT_FILE"
+
+  certificate_dir="$(mktemp -d "$TLS_ROOT/.server.XXXXXX")"
+  openssl req -newkey rsa:3072 -sha256 -nodes \
+    -subj "/CN=$SERVER_IP" \
+    -keyout "$certificate_dir/server.key" \
+    -out "$certificate_dir/server.csr" >/dev/null 2>&1
+  {
+    printf 'basicConstraints=critical,CA:FALSE\n'
+    printf 'keyUsage=critical,digitalSignature,keyEncipherment\n'
+    printf 'extendedKeyUsage=serverAuth\n'
+    printf 'subjectAltName=IP:%s\n' "$SERVER_IP"
+  } > "$certificate_dir/server.ext"
+  serial="$(openssl rand -hex 16)"
+  openssl x509 -req -sha256 -days 397 \
+    -in "$certificate_dir/server.csr" \
+    -CA "$TLS_CA_CERT_FILE" \
+    -CAkey "$TLS_CA_KEY_FILE" \
+    -set_serial "0x$serial" \
+    -extfile "$certificate_dir/server.ext" \
+    -out "$certificate_dir/server.crt" >/dev/null 2>&1
+  install -m 0600 "$certificate_dir/server.key" "$TLS_KEY_FILE"
+  install -m 0644 "$certificate_dir/server.crt" "$TLS_CERT_FILE"
+  rm -rf -- "$certificate_dir"
+  install -m 0644 "$TLS_CA_CERT_FILE" "$CONFIG_ROOT/perfpilot-agent-ca.crt"
 }
 
 install_node() {
@@ -177,8 +261,11 @@ write_initial_environment() {
     printf 'PERFPILOT_RESET_ANALYSIS_DATA=true\n'
     printf 'PERFPILOT_EXPECTED_ANALYSIS_ROOT=%s/local-runtime\n' "$DATA_ROOT"
     printf 'PERFPILOT_BOOTSTRAP_ADMIN_PASSWORD_FILE=%s\n' "$ADMIN_PASSWORD_FILE"
-    printf 'PERFPILOT_LOCAL_API_ORIGIN=http://%s:8000\n' "$SERVER_IP"
-    printf 'PERFPILOT_LOCAL_WEB_ORIGIN=http://%s:3000\n' "$SERVER_IP"
+    printf 'PERFPILOT_SERVER_IP=%s\n' "$SERVER_IP"
+    printf 'PERFPILOT_TLS_CERT_FILE=%s\n' "$TLS_CERT_FILE"
+    printf 'PERFPILOT_TLS_KEY_FILE=%s\n' "$TLS_KEY_FILE"
+    printf 'PERFPILOT_LOCAL_API_ORIGIN=https://%s:8443\n' "$SERVER_IP"
+    printf 'PERFPILOT_LOCAL_WEB_ORIGIN=https://%s:8443\n' "$SERVER_IP"
     printf 'PERFPILOT_LOCAL_ANDROID_MEMORY_ROOT=%s/Android-App-Memory-Analysis\n' \
       "$ENGINE_ROOT"
     printf 'PERFPILOT_LOCAL_ADB=/usr/bin/adb\n'
@@ -196,6 +283,11 @@ configure_deployment_environment() {
     "PERFPILOT_LOCAL_DATA_DIR=$DATA_ROOT/local-runtime" \
     "PERFPILOT_LOCAL_STATE_DIR=$STATE_ROOT/local-control" \
     "PERFPILOT_LOCAL_SOURCE_CODE_ANALYSIS_ENABLED=true" \
+    "PERFPILOT_SERVER_IP=$SERVER_IP" \
+    "PERFPILOT_TLS_CERT_FILE=$TLS_CERT_FILE" \
+    "PERFPILOT_TLS_KEY_FILE=$TLS_KEY_FILE" \
+    "PERFPILOT_LOCAL_API_ORIGIN=https://$SERVER_IP:8443" \
+    "PERFPILOT_LOCAL_WEB_ORIGIN=https://$SERVER_IP:8443" \
     "PERFPILOT_RESET_ANALYSIS_DATA=true" \
     "PERFPILOT_EXPECTED_ANALYSIS_ROOT=$DATA_ROOT/local-runtime"; do
     key="${entry%%=*}"
@@ -214,8 +306,10 @@ configure_deployment_environment() {
 }
 
 install_node
+install_caddy
 install -d -m 0700 "$STATE_ROOT" "$STATE_ROOT/local-control" "$DATA_ROOT/local-runtime"
 mkdir -p "$ENGINE_ROOT" "$CONFIG_ROOT"
+configure_tls
 
 sync_engine \
   SmartPerfetto \
@@ -253,6 +347,7 @@ printf '%s\n' '正在构建 SmartPerfetto……'
 
 write_initial_environment
 configure_deployment_environment
+install -m 0600 "$PROJECT_DIR/infra/ubuntu-user/Caddyfile" "$CONFIG_ROOT/Caddyfile"
 
 set -a
 # shellcheck disable=SC1090
@@ -266,18 +361,21 @@ install -m 0644 "$PROJECT_DIR"/infra/ubuntu-user/systemd/*.service \
   "$HOME/.config/systemd/user/"
 systemctl --user daemon-reload
 systemctl --user disable perfpilot-smartperfetto.service perfpilot-api.service \
-  perfpilot-web.service 2>/dev/null || true
+  perfpilot-web.service perfpilot-gateway.service 2>/dev/null || true
 systemctl --user enable perfpilot.target
 "$PROJECT_DIR/scripts/restart-ubuntu-perfpilot.sh"
 
 wait_for_url http://127.0.0.1:3001/health SmartPerfetto
-wait_for_url "http://$SERVER_IP:8000/v1/health" PerfPilot-API
-wait_for_url "http://$SERVER_IP:3000" PerfPilot-Web
+wait_for_url "https://$SERVER_IP:8443/v1/health" PerfPilot-API \
+  "$CONFIG_ROOT/perfpilot-agent-ca.crt"
+wait_for_url "https://$SERVER_IP:8443" PerfPilot-Web \
+  "$CONFIG_ROOT/perfpilot-agent-ca.crt"
 
 printf '%s\n' \
   '' \
   'Ubuntu 服务器测试版已启动。' \
-  "网页：http://$SERVER_IP:3000" \
-  "API：http://$SERVER_IP:8000/v1/health" \
+  "网页：https://$SERVER_IP:8443" \
+  "API：https://$SERVER_IP:8443/v1/health" \
+  "Agent CA：$CONFIG_ROOT/perfpilot-agent-ca.crt" \
   '重启（永久清空分析数据）：bash scripts/restart-ubuntu-perfpilot.sh' \
   '状态：systemctl --user status perfpilot.target'
