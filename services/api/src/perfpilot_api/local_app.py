@@ -4749,6 +4749,12 @@ class _LocalRuntime:
 
     def response(self, analysis: _LocalAnalysis) -> dict[str, object]:
         if analysis.analysis_mode == "device":
+            device_schema_version = (
+                "1.1"
+                if analysis.device_agent_id is not None
+                or analysis.source_binding is not None
+                else "1.0"
+            )
             target = analysis.inputs["apk"]
             if target.upload_id is None:
                 raise RuntimeError("local APK upload is unavailable")
@@ -4790,7 +4796,10 @@ class _LocalRuntime:
                     }
 
             def render_scenario(scenario_type: str) -> dict[str, object]:
-                if scenario_type == "memory_cycle":
+                if (
+                    scenario_type == "memory_cycle"
+                    and device_schema_version == "1.1"
+                ):
                     return {
                         "scenario_job_id": None,
                         "scenario_type": "memory_cycle",
@@ -4844,7 +4853,7 @@ class _LocalRuntime:
                 }
 
             return {
-                "schema_version": "1.1" if analysis.source_binding is not None else "1.0",
+                "schema_version": device_schema_version,
                 "analysis_id": str(analysis.analysis_id),
                 "team_id": str(analysis.team_id),
                 "analysis_mode": "device",
@@ -4884,7 +4893,7 @@ class _LocalRuntime:
                 "failure": analysis.failure,
                 **(
                     {"source_code_analysis": dict(analysis.source_code_analysis)}
-                    if analysis.source_binding is not None
+                    if device_schema_version == "1.1"
                     else {}
                 ),
             }
@@ -5737,10 +5746,11 @@ def create_local_app(
             )
             if target is None:
                 raise ApiError("remote_device_capture_unavailable", "远端设备不可用", 409, False)
+            canonical_body = body.model_copy(update={"schema_version": "1.1"})
             return runtime.response(
                 await runtime.create(
                     team_id,
-                    body,
+                    canonical_body,
                     device_agent_id=target.agent_id,
                     device_digest=target.device_digest,
                 )

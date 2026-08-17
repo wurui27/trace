@@ -3343,7 +3343,7 @@ def test_local_remote_capture_finalizes_apk_and_publishes_agent_task(
             f"/v1/teams/{user.team_id}/analyses",
             headers=browser_headers,
             json={
-                "schema_version": "1.1",
+                "schema_version": "1.0",
                 "analysis_mode": "device",
                 "device_id": device_id,
                 "scenarios": ["cold_start", "scroll", "memory_cycle"],
@@ -3356,8 +3356,27 @@ def test_local_remote_capture_finalizes_apk_and_publishes_agent_task(
             },
         )
         assert created.status_code == 201, created.text
-        analysis_id = created.json()["analysis_id"]
-        slot = created.json()["apk_upload"]
+        created_document = created.json()
+        assert created_document["schema_version"] == "1.1"
+        assert created_document["source_code_analysis"] == {
+            "requested": False,
+            "provider_kind": None,
+            "agent_id": None,
+            "workspace_id": None,
+            "snapshot_policy": None,
+            "validation_profile_id": None,
+            "context_state": "not_requested",
+            "match_summary": "none",
+            "verification_state": "not_requested",
+            "failure_code": None,
+        }
+        assert [item["state"] for item in created_document["scenarios"]] == [
+            "awaiting_input",
+            "awaiting_input",
+            "not_requested",
+        ]
+        analysis_id = created_document["analysis_id"]
+        slot = created_document["apk_upload"]
         put = urlsplit(slot["put_url"])
         assert (
             client.put(
@@ -4775,6 +4794,63 @@ def test_local_remote_device_response_marks_memory_cycle_not_requested(
     ]
     assert response["scenarios"][2]["sample_verdict_counts"]["total"] == 0
     assert response["scenarios"][2]["failure"] is None
+
+
+def test_local_nonremote_device_response_preserves_legacy_1_0_memory_cycle(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+    )
+    runtime = app.state.local_runtime
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("82000000-0000-4000-8000-000000000001")
+    upload_id = "85000000-0000-4000-8000-000000000001"
+    checksum = base64.b64encode(hashlib.sha256(b"x").digest()).decode()
+    analysis = _LocalAnalysis(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        profile="startup",
+        question=None,
+        inputs={
+            "apk": _LocalInput(
+                _InputDescriptor(
+                    kind="apk",
+                    mime="application/vnd.android.package-archive",
+                    size=1,
+                    sha256_b64=checksum,
+                ),
+                upload_id=upload_id,
+            )
+        },
+        analysis_mode="device",
+        device_id=UUID("72000000-0000-4000-8000-000000000001"),
+        state="queued",
+    )
+    runtime.analyses[(team_id, analysis_id)] = analysis
+    runtime._register_upload(
+        _LocalUpload(
+            upload_id=upload_id,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            kind="apk",
+            mime="application/vnd.android.package-archive",
+            size=1,
+            sha256_b64=checksum,
+            token="legacy-device-upload-token",
+            path=tmp_path / "apk",
+        )
+    )
+
+    response = runtime.response(analysis)
+
+    assert response["schema_version"] == "1.0"
+    assert [item["state"] for item in response["scenarios"]] == [
+        "queued",
+        "queued",
+        "queued",
+    ]
 
 
 def test_local_remote_report_preserves_completed_startup_when_scroll_capture_fails(

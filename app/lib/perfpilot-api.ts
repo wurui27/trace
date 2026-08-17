@@ -123,28 +123,41 @@ export interface SourceWorkspaceListResponse {
   readonly workspaces: readonly SourceWorkspaceView[];
 }
 
-export interface SourceCodeAnalysis extends SourceBinding {
-  readonly requested: true;
-  readonly context_state:
-    | "waiting_for_agent"
-    | "extracting"
-    | "available"
-    | "unavailable";
-  readonly match_summary: "strong" | "weak" | "none";
-  readonly verification_state:
-    | "not_requested"
-    | "pending"
-    | "validating"
-    | "verified"
-    | "apply_failed"
-    | "validation_failed"
-    | "source_changed"
-    | "not_configured"
-    | "timeout"
-    | "canceled"
-    | "unavailable";
-  readonly failure_code: string | null;
-}
+export type SourceCodeAnalysis =
+  | (SourceBinding & {
+      readonly requested: true;
+      readonly context_state:
+        | "waiting_for_agent"
+        | "extracting"
+        | "available"
+        | "unavailable";
+      readonly match_summary: "strong" | "weak" | "none";
+      readonly verification_state:
+        | "not_requested"
+        | "pending"
+        | "validating"
+        | "verified"
+        | "apply_failed"
+        | "validation_failed"
+        | "source_changed"
+        | "not_configured"
+        | "timeout"
+        | "canceled"
+        | "unavailable";
+      readonly failure_code: string | null;
+    })
+  | {
+      readonly requested: false;
+      readonly provider_kind: null;
+      readonly agent_id: null;
+      readonly workspace_id: null;
+      readonly snapshot_policy: null;
+      readonly validation_profile_id: null;
+      readonly context_state: "not_requested";
+      readonly match_summary: "none";
+      readonly verification_state: "not_requested";
+      readonly failure_code: null;
+    };
 
 export interface ReportMetric {
   readonly metric_id: string;
@@ -1107,9 +1120,9 @@ function sourceWorkspaceListResponse(value: unknown): SourceWorkspaceListRespons
 }
 
 function validSourceCodeAnalysis(value: unknown): value is SourceCodeAnalysis {
-  return (
-    object(value) &&
-    exactKeys(value, [
+  if (
+    !object(value) ||
+    !exactKeys(value, [
       "requested",
       "provider_kind",
       "agent_id",
@@ -1120,7 +1133,24 @@ function validSourceCodeAnalysis(value: unknown): value is SourceCodeAnalysis {
       "match_summary",
       "verification_state",
       "failure_code",
-    ]) &&
+    ])
+  ) {
+    return false;
+  }
+  if (value.requested === false) {
+    return (
+      value.provider_kind === null &&
+      value.agent_id === null &&
+      value.workspace_id === null &&
+      value.snapshot_policy === null &&
+      value.validation_profile_id === null &&
+      value.context_state === "not_requested" &&
+      value.match_summary === "none" &&
+      value.verification_state === "not_requested" &&
+      value.failure_code === null
+    );
+  }
+  return (
     value.requested === true &&
     value.provider_kind === "agent_workspace" &&
     typeof value.agent_id === "string" &&
@@ -2742,7 +2772,7 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         {
           method: "POST",
           body: JSON.stringify({
-            schema_version: sourceBinding ? "1.1" : "1.0",
+            schema_version: "1.1",
             analysis_mode: "device",
             device_id: deviceId,
             scenarios: ["cold_start", "scroll", "memory_cycle"],

@@ -371,11 +371,11 @@ describe("PerfPilot browser API", () => {
     });
   });
 
-  it("creates a device analysis for the selected device and uploads its APK", async () => {
+  it("creates a no-source remote device 1.1 analysis and uploads its APK", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const checksum = "A5BYxvLAy0ksUzsKTRTvd8wPeKvMztUofYShogEc+4E=";
     const deviceAnalysis = {
-      schema_version: "1.0",
+      schema_version: "1.1",
       analysis_id: ANALYSIS_ID,
       team_id: TEAM_ID,
       analysis_mode: "device",
@@ -401,7 +401,7 @@ describe("PerfPilot browser API", () => {
       scenarios: ["cold_start", "scroll", "memory_cycle"].map((scenario_type) => ({
         scenario_job_id: null,
         scenario_type,
-        state: "awaiting_input",
+        state: scenario_type === "memory_cycle" ? "not_requested" : "awaiting_input",
         version: null,
         device_group_id: null,
         sample_verdict_counts: {
@@ -428,6 +428,18 @@ describe("PerfPilot browser API", () => {
       started_at: null,
       completed_at: null,
       failure: null,
+      source_code_analysis: {
+        requested: false,
+        provider_kind: null,
+        agent_id: null,
+        workspace_id: null,
+        snapshot_policy: null,
+        validation_profile_id: null,
+        context_state: "not_requested",
+        match_summary: "none",
+        verification_state: "not_requested",
+        failure_code: null,
+      },
     };
     const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
       const url = String(input);
@@ -474,7 +486,7 @@ describe("PerfPilot browser API", () => {
     expect(result.analysis).toMatchObject({ analysis_mode: "device", state: "queued" });
     const create = calls.find((call) => call.url.endsWith("/analyses"));
     expect(JSON.parse(String(create?.init.body))).toEqual({
-      schema_version: "1.0",
+      schema_version: "1.1",
       analysis_mode: "device",
       device_id: DEVICE_ID,
       scenarios: ["cold_start", "scroll", "memory_cycle"],
