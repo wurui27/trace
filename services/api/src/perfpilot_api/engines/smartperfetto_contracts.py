@@ -62,6 +62,14 @@ _SIGNED_HTTP_URL = re.compile(
 _CREDENTIAL_MARKER = re.compile(
     r"(?i)(?:\bbearer\s+|\bauthorization\b|\bapi[ _-]?key\b|\baccess[ _-]?token\b)"
 )
+_CREDENTIAL_ASSIGNMENT = re.compile(
+    r"(?i)(?<![a-z0-9])[\"']?(?:authorization|api[ _-]?key|access[ _-]?token|"
+    r"access[ _-]?key|aws[ _-]?access[ _-]?key[ _-]?id|"
+    r"aws[ _-]?secret[ _-]?access[ _-]?key|client[ _-]?secret|credential|"
+    r"private[ _-]?key|refresh[ _-]?token|secret[ _-]?access[ _-]?key|"
+    r"session[ _-]?token|token|secret(?:[ _-]?key)?|password|passwd)"
+    r"[\"']?\s*[:=]\s*[\"']?\S+"
+)
 _OBJECT_STORE_URI = re.compile(r"(?i)^(?:s3|gs|az|r2)://")
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
 _EMBEDDED_POSIX_ABSOLUTE_PATH = re.compile(
@@ -267,6 +275,7 @@ def _redact_string(value: str) -> str:
     variants = _privacy_variants(value)
     if variants is None or any(
         _CREDENTIAL_MARKER.search(variant)
+        or _CREDENTIAL_ASSIGNMENT.search(variant)
         or _SIGNED_HTTP_URL.search(variant)
         or _OBJECT_STORE_URI.search(variant)
         or variant.startswith("/")

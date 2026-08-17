@@ -34,6 +34,7 @@ class _ReportTransport:
     [
         "%2Fhome%2Frivotek%2Fprivate%2Fresult.json",
         "滚动帧率样本包含上游原样百分号编码 %CC",
+        "采样字段 password=private-value",
     ],
 )
 async def test_gateway_redacts_percent_encoded_or_invalid_private_text(
