@@ -29,6 +29,34 @@ class _ReportTransport:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "private_text",
+    [
+        "%2Fhome%2Frivotek%2Fprivate%2Fresult.json",
+        "滚动帧率样本包含上游原样百分号编码 %CC",
+    ],
+)
+async def test_gateway_redacts_percent_encoded_or_invalid_private_text(
+    private_text: str,
+) -> None:
+    payload = json.loads(_FIXTURE.read_text(encoding="utf-8"))
+    report = payload["report"]
+    assert isinstance(report, dict)
+    report["conversationTimeline"] = [{"role": "tool", "text": private_text}]
+    raw_body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    gateway = SmartPerfettoLocalGateway()
+    await gateway._transport.aclose()
+    gateway._transport = _ReportTransport(  # type: ignore[assignment]
+        SmartPerfettoJsonResponse(200, payload, raw_body)
+    )
+
+    result = await gateway.fetch_result(LocalEngineRun("session-synthetic-001", "run-1"))
+
+    report_payload = result.payload["report"]
+    assert report_payload["conversationTimeline"][0]["text"] == "[redacted]"  # type: ignore[index]
+
+
+@pytest.mark.asyncio
 async def test_gateway_original_report_redacts_private_runtime_paths() -> None:
     payload = json.loads(_FIXTURE.read_text(encoding="utf-8"))
     report = payload["report"]

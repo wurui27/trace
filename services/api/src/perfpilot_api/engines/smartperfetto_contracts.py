@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from collections.abc import Mapping, Sequence
 from typing import Annotated, Literal
+from urllib.parse import unquote
 
 from pydantic import (
     BaseModel,
@@ -104,6 +106,7 @@ _ALLOWED_STABLE_REPORT_KEYS = (_ALLOWED_REPORT_KEYS - {"reportUrl", "reportError
 _MAX_REPORT_DEPTH = 12
 _MAX_REPORT_COLLECTION_ITEMS = 512
 _MAX_REPORT_STRING_LENGTH = 16_384
+_MAX_PRIVACY_DECODE_PASSES = 8
 # Keep the validated report within the same bound as one canonical engine
 # envelope. Real SmartPerfetto result contracts can exceed 512 KiB while the
 # bounded raw report and canonical persistence layers both allow 2 MiB.
@@ -240,16 +243,36 @@ def _normalized_key(value: object) -> str:
     return re.sub(r"[^a-z0-9]", "", str(value).casefold())
 
 
+def _privacy_variants(value: str) -> tuple[str, ...] | None:
+    current = unicodedata.normalize("NFKC", value.strip())
+    variants = [current]
+    for _ in range(_MAX_PRIVACY_DECODE_PASSES):
+        if "%" not in current:
+            return tuple(variants)
+        try:
+            decoded = unquote(current, encoding="utf-8", errors="strict")
+        except UnicodeError:
+            return None
+        decoded = unicodedata.normalize("NFKC", decoded.strip())
+        if decoded == current:
+            return tuple(variants)
+        variants.append(decoded)
+        current = decoded
+    return None
+
+
 def _redact_string(value: str) -> str:
     if len(value) > _MAX_REPORT_STRING_LENGTH:
         raise ValueError("report contract invalid")
-    if (
-        _CREDENTIAL_MARKER.search(value)
-        or _SIGNED_HTTP_URL.search(value)
-        or _OBJECT_STORE_URI.search(value)
-        or value.startswith("/")
-        or _WINDOWS_ABSOLUTE_PATH.search(value)
-        or _EMBEDDED_POSIX_ABSOLUTE_PATH.search(value)
+    variants = _privacy_variants(value)
+    if variants is None or any(
+        _CREDENTIAL_MARKER.search(variant)
+        or _SIGNED_HTTP_URL.search(variant)
+        or _OBJECT_STORE_URI.search(variant)
+        or variant.startswith("/")
+        or _WINDOWS_ABSOLUTE_PATH.search(variant)
+        or _EMBEDDED_POSIX_ABSOLUTE_PATH.search(variant)
+        for variant in variants
     ):
         return "[redacted]"
     return value
