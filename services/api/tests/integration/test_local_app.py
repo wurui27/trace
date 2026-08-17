@@ -33,9 +33,11 @@ from perfpilot_api.local_app import (
     _LocalAnalysis,
     _LocalInput,
     _LocalUpload,
+    _PersistedLocalEvidenceError,
     _compose_local_report,
     _evidence_manifest,
     _prepare_local_report,
+    _prepared_from_persisted_documents,
     _public_origin,
     _restore_ai_rounds,
     _source_code_analysis_unavailable_document,
@@ -58,6 +60,7 @@ from perfpilot_api.local_device_capture import (
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
+from perfpilot_api.reports.source_context import validate_source_context
 from perfpilot_api.security.task_snapshots import (
     validate_source_task_snapshot,
     verify_task_jws,
@@ -81,6 +84,7 @@ from perfpilot_api.services.agent_tasks import (
     ValidatedAgentExecutionManifest,
 )
 from perfpilot_api.services.source_workspaces import SourceBinding
+from perfpilot_api.workers.source_orchestrator import derive_source_authority
 from perfpilot_api.security.agent_signatures import (
     encode_ed25519_public_key,
     encode_signature,
@@ -1599,7 +1603,16 @@ def test_local_weak_source_context_never_publishes_paths_or_symbols() -> None:
         analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
         profile="startup",
         question=None,
-        inputs={},
+        inputs={
+            "trace": _LocalInput(
+                _InputDescriptor(
+                    kind="trace",
+                    mime="application/octet-stream",
+                    size=1,
+                    sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+                )
+            )
+        },
         source_binding=binding,
         source_code_analysis={
             **_source_code_analysis_document(binding),
@@ -1642,6 +1655,105 @@ def test_local_weak_source_context_never_publishes_paths_or_symbols() -> None:
     assert public_source["fixes"] == []
     assert path_marker not in serialized
     assert "demo.WeakSource.init" not in serialized
+
+
+def test_persisted_source_strong_projection_rebuild_retains_validated_context() -> None:
+    binding = SourceBinding(
+        provider_kind="agent_workspace",
+        agent_id=UUID("91000000-0000-4000-8000-000000000001"),
+        workspace_id=UUID("92000000-0000-4000-8000-000000000001"),
+        snapshot_policy="tracked_worktree",
+        validation_profile_id=UUID("96000000-0000-4000-8000-000000000001"),
+    )
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={
+            "trace": _LocalInput(
+                _InputDescriptor(
+                    kind="trace",
+                    mime="application/octet-stream",
+                    size=1,
+                    sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+                )
+            )
+        },
+        source_binding=binding,
+    )
+    result = _smartperfetto_result()
+    result.payload["report"]["dataEnvelopes"][0]["evidence"][0]["fields"][
+        "mapped_symbol"
+    ] = "demo.Startup.init"
+    core = _prepare_local_report(analysis, result)
+    authority = derive_source_authority(core.core_document)
+    content = "fun init() = loadNow()"
+    context = validate_source_context(
+        {
+            "snapshot_id": "94000000-0000-4000-8000-000000000001",
+            "snapshot_hash": "b" * 64,
+            "git_head": "a" * 40,
+            "tracked_dirty_count": 0,
+            "fragments": [{
+                "source_ref_id": "97000000-0000-4000-8000-000000000001",
+                "relative_path": "app/src/main/java/demo/Startup.kt",
+                "language": "kotlin",
+                "symbol": "demo.Startup.init",
+                "start_line": 1,
+                "end_line": 1,
+                "content": content,
+                "content_sha256": hashlib.sha256(content.encode()).hexdigest(),
+                "snapshot_hash": "b" * 64,
+                "finding_ids": [authority.finding_ids[0]],
+                "evidence_ids": [authority.evidence_ids[0]],
+                "rule_ids": ["android.startup.eager_initialization"],
+                "match_signals": ["trace_symbol"],
+            }],
+            "exclusions": [],
+            "truncated": False,
+        },
+        direct_identifiers=authority.direct_identifiers,
+        allowed_finding_ids=authority.finding_ids,
+        allowed_evidence_ids=authority.evidence_ids,
+    )
+    analysis.source_context = context
+    analysis.source_code_analysis = {
+        **_source_code_analysis_document(binding),
+        "context_state": "available",
+        "match_summary": "strong",
+    }
+    prepared = _prepare_local_report(analysis, result, source_context=context)
+
+    restored = _prepared_from_persisted_documents(
+        analysis,
+        source_value=prepared.source_report,
+        core_value=prepared.core_document,
+        projection_value=prepared.projection.document,
+        report_value=None,
+    )
+
+    assert restored.projection.canonical_bytes == prepared.projection.canonical_bytes
+    assert restored.projection.document["source_context"]["match_summary"] == "strong"
+
+    tampered_context = copy.deepcopy(context)
+    tampered_content = "fun init() = executeUntrustedPayload()"
+    tampered_context["fragments"][0]["content"] = tampered_content
+    tampered_context["fragments"][0]["content_sha256"] = hashlib.sha256(
+        tampered_content.encode()
+    ).hexdigest()
+    analysis.source_context = tampered_context
+    with pytest.raises(
+        _PersistedLocalEvidenceError,
+        match="ai_source_evidence_invalid",
+    ):
+        _prepared_from_persisted_documents(
+            analysis,
+            source_value=prepared.source_report,
+            core_value=prepared.core_document,
+            projection_value=prepared.projection.document,
+            report_value=None,
+        )
 
 
 def test_local_restart_degrades_waiting_source_and_finishes_persisted_report(
@@ -4024,6 +4136,11 @@ def test_local_remote_capture_report_runs_real_agent_lifecycle(
             {
                 **smartperfetto_result.payload["report"],
                 "analysisNotes": [f"{scenario_type} original"],
+                **(
+                    {"boundedPayload": "x" * 1_100_000}
+                    if outcome == "completed"
+                    else {}
+                ),
             },
             ensure_ascii=True,
             indent=2,
@@ -4324,6 +4441,32 @@ def test_local_remote_capture_report_runs_real_agent_lifecycle(
                     if report_response.status_code == 200:
                         break
                     time.sleep(0.01)
+            if outcome == "source_strong":
+                for _ in range(200):
+                    active_task = app.state.local_runtime.analyses[
+                        (user.team_id, UUID(created["analysis_id"]))
+                    ].task
+                    if active_task is None or active_task.done():
+                        break
+                    time.sleep(0.01)
+                rerun = client.post(
+                    f"/v1/teams/{user.team_id}/analyses/"
+                    f"{created['analysis_id']}/synthesis-runs",
+                    headers=browser_headers,
+                )
+                assert rerun.status_code == 201, rerun.text
+                assert rerun.json()["generation"] == 2
+                for _ in range(200):
+                    report_response = client.get(
+                        f"/v1/teams/{user.team_id}/analyses/"
+                        f"{created['analysis_id']}/report"
+                    )
+                    if (
+                        report_response.status_code == 200
+                        and report_response.json()["report_version"] == 2
+                    ):
+                        break
+                    time.sleep(0.01)
             projected = client.get(
                 f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
             ).json()
@@ -4489,7 +4632,12 @@ def test_local_remote_capture_report_runs_real_agent_lifecycle(
         assert fix["relative_path"] == "app/src/main/java/demo/Startup.kt"
         assert fix["symbol"] == "demo.Startup.init"
         assert fix["diff"].startswith("diff --git a/app/")
-        assert provider.calls == 1
+        assert report["report_version"] == 2
+        assert smartperfetto.submissions == [
+            (b"startup-trace", "startup", None),
+            (b"scroll-trace", "scroll", None),
+        ]
+        assert provider.calls == 2
     elif outcome == "smartperfetto_partial":
         assert report_response.status_code == 200, report_response.text
         report = report_response.json()
@@ -4787,8 +4935,8 @@ def test_local_remote_report_preserves_completed_startup_when_scroll_capture_fai
     [
         ("startup", "submit"),
         ("scroll", "submit"),
-        ("startup", "read"),
-        ("scroll", "read"),
+        ("startup", "copy"),
+        ("scroll", "copy"),
     ],
 )
 def test_local_remote_scenario_failure_preserves_other_scenario_report(
@@ -4836,20 +4984,20 @@ def test_local_remote_scenario_failure_preserves_other_scenario_report(
     private_key = Ed25519PrivateKey.generate()
     apk = b"inverse remote partial apk"
     checksum = base64.b64encode(hashlib.sha256(apk).digest()).decode("ascii")
-    if failure_boundary == "read":
-        read_completed_artifact = (
-            app.state.local_runtime.agent_artifacts.read_completed_artifact
+    if failure_boundary == "copy":
+        copy_completed_artifact = (
+            app.state.local_runtime.agent_artifacts.copy_completed_artifact_to_fd
         )
 
-        async def fail_selected_read(**kwargs):
+        async def fail_selected_copy(**kwargs):
             if kwargs["artifact_kind"] == f"{failed_profile}_trace":
                 raise RuntimeError("private artifact read failure detail")
-            return await read_completed_artifact(**kwargs)
+            return await copy_completed_artifact(**kwargs)
 
         monkeypatch.setattr(
             app.state.local_runtime.agent_artifacts,
-            "read_completed_artifact",
-            fail_selected_read,
+            "copy_completed_artifact_to_fd",
+            fail_selected_copy,
         )
 
     with _RawTestClient(app) as client:

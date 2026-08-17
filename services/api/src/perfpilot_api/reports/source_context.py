@@ -49,6 +49,20 @@ _RULE_IDS = {
     "android.memory.bitmap_retention",
 }
 _MATCH_SIGNALS = {"trace_symbol", "android_component", "android_rule"}
+_VALIDATED_RESULT_KEYS = {
+    "snapshot_id",
+    "snapshot_hash",
+    "git_head",
+    "tracked_dirty_count",
+    "trust",
+    "match_summary",
+    "fragments",
+    "exclusions",
+    "truncated",
+}
+_VALIDATED_FRAGMENT_KEYS = (
+    _FRAGMENT_KEYS - {"snapshot_hash", "match_signals"}
+) | {"match_grade"}
 
 
 class SourceContextValidationError(ValueError):
@@ -311,9 +325,54 @@ def validate_source_context_transport(
     )
 
 
+def validate_persisted_source_context(
+    document: Mapping[str, object],
+    *,
+    direct_identifiers: Sequence[str] = (),
+    allowed_finding_ids: Iterable[str] | None = (),
+    allowed_evidence_ids: Iterable[str] | None = (),
+) -> dict[str, object]:
+    """Revalidate the normalized context stored after Agent authority checks."""
+
+    if not isinstance(document, Mapping) or set(document) != _VALIDATED_RESULT_KEYS:
+        raise SourceContextValidationError
+    fragments = document.get("fragments")
+    snapshot_hash = document.get("snapshot_hash")
+    if not isinstance(fragments, list) or not isinstance(snapshot_hash, str):
+        raise SourceContextValidationError
+    restored_fragments: list[dict[str, object]] = []
+    for fragment in fragments:
+        if not isinstance(fragment, Mapping) or set(fragment) != _VALIDATED_FRAGMENT_KEYS:
+            raise SourceContextValidationError
+        restored_fragments.append(
+            {
+                **{key: value for key, value in fragment.items() if key != "match_grade"},
+                "snapshot_hash": snapshot_hash,
+                "match_signals": [
+                    "trace_symbol" if fragment.get("symbol") is not None else "android_rule"
+                ],
+            }
+        )
+    restored = {
+        key: value
+        for key, value in document.items()
+        if key not in {"trust", "match_summary", "fragments"}
+    } | {"fragments": restored_fragments}
+    validated = validate_source_context(
+        restored,
+        direct_identifiers=direct_identifiers,
+        allowed_finding_ids=allowed_finding_ids,
+        allowed_evidence_ids=allowed_evidence_ids,
+    )
+    if _canonical(validated) != _canonical(document):
+        raise SourceContextValidationError
+    return validated
+
+
 __all__ = [
     "SourceContextValidationError",
     "grade_source_match",
     "validate_source_context",
+    "validate_persisted_source_context",
     "validate_source_context_transport",
 ]

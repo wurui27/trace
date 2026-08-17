@@ -861,6 +861,76 @@ async def test_finalized_exact_completion_verify_does_not_block_event_loop(
 
 
 @pytest.mark.asyncio
+async def test_completed_artifact_copy_streams_off_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    chunk = b"x" * (1024 * 1024)
+    size = 65 * len(chunk)
+    digest = hashlib.sha256()
+    for _ in range(65):
+        digest.update(chunk)
+    checksum = base64.b64encode(digest.digest()).decode("ascii")
+    service = _service(tmp_path)
+    slot = await service.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=size,
+        sha256_b64=checksum,
+    )
+    item = service._uploads[slot.upload_id]
+    item.finalized_at = NOW
+    service._artifacts[item.artifact_id] = item
+    completed = _completed_path(tmp_path, item.artifact_id)
+    completed.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with completed.open("wb") as stream:
+        for _ in range(65):
+            stream.write(chunk)
+    completed.chmod(0o600)
+    destination = tmp_path / "private.trace"
+    destination.touch(mode=0o600)
+    copied = threading.Event()
+    release = threading.Event()
+    original_copy = service._copy_completed_artifact_to_fd
+
+    def slow_copy(*args: object) -> None:
+        copied.set()
+        assert release.wait(timeout=2)
+        original_copy(*args)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(service, "_copy_completed_artifact_to_fd", slow_copy)
+    descriptor = os.open(destination, os.O_WRONLY)
+    task = asyncio.create_task(
+        service.copy_completed_artifact_to_fd(
+            team_id=TEAM_ID,
+            analysis_id=ANALYSIS_ID,
+            agent_id=AGENT_ID,
+            execution_id=EXECUTION_ID,
+            lease_version=3,
+            artifact_id=item.artifact_id,
+            artifact_kind=item.artifact_kind,
+            mime=item.mime,
+            size=item.size,
+            sha256_b64=item.sha256_b64,
+            destination_fd=descriptor,
+        )
+    )
+    assert await asyncio.to_thread(copied.wait, 2)
+    await asyncio.wait_for(asyncio.sleep(0), timeout=0.05)
+    release.set()
+    await task
+    os.close(descriptor)
+    copied_digest = hashlib.sha256()
+    with destination.open("rb") as stream:
+        while copied_chunk := stream.read(1024 * 1024):
+            copied_digest.update(copied_chunk)
+    assert destination.stat().st_size == size
+    assert base64.b64encode(copied_digest.digest()).decode("ascii") == checksum
+
+
+@pytest.mark.asyncio
 async def test_memory_evidence_is_rejected_before_analysis_directory_write(
     tmp_path: Path,
 ) -> None:

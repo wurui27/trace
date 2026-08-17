@@ -1371,6 +1371,21 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("accepts a bounded two-scenario original collection above the single-report limit", async () => {
+    const document = { value: "x".repeat(1_100_000) };
+    const collection = {
+      mode: "scenario_collection",
+      reports: [
+        { scenario_type: "startup", label: "启动", document },
+        { scenario_type: "scroll", label: "滑动", document },
+      ],
+    };
+    const fetcher = vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(collection));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.smartPerfettoOriginal(TEAM_ID, ANALYSIS_ID)).resolves.toEqual(collection);
+  });
+
   it("rejects source refs for none and fixes for weak source matches", async () => {
     const sourceRef = {
       source_ref_id: "95000000-0000-4000-8000-000000000001",

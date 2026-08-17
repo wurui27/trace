@@ -15,6 +15,9 @@ from perfpilot_api.reports.contracts import canonical_json_bytes
 
 
 MAX_SMARTPERFETTO_ORIGINAL_BYTES = 2 * 1024 * 1024
+MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES = (
+    2 * MAX_SMARTPERFETTO_ORIGINAL_BYTES + 64 * 1024
+)
 _VERSION = 1
 _MIME = "application/json"
 _ARTIFACT_NAMESPACE = UUID("9987841c-09df-53fa-8cad-fca8888f5d27")
@@ -165,6 +168,18 @@ class SmartPerfettoOriginalCollectionBinding:
             (item.binding.team_id, item.binding.analysis_id) for item in self.reports
         }
         if len(identities) != 1:
+            raise SmartPerfettoOriginalInvalid
+        if any(
+            type(item.binding.size) is not int
+            or not 0 < item.binding.size <= MAX_SMARTPERFETTO_ORIGINAL_BYTES
+            for item in self.reports
+        ):
+            raise SmartPerfettoOriginalInvalid
+        if (
+            sum(item.binding.size for item in self.reports)
+            + 64 * 1024
+            > MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES
+        ):
             raise SmartPerfettoOriginalInvalid
 
     def public_document(self) -> dict[str, object]:
@@ -569,11 +584,11 @@ def read_smartperfetto_original_collection(
     binding: SmartPerfettoOriginalCollectionBinding,
     team_id: UUID,
     analysis_id: UUID,
-    maximum_bytes: int = MAX_SMARTPERFETTO_ORIGINAL_BYTES,
+    maximum_bytes: int = MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES,
 ) -> bytes:
     if (
         type(maximum_bytes) is not int
-        or not 0 < maximum_bytes <= MAX_SMARTPERFETTO_ORIGINAL_BYTES
+        or not 0 < maximum_bytes <= MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES
     ):
         raise SmartPerfettoOriginalInvalid
     reports: list[dict[str, object]] = []
@@ -599,6 +614,7 @@ def read_smartperfetto_original_collection(
 
 __all__ = [
     "MAX_SMARTPERFETTO_ORIGINAL_BYTES",
+    "MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES",
     "SmartPerfettoOriginalBinding",
     "SmartPerfettoOriginalCollectionBinding",
     "SmartPerfettoOriginalError",

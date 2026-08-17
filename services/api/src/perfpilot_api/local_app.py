@@ -119,7 +119,10 @@ from perfpilot_api.reports.projection import (
     ProjectionSizeError,
     build_ai_projection,
 )
-from perfpilot_api.reports.source_context import SourceContextValidationError
+from perfpilot_api.reports.source_context import (
+    SourceContextValidationError,
+    validate_persisted_source_context,
+)
 from perfpilot_api.reports.writer import AnalysisReportWriteRequest, compose_analysis_report
 from perfpilot_api.services.canonical_result_reader import LoadedCanonicalResult
 from perfpilot_api.security.agent_credentials import AgentCredentialCodec
@@ -2104,6 +2107,26 @@ def _prepared_from_persisted_documents(
             canonical_bytes=core_bytes,
             sha256_b64=_sha256_b64(core_bytes),
         )
+        source_context: dict[str, object] | None = None
+        if analysis.source_binding is not None:
+            if analysis.source_code_analysis.get("context_state") == "available":
+                authority = derive_source_authority(core_document)
+                context = analysis.source_context
+                if not isinstance(context, Mapping):
+                    raise ValueError
+                source_context = validate_persisted_source_context(
+                    context,
+                    direct_identifiers=authority.direct_identifiers,
+                    allowed_finding_ids=authority.finding_ids,
+                    allowed_evidence_ids=authority.evidence_ids,
+                )
+                if (
+                    source_context.get("match_summary")
+                    != analysis.source_code_analysis.get("match_summary")
+                ):
+                    raise ValueError
+            elif analysis.source_code_analysis.get("context_state") != "unavailable":
+                raise ValueError
         provenance = core_document.get("provenance")
         if not isinstance(provenance, Mapping):
             raise ValueError
@@ -2114,6 +2137,7 @@ def _prepared_from_persisted_documents(
                 normalized,
                 analysis_profile=analysis.profile,  # type: ignore[arg-type]
                 question=analysis.question,
+                source_context=source_context,
             )
         except (
             ProjectionPrivacyError,
@@ -2488,7 +2512,36 @@ class _LocalRuntime:
                 descriptor = -1
                 run: LocalEngineRun | None = None
                 try:
-                    trace = await self.agent_artifacts.read_completed_artifact(
+                    temporary = (
+                        await asyncio.to_thread(
+                            self.store.analysis_subdirectory,
+                            analysis.team_id,
+                            analysis.analysis_id,
+                            "device-captures",
+                        )
+                        / f".{scenario_type}-{uuid4().hex}.trace"
+                    )
+                    open_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            os.open,
+                            temporary,
+                            os.O_CREAT
+                            | os.O_EXCL
+                            | os.O_WRONLY
+                            | getattr(os, "O_CLOEXEC", 0)
+                            | getattr(os, "O_NOFOLLOW", 0),
+                            0o600,
+                        )
+                    )
+                    try:
+                        descriptor = await asyncio.shield(open_task)
+                    except asyncio.CancelledError:
+                        try:
+                            descriptor = await open_task
+                        except Exception:
+                            pass
+                        raise
+                    await self.agent_artifacts.copy_completed_artifact_to_fd(
                         team_id=analysis.team_id,
                         analysis_id=analysis.analysis_id,
                         agent_id=access.agent_id,
@@ -2499,25 +2552,11 @@ class _LocalRuntime:
                         mime=artifact.mime,
                         size=artifact.size,
                         sha256_b64=artifact.sha256_b64,
+                        destination_fd=descriptor,
                     )
-                    temporary = (
-                        self.store.analysis_subdirectory(
-                            analysis.team_id,
-                            analysis.analysis_id,
-                            "device-captures",
-                        )
-                        / f".{scenario_type}-{uuid4().hex}.trace"
-                    )
-                    descriptor = os.open(
-                        temporary,
-                        os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                        0o600,
-                    )
-                    with os.fdopen(descriptor, "wb") as stream:
-                        descriptor = -1
-                        stream.write(trace)
-                        stream.flush()
-                        os.fsync(stream.fileno())
+                    closing_descriptor = descriptor
+                    descriptor = -1
+                    await asyncio.to_thread(os.close, closing_descriptor)
                     run = await self.gateway.submit(
                         trace_path=temporary,
                         profile=scenario_type,
@@ -2551,9 +2590,11 @@ class _LocalRuntime:
                     )
                 finally:
                     if descriptor >= 0:
-                        os.close(descriptor)
+                        closing_descriptor = descriptor
+                        descriptor = -1
+                        await asyncio.to_thread(os.close, closing_descriptor)
                     if temporary is not None:
-                        temporary.unlink(missing_ok=True)
+                        await asyncio.to_thread(temporary.unlink, missing_ok=True)
             if not results:
                 await self._fail_analysis(
                     analysis,
@@ -3304,7 +3345,10 @@ class _LocalRuntime:
             analysis.state = "analyzing"
             analysis.failure = None
             analysis.stages["smartperfetto"] = "completed"
-            if analysis.source_binding is not None:
+            if (
+                analysis.source_binding is not None
+                and analysis.source_code_analysis.get("context_state") != "available"
+            ):
                 analysis.source_code_analysis = (
                     _source_code_analysis_unavailable_document(
                         analysis.source_binding

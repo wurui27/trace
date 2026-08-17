@@ -3,6 +3,8 @@ import { sha256 } from "@noble/hashes/sha2.js";
 const API_PREFIX = "/api/v1/";
 const MAX_JSON_BYTES = 10 * 1024 * 1024;
 const MAX_SMARTPERFETTO_ORIGINAL_BYTES = 2 * 1024 * 1024;
+const MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES =
+  2 * MAX_SMARTPERFETTO_ORIGINAL_BYTES + 64 * 1024;
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
@@ -2923,7 +2925,7 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         aborted(signal);
         throw new PerfPilotApiError("network_unavailable", "网络连接不可用", true, null, { cause: error });
       }
-      const payload = await readJson(response, MAX_SMARTPERFETTO_ORIGINAL_BYTES);
+      const payload = await readJson(response, MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES);
       if (!response.ok) {
         throw new PerfPilotApiError("invalid_api_response", "SmartPerfetto 原始报告无效", false, null);
       }

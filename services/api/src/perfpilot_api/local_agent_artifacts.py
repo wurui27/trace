@@ -67,6 +67,13 @@ _CLOEXEC = getattr(os, "O_CLOEXEC", 0)
 _NONBLOCK = getattr(os, "O_NONBLOCK", 0)
 
 
+def _consume_background_task(task: asyncio.Task[None]) -> None:
+    try:
+        task.result()
+    except BaseException:
+        pass
+
+
 class _ManagedInputStream(Iterator[bytes]):
     def __init__(self, descriptor: int, directory: int) -> None:
         self._descriptor = descriptor
@@ -1694,7 +1701,7 @@ class LocalAgentArtifactService:
             ):
                 raise AgentUploadMismatch("execution artifacts do not match finalized uploads")
 
-    async def read_completed_artifact(
+    async def copy_completed_artifact_to_fd(
         self,
         *,
         team_id: UUID,
@@ -1707,8 +1714,9 @@ class LocalAgentArtifactService:
         mime: str,
         size: int,
         sha256_b64: str,
-    ) -> bytes:
-        """Read an immutable Agent artifact only through its complete ownership binding."""
+        destination_fd: int,
+    ) -> None:
+        """Copy an immutable, exactly-bound Agent artifact without materializing it."""
 
         item = self._artifacts.get(artifact_id)
         if (
@@ -1723,14 +1731,44 @@ class LocalAgentArtifactService:
             or item.mime != mime
             or item.size != size
             or not hmac.compare_digest(item.sha256_b64, sha256_b64)
+            or type(destination_fd) is not int
+            or destination_fd < 0
         ):
             raise AgentUploadNotFound("completed artifact was not found")
-        return await asyncio.to_thread(self._read_completed_artifact, item)
+        try:
+            owned_destination = os.dup(destination_fd)
+        except OSError:
+            raise AgentUploadMismatch("completed artifact does not match") from None
+        task = asyncio.create_task(
+            asyncio.to_thread(
+                self._copy_completed_artifact_to_fd,
+                item,
+                owned_destination,
+            )
+        )
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            task.add_done_callback(_consume_background_task)
+            raise
 
-    def _read_completed_artifact(self, item: _Upload) -> bytes:
-        directory = self._completed_fd(item, create=False)
+    def _copy_completed_artifact_to_fd(
+        self,
+        item: _Upload,
+        destination_fd: int,
+    ) -> None:
+        directory = -1
         descriptor = -1
         try:
+            directory = self._completed_fd(item, create=False)
+            destination = os.fstat(destination_fd)
+            if (
+                not self._is_private_regular(destination)
+                or destination.st_nlink != 1
+            ):
+                raise OSError
+            os.ftruncate(destination_fd, 0)
+            os.lseek(destination_fd, 0, os.SEEK_SET)
             name = f"{item.artifact_kind}-{item.artifact_id}.bin"
             descriptor = os.open(
                 name,
@@ -1741,26 +1779,32 @@ class LocalAgentArtifactService:
             if not self._is_private_regular(metadata) or metadata.st_size != item.size:
                 raise OSError
             digest = hashlib.sha256()
-            chunks: list[bytes] = []
             observed_size = 0
             while chunk := os.read(descriptor, 1024 * 1024):
                 observed_size += len(chunk)
                 if observed_size > item.size:
                     raise OSError
                 digest.update(chunk)
-                chunks.append(chunk)
+                remaining = memoryview(chunk)
+                while remaining:
+                    written = os.write(destination_fd, remaining)
+                    if written <= 0:
+                        raise OSError
+                    remaining = remaining[written:]
             if observed_size != item.size or not hmac.compare_digest(
                 base64.b64encode(digest.digest()).decode("ascii"),
                 item.sha256_b64,
             ):
                 raise OSError
-            return b"".join(chunks)
+            os.fsync(destination_fd)
         except OSError:
             raise AgentUploadMismatch("completed artifact does not match") from None
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
-            os.close(directory)
+            if directory >= 0:
+                os.close(directory)
+            os.close(destination_fd)
 
     async def project_completion(
         self,

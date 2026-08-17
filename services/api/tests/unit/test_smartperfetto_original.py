@@ -8,10 +8,13 @@ from uuid import uuid4
 import pytest
 
 from perfpilot_api.reports.smartperfetto_original import (
+    MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES,
     MAX_SMARTPERFETTO_ORIGINAL_BYTES,
+    SmartPerfettoOriginalBinding,
     SmartPerfettoOriginalCollectionBinding,
     SmartPerfettoOriginalInvalid,
     SmartPerfettoOriginalNotFound,
+    SmartPerfettoScenarioOriginalBinding,
     persist_smartperfetto_original,
     persist_smartperfetto_scenario_original,
     read_smartperfetto_original,
@@ -198,7 +201,7 @@ def test_scenario_collection_is_ordered_team_bound_and_byte_faithful(
         SmartPerfettoOriginalCollectionBinding(reports=tuple(reversed(entries)))
 
 
-def test_collection_payload_can_exceed_the_bounded_combined_response(
+def test_collection_payload_uses_bounded_two_scenario_response(
     tmp_path: Path,
 ) -> None:
     team_id = uuid4()
@@ -218,10 +221,39 @@ def test_collection_payload_can_exceed_the_bounded_combined_response(
     )
 
     assert sum(item.binding.size for item in entries) > MAX_SMARTPERFETTO_ORIGINAL_BYTES
-    with pytest.raises(SmartPerfettoOriginalInvalid):
-        read_smartperfetto_original_collection(
-            root=tmp_path,
-            binding=SmartPerfettoOriginalCollectionBinding(reports=entries),
-            team_id=team_id,
-            analysis_id=analysis_id,
+    combined = read_smartperfetto_original_collection(
+        root=tmp_path,
+        binding=SmartPerfettoOriginalCollectionBinding(reports=entries),
+        team_id=team_id,
+        analysis_id=analysis_id,
+    )
+    assert [item["document"] for item in json.loads(combined)["reports"]] == [
+        json.loads(payload),
+        json.loads(payload),
+    ]
+
+
+def test_collection_rejects_oversized_scenario_before_advertising_collection() -> None:
+    team_id = uuid4()
+    analysis_id = uuid4()
+    assert MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES == (
+        2 * MAX_SMARTPERFETTO_ORIGINAL_BYTES + 64 * 1024
+    )
+    oversized = MAX_SMARTPERFETTO_ORIGINAL_BYTES + 1
+    reports = tuple(
+        SmartPerfettoScenarioOriginalBinding(
+            scenario_type=scenario_type,
+            binding=SmartPerfettoOriginalBinding(
+                artifact_id=uuid4(),
+                team_id=team_id,
+                analysis_id=analysis_id,
+                version=1,
+                mime="application/json",
+                size=oversized,
+                sha256="a" * 64,
+            ),
         )
+        for scenario_type in ("startup", "scroll")
+    )
+    with pytest.raises(SmartPerfettoOriginalInvalid):
+        SmartPerfettoOriginalCollectionBinding(reports=reports)
