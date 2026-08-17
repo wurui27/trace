@@ -62,6 +62,9 @@ _CREDENTIAL_MARKER = re.compile(
 )
 _OBJECT_STORE_URI = re.compile(r"(?i)^(?:s3|gs|az|r2)://")
 _WINDOWS_ABSOLUTE_PATH = re.compile(r"^[A-Za-z]:[\\/]")
+_EMBEDDED_POSIX_ABSOLUTE_PATH = re.compile(
+    r"(?<![:/])/(?:[A-Za-z0-9._-]+/)+[A-Za-z0-9._-]+"
+)
 _FORBIDDEN_REPORT_KEYS = {
     "apikey",
     "authorization",
@@ -246,6 +249,7 @@ def _redact_string(value: str) -> str:
         or _OBJECT_STORE_URI.search(value)
         or value.startswith("/")
         or _WINDOWS_ABSOLUTE_PATH.search(value)
+        or _EMBEDDED_POSIX_ABSOLUTE_PATH.search(value)
     ):
         return "[redacted]"
     return value

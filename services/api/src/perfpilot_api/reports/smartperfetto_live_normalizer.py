@@ -250,7 +250,11 @@ def _envelope_facts(
         meta = raw.get("meta") if isinstance(raw.get("meta"), Mapping) else {}
         source_name = _text(meta.get("source"), fallback=f"envelope_{envelope_index}")
         source_slug = _slug(source_name, fallback="envelope")
-        evidence_id = _stable(analysis_id, "live-envelope", f"{source_name}:{envelope_index}")
+        evidence_id = _stable(
+            analysis_id,
+            "live-envelope",
+            f"{scenario}:{source_name}:{envelope_index}",
+        )
         fields: dict[str, object] = {}
         for column, value in zip(columns, row, strict=True):
             field_name = _slug(column, fallback="field")
@@ -350,6 +354,7 @@ def _recommendation(diagnostic: Mapping[str, object], fallback: str | None) -> s
 def _diagnostic_facts(
     analysis_id: UUID,
     artifact_id: UUID,
+    scenario: str,
     diagnostics: Sequence[object],
     actions: Sequence[object],
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
@@ -385,7 +390,11 @@ def _diagnostic_facts(
                 ),
                 "",
             )
-        evidence_id = _stable(analysis_id, "live-diagnostic-evidence", source_id)
+        evidence_id = _stable(
+            analysis_id,
+            "live-diagnostic-evidence",
+            f"{scenario}:{source_id}",
+        )
         evidence.append(
             {
                 "evidence_id": evidence_id,
@@ -404,7 +413,11 @@ def _diagnostic_facts(
         confidence = _confidence(raw.get("confidence"))
         findings.append(
             {
-                "finding_id": _stable(analysis_id, "live-finding", source_id),
+                "finding_id": _stable(
+                    analysis_id,
+                    "live-finding",
+                    f"{scenario}:{source_id}",
+                ),
                 "rule_id": _slug(f"smartperfetto.{source_id}", fallback="smartperfetto"),
                 "kind": "root_cause",
                 "status": "confirmed" if confidence in {"high", "medium"} else "suspected",
@@ -458,6 +471,7 @@ def _build_core(
     diagnostic_evidence, findings = _diagnostic_facts(
         source.analysis_id,
         source.artifact_id,
+        scenario,
         diagnostics,
         actions,
     )
@@ -471,7 +485,11 @@ def _build_core(
     if not envelope_evidence and not diagnostic_evidence:
         raise _fail()
     trace_start, trace_end = _bounds(envelopes)
-    limitation_id = _stable(source.analysis_id, "live-limitation", "quality-counters")
+    limitation_id = _stable(
+        source.analysis_id,
+        "live-limitation",
+        f"{scenario}:quality-counters",
+    )
     return {
         "schema_version": "1.0",
         "analysis_id": str(source.analysis_id),

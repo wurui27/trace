@@ -375,6 +375,12 @@ class SmartPerfettoLocalGateway:
             "report",
         )
         report = parsed.sanitized_report
+        original_report = json.loads(original_report_bytes)
+        public_original = dict(original_report) if isinstance(original_report, dict) else {}
+        public_original.pop("reportUrl", None)
+        public_original["reportId"] = parsed.report_id
+        if public_original != report:
+            original_report_bytes = canonical_json_bytes(report)
         usable = bool(
             isinstance(report.get("summary"), Mapping)
             and str(report["summary"].get("conclusion", "")).strip()

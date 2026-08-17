@@ -10,8 +10,17 @@ from uuid import UUID
 
 import pytest
 
-from perfpilot_api.reports.contracts import canonical_json_bytes
-from perfpilot_api.reports.normalizer import SmartPerfettoNormalizationError, normalize_smartperfetto_result
+from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
+from perfpilot_api.ai.synthesis import validate_synthesis_output
+from perfpilot_api.reports.normalizer import (
+    NormalizedTraceReport,
+    SmartPerfettoNormalizationError,
+    normalize_smartperfetto_result,
+)
+from perfpilot_api.reports.smartperfetto_live_normalizer import (
+    normalize_live_smartperfetto_result,
+)
+from perfpilot_api.reports.projection import build_ai_projection
 from perfpilot_api.services.canonical_result_reader import LoadedCanonicalResult
 from perfpilot_api.engines.canonical_results import (
     EngineResultWrite,
@@ -45,6 +54,137 @@ def _source(document: dict[str, object] | None = None) -> LoadedCanonicalResult:
 
 def _report(document: dict[str, object]) -> dict[str, object]:
     return document["result"]["payload"]["report"]  # type: ignore[index,return-value]
+
+
+def _live_source(scenario_type: str, *, artifact_id: str) -> LoadedCanonicalResult:
+    document = json.loads(FIXTURE.read_text())
+    document["artifact_id"] = artifact_id
+    document["result"]["payload"]["report"] = {  # type: ignore[index]
+        "resultContract": {
+            "version": "1.0.0",
+            "dataEnvelopes": [
+                {
+                    "meta": {
+                        "source": f"{scenario_type}.frame_timeline",
+                        "stepId": f"{scenario_type}.frames",
+                    },
+                    "data": {
+                        "columns": ["frame_count"],
+                        "rows": [[7]],
+                    },
+                    "display": {
+                        "title": "Frame count",
+                        "columns": [
+                            {
+                                "name": "frame_count",
+                                "label": "Frame count",
+                                "unit": "count",
+                            }
+                        ],
+                    },
+                },
+                {
+                    "meta": {
+                        "source": "shared.cpu_metrics",
+                        "stepId": "shared.cpu",
+                    },
+                    "data": {
+                        "columns": ["duration_ms"],
+                        "rows": [[12]],
+                    },
+                    "display": {
+                        "title": "CPU duration",
+                        "columns": [
+                            {
+                                "name": "duration_ms",
+                                "label": "CPU duration",
+                                "unit": "ms",
+                            }
+                        ],
+                    },
+                },
+            ],
+            "diagnostics": [
+                {
+                    "id": "shared-diagnostic",
+                    "title": "Shared diagnostic",
+                    "description": "Shared diagnostic description",
+                    "severity": "warning",
+                    "confidence": 0.8,
+                    "evidence": [],
+                }
+            ],
+            "actions": [],
+        }
+    }
+    return _source(document)
+
+
+def test_live_normalizer_namespaces_public_ids_by_scenario() -> None:
+    startup_report = normalize_live_smartperfetto_result(
+        _live_source(
+            "startup", artifact_id="85000000-0000-4000-8000-000000000001"
+        ),
+        analysis_mode="device",
+    )
+    scroll_report = normalize_live_smartperfetto_result(
+        _live_source(
+            "scroll", artifact_id="85000000-0000-4000-8000-000000000002"
+        ),
+        analysis_mode="device",
+    )
+    startup = startup_report.document
+    scroll = scroll_report.document
+
+    startup_scenario = startup["scenario_reports"][0]  # type: ignore[index]
+    scroll_scenario = scroll["scenario_reports"][0]  # type: ignore[index]
+    for collection, identifier in (
+        ("metrics", "metric_id"),
+        ("findings", "finding_id"),
+        ("evidence", "evidence_id"),
+    ):
+        startup_ids = {item[identifier] for item in startup_scenario[collection]}
+        scroll_ids = {item[identifier] for item in scroll_scenario[collection]}
+        assert startup_ids.isdisjoint(scroll_ids)
+    assert {
+        item["limitation_id"] for item in startup["limitations"]  # type: ignore[index]
+    }.isdisjoint(
+        item["limitation_id"] for item in scroll["limitations"]  # type: ignore[index]
+    )
+
+    merged_document = {
+        **startup,
+        "scenario_reports": [
+            startup["scenario_reports"][0],  # type: ignore[index]
+            scroll["scenario_reports"][0],  # type: ignore[index]
+        ],
+        "limitations": [*startup["limitations"], *scroll["limitations"]],  # type: ignore[index]
+    }
+    merged_bytes = canonical_json_bytes(
+        validate_contract("normalized-trace-report", merged_document)
+    )
+    projection = build_ai_projection(
+        NormalizedTraceReport(
+            canonical_bytes=merged_bytes,
+            sha256_b64=base64.b64encode(hashlib.sha256(merged_bytes).digest()).decode(),
+        ),
+        analysis_profile="auto",
+        question=None,
+    )
+    validate_synthesis_output(
+        projection=projection,
+        candidate={
+            "schema_version": "2.0",
+            "verdict": "已完成两个场景的证据校验。",
+            "executive_summary": "已完成两个场景的证据校验。",
+            "key_metric_ids": [],
+            "top_findings": [],
+            "recommendations": [],
+            "source_fixes": [],
+            "retest_plan": [],
+            "limitations": [],
+        },
+    )
 
 
 def test_normalizer_is_byte_stable_and_sorts_public_ids() -> None:
