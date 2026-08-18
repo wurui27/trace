@@ -40,10 +40,12 @@ from perfpilot_api.local_app import (
     _prepare_local_report,
     _prepared_from_persisted_documents,
     _public_origin,
+    _remote_capture_question,
     _restore_ai_rounds,
     _source_code_analysis_unavailable_document,
     _source_code_analysis_document,
     _local_source_code_document,
+    _normalize_local_smartperfetto_result,
     create_local_app,
 )
 from perfpilot_api.local_analysis_store import (
@@ -1841,6 +1843,55 @@ def test_persisted_source_strong_projection_rebuild_retains_validated_context() 
             projection_value=prepared.projection.document,
             report_value=None,
         )
+
+
+def test_script_capture_normalization_uses_completed_trace_digest_without_apk() -> None:
+    digest = base64.b64encode(hashlib.sha256(b"captured trace").digest()).decode()
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={},
+        capture_configuration={
+            "test_type": "cold_start",
+            "launch_mode": "automatic",
+            "duration_seconds": 15,
+            "package_name": "com.rivotek.mediacenter",
+            "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        },
+    )
+
+    normalized = _normalize_local_smartperfetto_result(
+        analysis,
+        _smartperfetto_result(),
+        profile="startup",
+        input_sha256_b64=digest,
+    )
+
+    assert normalized.report.document["schema_version"] == "1.0"
+
+
+def test_script_capture_question_fences_smartperfetto_to_selected_package() -> None:
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={},
+        capture_configuration={
+            "test_type": "cold_start",
+            "launch_mode": "automatic",
+            "duration_seconds": 15,
+            "package_name": "com.rivotek.mediacenter",
+            "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        },
+    )
+
+    question = _remote_capture_question(analysis, scenario_type="startup")
+
+    assert "com.rivotek.mediacenter" in question
+    assert "不要替换成其他应用" in question
 
 
 def test_local_restart_degrades_waiting_source_and_finishes_persisted_report(

@@ -1334,12 +1334,15 @@ def _normalize_local_smartperfetto_result(
     result: EngineResult,
     *,
     profile: str,
+    input_sha256_b64: str | None = None,
 ) -> _NormalizedLocalResult:
     execution_id = uuid4()
     artifact_id = result_artifact_id(execution_id)
-    source_input = analysis.inputs[
-        "trace" if analysis.analysis_mode == "trace_upload" else "apk"
-    ].descriptor
+    if input_sha256_b64 is None:
+        source_input = analysis.inputs[
+            "trace" if analysis.analysis_mode == "trace_upload" else "apk"
+        ].descriptor
+        input_sha256_b64 = source_input.sha256_b64
     canonical = canonicalize_engine_result(
         EngineResultWrite(
             team_id=analysis.team_id,
@@ -1354,7 +1357,7 @@ def _normalize_local_smartperfetto_result(
             engine_image_digest=_ENGINE_IMAGE_DIGEST,
             attempt_number=1,
             input_manifest_hash=hashlib.sha256(
-                source_input.sha256_b64.encode()
+                input_sha256_b64.encode()
             ).hexdigest(),
             config_hash=hashlib.sha256(
                 f"{profile}\0{analysis.question or ''}".encode()
@@ -1391,6 +1394,26 @@ def _normalize_local_smartperfetto_result(
         canonical_sha256_b64=canonical.checksum_sha256_b64,
         source_report=dict(report_payload),
         original_report_bytes=result.original_report_bytes,
+    )
+
+
+def _remote_capture_question(
+    analysis: _LocalAnalysis,
+    *,
+    scenario_type: Literal["startup", "scroll"],
+) -> str | None:
+    configuration = analysis.capture_configuration
+    package_name = (
+        configuration.get("package_name")
+        if isinstance(configuration, Mapping)
+        else None
+    )
+    if not isinstance(package_name, str) or not package_name:
+        return analysis.question
+    scenario_name = "启动" if scenario_type == "startup" else "滑动"
+    return (
+        f"请仅分析目标应用 {package_name} 的{scenario_name}性能；"
+        "若 Trace 不包含该应用数据，请明确说明，不要替换成其他应用。"
     )
 
 
@@ -2674,7 +2697,10 @@ class _LocalRuntime:
                     run = await self.gateway.submit(
                         trace_path=temporary,
                         profile=scenario_type,
-                        question=None,
+                        question=_remote_capture_question(
+                            analysis,
+                            scenario_type=scenario_type,
+                        ),
                     )
                     await self._register_source_run(analysis, run)
                     result = await self._wait_engine_result(
@@ -2685,6 +2711,7 @@ class _LocalRuntime:
                         analysis,
                         result,
                         profile=scenario_type,
+                        input_sha256_b64=artifact.sha256_b64,
                     )
                     results[scenario_type] = result
                     normalized_results[scenario_type] = normalized
