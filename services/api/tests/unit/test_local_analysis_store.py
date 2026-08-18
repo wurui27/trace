@@ -227,6 +227,25 @@ def test_store_isolates_same_analysis_id_between_teams(tmp_path: Path) -> None:
     }
 
 
+def test_store_removes_exact_analysis_without_touching_other_team(tmp_path: Path) -> None:
+    store = LocalAnalysisStore(tmp_path)
+    first = {"team_id": str(TEAM_ID), "analysis_id": str(ANALYSIS_ID)}
+    second = {"team_id": str(OTHER_TEAM_ID), "analysis_id": str(ANALYSIS_ID)}
+    store.save_state(TEAM_ID, ANALYSIS_ID, first)
+    store.save_document(TEAM_ID, ANALYSIS_ID, "report.json", {"owner": "first"})
+    upload = store.upload_path(TEAM_ID, ANALYSIS_ID, str(ANALYSIS_ID))
+    upload.write_bytes(b"private trace")
+    store.save_state(OTHER_TEAM_ID, ANALYSIS_ID, second)
+
+    store.remove_analysis(TEAM_ID, ANALYSIS_ID)
+
+    assert (TEAM_ID, ANALYSIS_ID) not in store.load_states()
+    assert store.load_document(OTHER_TEAM_ID, ANALYSIS_ID, "state.json") == second
+    assert not (
+        tmp_path / "teams" / str(TEAM_ID) / "analyses" / str(ANALYSIS_ID)
+    ).exists()
+
+
 def test_store_rejects_state_copied_into_another_team_directory(tmp_path: Path) -> None:
     store = LocalAnalysisStore(tmp_path)
     state = {"team_id": str(TEAM_ID), "analysis_id": str(ANALYSIS_ID)}

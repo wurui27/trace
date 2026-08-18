@@ -2590,6 +2590,38 @@ class _LocalRuntime:
             document,
         )
 
+    async def _remove_previous_team_analyses(
+        self,
+        analysis: _LocalAnalysis,
+    ) -> None:
+        async with self.lock:
+            previous = tuple(
+                current
+                for (team_id, analysis_id), current in self.analyses.items()
+                if team_id == analysis.team_id
+                and analysis_id != analysis.analysis_id
+                and current.state in _TERMINAL_ANALYSIS_STATES
+            )
+        for current in previous:
+            await asyncio.to_thread(
+                self.store.remove_analysis,
+                current.team_id,
+                current.analysis_id,
+            )
+        async with self.lock:
+            for current in previous:
+                key = (current.team_id, current.analysis_id)
+                if self.analyses.get(key) is not current:
+                    continue
+                del self.analyses[key]
+                self.remote_publication_locks.pop(key, None)
+                for upload in tuple(self.uploads.values()):
+                    if (
+                        upload.team_id == current.team_id
+                        and upload.analysis_id == current.analysis_id
+                    ):
+                        self._unregister_upload(upload)
+
     async def observe_agent_completion(
         self,
         access: AgentExecutionAccess,
@@ -5070,6 +5102,11 @@ class _LocalRuntime:
             analysis.stages["report"] = "completed"
             analysis.version += 1
         await self._persist(analysis)
+        if (
+            analysis.analysis_mode == "trace_upload"
+            and analysis.trace_test_type is not None
+        ):
+            await self._remove_previous_team_analyses(analysis)
 
     async def _fail_synthesis_rerun(
         self,

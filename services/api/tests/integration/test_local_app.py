@@ -3091,6 +3091,131 @@ def _upload_and_finalize_trace(
     )
 
 
+def test_successful_trace_submission_removes_only_current_team_previous_analysis(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    first_trace = b"first-account-trace"
+    second_trace = b"second-account-trace"
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        first_id, first_checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+            trace=first_trace,
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=first_id,
+            headers=headers,
+            checksum=first_checksum,
+            trace=first_trace,
+        )
+        for _ in range(100):
+            if client.get(
+                f"/v1/teams/{team_id}/analyses/{first_id}/report"
+            ).status_code == 200:
+                break
+            time.sleep(0.01)
+        assert client.get(
+            f"/v1/teams/{team_id}/analyses/{first_id}/report"
+        ).status_code == 200
+
+        other_team_id = UUID("82000000-0000-4000-8000-000000000099")
+        other_analysis_id = UUID("91000000-0000-4000-8000-000000000099")
+        extra_store = LocalAnalysisStore(tmp_path)
+        extra_store.save_state(
+            other_team_id,
+            other_analysis_id,
+            {
+                "team_id": str(other_team_id),
+                "analysis_id": str(other_analysis_id),
+                "state": "completed",
+            },
+        )
+        extra_store.close()
+
+        second_id, second_checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+            trace=second_trace,
+        )
+        slot = client.post(
+            f"/v1/teams/{team_id}/analyses/{second_id}/uploads",
+            headers=headers,
+            json={
+                "artifact_kind": "trace",
+                "mime": "application/octet-stream",
+                "size": len(second_trace),
+                "sha256_b64": second_checksum,
+            },
+        ).json()["upload"]
+        put = urlsplit(slot["put_url"])
+        assert client.put(
+            f"{put.path}?{put.query}",
+            content=second_trace,
+            headers=slot["required_headers"],
+        ).status_code == 200
+
+        failed = client.post(
+            f"/v1/teams/{team_id}/analyses/{second_id}/finalize-upload",
+            headers=headers,
+            json={
+                "upload_id": slot["upload_id"],
+                "sha256_b64": base64.b64encode(b"x" * 32).decode("ascii"),
+                "size": len(second_trace),
+            },
+        )
+        assert failed.status_code == 409
+        assert client.get(
+            f"/v1/teams/{team_id}/analyses/{first_id}/report"
+        ).status_code == 200
+
+        succeeded = client.post(
+            f"/v1/teams/{team_id}/analyses/{second_id}/finalize-upload",
+            headers=headers,
+            json={
+                "upload_id": slot["upload_id"],
+                "sha256_b64": second_checksum,
+                "size": len(second_trace),
+            },
+        )
+        assert succeeded.status_code == 200
+        for _ in range(100):
+            if client.get(
+                f"/v1/teams/{team_id}/analyses/{second_id}/report"
+            ).status_code == 200:
+                break
+            time.sleep(0.01)
+        assert client.get(
+            f"/v1/teams/{team_id}/analyses/{second_id}/report"
+        ).status_code == 200
+        assert client.get(
+            f"/v1/teams/{team_id}/analyses/{first_id}"
+        ).status_code == 404
+
+    reopened = LocalAnalysisStore(tmp_path)
+    assert (UUID(team_id), UUID(first_id)) not in reopened.load_states()
+    assert reopened.load_document(
+        other_team_id, other_analysis_id, "state.json"
+    ) == {
+        "team_id": str(other_team_id),
+        "analysis_id": str(other_analysis_id),
+        "state": "completed",
+    }
+    reopened.close()
+
+
 def _persist_created_trace_analysis(
     tmp_path: Path,
 ) -> tuple[str, UUID, dict[str, object]]:

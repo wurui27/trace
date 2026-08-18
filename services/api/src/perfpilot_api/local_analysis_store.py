@@ -336,6 +336,81 @@ class LocalAnalysisStore:
                 states[(team_id, analysis_id)] = state
         return states
 
+    @staticmethod
+    def _remove_directory_contents(directory_fd: int) -> None:
+        try:
+            entries = list(os.scandir(directory_fd))
+        except OSError:
+            raise LocalAnalysisStoreError("local analysis removal failed") from None
+        for entry in entries:
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+                if stat.S_ISREG(metadata.st_mode):
+                    os.unlink(entry.name, dir_fd=directory_fd)
+                    continue
+                if not stat.S_ISDIR(metadata.st_mode):
+                    raise LocalAnalysisStoreError("unsafe local analysis path")
+                child_fd = os.open(
+                    entry.name,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | getattr(os, "O_CLOEXEC", 0)
+                    | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=directory_fd,
+                )
+                try:
+                    LocalAnalysisStore._remove_directory_contents(child_fd)
+                finally:
+                    os.close(child_fd)
+                os.rmdir(entry.name, dir_fd=directory_fd)
+            except LocalAnalysisStoreError:
+                raise
+            except OSError:
+                raise LocalAnalysisStoreError(
+                    "local analysis removal failed"
+                ) from None
+
+    def remove_analysis(self, team_id: UUID, analysis_id: UUID) -> None:
+        """Remove one exact tenant analysis without following filesystem links."""
+
+        self._verify_trusted_root()
+        _require_uuid(team_id, "team_id")
+        _require_uuid(analysis_id, "analysis_id")
+        flags = (
+            os.O_RDONLY
+            | os.O_DIRECTORY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        descriptors: list[int] = []
+        try:
+            try:
+                team_fd = os.open(str(team_id), flags, dir_fd=self._root_fd)
+            except FileNotFoundError:
+                return
+            descriptors.append(team_fd)
+            try:
+                analyses_fd = os.open("analyses", flags, dir_fd=team_fd)
+            except FileNotFoundError:
+                return
+            descriptors.append(analyses_fd)
+            try:
+                analysis_fd = os.open(str(analysis_id), flags, dir_fd=analyses_fd)
+            except FileNotFoundError:
+                return
+            descriptors.append(analysis_fd)
+            self._remove_directory_contents(analysis_fd)
+            os.close(descriptors.pop())
+            os.rmdir(str(analysis_id), dir_fd=analyses_fd)
+            os.fsync(analyses_fd)
+        except LocalAnalysisStoreError:
+            raise
+        except OSError:
+            raise LocalAnalysisStoreError("local analysis removal failed") from None
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+
 
 __all__ = [
     "LocalAnalysisStore",
