@@ -241,6 +241,15 @@ def test_rejects_invented_numeric_target_attached_to_unit() -> None:
         _validate(candidate)
 
 
+def test_allows_digits_embedded_in_technical_identifiers() -> None:
+    candidate = _candidate()
+    candidate["recommendations"][0]["action"] = (  # type: ignore[index]
+        "Move fzlthpro_gb18030.ttf off the startup path."
+    )
+
+    _validate(candidate)
+
+
 @pytest.mark.parametrize(
     ("section", "identifier"),
     [("recommendations", "recommendation_id"), ("retest_plan", "retest_id")],
