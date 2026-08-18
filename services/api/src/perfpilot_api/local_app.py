@@ -370,17 +370,11 @@ class SmartPerfettoLocalGateway:
         if not 200 <= response.status_code <= 299:
             raise RuntimeError("SmartPerfetto report is unavailable")
         parsed = SmartPerfettoReportResponse.model_validate(response.payload)
-        original_report_bytes = _top_level_json_value_bytes(
-            response.raw_body,
-            "report",
-        )
         report = parsed.sanitized_report
-        original_report = json.loads(original_report_bytes)
-        public_original = dict(original_report) if isinstance(original_report, dict) else {}
-        public_original.pop("reportUrl", None)
-        public_original["reportId"] = parsed.report_id
-        if public_original != report:
-            original_report_bytes = canonical_json_bytes(report)
+        original_report_html_bytes = await self._transport.request_html(
+            f"/api/reports/{parsed.report_id}/export",
+            workspace_id=self._workspace_id,
+        )
         usable = bool(
             isinstance(report.get("summary"), Mapping)
             and str(report["summary"].get("conclusion", "")).strip()
@@ -389,7 +383,7 @@ class SmartPerfettoLocalGateway:
             contract="workspace-agent-v1",
             state="completed" if usable else "insufficient_data",
             payload={"reportId": parsed.report_id, "report": report},
-            original_report_bytes=original_report_bytes,
+            original_report_html_bytes=original_report_html_bytes,
         )
 
     async def cancel(self, run: LocalEngineRun) -> None:

@@ -224,6 +224,46 @@ async def test_transport_bounds_and_parses_json_exactly_once() -> None:
 
 
 @pytest.mark.asyncio
+async def test_transport_preserves_native_html_response_bytes() -> None:
+    original = (
+        b'<!DOCTYPE html>\n<html><body data-order="b a">'
+        b'\xe4\xb8\xad\\u6587</body></html>\n'
+    )
+    requests: list[httpx.Request] = []
+
+    async def resolve(_: SecretStr) -> SecretStr:
+        return SecretStr("service-secret")
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/html; charset=utf-8"},
+            content=original,
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+    ) as client:
+        transport = SmartPerfettoTransport(
+            base_url="https://smartperfetto.example.com",
+            credential_reference=SecretStr("secret-ref"),
+            credential_resolver=resolve,
+            client=client,
+            max_json_bytes=4096,
+        )
+        actual = await transport.request_html(
+            "/api/reports/report-1/export",
+            workspace_id="workspace-server-owned",
+        )
+
+    assert actual == original
+    assert requests[0].headers["Accept"] == "text/html"
+    assert requests[0].headers["X-Workspace-Id"] == "workspace-server-owned"
+
+
+@pytest.mark.asyncio
 async def test_transport_rejects_malformed_or_non_object_json() -> None:
     async def resolve(_: SecretStr) -> SecretStr:
         return SecretStr("service-secret")

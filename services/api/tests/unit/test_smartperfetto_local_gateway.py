@@ -18,11 +18,22 @@ _FIXTURE = (
 
 
 class _ReportTransport:
-    def __init__(self, response: SmartPerfettoJsonResponse) -> None:
+    def __init__(
+        self,
+        response: SmartPerfettoJsonResponse,
+        *,
+        html: bytes = b"<!DOCTYPE html><html><body>native</body></html>",
+    ) -> None:
         self._response = response
+        self.html = html
+        self.html_requests: list[tuple[str, str]] = []
 
     async def request_json(self, *_args: object, **_kwargs: object) -> SmartPerfettoJsonResponse:
         return self._response
+
+    async def request_html(self, path: str, *, workspace_id: str) -> bytes:
+        self.html_requests.append((path, workspace_id))
+        return self.html
 
     async def aclose(self) -> None:
         return None
@@ -58,7 +69,7 @@ async def test_gateway_redacts_percent_encoded_or_invalid_private_text(
 
 
 @pytest.mark.asyncio
-async def test_gateway_original_report_redacts_private_runtime_paths() -> None:
+async def test_gateway_preserves_native_html_and_redacts_machine_evidence() -> None:
     payload = json.loads(_FIXTURE.read_text(encoding="utf-8"))
     report = payload["report"]
     assert isinstance(report, dict)
@@ -74,16 +85,23 @@ async def test_gateway_original_report_redacts_private_runtime_paths() -> None:
     raw_body = json.dumps(payload, ensure_ascii=True, indent=2).encode("utf-8") + b"\n"
     gateway = SmartPerfettoLocalGateway()
     await gateway._transport.aclose()
-    gateway._transport = _ReportTransport(  # type: ignore[assignment]
-        SmartPerfettoJsonResponse(200, payload, raw_body)
+    original_html = (
+        b'<!DOCTYPE html>\n<html><body data-order="b a">'
+        b'\xe4\xb8\xad\\u6587</body></html>\n'
     )
+    transport = _ReportTransport(
+        SmartPerfettoJsonResponse(200, payload, raw_body),
+        html=original_html,
+    )
+    gateway._transport = transport  # type: ignore[assignment]
 
     result = await gateway.fetch_result(LocalEngineRun("session-synthetic-001", "run-1"))
 
-    assert result.original_report_bytes is not None
-    original = json.loads(result.original_report_bytes)
-    serialized = json.dumps(original, ensure_ascii=False)
-    assert "logFile" not in original
+    serialized = json.dumps(result.payload["report"], ensure_ascii=False)
     assert "/home/rivotek" not in serialized
     assert "/synthetic/private" not in serialized
     assert "[redacted]" in serialized
+    assert result.original_report_html_bytes == original_html
+    assert transport.html_requests == [
+        ("/api/reports/report-synthetic-001/export", "default-workspace")
+    ]

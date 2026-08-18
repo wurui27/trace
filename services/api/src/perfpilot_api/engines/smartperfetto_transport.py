@@ -18,6 +18,7 @@ from perfpilot_api.engines.errors import EngineAdapterError
 
 CredentialResolver = Callable[[SecretStr], Awaitable[SecretStr]]
 _EXTERNAL_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,254}$")
+_MAX_HTML_BYTES = 16 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +200,55 @@ class SmartPerfettoTransport:
                 payload=payload,
                 raw_body=raw_body,
             )
+        except EngineAdapterError:
+            raise
+        except httpx.TimeoutException:
+            raise _error("engine_timeout", retryable=True) from None
+        except httpx.RequestError:
+            raise _error("engine_unavailable", retryable=True) from None
+        finally:
+            if response is not None:
+                await response.aclose()
+
+    async def request_html(self, path: str, *, workspace_id: str) -> bytes:
+        safe_path = _validate_path(path)
+        headers = await self._headers(
+            accept="text/html",
+            workspace_id=workspace_id,
+        )
+        headers["Accept-Encoding"] = "identity"
+        response: httpx.Response | None = None
+        try:
+            request = self._client.build_request(
+                "GET",
+                f"{self._base_url}{safe_path}",
+                headers=headers,
+            )
+            response = await self._client.send(
+                request,
+                stream=True,
+                follow_redirects=False,
+            )
+            self._check_status(response)
+            if not 200 <= response.status_code <= 299:
+                raise _error("engine_contract_invalid", retryable=False)
+            content_type = response.headers.get("content-type", "")
+            if content_type.split(";", 1)[0].strip().casefold() != "text/html":
+                raise _error("engine_contract_invalid", retryable=False)
+            content_encoding = response.headers.get("content-encoding", "").casefold()
+            if content_encoding not in {"", "identity"}:
+                raise _error("engine_contract_invalid", retryable=False)
+            chunks: list[bytes] = []
+            size = 0
+            async for chunk in response.aiter_bytes():
+                size += len(chunk)
+                if size > _MAX_HTML_BYTES:
+                    raise _error("engine_contract_invalid", retryable=False)
+                chunks.append(chunk)
+            payload = b"".join(chunks)
+            if not payload:
+                raise _error("engine_contract_invalid", retryable=False)
+            return payload
         except EngineAdapterError:
             raise
         except httpx.TimeoutException:

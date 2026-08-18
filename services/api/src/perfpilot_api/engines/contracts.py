@@ -123,6 +123,7 @@ class EngineResult:
     state: EngineTerminalStateValue
     payload: dict[str, object]
     original_report_bytes: bytes | None = field(default=None, repr=False)
+    original_report_html_bytes: bytes | None = field(default=None, repr=False)
 
 
 class EngineAdapter(Protocol):
