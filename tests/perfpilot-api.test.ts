@@ -1388,6 +1388,41 @@ describe("PerfPilot browser API", () => {
     await expect(client.smartPerfettoOriginal(TEAM_ID, ANALYSIS_ID)).resolves.toEqual(collection);
   });
 
+  it("accepts a privacy-redacted weak source match without public source refs", async () => {
+    const report = sourceAwareReportPayload();
+    report.source_code = {
+      requested: true,
+      provider_kind: "agent_workspace",
+      agent_id: AGENT_ID,
+      workspace_id: "92000000-0000-4000-8000-000000000001",
+      snapshot_policy: "tracked_worktree",
+      validation_profile_id: "94000000-0000-4000-8000-000000000001",
+      snapshot: {
+        snapshot_id: "93000000-0000-4000-8000-000000000001",
+        snapshot_hash: "b".repeat(64),
+        git_head: "c".repeat(40),
+      },
+      context_state: "available",
+      match_summary: "weak",
+      source_refs: [],
+      exclusions: [],
+      fixes: [],
+      limitations: [],
+    };
+    const client = createPerfPilotClient({
+      fetcher: vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(report)),
+    });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      source_code: {
+        context_state: "available",
+        match_summary: "weak",
+        source_refs: [],
+        fixes: [],
+      },
+    });
+  });
+
   it("rejects source refs for none and fixes for weak source matches", async () => {
     const sourceRef = {
       source_ref_id: "95000000-0000-4000-8000-000000000001",

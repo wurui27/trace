@@ -1748,6 +1748,9 @@ function validSourceCodeReport(value: unknown): value is SourceCodeReport {
   if (value.match_summary === "none") {
     return value.source_refs.length === 0 && value.fixes.length === 0;
   }
+  if (value.match_summary === "weak" && value.source_refs.length === 0) {
+    return value.fixes.length === 0;
+  }
   if (value.source_refs.length === 0 || value.source_refs.some(
     (reference) => reference.match_grade !== value.match_summary ||
       reference.snapshot_hash !== value.snapshot?.snapshot_hash,
