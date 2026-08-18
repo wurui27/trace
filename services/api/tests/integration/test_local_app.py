@@ -3322,8 +3322,8 @@ def test_local_app_does_not_expose_host_adb_through_team_directory(
 
     assert first.status_code == 200
     assert second.status_code == 200
-    assert first.json() == {"schema_version": "1.0", "devices": []}
-    assert second.json() == {"schema_version": "1.0", "devices": []}
+    assert first.json() == {"schema_version": "1.1", "devices": []}
+    assert second.json() == {"schema_version": "1.1", "devices": []}
     assert device_probe.calls == 0
 
 
@@ -3344,7 +3344,7 @@ def test_local_team_device_directory_is_empty_without_one_ready_device(
         response = client.get(f"/v1/teams/{team_id}/devices")
 
     assert response.status_code == 200
-    assert response.json() == {"schema_version": "1.0", "devices": []}
+    assert response.json() == {"schema_version": "1.1", "devices": []}
 
 
 def test_local_app_rejects_host_device_analysis_without_remote_capture(
@@ -3396,6 +3396,158 @@ def test_local_app_rejects_host_device_analysis_without_remote_capture(
 
     assert created.status_code == 409
     assert created.json()["error"]["code"] == "remote_device_capture_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("test_type", "launch_mode", "target", "expected_scenario"),
+    [
+        (
+            "cold_start",
+            "automatic",
+            {
+                "package_name": "com.rivotek.mediacenter",
+                "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+            },
+            "startup",
+        ),
+        ("hot_start", "manual", None, "startup"),
+        (
+            "scroll",
+            "manual",
+            {
+                "package_name": "com.rivotek.mediacenter",
+                "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+            },
+            "scroll",
+        ),
+    ],
+)
+def test_local_script_capture_queues_without_apk_upload(
+    tmp_path: Path,
+    test_type: str,
+    launch_mode: str,
+    target: dict[str, str] | None,
+    expected_scenario: str,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    user = control.ensure_user("user01", "initial user password", False).principal
+    control.change_password(
+        user.user_id, "initial user password", "established user password"
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+    )
+    private_key = Ed25519PrivateKey.generate()
+
+    with _RawTestClient(app) as client:
+        browser_headers = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        registration = client.post(
+            f"/v1/teams/{user.team_id}/agents/registration-codes",
+            headers=browser_headers,
+            json={"schema_version": "1.0", "name": "Capture Mac"},
+        ).json()
+        credentials = client.post(
+            "/v1/agent/register",
+            json={
+                "schema_version": "1.1",
+                "registration_code": registration["registration_code"],
+                "public_key_b64": encode_ed25519_public_key(private_key.public_key()),
+                "platform": "macos",
+                "agent_version": "1.2.3",
+                "hostname": "capture-mac",
+                "os_version": "macOS 15",
+            },
+        ).json()
+        agent_headers = {"Authorization": f"Bearer {credentials['access_token']}"}
+        heartbeat = client.post(
+            "/v1/agent/heartbeat",
+            headers=agent_headers,
+            json={
+                "schema_version": "1.1",
+                "agent_version": "1.2.3",
+                "platform": "macos",
+                "hostname": "capture-mac",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [
+                    {
+                        "client_ref": "74000000-0000-4000-8000-000000000001",
+                        "serial": "emulator-5554",
+                        "manufacturer": "Rivotek",
+                        "model": "Media Center",
+                        "android_release": "13",
+                        "api_level": 33,
+                        "connection_type": "usb",
+                        "adb_state": "device",
+                        "battery_percent": 80,
+                        "temperature_c": None,
+                        "storage_available_bytes": 1024,
+                        "property_error_code": None,
+                        "launch_targets": [
+                            {
+                                "package_name": "com.rivotek.mediacenter",
+                                "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+                            }
+                        ],
+                    }
+                ],
+                "workspaces": [],
+            },
+        )
+        assert heartbeat.status_code == 200, heartbeat.text
+        device_id = heartbeat.json()["devices"][0]["device_id"]
+        created = client.post(
+            f"/v1/teams/{user.team_id}/analyses",
+            headers=browser_headers,
+            json={
+                "schema_version": "1.2",
+                "analysis_mode": "device",
+                "device_id": device_id,
+                "test_type": test_type,
+                "launch_mode": launch_mode,
+                "duration_seconds": 15,
+                "target": target,
+            },
+        )
+
+        assert created.status_code == 201, created.text
+        document = created.json()
+        assert document["schema_version"] == "1.2"
+        assert "apk_upload" not in document
+        assert document["capture_configuration"] == {
+            "test_type": test_type,
+            "launch_mode": launch_mode,
+            "duration_seconds": 15,
+            "target": target,
+        }
+        assert [item["scenario_type"] for item in document["scenarios"]] == [
+            test_type
+        ]
+        client.cookies.clear()
+        delivery = client.get(
+            "/v1/agent/tasks/next?wait_seconds=0", headers=agent_headers
+        )
+        assert delivery.status_code == 200, delivery.text
+        claims = verify_task_jws(
+            delivery.json()["snapshot_jws"],
+            credentials["task_signing_key"]["public_key_b64"],
+            expected_kid=credentials["task_signing_key"]["kid"],
+            expected_team_id=user.team_id,
+        )
+        assert claims["schema_version"] == "1.2"
+        assert claims["input_artifacts"] == []
+        assert claims["test_type"] == test_type
+        assert claims["launch_mode"] == launch_mode
+        assert [item["scenario_type"] for item in claims["scenarios"]] == [
+            expected_scenario
+        ]
 
 
 def test_local_remote_capture_finalizes_apk_and_publishes_agent_task(

@@ -61,10 +61,28 @@ class TaskScenario(BaseModel):
     swipe_count: int = Field(strict=True, ge=0, le=120)
 
 
+PackageName = Annotated[
+    str,
+    StringConstraints(
+        min_length=3,
+        max_length=255,
+        pattern=r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$",
+    ),
+]
+LaunchActivity = Annotated[
+    str,
+    StringConstraints(
+        min_length=3,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$",
+    ),
+]
+
+
 class TaskSnapshot(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    schema_version: Literal["1.0", "1.1"]
+    schema_version: Literal["1.0", "1.1", "1.2"]
     aud: Literal["perfpilot-agent"]
     team_id: UUID | None = None
     agent_id: UUID
@@ -74,23 +92,17 @@ class TaskSnapshot(BaseModel):
     analysis_id: UUID
     issued_at: datetime
     expires_at: datetime
-    package_name: str = Field(
-        min_length=3,
-        max_length=255,
-        pattern=r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$",
-    )
-    launch_activity: str = Field(
-        min_length=3,
-        max_length=512,
-        pattern=r"^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$",
-    )
+    package_name: PackageName | None
+    launch_activity: LaunchActivity | None
     cleanup_policy: Literal["keep_installed", "uninstall"]
-    input_artifacts: tuple[TaskInputArtifact, ...] = Field(min_length=1, max_length=8)
+    input_artifacts: tuple[TaskInputArtifact, ...] = Field(max_length=8)
     scenarios: tuple[TaskScenario, ...] = Field(min_length=1, max_length=3)
     allowed_uploads: tuple[
         Literal["startup_trace", "scroll_trace", "memory_evidence", "agent_log"],
         ...,
     ] = Field(min_length=1, max_length=8)
+    test_type: Literal["cold_start", "hot_start", "scroll"] | None = None
+    launch_mode: Literal["automatic", "manual"] | None = None
 
     @field_validator("issued_at", "expires_at", mode="before")
     @classmethod
@@ -108,8 +120,16 @@ class TaskSnapshot(BaseModel):
 
     @model_validator(mode="after")
     def validate_unique_items(self) -> Self:
-        if (self.schema_version == "1.1") != (self.team_id is not None):
+        if (self.schema_version != "1.0") != (self.team_id is not None):
             raise ValueError("task team binding does not match schema version")
+        if self.schema_version in {"1.0", "1.1"} and (
+            self.package_name is None
+            or self.launch_activity is None
+            or not self.input_artifacts
+            or self.test_type is not None
+            or self.launch_mode is not None
+        ):
+            raise ValueError("legacy capture task shape is invalid")
         if self.schema_version == "1.1" and (
             tuple(item.kind for item in self.input_artifacts) != ("apk",)
             or tuple(item.scenario_type for item in self.scenarios)
@@ -118,6 +138,44 @@ class TaskSnapshot(BaseModel):
             != ("startup_trace", "scroll_trace", "agent_log")
         ):
             raise ValueError("remote capture task shape is invalid")
+        if self.schema_version == "1.2":
+            expected_scenario = "scroll" if self.test_type == "scroll" else "startup"
+            expected_uploads = (f"{expected_scenario}_trace", "agent_log")
+            has_target = self.package_name is not None and self.launch_activity is not None
+            target_is_bound = (
+                has_target
+                and self.launch_activity is not None
+                and self.package_name is not None
+                and self.launch_activity.split("/", 1)[0] == self.package_name
+            )
+            if (
+                self.test_type is None
+                or self.launch_mode is None
+                or self.cleanup_policy != "keep_installed"
+                or self.input_artifacts
+                or len(self.scenarios) != 1
+                or self.scenarios[0].scenario_type != expected_scenario
+                or self.scenarios[0].duration_seconds < 1
+                or self.scenarios[0].memory_rounds != 0
+                or self.scenarios[0].swipe_count != 0
+                or self.allowed_uploads != expected_uploads
+                or (self.test_type == "scroll" and self.launch_mode != "manual")
+                or (
+                    self.test_type == "scroll"
+                    and not target_is_bound
+                )
+                or (
+                    self.test_type in {"cold_start", "hot_start"}
+                    and self.launch_mode == "automatic"
+                    and not target_is_bound
+                )
+                or (
+                    self.test_type in {"cold_start", "hot_start"}
+                    and self.launch_mode == "manual"
+                    and (self.package_name is not None or self.launch_activity is not None)
+                )
+            ):
+                raise ValueError("script capture task shape is invalid")
         if len({item.artifact_id for item in self.input_artifacts}) != len(self.input_artifacts):
             raise ValueError("task input artifacts must be unique")
         if len({item.scenario_type for item in self.scenarios}) != len(self.scenarios):
@@ -336,7 +394,7 @@ class TaskVerifier:
                 or task.expires_at <= normalized_now
                 or task.agent_id != expected_agent_id
                 or (
-                    task.schema_version == "1.1"
+                    task.schema_version in {"1.1", "1.2"}
                     and (expected_team_id is None or task.team_id != expected_team_id)
                 )
                 or (
@@ -438,7 +496,7 @@ class TaskVerifier:
             normalized_now = now.astimezone(UTC)
             lifetime = task.expires_at - task.issued_at
             if (
-                task.schema_version != "1.1"
+                task.schema_version not in {"1.1", "1.2"}
                 or lifetime <= timedelta(0)
                 or lifetime > _MAXIMUM_LIFETIME
                 or task.issued_at > normalized_now + _MAXIMUM_ISSUED_AT_SKEW

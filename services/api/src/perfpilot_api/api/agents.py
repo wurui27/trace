@@ -160,6 +160,10 @@ def _device_payload(device: DeviceView) -> dict[str, object]:
         "adb_state": device.adb_state,
         "state": device.state,
         "last_seen_at": _utc(device.last_seen_at),
+        "launch_targets": [
+            {"package_name": package, "launch_activity": activity}
+            for package, activity in device.launch_targets
+        ],
     }
 
 
@@ -262,7 +266,7 @@ async def list_devices(
     devices = await device_directory.list_devices(team_id=team_id)
     response.headers["cache-control"] = "no-store"
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "devices": [_device_payload(device) for device in devices],
     }
 

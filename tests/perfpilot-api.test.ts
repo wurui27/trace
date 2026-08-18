@@ -310,6 +310,12 @@ describe("PerfPilot browser API", () => {
       adb_state: "device",
       state: "ready",
       last_seen_at: "2026-08-05T08:00:00Z",
+      launch_targets: [
+        {
+          package_name: "com.rivotek.mediacenter",
+          launch_activity: "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        },
+      ],
     };
     const fetcher = vi
       .fn<typeof fetch>()
@@ -317,7 +323,7 @@ describe("PerfPilot browser API", () => {
         Response.json({ schema_version: "1.0", csrf_token: "csrf-agent" }),
       )
       .mockResolvedValueOnce(
-        Response.json({ schema_version: "1.0", devices: [device] }),
+        Response.json({ schema_version: "1.1", devices: [device] }),
       )
       .mockResolvedValueOnce(
         Response.json({ schema_version: "1.0", agents: [agent] }),
@@ -340,7 +346,7 @@ describe("PerfPilot browser API", () => {
 
     await client.csrf();
     await expect(client.devices(TEAM_ID)).resolves.toEqual({
-      schema_version: "1.0",
+      schema_version: "1.1",
       devices: [device],
     });
     await expect(client.agents(TEAM_ID)).resolves.toEqual({
@@ -371,37 +377,31 @@ describe("PerfPilot browser API", () => {
     });
   });
 
-  it("creates a no-source remote device 1.1 analysis and uploads its APK", async () => {
+  it("creates a no-source remote device 1.2 script capture without uploading an APK", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
-    const checksum = "A5BYxvLAy0ksUzsKTRTvd8wPeKvMztUofYShogEc+4E=";
     const deviceAnalysis = {
-      schema_version: "1.1",
+      schema_version: "1.2",
       analysis_id: ANALYSIS_ID,
       team_id: TEAM_ID,
       analysis_mode: "device",
       device_id: DEVICE_ID,
-      state: "created",
-      version: 2,
+      state: "queued",
+      version: 4,
       application_version_id: null,
       application_metadata: null,
-      apk_upload: {
-        state: "pending",
-        upload_id: "85000000-0000-4000-8000-000000000001",
-        artifact_kind: "apk",
-        mime: "application/vnd.android.package-archive",
-        size: 3,
-        sha256_b64: checksum,
-        expires_at: "2026-08-05T08:15:00Z",
-        put_url: "https://objects.example/device-apk?signature=private",
-        required_headers: {
-          "Content-Type": "application/vnd.android.package-archive",
-          "x-amz-checksum-sha256": checksum,
+      capture_configuration: {
+        test_type: "cold_start",
+        launch_mode: "automatic",
+        duration_seconds: 15,
+        target: {
+          package_name: "com.rivotek.mediacenter",
+          launch_activity: "com.rivotek.mediacenter/.shell.MediaCenterActivity",
         },
       },
-      scenarios: ["cold_start", "scroll", "memory_cycle"].map((scenario_type) => ({
+      scenarios: ["cold_start"].map((scenario_type) => ({
         scenario_job_id: null,
         scenario_type,
-        state: scenario_type === "memory_cycle" ? "not_requested" : "awaiting_input",
+        state: "queued",
         version: null,
         device_group_id: null,
         sample_verdict_counts: {
@@ -450,58 +450,48 @@ describe("PerfPilot browser API", () => {
       if (url.endsWith("/analyses") && init.method === "POST") {
         return Response.json(deviceAnalysis, { status: 201 });
       }
-      if (url.startsWith("https://objects.example/")) {
-        return new Response(null, { status: 200 });
-      }
-      if (url.endsWith("/finalize-upload")) {
-        return Response.json({
-          schema_version: "1.0",
-          upload: {
-            state: "finalized",
-            upload_id: deviceAnalysis.apk_upload.upload_id,
-            artifact_id: "86000000-0000-4000-8000-000000000001",
-            artifact_kind: "apk",
-            mime: deviceAnalysis.apk_upload.mime,
-            size: 3,
-            sha256_b64: checksum,
-            finalized_at: "2026-08-05T08:01:00Z",
-          },
-        });
-      }
       if (url.endsWith(`/analyses/${ANALYSIS_ID}`)) {
-        return Response.json({ ...deviceAnalysis, state: "queued", version: 4 });
+        return Response.json(deviceAnalysis);
       }
       throw new Error(`undeclared request: ${url}`);
     });
     const client = createPerfPilotClient({ fetcher });
-    const apk = new File([new Uint8Array([1, 2, 3])], "demo.apk", {
-      type: "application/vnd.android.package-archive",
-    });
 
     const result = await enqueueDeviceAnalysis(
-      { teamId: TEAM_ID, deviceId: DEVICE_ID, apk },
+      {
+        teamId: TEAM_ID,
+        deviceId: DEVICE_ID,
+        testType: "cold_start",
+        launchMode: "automatic",
+        durationSeconds: 15,
+        target: {
+          package_name: "com.rivotek.mediacenter",
+          launch_activity: "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        },
+      },
       { client, randomUUID: () => "device-analysis-fixed" },
     );
 
     expect(result.analysis).toMatchObject({ analysis_mode: "device", state: "queued" });
     const create = calls.find((call) => call.url.endsWith("/analyses"));
     expect(JSON.parse(String(create?.init.body))).toEqual({
-      schema_version: "1.1",
+      schema_version: "1.2",
       analysis_mode: "device",
       device_id: DEVICE_ID,
-      scenarios: ["cold_start", "scroll", "memory_cycle"],
-      apk: {
-        artifact_kind: "apk",
-        mime: "application/vnd.android.package-archive",
-        size: 3,
-        sha256_b64: checksum,
+      test_type: "cold_start",
+      launch_mode: "automatic",
+      duration_seconds: 15,
+      target: {
+        package_name: "com.rivotek.mediacenter",
+        launch_activity: "com.rivotek.mediacenter/.shell.MediaCenterActivity",
       },
     });
     expect(new Headers(create?.init.headers).get("idempotency-key")).toBe(
       "device-analysis-fixed",
     );
-    expect(calls.some((call) => call.url.startsWith("https://objects.example/"))).toBe(true);
-    expect(calls.some((call) => call.url.endsWith("/finalize-upload"))).toBe(true);
+    expect(calls).toHaveLength(3);
+    expect(calls.some((call) => call.url.startsWith("https://objects.example/"))).toBe(false);
+    expect(calls.some((call) => call.url.endsWith("/finalize-upload"))).toBe(false);
   });
 
   it("lists only validated report-bearing analyses for the requested team", async () => {

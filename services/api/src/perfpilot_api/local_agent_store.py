@@ -87,7 +87,9 @@ _DEVICE_KEYS = {
     "storage_available_bytes",
     "property_error_code",
     "last_seen_at",
+    "launch_targets",
 }
+_LEGACY_DEVICE_KEYS = _DEVICE_KEYS - {"launch_targets"}
 
 
 class LocalAgentStoreError(RuntimeError):
@@ -622,6 +624,7 @@ class LocalAgentStore:
                     storage_available_bytes=observation.storage_available_bytes,
                     property_error_code=observation.property_error_code,
                     last_seen_at=now,
+                    launch_targets=observation.launch_targets,
                 )
                 encoded = self._device_document(stored)
                 if current is None:
@@ -954,12 +957,27 @@ class LocalAgentStore:
 
     @staticmethod
     def _device_from_document(item: object) -> StoredDevice:
-        if not isinstance(item, dict) or set(item) != _DEVICE_KEYS:
+        if not isinstance(item, dict) or set(item) not in {
+            frozenset(_DEVICE_KEYS),
+            frozenset(_LEGACY_DEVICE_KEYS),
+        }:
             raise ValueError
         if any(item[key] is not None and not isinstance(item[key], str) for key in (
             "agent_name", "serial_digest", "serial_suffix", "manufacturer", "model",
             "android_release", "connection_type", "adb_state", "state", "property_error_code"
         )):
+            raise ValueError
+        launch_targets = item.get("launch_targets", [])
+        if (
+            not isinstance(launch_targets, (list, tuple))
+            or len(launch_targets) > 128
+            or any(
+                not isinstance(target, (list, tuple))
+                or len(target) != 2
+                or not all(isinstance(value, str) for value in target)
+                for target in launch_targets
+            )
+        ):
             raise ValueError
         return StoredDevice(
             device_id=_parse_uuid(item["device_id"]),
@@ -980,6 +998,7 @@ class LocalAgentStore:
             storage_available_bytes=item["storage_available_bytes"],
             property_error_code=item["property_error_code"],
             last_seen_at=_parse_timestamp(item["last_seen_at"], optional=True),
+            launch_targets=tuple((target[0], target[1]) for target in launch_targets),
         )
 
 

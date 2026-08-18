@@ -134,7 +134,7 @@ export function NewAnalysisDialog({
               <div>
                 <p className="section-label">分析入口</p>
                 <h2 id={titleId}>新建性能分析</h2>
-                <p>选择真机自动采集，或直接上传已有 Trace。</p>
+                <p>选择真机测试类别，或直接上传已有 Trace。</p>
               </div>
               <button
                 ref={closeButtonRef}
@@ -151,7 +151,7 @@ export function NewAnalysisDialog({
               <button
                 type="button"
                 className={`new-analysis-mode-card${mode === "device" ? " is-selected" : ""}`}
-                aria-label="真机自动测试"
+                aria-label="真机性能测试"
                 aria-pressed={mode === "device"}
                 onClick={() => setMode("device")}
               >
@@ -160,10 +160,10 @@ export function NewAnalysisDialog({
                 </span>
                 <span className="new-analysis-mode-copy">
                   <span className="new-analysis-mode-heading">
-                    <strong>真机自动测试</strong>
-                    <span className="new-analysis-recommended-badge">自动采集</span>
+                    <strong>真机性能测试</strong>
+                    <span className="new-analysis-recommended-badge">设备采集</span>
                   </span>
-                  <span>安装 APK，依次采集启动、滑动和内存证据。</span>
+                  <span>选择冷启动、热启动或手动滑动，直接采集设备 Trace。</span>
                 </span>
               </button>
 

@@ -70,6 +70,7 @@ class FakeProbe:
             abi="arm64-v8a",
             fingerprint="google/panther/demo",
             perfetto_available=True,
+            launch_targets=(),
         )
 
 
@@ -162,6 +163,23 @@ async def test_device_probe_reads_bounded_properties_for_one_bound_serial(
             "/dev/block/data 100000 50000 41943040 50% /data\n"
         ),
         ("shell", "which", "perfetto"): "/system/bin/perfetto\n",
+        (
+            "shell",
+            "cmd",
+            "package",
+            "query-activities",
+            "--brief",
+            "-a",
+            "android.intent.action.MAIN",
+            "-c",
+            "android.intent.category.LAUNCHER",
+        ): (
+            "2 activities found:\n"
+            "  Activity #0:\n"
+            "    com.rivotek.mediacenter/.shell.MediaCenterActivity\n"
+            "  Activity #1:\n"
+            "    com.rivotek.gallery/.MainActivity\n"
+        ),
     }
     calls: list[list[str]] = []
 
@@ -190,6 +208,13 @@ async def test_device_probe_reads_bounded_properties_for_one_bound_serial(
     assert result.temperature_c == 31.5
     assert result.storage_available_bytes == 42_949_672_960
     assert result.perfetto_available is True
+    assert tuple(
+        (target.package_name, target.launch_activity)
+        for target in result.launch_targets
+    ) == (
+        ("com.rivotek.gallery", "com.rivotek.gallery/.MainActivity"),
+        ("com.rivotek.mediacenter", "com.rivotek.mediacenter/.shell.MediaCenterActivity"),
+    )
     assert all(call[1:3] == ["-s", "R3CN30SECRET"] for call in calls)
 
 

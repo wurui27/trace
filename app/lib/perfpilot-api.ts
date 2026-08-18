@@ -456,7 +456,7 @@ export interface TraceFileSelection {
 }
 
 export interface AnalysisResponse {
-  readonly schema_version: "1.0" | "1.1";
+  readonly schema_version: "1.0" | "1.1" | "1.2";
   readonly analysis_id: string;
   readonly team_id: string;
   readonly analysis_mode: AnalysisMode;
@@ -490,6 +490,17 @@ export interface AnalysisResponse {
   readonly active_lease?: ActiveAnalysisLease | null;
   readonly started_at?: string | null;
   readonly completed_at?: string | null;
+  readonly capture_configuration?: DeviceCaptureConfiguration;
+}
+
+export type DeviceTestType = "cold_start" | "hot_start" | "scroll";
+export type DeviceLaunchMode = "automatic" | "manual";
+
+export interface DeviceCaptureConfiguration {
+  readonly test_type: DeviceTestType;
+  readonly launch_mode: DeviceLaunchMode;
+  readonly duration_seconds: number;
+  readonly target: DeviceLaunchTarget | null;
 }
 
 export interface AnalysisListItem extends AnalysisResponse {
@@ -537,7 +548,7 @@ export interface SampleVerdictCounts {
 
 export interface AnalysisScenario {
   readonly scenario_job_id: string | null;
-  readonly scenario_type: "cold_start" | "scroll" | "memory_cycle";
+  readonly scenario_type: "cold_start" | "hot_start" | "scroll" | "memory_cycle";
   readonly state:
     | "awaiting_input"
     | "queued"
@@ -612,10 +623,16 @@ export interface RemoteDeviceView {
   readonly adb_state: "device" | "unauthorized" | "offline" | "booting";
   readonly state: RemoteDeviceState;
   readonly last_seen_at: string | null;
+  readonly launch_targets: readonly DeviceLaunchTarget[];
+}
+
+export interface DeviceLaunchTarget {
+  readonly package_name: string;
+  readonly launch_activity: string;
 }
 
 export interface RemoteDeviceListResponse {
-  readonly schema_version: "1.0";
+  readonly schema_version: "1.0" | "1.1";
   readonly devices: readonly RemoteDeviceView[];
 }
 
@@ -720,7 +737,7 @@ export interface PerfPilotClient {
   createDeviceAnalysis(
     teamId: string,
     deviceId: string,
-    apk: InputDescriptor,
+    configuration: DeviceCaptureConfiguration,
     idempotencyKey: string,
     sourceBinding?: SourceBinding,
     signal?: AbortSignal,
@@ -2047,23 +2064,25 @@ function normalizedAgentName(name: string): string {
   return normalized;
 }
 
-function remoteDeviceView(value: unknown): RemoteDeviceView {
+function remoteDeviceView(value: unknown, allowLaunchTargets: boolean): RemoteDeviceView {
+  const expectedKeys = [
+    "device_id",
+    "agent_id",
+    "agent_name",
+    "serial_suffix",
+    "manufacturer",
+    "model",
+    "android_release",
+    "api_level",
+    "connection_type",
+    "adb_state",
+    "state",
+    "last_seen_at",
+    ...(allowLaunchTargets ? ["launch_targets"] : []),
+  ];
   if (
     !object(value) ||
-    !exactKeys(value, [
-      "device_id",
-      "agent_id",
-      "agent_name",
-      "serial_suffix",
-      "manufacturer",
-      "model",
-      "android_release",
-      "api_level",
-      "connection_type",
-      "adb_state",
-      "state",
-      "last_seen_at",
-    ]) ||
+    !exactKeys(value, expectedKeys) ||
     typeof value.device_id !== "string" ||
     typeof value.agent_id !== "string" ||
     typeof value.agent_name !== "string" ||
@@ -2081,28 +2100,56 @@ function remoteDeviceView(value: unknown): RemoteDeviceView {
     !["ready", "busy", "unauthorized", "booting", "quarantined", "offline"].includes(
       String(value.state),
     ) ||
-    !validDateTime(value.last_seen_at, true)
+    !validDateTime(value.last_seen_at, true) ||
+    (allowLaunchTargets &&
+      (!Array.isArray(value.launch_targets) ||
+        value.launch_targets.length > 128 ||
+        !value.launch_targets.every(
+          (target) =>
+            object(target) &&
+            exactKeys(target, ["package_name", "launch_activity"]) &&
+            typeof target.package_name === "string" &&
+            /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(
+              target.package_name,
+            ) &&
+            typeof target.launch_activity === "string" &&
+            /^[A-Za-z0-9_.$]+\/[A-Za-z0-9_.$]+$/.test(target.launch_activity) &&
+            target.launch_activity.split("/", 1)[0] === target.package_name,
+        ) ||
+        new Set(
+          value.launch_targets.map((target) =>
+            object(target) ? target.launch_activity : null,
+          ),
+        ).size !== value.launch_targets.length))
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
-  return value as unknown as RemoteDeviceView;
+  return {
+    ...value,
+    launch_targets: allowLaunchTargets ? value.launch_targets : [],
+  } as unknown as RemoteDeviceView;
 }
 
 function remoteDeviceListResponse(value: unknown): RemoteDeviceListResponse {
   if (
     !object(value) ||
     !exactKeys(value, ["schema_version", "devices"]) ||
-    value.schema_version !== "1.0" ||
+    !["1.0", "1.1"].includes(String(value.schema_version)) ||
     !Array.isArray(value.devices) ||
     value.devices.length > 256
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
-  const devices = value.devices.map(remoteDeviceView);
+  const devices = value.devices.map((item) =>
+    remoteDeviceView(item, value.schema_version === "1.1"),
+  );
   if (new Set(devices.map((device) => device.device_id)).size !== devices.length) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
-  return { schema_version: "1.0", devices };
+  return {
+    schema_version: value.schema_version as "1.0" | "1.1",
+    devices,
+  };
 }
 
 function localDeviceResponse(value: unknown): LocalDeviceStatusResponse {
@@ -2194,6 +2241,37 @@ function validApplicationMetadata(value: unknown): value is ApplicationMetadata 
     (value.target_sdk === null || Number.isSafeInteger(value.target_sdk)) &&
     stringArray(value.supported_abis, 32) &&
     typeof value.has_native_libraries === "boolean"
+  );
+}
+
+function validDeviceCaptureConfiguration(
+  value: unknown,
+): value is DeviceCaptureConfiguration {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["test_type", "launch_mode", "duration_seconds", "target"]) ||
+    !["cold_start", "hot_start", "scroll"].includes(String(value.test_type)) ||
+    !["automatic", "manual"].includes(String(value.launch_mode)) ||
+    !Number.isSafeInteger(value.duration_seconds) ||
+    Number(value.duration_seconds) < 1 ||
+    Number(value.duration_seconds) > 300
+  ) {
+    return false;
+  }
+  const requiresTarget = value.launch_mode === "automatic" || value.test_type === "scroll";
+  const validTarget =
+    object(value.target) &&
+    exactKeys(value.target, ["package_name", "launch_activity"]) &&
+    typeof value.target.package_name === "string" &&
+    /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(
+      value.target.package_name,
+    ) &&
+    typeof value.target.launch_activity === "string" &&
+    /^[A-Za-z0-9_.$]+\/[A-Za-z0-9_.$]+$/.test(value.target.launch_activity) &&
+    value.target.launch_activity.split("/", 1)[0] === value.target.package_name;
+  return (
+    (value.test_type !== "scroll" || value.launch_mode === "manual") &&
+    (requiresTarget ? validTarget : value.target === null)
   );
 }
 
@@ -2336,7 +2414,19 @@ function analysisResponse(value: unknown): AnalysisResponse {
     ? value.analysis_mode === "trace_upload"
       ? ["analysis_profile", "question", "input_uploads", "stages", "ai_rounds", "source_analysis"]
       : value.analysis_mode === "device"
-        ? [
+        ? value.schema_version === "1.2"
+          ? [
+              "device_id",
+              "application_version_id",
+              "application_metadata",
+              "capture_configuration",
+              "scenarios",
+              "sample_verdict_counts",
+              "active_lease",
+              "started_at",
+              "completed_at",
+            ]
+          : [
             "device_id",
             "application_version_id",
             "application_metadata",
@@ -2346,13 +2436,13 @@ function analysisResponse(value: unknown): AnalysisResponse {
             "active_lease",
             "started_at",
             "completed_at",
-          ]
+            ]
         : ["application_version_id", "application_metadata", "question"]
     : [];
   if (
     !object(value) ||
     !exactKeys(value, [...commonKeys, ...modeKeys]) ||
-    !["1.0", "1.1"].includes(String(value.schema_version)) ||
+    !["1.0", "1.1", "1.2"].includes(String(value.schema_version)) ||
     !["device", "trace_upload", "memory_upload"].includes(String(value.analysis_mode)) ||
     typeof value.analysis_id !== "string" ||
     typeof value.team_id !== "string" ||
@@ -2369,7 +2459,7 @@ function analysisResponse(value: unknown): AnalysisResponse {
         cancelRequestedAt.length > 64 ||
         Number.isNaN(Date.parse(cancelRequestedAt)))) ||
     (value.failure !== null && !validFailure(value.failure)) ||
-    (value.schema_version === "1.1") !== hasSourceCode ||
+    (["1.1", "1.2"].includes(String(value.schema_version))) !== hasSourceCode ||
     (hasSourceCode && !validSourceCodeAnalysis(value.source_code_analysis))
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
@@ -2392,6 +2482,31 @@ function analysisResponse(value: unknown): AnalysisResponse {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
   if (value.analysis_mode === "device") {
+    if (value.schema_version === "1.2") {
+      if (
+        typeof value.device_id !== "string" ||
+        value.application_version_id !== null ||
+        value.application_metadata !== null ||
+        !validDeviceCaptureConfiguration(value.capture_configuration) ||
+        !Array.isArray(value.scenarios) ||
+        value.scenarios.length !== 1 ||
+        !validAnalysisScenario(
+          value.scenarios[0],
+          value.capture_configuration.test_type,
+        ) ||
+        !validVerdictCounts(value.sample_verdict_counts) ||
+        (value.active_lease !== null && !validActiveLease(value.active_lease)) ||
+        !validDateTime(value.started_at, true) ||
+        !validDateTime(value.completed_at, true)
+      ) {
+        throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+      }
+      return {
+        ...value,
+        stages: [],
+        input_uploads: [],
+      } as unknown as AnalysisResponse;
+    }
     const scenarioTypes = ["cold_start", "scroll", "memory_cycle"] as const;
     if (
       typeof value.device_id !== "string" ||
@@ -2762,7 +2877,7 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
     async createDeviceAnalysis(
       teamId,
       deviceId,
-      apk,
+      configuration,
       idempotencyKey,
       sourceBinding,
       signal,
@@ -2772,16 +2887,13 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         {
           method: "POST",
           body: JSON.stringify({
-            schema_version: "1.1",
+            schema_version: "1.2",
             analysis_mode: "device",
             device_id: deviceId,
-            scenarios: ["cold_start", "scroll", "memory_cycle"],
-            apk: {
-              artifact_kind: "apk",
-              mime: apk.mime,
-              size: apk.size,
-              sha256_b64: apk.sha256_b64,
-            },
+            test_type: configuration.test_type,
+            launch_mode: configuration.launch_mode,
+            duration_seconds: configuration.duration_seconds,
+            target: configuration.target,
             ...(sourceBinding ? { source_binding: sourceBinding } : {}),
           }),
         },
@@ -3114,15 +3226,16 @@ export const submitTraceAnalysis = enqueueTraceAnalysis;
 
 export type DeviceSubmissionPhase =
   | "session"
-  | "hashing"
   | "creating"
-  | "uploading"
   | "submitted";
 
 export interface SubmitDeviceAnalysisInput {
   readonly teamId: string;
   readonly deviceId: string;
-  readonly apk: File;
+  readonly testType: DeviceTestType;
+  readonly launchMode: DeviceLaunchMode;
+  readonly durationSeconds: number;
+  readonly target: DeviceLaunchTarget | null;
   readonly sourceBinding?: SourceBinding;
   readonly signal?: AbortSignal;
   readonly onProgress?: (phase: DeviceSubmissionPhase) => void;
@@ -3143,48 +3256,39 @@ export async function enqueueDeviceAnalysis(
   if (!submission.teamId || !submission.deviceId) {
     throw new PerfPilotApiError("device_required", "请选择可用的 Android 设备", false, null);
   }
-  if (!(submission.apk instanceof File) || !submission.apk.name.toLowerCase().endsWith(".apk")) {
-    throw new PerfPilotApiError("apk_required", "请选择 APK 文件", false, null);
+  if (
+    !["cold_start", "hot_start", "scroll"].includes(submission.testType) ||
+    !["automatic", "manual"].includes(submission.launchMode) ||
+    !Number.isInteger(submission.durationSeconds) ||
+    submission.durationSeconds < 1 ||
+    submission.durationSeconds > 300 ||
+    (submission.testType === "scroll" && submission.launchMode !== "manual") ||
+    ((submission.launchMode === "automatic" || submission.testType === "scroll") &&
+      submission.target === null) ||
+    (submission.launchMode === "manual" &&
+      submission.testType !== "scroll" &&
+      submission.target !== null)
+  ) {
+    throw new PerfPilotApiError("capture_configuration_invalid", "测试配置无效", false, null);
   }
 
   onProgress?.("session");
   await client.csrf(signal);
-  onProgress?.("hashing");
-  const apk: InputDescriptor = {
-    kind: "apk",
-    file: submission.apk,
-    mime: "application/vnd.android.package-archive",
-    size: submission.apk.size,
-    sha256_b64: await sha256Base64(submission.apk, signal),
-  };
 
   onProgress?.("creating");
   const created = await client.createDeviceAnalysis(
     submission.teamId,
     submission.deviceId,
-    apk,
+    {
+      test_type: submission.testType,
+      launch_mode: submission.launchMode,
+      duration_seconds: submission.durationSeconds,
+      target: submission.target,
+    },
     randomUUID(),
     submission.sourceBinding,
     signal,
   );
-  const authorization = created.apk_upload;
-  if (created.analysis_mode !== "device" || authorization === null || authorization === undefined) {
-    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
-  }
-
-  if (authorization.state === "pending") {
-    onProgress?.("uploading");
-    const slot: UploadSlot = { schema_version: "1.0", upload: authorization };
-    await client.putInput(slot, apk, signal);
-    await client.finalizeInput(
-      submission.teamId,
-      created.analysis_id,
-      apk,
-      authorization.upload_id,
-      signal,
-    );
-  }
-
   const current = await client.analysis(submission.teamId, created.analysis_id, signal);
   if (
     current.analysis_mode !== "device" ||

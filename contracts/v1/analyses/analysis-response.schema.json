@@ -13,7 +13,6 @@
     "version",
     "application_version_id",
     "application_metadata",
-    "apk_upload",
     "scenarios",
     "sample_verdict_counts",
     "active_lease",
@@ -24,7 +23,7 @@
     "failure"
   ],
   "properties": {
-    "schema_version": {"enum": ["1.0", "1.1"]},
+    "schema_version": {"enum": ["1.0", "1.1", "1.2"]},
     "analysis_id": {"type": "string", "format": "uuid"},
     "team_id": {"type": "string", "format": "uuid"},
     "analysis_mode": {"enum": ["device", "trace_upload", "memory_upload"]},
@@ -71,7 +70,8 @@
       "items": {
         "oneOf": [
           {"$ref": "#/$defs/scenarioProgress"},
-          {"$ref": "#/$defs/notRequestedMemoryScenario"}
+          {"$ref": "#/$defs/notRequestedMemoryScenario"},
+          {"$ref": "#/$defs/scriptScenarioProgress"}
         ]
       }
     },
@@ -113,7 +113,8 @@
       }
     },
     "source_analysis": {"$ref": "#/$defs/sourceAnalysis"},
-    "source_code_analysis": {"$ref": "#/$defs/sourceCodeAnalysis"}
+    "source_code_analysis": {"$ref": "#/$defs/sourceCodeAnalysis"},
+    "capture_configuration": {"$ref": "#/$defs/deviceCaptureConfiguration"}
   },
   "allOf": [
     {
@@ -140,7 +141,7 @@
     },
     {
       "if": {
-        "properties": {"schema_version": {"const": "1.1"}},
+        "properties": {"schema_version": {"enum": ["1.1", "1.2"]}},
         "required": ["schema_version"]
       },
       "then": {
@@ -191,6 +192,7 @@
       "oneOf": [
         {
           "properties": {
+            "schema_version": {"enum": ["1.0", "1.1"]},
             "analysis_mode": {"const": "device"},
             "apk_upload": {
               "oneOf": [
@@ -200,9 +202,65 @@
             },
             "scenarios": {"$ref": "#/$defs/compatibleDeviceScenarios"}
           },
-          "required": ["analysis_mode", "device_id"],
+          "required": ["analysis_mode", "device_id", "apk_upload"],
           "not": {
             "anyOf": [
+              {"required": ["question"]},
+              {"required": ["analysis_profile"]},
+              {"required": ["input_uploads"]},
+              {"required": ["stages"]}
+            ]
+          }
+        },
+        {
+          "properties": {
+            "schema_version": {"const": "1.2"},
+            "analysis_mode": {"const": "device"},
+            "application_version_id": {"type": "null"},
+            "application_metadata": {"type": "null"},
+            "capture_configuration": {"$ref": "#/$defs/deviceCaptureConfiguration"},
+            "scenarios": {"$ref": "#/$defs/scriptDeviceScenarios"},
+            "sample_verdict_counts": {"$ref": "#/$defs/verdictCounts"}
+          },
+          "required": ["analysis_mode", "device_id", "capture_configuration"],
+          "oneOf": [
+            {
+              "properties": {
+                "capture_configuration": {
+                  "allOf": [
+                    {"$ref": "#/$defs/deviceCaptureConfiguration"},
+                    {"properties": {"test_type": {"const": "cold_start"}}}
+                  ]
+                },
+                "scenarios": {"$ref": "#/$defs/coldStartScriptScenarios"}
+              }
+            },
+            {
+              "properties": {
+                "capture_configuration": {
+                  "allOf": [
+                    {"$ref": "#/$defs/deviceCaptureConfiguration"},
+                    {"properties": {"test_type": {"const": "hot_start"}}}
+                  ]
+                },
+                "scenarios": {"$ref": "#/$defs/hotStartScriptScenarios"}
+              }
+            },
+            {
+              "properties": {
+                "capture_configuration": {
+                  "allOf": [
+                    {"$ref": "#/$defs/deviceCaptureConfiguration"},
+                    {"properties": {"test_type": {"const": "scroll"}}}
+                  ]
+                },
+                "scenarios": {"$ref": "#/$defs/scrollScriptScenarios"}
+              }
+            }
+          ],
+          "not": {
+            "anyOf": [
+              {"required": ["apk_upload"]},
               {"required": ["question"]},
               {"required": ["analysis_profile"]},
               {"required": ["input_uploads"]},
@@ -227,7 +285,7 @@
               ]
             }
           },
-          "required": ["analysis_mode", "question"],
+          "required": ["analysis_mode", "question", "apk_upload"],
           "not": {
             "anyOf": [
               {"required": ["device_id"]},
@@ -270,7 +328,8 @@
             "analysis_profile",
             "question",
             "input_uploads",
-            "stages"
+            "stages",
+            "apk_upload"
           ],
           "not": {"required": ["device_id"]}
         }
@@ -727,6 +786,174 @@
         "validation_error": {"const": 0},
         "total": {"const": 0}
       }
+    },
+    "launchTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package_name", "launch_activity"],
+      "properties": {
+        "package_name": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+        },
+        "launch_activity": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$"
+        }
+      }
+    },
+    "deviceCaptureConfiguration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["test_type", "launch_mode", "duration_seconds", "target"],
+      "properties": {
+        "test_type": {"enum": ["cold_start", "hot_start", "scroll"]},
+        "launch_mode": {"enum": ["automatic", "manual"]},
+        "duration_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+        "target": {
+          "oneOf": [
+            {"$ref": "#/$defs/launchTarget"},
+            {"type": "null"}
+          ]
+        }
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "test_type": {"enum": ["cold_start", "hot_start"]},
+            "launch_mode": {"const": "automatic"},
+            "target": {"$ref": "#/$defs/launchTarget"}
+          }
+        },
+        {
+          "properties": {
+            "test_type": {"enum": ["cold_start", "hot_start"]},
+            "launch_mode": {"const": "manual"},
+            "target": {"type": "null"}
+          }
+        },
+        {
+          "properties": {
+            "test_type": {"const": "scroll"},
+            "launch_mode": {"const": "manual"},
+            "target": {"$ref": "#/$defs/launchTarget"}
+          }
+        }
+      ]
+    },
+    "scriptScenarioProgress": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "scenario_job_id",
+        "scenario_type",
+        "state",
+        "version",
+        "device_group_id",
+        "sample_verdict_counts",
+        "started_at",
+        "completed_at",
+        "failure"
+      ],
+      "properties": {
+        "scenario_job_id": {
+          "oneOf": [
+            {"type": "string", "format": "uuid"},
+            {"type": "null"}
+          ]
+        },
+        "scenario_type": {"enum": ["cold_start", "hot_start", "scroll"]},
+        "state": {
+          "enum": [
+            "queued",
+            "scheduled",
+            "running",
+            "analyzing",
+            "completed",
+            "failed",
+            "canceled"
+          ]
+        },
+        "version": {"type": "integer", "minimum": 1},
+        "device_group_id": {
+          "oneOf": [
+            {"type": "string", "format": "uuid"},
+            {"type": "null"}
+          ]
+        },
+        "sample_verdict_counts": {"$ref": "#/$defs/verdictCounts"},
+        "started_at": {"$ref": "#/$defs/nullableDateTime"},
+        "completed_at": {"$ref": "#/$defs/nullableDateTime"},
+        "failure": {
+          "oneOf": [
+            {"type": "null"},
+            {"$ref": "#/$defs/failure"}
+          ]
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {"state": {"const": "failed"}},
+            "required": ["state"]
+          },
+          "then": {"properties": {"failure": {"$ref": "#/$defs/failure"}}},
+          "else": {"properties": {"failure": {"type": "null"}}}
+        }
+      ]
+    },
+    "coldStartScriptScenarios": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scriptScenarioProgress"},
+            {"properties": {"scenario_type": {"const": "cold_start"}}}
+          ]
+        }
+      ],
+      "items": false
+    },
+    "hotStartScriptScenarios": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scriptScenarioProgress"},
+            {"properties": {"scenario_type": {"const": "hot_start"}}}
+          ]
+        }
+      ],
+      "items": false
+    },
+    "scrollScriptScenarios": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 1,
+      "prefixItems": [
+        {
+          "allOf": [
+            {"$ref": "#/$defs/scriptScenarioProgress"},
+            {"properties": {"scenario_type": {"const": "scroll"}}}
+          ]
+        }
+      ],
+      "items": false
+    },
+    "scriptDeviceScenarios": {
+      "oneOf": [
+        {"$ref": "#/$defs/coldStartScriptScenarios"},
+        {"$ref": "#/$defs/hotStartScriptScenarios"},
+        {"$ref": "#/$defs/scrollScriptScenarios"}
+      ]
     },
     "deviceScenarios": {
       "type": "array",

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import json
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -9,6 +10,7 @@ from uuid import UUID
 import pytest
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from pydantic import ValidationError
 
 from perfpilot_agent.security import TaskRejected, TaskVerifier, VerifiedSourceTask
 
@@ -139,6 +141,127 @@ def test_task_verifier_rejects_memory_upload_for_v11_capture(
             expected_lease_version=1,
             known_device_digests={DEVICE_DIGEST},
         )
+
+
+@pytest.mark.parametrize(
+    ("test_type", "launch_mode", "scenario_type", "package_name", "launch_activity"),
+    [
+        (
+            "cold_start",
+            "automatic",
+            "startup",
+            "com.rivotek.mediacenter",
+            "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        ),
+        ("hot_start", "manual", "startup", None, None),
+        (
+            "scroll",
+            "manual",
+            "scroll",
+            "com.rivotek.mediacenter",
+            "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        ),
+    ],
+)
+def test_task_verifier_accepts_script_capture_v12(
+    signing_key: Ed25519PrivateKey,
+    task_claims: dict[str, Any],
+    test_type: str,
+    launch_mode: str,
+    scenario_type: str,
+    package_name: str | None,
+    launch_activity: str | None,
+) -> None:
+    task_claims.update(
+        {
+            "schema_version": "1.2",
+            "team_id": str(TEAM_ID),
+            "test_type": test_type,
+            "launch_mode": launch_mode,
+            "package_name": package_name,
+            "launch_activity": launch_activity,
+            "cleanup_policy": "keep_installed",
+            "input_artifacts": [],
+            "scenarios": [
+                {
+                    "scenario_type": scenario_type,
+                    "recipe_version": 1,
+                    "recipe_hash": "d" * 64,
+                    "duration_seconds": 15,
+                    "memory_rounds": 0,
+                    "swipe_count": 0,
+                }
+            ],
+            "allowed_uploads": [f"{scenario_type}_trace", "agent_log"],
+        }
+    )
+
+    task = verifier(signing_key).verify_device(
+        task_claims,
+        base64.b64encode(
+            signing_key.sign(
+                json.dumps(
+                    task_claims,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            )
+        ).decode("ascii"),
+        expected_agent_id=AGENT_ID,
+        expected_team_id=TEAM_ID,
+        known_device_digests={DEVICE_DIGEST},
+    )
+
+    assert task.test_type == test_type
+    assert task.launch_mode == launch_mode
+    assert task.input_artifacts == ()
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"test_type": "scroll", "launch_mode": "automatic"},
+        {"test_type": "cold_start", "launch_mode": "automatic", "package_name": None},
+        {
+            "test_type": "hot_start",
+            "launch_mode": "manual",
+            "package_name": "com.rivotek.mediacenter",
+        },
+    ],
+)
+def test_task_verifier_rejects_open_or_incoherent_script_capture_v12(
+    task_claims: dict[str, Any],
+    updates: dict[str, object],
+) -> None:
+    claims = {
+        **task_claims,
+        "schema_version": "1.2",
+        "team_id": str(TEAM_ID),
+        "test_type": "cold_start",
+        "launch_mode": "automatic",
+        "package_name": "com.rivotek.mediacenter",
+        "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        "cleanup_policy": "keep_installed",
+        "input_artifacts": [],
+        "scenarios": [task_claims["scenarios"][0]],
+        "allowed_uploads": ["startup_trace", "agent_log"],
+        **updates,
+    }
+    if updates.get("test_type") == "scroll":
+        claims["scenarios"] = [
+            {**task_claims["scenarios"][0], "scenario_type": "scroll"}
+        ]
+        claims["allowed_uploads"] = ["scroll_trace", "agent_log"]
+    if updates.get("launch_mode") == "manual" and "launch_activity" not in updates:
+        claims["launch_activity"] = None
+
+    with pytest.raises(ValidationError):
+        # Model validation is also the signed device-task boundary.
+        from perfpilot_agent.security import TaskSnapshot
+
+        TaskSnapshot.model_validate(claims)
 
 
 @pytest.mark.parametrize("failure", ["wrong_agent", "expired"])

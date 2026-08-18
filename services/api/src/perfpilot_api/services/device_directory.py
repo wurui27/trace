@@ -87,6 +87,7 @@ class SanitizedDeviceObservation:
     temperature_c: Decimal | None
     storage_available_bytes: int | None
     property_error_code: str | None
+    launch_targets: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +110,7 @@ class StoredDevice:
     storage_available_bytes: int | None
     property_error_code: str | None
     last_seen_at: datetime | None
+    launch_targets: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -139,6 +141,7 @@ class DeviceView:
     adb_state: AdbState
     state: DeviceState
     last_seen_at: datetime | None
+    launch_targets: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +249,7 @@ class InMemoryDeviceDirectoryRepository:
                     storage_available_bytes=observation.storage_available_bytes,
                     property_error_code=observation.property_error_code,
                     last_seen_at=now,
+                    launch_targets=observation.launch_targets,
                 )
                 self._devices[stored.device_id] = stored
                 accepted.append(stored)
@@ -717,6 +721,7 @@ class DeviceDirectory:
         temperature_c: Decimal | None,
         storage_available_bytes: int | None,
         property_error_code: str | None,
+        launch_targets: tuple[tuple[str, str], ...] = (),
     ) -> SanitizedDeviceObservation:
         try:
             if (
@@ -761,6 +766,31 @@ class DeviceDirectory:
                 _PROPERTY_ERROR_PATTERN.fullmatch(property_error_code) is None
             ):
                 raise DeviceHeartbeatRejected
+            if not isinstance(launch_targets, tuple) or len(launch_targets) > 128:
+                raise DeviceHeartbeatRejected
+            normalized_targets: list[tuple[str, str]] = []
+            for target in launch_targets:
+                if (
+                    not isinstance(target, tuple)
+                    or len(target) != 2
+                    or not all(isinstance(item, str) for item in target)
+                ):
+                    raise DeviceHeartbeatRejected
+                package_name, launch_activity = target
+                if (
+                    re.fullmatch(
+                        r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+",
+                        package_name,
+                    )
+                    is None
+                    or re.fullmatch(r"[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+", launch_activity)
+                    is None
+                    or launch_activity.split("/", 1)[0] != package_name
+                ):
+                    raise DeviceHeartbeatRejected
+                normalized_targets.append((package_name, launch_activity))
+            if len(set(normalized_targets)) != len(normalized_targets):
+                raise DeviceHeartbeatRejected
             digest = hmac.new(
                 self._serial_hmac_key,
                 serial.encode("ascii"),
@@ -780,6 +810,7 @@ class DeviceDirectory:
                 temperature_c=temperature_c,
                 storage_available_bytes=storage_available_bytes,
                 property_error_code=property_error_code,
+                launch_targets=tuple(sorted(normalized_targets)),
             )
         except (ArithmeticError, UnicodeError, ValueError):
             raise DeviceHeartbeatRejected from None
@@ -853,6 +884,7 @@ class DeviceDirectory:
                     else device.state
                 ),
                 last_seen_at=device.last_seen_at,
+                launch_targets=device.launch_targets,
             )
             for device in await self._repository.list_team(team_id)
         )
@@ -1092,6 +1124,7 @@ def _stored_device_record(
         storage_available_bytes=stored.storage_available_bytes,
         property_error_code=stored.last_property_error_code,
         last_seen_at=stored.last_seen_at,
+        launch_targets=(),
     )
 
 

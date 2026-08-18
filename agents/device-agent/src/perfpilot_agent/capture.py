@@ -6,6 +6,8 @@ import json
 import os
 import re
 import shutil
+import signal
+import stat
 import tarfile
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
@@ -13,6 +15,7 @@ from datetime import UTC, datetime
 from importlib.resources import files
 from pathlib import Path
 from typing import Protocol
+from uuid import uuid4
 from perfpilot_agent import __version__
 from perfpilot_agent.adb import ProcessResult, ProcessRunner, run_process
 from perfpilot_agent.config import AgentConfig
@@ -39,12 +42,203 @@ _TOTAL_PSS = re.compile(r"TOTAL PSS:\s*(\d+)", re.IGNORECASE)
 _TOTAL_ROW = re.compile(r"^\s*TOTAL\s+(\d+)(?:\s+(\d+))?", re.MULTILINE)
 _MAXIMUM_COMMAND_OUTPUT = 4 * 1024 * 1024
 _MAXIMUM_AGENT_LOG = 64 * 1024
+_MAXIMUM_SCRIPT_OUTPUT = 256 * 1024
+_MAXIMUM_TRACE_BYTES = 512 * 1024 * 1024
 
 
 class CaptureError(RuntimeError):
     def __init__(self, code: str = "capture_failed") -> None:
         super().__init__("PerfPilot Agent capture failed")
         self.code = code if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", code) else "capture_failed"
+
+
+class CaptureScriptRunner:
+    def __init__(self, *, script_root: Path, adb_binary: Path) -> None:
+        if not script_root.is_absolute() or not adb_binary.is_absolute():
+            raise ValueError("capture script configuration is invalid")
+        root = script_root.resolve(strict=True)
+        if script_root.is_symlink() or not root.is_dir():
+            raise ValueError("capture script configuration is invalid")
+        self._script_root = root
+        self._adb_binary = adb_binary
+
+    def _script(self, name: str) -> Path:
+        candidate = self._script_root / name
+        try:
+            metadata = candidate.lstat()
+            resolved = candidate.resolve(strict=True)
+        except OSError:
+            raise CaptureError("capture_script_unavailable") from None
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or candidate.is_symlink()
+            or not resolved.is_relative_to(self._script_root)
+        ):
+            raise CaptureError("capture_script_unavailable")
+        return resolved
+
+    @staticmethod
+    def _private_directory(path: Path) -> None:
+        path.mkdir(mode=0o700, parents=False, exist_ok=False)
+        os.chmod(path, 0o700)
+
+    @staticmethod
+    def _trace_from(root: Path, filename: str) -> Path:
+        matches: list[Path] = []
+        for directory, directory_names, filenames in os.walk(root, followlinks=False):
+            base = Path(directory)
+            directory_names[:] = [
+                name for name in directory_names if not (base / name).is_symlink()
+            ]
+            if filename in filenames:
+                matches.append(base / filename)
+        if len(matches) != 1:
+            raise CaptureError("trace_capture_invalid")
+        target = matches[0]
+        metadata = target.lstat()
+        resolved = target.resolve(strict=True)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or target.is_symlink()
+            or not resolved.is_relative_to(root)
+            or not 1 <= metadata.st_size <= _MAXIMUM_TRACE_BYTES
+        ):
+            raise CaptureError("trace_capture_invalid")
+        os.chmod(target, 0o600)
+        return target
+
+    async def _execute(
+        self,
+        *,
+        script: Path,
+        arguments: Sequence[str],
+        environment: dict[str, str],
+        duration_seconds: int,
+        send_enter: bool,
+    ) -> None:
+        process = await asyncio.create_subprocess_exec(
+            "/bin/bash",
+            str(script),
+            *arguments,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=environment,
+            start_new_session=True,
+        )
+        output = bytearray()
+
+        async def collect_output() -> None:
+            assert process.stdout is not None
+            while chunk := await process.stdout.read(8 * 1024):
+                output.extend(chunk)
+                if len(output) > _MAXIMUM_SCRIPT_OUTPUT:
+                    raise CaptureError("capture_script_output_too_large")
+
+        try:
+            if process.stdin is not None:
+                if send_enter:
+                    process.stdin.write(b"\n")
+                    await process.stdin.drain()
+                process.stdin.close()
+            async with asyncio.timeout(duration_seconds + 180):
+                _, returncode = await asyncio.gather(collect_output(), process.wait())
+            if returncode != 0:
+                raise CaptureError("capture_script_failed")
+        except BaseException:
+            if process.returncode is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except OSError:
+                    process.kill()
+                await asyncio.gather(process.wait(), return_exceptions=True)
+            raise
+
+    async def capture(
+        self,
+        *,
+        task: TaskSnapshot,
+        serial: str,
+        workspace: Path,
+    ) -> Path:
+        if task.schema_version != "1.2" or _SERIAL.fullmatch(serial) is None:
+            raise CaptureError("capture_script_task_invalid")
+        duration = task.scenarios[0].duration_seconds
+        output_root = workspace / f"script-output-{uuid4().hex}"
+        self._private_directory(output_root)
+        path_entries = tuple(
+            dict.fromkeys(
+                (
+                    str(self._adb_binary.parent),
+                    "/opt/homebrew/bin",
+                    "/usr/local/bin",
+                    "/usr/bin",
+                    "/bin",
+                    "/usr/sbin",
+                    "/sbin",
+                )
+            )
+        )
+        environment = {
+            "ANDROID_SERIAL": serial,
+            "LANG": "C.UTF-8",
+            "LC_ALL": "C.UTF-8",
+            "PATH": ":".join(path_entries),
+            "TMPDIR": str(workspace),
+        }
+        if task.test_type in {"cold_start", "hot_start"} and task.launch_mode == "automatic":
+            assert task.package_name is not None and task.launch_activity is not None
+            environment.update(
+                {
+                    "TRACE_ACTIVITY": task.launch_activity,
+                    "TRACE_AUTOFILL_EXCEL": "0",
+                    "TRACE_MEASUREMENT_KIND": "kpi",
+                    "TRACE_OUTDIR": str(output_root),
+                }
+            )
+            await self._execute(
+                script=self._script("trace_app.sh"),
+                arguments=(
+                    task.launch_activity,
+                    str(duration),
+                    "cold" if task.test_type == "cold_start" else "hot",
+                ),
+                environment=environment,
+                duration_seconds=duration,
+                send_enter=False,
+            )
+            return self._trace_from(output_root, "trace.pb")
+        if task.test_type in {"cold_start", "hot_start"}:
+            environment["TRACE_OUTPUT_ROOT"] = str(output_root)
+            await self._execute(
+                script=self._script("trace_manual.sh"),
+                arguments=(str(duration),),
+                environment=environment,
+                duration_seconds=duration,
+                send_enter=False,
+            )
+            return self._trace_from(output_root, "trace.pb")
+        assert task.package_name is not None and task.launch_activity is not None
+        environment.update(
+            {
+                "SCROLL_MANUAL": "1",
+                "SCROLL_OUTPUT_ROOT": str(output_root),
+            }
+        )
+        await self._execute(
+            script=self._script("scroll_test.sh"),
+            arguments=(
+                task.package_name,
+                str(duration),
+                "1",
+                task.launch_activity,
+                "vertical",
+            ),
+            environment=environment,
+            duration_seconds=duration,
+            send_enter=True,
+        )
+        return self._trace_from(output_root, "scroll_r1.pb")
 
 
 @dataclass(frozen=True, slots=True)
@@ -446,6 +640,8 @@ class CaptureExecution:
         clock: Callable[[], datetime],
         sleep: Callable[[float], Awaitable[None]],
         redactor: SecretRedactor | None,
+        serial: str,
+        script_runner: CaptureScriptRunner | None = None,
     ) -> None:
         self._signed_task = task
         self._workspace = workspace
@@ -455,6 +651,8 @@ class CaptureExecution:
         self._clock = clock
         self._sleep = sleep
         self._redactor = redactor
+        self._script_runner = script_runner
+        self._serial = serial
         self._stop_lock = asyncio.Lock()
         self._task = asyncio.create_task(self._execute())
 
@@ -494,16 +692,30 @@ class CaptureExecution:
             start_thermal = await self._thermal_gate()
             descriptor: ArtifactDescriptor
             if scenario.scenario_type in {"startup", "scroll"}:
-                target = self._workspace / f"{scenario.scenario_type}.perfetto-trace"
-                await self._device.capture_trace(
-                    scenario_type=scenario.scenario_type,
-                    package_name=self._signed_task.package_name,
-                    launch_activity=self._signed_task.launch_activity,
-                    output=target,
-                    duration_seconds=scenario.duration_seconds,
-                    swipe_count=scenario.swipe_count,
-                    sleep=self._sleep,
-                )
+                if self._signed_task.schema_version == "1.2":
+                    if self._script_runner is None:
+                        raise CaptureError("capture_script_unavailable")
+                    target = await self._script_runner.capture(
+                        task=self._signed_task,
+                        serial=self._serial,
+                        workspace=self._workspace,
+                    )
+                else:
+                    if (
+                        self._signed_task.package_name is None
+                        or self._signed_task.launch_activity is None
+                    ):
+                        raise CaptureError("task_input_invalid")
+                    target = self._workspace / f"{scenario.scenario_type}.perfetto-trace"
+                    await self._device.capture_trace(
+                        scenario_type=scenario.scenario_type,
+                        package_name=self._signed_task.package_name,
+                        launch_activity=self._signed_task.launch_activity,
+                        output=target,
+                        duration_seconds=scenario.duration_seconds,
+                        swipe_count=scenario.swipe_count,
+                        sleep=self._sleep,
+                    )
                 descriptor = describe_artifact(
                     kind=(
                         "startup_trace" if scenario.scenario_type == "startup" else "scroll_trace"
@@ -577,21 +789,22 @@ class CaptureExecution:
         descriptors: list[ArtifactDescriptor] = []
         scenarios: list[_ScenarioResult] = []
         try:
-            apk_inputs = tuple(
-                item for item in self._signed_task.input_artifacts if item.kind == "apk"
-            )
-            if len(apk_inputs) != 1 or len(self._signed_task.input_artifacts) != 1:
-                raise CaptureError("task_input_invalid")
-            apk = await self._downloader.download(
-                execution_id=self._signed_task.execution_id,
-                lease_version=self._signed_task.lease_version,
-                artifact=apk_inputs[0],
-                target=self._workspace / "input.apk",
-            )
             adb_version = "unavailable"
             try:
                 adb_version = await self._device.adb_version()
-                await self._device.install(apk)
+                if self._signed_task.schema_version != "1.2":
+                    apk_inputs = tuple(
+                        item for item in self._signed_task.input_artifacts if item.kind == "apk"
+                    )
+                    if len(apk_inputs) != 1 or len(self._signed_task.input_artifacts) != 1:
+                        raise CaptureError("task_input_invalid")
+                    apk = await self._downloader.download(
+                        execution_id=self._signed_task.execution_id,
+                        lease_version=self._signed_task.lease_version,
+                        artifact=apk_inputs[0],
+                        target=self._workspace / "input.apk",
+                    )
+                    await self._device.install(apk)
             except CaptureError as error:
                 completed_at = self._now()
                 self._log(log_lines, f"preparation state=failed code={error.code}")
@@ -677,7 +890,10 @@ class CaptureExecution:
             return ExecutionOutcome(manifest=manifest)
         finally:
             await self._device.cleanup()
-            if self._signed_task.cleanup_policy == "uninstall":
+            if (
+                self._signed_task.cleanup_policy == "uninstall"
+                and self._signed_task.package_name is not None
+            ):
                 try:
                     await self._device.uninstall(self._signed_task.package_name)
                 except (CaptureError, OSError, ValueError):
@@ -726,9 +942,12 @@ class CaptureExecution:
     async def finalize(self) -> None:
         self._delete_incomplete(include_log=True)
         try:
-            self._workspace.rmdir()
+            metadata = self._workspace.lstat()
         except OSError:
-            pass
+            return
+        if not stat.S_ISDIR(metadata.st_mode) or self._workspace.is_symlink():
+            return
+        shutil.rmtree(self._workspace)
 
 
 class CaptureTaskRunner:
@@ -743,6 +962,7 @@ class CaptureTaskRunner:
         device_factory: Callable[..., CaptureDevice] | None = None,
         downloader_factory: Callable[..., InputDownloader] | None = None,
         uploader_factory: Callable[..., MultipartUploader] | None = None,
+        script_runner_factory: Callable[..., CaptureScriptRunner] | None = None,
         runner: ProcessRunner = run_process,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
@@ -772,6 +992,9 @@ class CaptureTaskRunner:
                 **kwargs,
             )
         )
+        self._script_runner_factory = script_runner_factory or (
+            lambda **kwargs: CaptureScriptRunner(**kwargs)
+        )
 
     async def start(self, task: TaskSnapshot, *, serial: str) -> CaptureExecution:
         root = self._config.workspace_root.resolve(strict=False)
@@ -790,6 +1013,14 @@ class CaptureTaskRunner:
         )
         downloader = self._downloader_factory(workspace_root=root)
         uploader = self._uploader_factory(checkpoint_path=workspace / "upload-state.json")
+        script_runner = (
+            None
+            if self._config.capture_script_root is None
+            else self._script_runner_factory(
+                script_root=self._config.capture_script_root,
+                adb_binary=self._adb_binary,
+            )
+        )
         return CaptureExecution(
             task=task,
             workspace=workspace,
@@ -799,6 +1030,8 @@ class CaptureTaskRunner:
             clock=self._clock,
             sleep=self._sleep,
             redactor=self._redactor,
+            script_runner=script_runner,
+            serial=serial,
         )
 
 
@@ -806,6 +1039,7 @@ __all__ = [
     "CaptureAdbDevice",
     "CaptureError",
     "CaptureExecution",
+    "CaptureScriptRunner",
     "CaptureTaskRunner",
     "ThermalReading",
     "write_memory_archive",

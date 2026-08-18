@@ -71,6 +71,8 @@ def _sized_unified_diff(path: str, target_bytes: int) -> str:
 
 def _heartbeat_v11() -> dict[str, object]:
     heartbeat = example("agent-heartbeat.valid.json")
+    for device in heartbeat["devices"]:  # type: ignore[union-attr]
+        device["launch_targets"] = []
     heartbeat.update(
         {
             "schema_version": "1.1",
@@ -171,6 +173,40 @@ def test_device_list_contract_never_accepts_raw_serial() -> None:
     assert [list(error.absolute_path) for error in errors] == [["devices", 0]]
 
 
+def test_launch_targets_are_closed_v11_device_metadata() -> None:
+    target = {
+        "package_name": "com.rivotek.mediacenter",
+        "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+    }
+    heartbeat_contract = validator("agents/heartbeat-request.schema.json")
+    heartbeat = _heartbeat_v11()
+    heartbeat["devices"][0]["launch_targets"] = [target]  # type: ignore[index]
+    heartbeat_contract.validate(heartbeat)
+
+    legacy_heartbeat = example("agent-heartbeat.valid.json")
+    heartbeat_contract.validate(legacy_heartbeat)
+    legacy_heartbeat["devices"][0]["launch_targets"] = [target]  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        heartbeat_contract.validate(legacy_heartbeat)
+
+    list_contract = validator("agents/device-list-response.schema.json")
+    response = example("agent-device-list.valid.json")
+    response["schema_version"] = "1.1"
+    response["devices"][0]["launch_targets"] = [target]  # type: ignore[index]
+    list_contract.validate(response)
+
+    legacy_response = example("agent-device-list.valid.json")
+    list_contract.validate(legacy_response)
+    legacy_response["devices"][0]["launch_targets"] = [target]  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        list_contract.validate(legacy_response)
+
+    invalid = deepcopy(response)
+    invalid["devices"][0]["launch_targets"][0]["path"] = "/private/app"  # type: ignore[index]
+    with pytest.raises(jsonschema.ValidationError):
+        list_contract.validate(invalid)
+
+
 def test_task_snapshot_binds_agent_device_execution_and_lease() -> None:
     payload = example("agent-task-snapshot.valid.json")
 
@@ -218,6 +254,67 @@ def test_task_snapshot_v11_is_apk_startup_scroll_without_memory_upload() -> None
     ):
         with pytest.raises(jsonschema.ValidationError):
             contract.validate(invalid)
+
+
+@pytest.mark.parametrize(
+    ("test_type", "launch_mode", "scenario_type", "package_name", "launch_activity"),
+    [
+        (
+            "cold_start",
+            "automatic",
+            "startup",
+            "com.rivotek.mediacenter",
+            "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        ),
+        ("hot_start", "manual", "startup", None, None),
+        (
+            "scroll",
+            "manual",
+            "scroll",
+            "com.rivotek.mediacenter",
+            "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        ),
+    ],
+)
+def test_task_snapshot_v12_is_one_script_capture_without_apk(
+    test_type: str,
+    launch_mode: str,
+    scenario_type: str,
+    package_name: str | None,
+    launch_activity: str | None,
+) -> None:
+    current = example("agent-task-snapshot.valid.json")
+    payload = {
+        **current,
+        "schema_version": "1.2",
+        "test_type": test_type,
+        "launch_mode": launch_mode,
+        "package_name": package_name,
+        "launch_activity": launch_activity,
+        "cleanup_policy": "keep_installed",
+        "input_artifacts": [],
+        "scenarios": [
+            {
+                **current["scenarios"][0],
+                "scenario_type": scenario_type,
+                "duration_seconds": 15,
+                "memory_rounds": 0,
+                "swipe_count": 0,
+            }
+        ],
+        "allowed_uploads": [f"{scenario_type}_trace", "agent_log"],
+    }
+
+    validator("agents/task-snapshot.schema.json").validate(payload)
+
+    poll = {
+        "schema_version": "1.1",
+        "task_kind": "device",
+        "lease_token": "opaque-lease-token-123",
+        "snapshot": payload,
+        "signature_b64": "A" * 86 + "==",
+    }
+    validator("agents/task-poll-response.schema.json").validate(poll)
 
 
 def test_source_task_is_not_a_device_capture_task() -> None:

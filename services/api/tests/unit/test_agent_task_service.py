@@ -114,6 +114,43 @@ def _remote_definition(
     )
 
 
+def _script_definition(
+    *,
+    test_type: str = "cold_start",
+    launch_mode: str = "automatic",
+) -> AgentTaskDefinition:
+    scenario_type = "scroll" if test_type == "scroll" else "startup"
+    has_target = launch_mode == "automatic" or test_type == "scroll"
+    return AgentTaskDefinition(
+        analysis_id=ANALYSIS_ID,
+        team_id=TEAM_ID,
+        agent_id=AGENT_ID,
+        device_id=DEVICE_ID,
+        device_digest="a" * 64,
+        package_name="com.rivotek.mediacenter" if has_target else None,
+        launch_activity=(
+            "com.rivotek.mediacenter/.shell.MediaCenterActivity"
+            if has_target
+            else None
+        ),
+        cleanup_policy="keep_installed",
+        input_artifacts=(),
+        scenarios=(
+            TaskScenario(
+                scenario_type=scenario_type,  # type: ignore[arg-type]
+                recipe_version=1,
+                recipe_hash="d" * 64,
+                duration_seconds=15,
+                memory_rounds=0,
+                swipe_count=0,
+            ),
+        ),
+        schema_version="1.2",
+        test_type=test_type,  # type: ignore[arg-type]
+        launch_mode=launch_mode,  # type: ignore[arg-type]
+    )
+
+
 def _service() -> tuple[AgentTaskService, InMemoryAgentTaskRepository, str]:
     private_key = Ed25519PrivateKey.generate()
     repository = InMemoryAgentTaskRepository(
@@ -181,6 +218,57 @@ async def test_remote_device_enqueue_is_replay_safe_and_oldest_first() -> None:
     )
     with pytest.raises(AgentTaskConflict):
         await repository.enqueue(conflicting, queued_at=NOW)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("test_type", "launch_mode", "expected_scenario"),
+    [
+        ("cold_start", "automatic", "startup"),
+        ("hot_start", "manual", "startup"),
+        ("scroll", "manual", "scroll"),
+    ],
+)
+async def test_script_capture_enqueue_signs_closed_v12_claims(
+    test_type: str,
+    launch_mode: str,
+    expected_scenario: str,
+) -> None:
+    private_key = Ed25519PrivateKey.generate()
+    repository = InMemoryAgentTaskRepository(
+        lease_id_source=lambda: LEASE_ID,
+        execution_id_source=lambda: EXECUTION_ID,
+    )
+    service = AgentTaskService(
+        repository=repository,
+        signer=TaskSnapshotSigner(
+            private_key=private_key,
+            kid="lan-test",
+            clock=lambda: NOW,
+        ),
+        wakeup=InMemoryAgentTaskWakeup(),
+        clock=lambda: NOW,
+    )
+    definition = _script_definition(test_type=test_type, launch_mode=launch_mode)
+
+    assert await service.enqueue(definition) is True
+    assert await service.schedule(analysis_id=ANALYSIS_ID) is not None
+    delivery = await service.poll(agent_id=AGENT_ID, wait_seconds=0)
+    assert delivery is not None
+    claims = verify_task_jws(
+        delivery.snapshot_jws,  # type: ignore[union-attr]
+        encode_ed25519_public_key(private_key.public_key()),
+        now=NOW,
+        expected_team_id=TEAM_ID,
+    )
+
+    assert claims["schema_version"] == "1.2"
+    assert claims["test_type"] == test_type
+    assert claims["launch_mode"] == launch_mode
+    assert claims["input_artifacts"] == []
+    assert [item["scenario_type"] for item in claims["scenarios"]] == [
+        expected_scenario
+    ]
 
 
 @pytest.mark.asyncio

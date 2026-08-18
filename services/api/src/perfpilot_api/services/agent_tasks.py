@@ -106,12 +106,14 @@ class AgentTaskDefinition:
     agent_id: UUID
     device_id: UUID
     device_digest: str
-    package_name: str
-    launch_activity: str
+    package_name: str | None
+    launch_activity: str | None
     cleanup_policy: CleanupPolicy
     input_artifacts: tuple[TaskInputArtifact, ...]
     scenarios: tuple[TaskScenario, ...]
-    schema_version: Literal["1.0", "1.1"] = "1.0"
+    schema_version: Literal["1.0", "1.1", "1.2"] = "1.0"
+    test_type: Literal["cold_start", "hot_start", "scroll"] | None = None
+    launch_mode: Literal["automatic", "manual"] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -641,12 +643,24 @@ class InMemoryAgentTaskRepository:
         queued_at: datetime,
     ) -> bool:
         _require_aware(queued_at)
-        if definition.schema_version != "1.1" or tuple(
-            item.scenario_type for item in definition.scenarios
-        ) != (
-            "startup",
-            "scroll",
-        ) or tuple(item.kind for item in definition.input_artifacts) != ("apk",):
+        scenario_types = tuple(item.scenario_type for item in definition.scenarios)
+        legacy_remote = (
+            definition.schema_version == "1.1"
+            and scenario_types == ("startup", "scroll")
+            and tuple(item.kind for item in definition.input_artifacts) == ("apk",)
+            and definition.test_type is None
+            and definition.launch_mode is None
+        )
+        script_remote = (
+            definition.schema_version == "1.2"
+            and definition.test_type in {"cold_start", "hot_start", "scroll"}
+            and definition.launch_mode in {"automatic", "manual"}
+            and not definition.input_artifacts
+            and scenario_types
+            == (("scroll",) if definition.test_type == "scroll" else ("startup",))
+            and definition.cleanup_policy == "keep_installed"
+        )
+        if not legacy_remote and not script_remote:
             raise AgentTaskConflict("Remote device tasks require startup and scroll scenarios")
         async with self._lock:
             existing = self._definitions.get(definition.analysis_id)
@@ -2414,8 +2428,11 @@ def _task_claims(task: ActiveAgentTask, *, issued_at: datetime) -> dict[str, obj
         ],
         "allowed_uploads": list(_allowed_uploads(scenario_types)),
     }
-    if definition.schema_version == "1.1":
+    if definition.schema_version in {"1.1", "1.2"}:
         claims["team_id"] = str(definition.team_id)
+    if definition.schema_version == "1.2":
+        claims["test_type"] = definition.test_type
+        claims["launch_mode"] = definition.launch_mode
     return claims
 
 

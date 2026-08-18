@@ -74,6 +74,57 @@
       "required": [
         "schema_version",
         "analysis_mode",
+        "device_id",
+        "test_type",
+        "launch_mode",
+        "duration_seconds",
+        "target"
+      ],
+      "properties": {
+        "schema_version": {"const": "1.2"},
+        "analysis_mode": {"const": "device"},
+        "device_id": {"$ref": "#/$defs/uuid"},
+        "test_type": {"enum": ["cold_start", "hot_start", "scroll"]},
+        "launch_mode": {"enum": ["automatic", "manual"]},
+        "duration_seconds": {"type": "integer", "minimum": 1, "maximum": 300},
+        "target": {
+          "oneOf": [
+            {"$ref": "#/$defs/launchTarget"},
+            {"type": "null"}
+          ]
+        },
+        "source_binding": {"$ref": "#/$defs/sourceBinding"}
+      },
+      "oneOf": [
+        {
+          "properties": {
+            "test_type": {"enum": ["cold_start", "hot_start"]},
+            "launch_mode": {"const": "automatic"},
+            "target": {"$ref": "#/$defs/launchTarget"}
+          }
+        },
+        {
+          "properties": {
+            "test_type": {"enum": ["cold_start", "hot_start"]},
+            "launch_mode": {"const": "manual"},
+            "target": {"type": "null"}
+          }
+        },
+        {
+          "properties": {
+            "test_type": {"const": "scroll"},
+            "launch_mode": {"const": "manual"},
+            "target": {"$ref": "#/$defs/launchTarget"}
+          }
+        }
+      ]
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "analysis_mode",
         "analysis_profile",
         "inputs"
       ],
@@ -274,6 +325,25 @@
             {"$ref": "#/$defs/uuid"},
             {"type": "null"}
           ]
+        }
+      }
+    },
+    "launchTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package_name", "launch_activity"],
+      "properties": {
+        "package_name": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+        },
+        "launch_activity": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$"
         }
       }
     },

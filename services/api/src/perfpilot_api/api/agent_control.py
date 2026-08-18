@@ -163,6 +163,31 @@ class HeartbeatDevice(BaseModel):
         max_length=96,
         pattern=r"^[a-z][a-z0-9_]*$",
     )
+    launch_targets: tuple["HeartbeatLaunchTarget", ...] = Field(
+        default=(),
+        max_length=128,
+    )
+
+
+class HeartbeatLaunchTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    package_name: str = Field(
+        min_length=3,
+        max_length=255,
+        pattern=r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$",
+    )
+    launch_activity: str = Field(
+        min_length=3,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$",
+    )
+
+    @model_validator(mode="after")
+    def validate_component(self) -> "HeartbeatLaunchTarget":
+        if self.launch_activity.split("/", 1)[0] != self.package_name:
+            raise ValueError("launch target package is invalid")
+        return self
 
 
 class HeartbeatValidationProfile(BaseModel):
@@ -730,6 +755,10 @@ async def heartbeat(
                 temperature_c=device.temperature_c,
                 storage_available_bytes=device.storage_available_bytes,
                 property_error_code=device.property_error_code,
+                launch_targets=tuple(
+                    (target.package_name, target.launch_activity)
+                    for target in device.launch_targets
+                ),
             )
             for device in payload.devices
         )

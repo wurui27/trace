@@ -280,7 +280,7 @@ def verify_task_jws(
         claims = _closed_json(payload)
         _validate_claims(claims, now=now or datetime.now(UTC))
         schema_version = claims.get("schema_version")
-        if schema_version == "1.1" and (
+        if schema_version in {"1.1", "1.2"} and (
             expected_team_id is None or claims.get("team_id") != str(expected_team_id)
         ):
             raise TaskSnapshotRejected

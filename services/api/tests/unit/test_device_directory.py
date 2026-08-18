@@ -199,6 +199,46 @@ def observation(
 
 
 @pytest.mark.asyncio
+async def test_launch_targets_are_bound_to_the_observed_device(
+    harness: DirectoryHarness,
+) -> None:
+    sanitized = harness.directory.sanitize_observation(
+        client_ref=uuid4(),
+        serial="DEVICE0001",
+        manufacturer="UNISOC",
+        model="ums9620",
+        android_release="15",
+        api_level=35,
+        connection_type="usb",
+        adb_state="device",
+        battery_percent=82,
+        temperature_c=Decimal("31.5"),
+        storage_available_bytes=40 * 1024 * 1024,
+        property_error_code=None,
+        launch_targets=(
+            (
+                "com.rivotek.mediacenter",
+                "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+            ),
+        ),
+    )
+
+    await harness.directory.replace_heartbeat(
+        agent_id=harness.agent_id,
+        heartbeat=heartbeat(),
+        devices=(sanitized,),
+    )
+
+    devices = await harness.directory.list_devices(team_id=TEAM_ID)
+    assert devices[0].launch_targets == (
+        (
+            "com.rivotek.mediacenter",
+            "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        ),
+    )
+
+
+@pytest.mark.asyncio
 async def test_heartbeat_masks_serial_and_never_retains_raw_value(
     harness: DirectoryHarness,
 ) -> None:

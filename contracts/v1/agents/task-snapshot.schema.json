@@ -6,14 +6,37 @@
   "oneOf": [
     {
       "properties": {"schema_version": {"const": "1.0"}},
-      "not": {"required": ["team_id"]}
+      "not": {
+        "anyOf": [
+          {"required": ["team_id"]},
+          {"required": ["test_type"]},
+          {"required": ["launch_mode"]}
+        ]
+      },
+      "allOf": [
+        {
+          "properties": {
+            "package_name": {"$ref": "#/$defs/packageName"},
+            "launch_activity": {"$ref": "#/$defs/launchActivity"},
+            "input_artifacts": {"minItems": 1}
+          }
+        }
+      ]
     },
     {
       "properties": {"schema_version": {"const": "1.1"}},
       "required": ["team_id"],
+      "not": {
+        "anyOf": [
+          {"required": ["test_type"]},
+          {"required": ["launch_mode"]}
+        ]
+      },
       "allOf": [
         {
           "properties": {
+            "package_name": {"$ref": "#/$defs/packageName"},
+            "launch_activity": {"$ref": "#/$defs/launchActivity"},
             "input_artifacts": {
               "minItems": 1,
               "maxItems": 1,
@@ -48,6 +71,65 @@
           }
         }
       ]
+    },
+    {
+      "properties": {"schema_version": {"const": "1.2"}},
+      "required": ["team_id", "test_type", "launch_mode"],
+      "allOf": [
+        {
+          "properties": {
+            "cleanup_policy": {"const": "keep_installed"},
+            "input_artifacts": {"maxItems": 0},
+            "scenarios": {"minItems": 1, "maxItems": 1}
+          }
+        },
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "test_type": {"enum": ["cold_start", "hot_start"]},
+                "launch_mode": {"const": "automatic"},
+                "package_name": {"$ref": "#/$defs/packageName"},
+                "launch_activity": {"$ref": "#/$defs/launchActivity"},
+                "scenarios": {
+                  "prefixItems": [
+                    {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_type": {"const": "startup"}, "duration_seconds": {"minimum": 1}, "memory_rounds": {"const": 0}, "swipe_count": {"const": 0}}}]}
+                  ]
+                },
+                "allowed_uploads": {"const": ["startup_trace", "agent_log"]}
+              }
+            },
+            {
+              "properties": {
+                "test_type": {"enum": ["cold_start", "hot_start"]},
+                "launch_mode": {"const": "manual"},
+                "package_name": {"type": "null"},
+                "launch_activity": {"type": "null"},
+                "scenarios": {
+                  "prefixItems": [
+                    {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_type": {"const": "startup"}, "duration_seconds": {"minimum": 1}, "memory_rounds": {"const": 0}, "swipe_count": {"const": 0}}}]}
+                  ]
+                },
+                "allowed_uploads": {"const": ["startup_trace", "agent_log"]}
+              }
+            },
+            {
+              "properties": {
+                "test_type": {"const": "scroll"},
+                "launch_mode": {"const": "manual"},
+                "package_name": {"$ref": "#/$defs/packageName"},
+                "launch_activity": {"$ref": "#/$defs/launchActivity"},
+                "scenarios": {
+                  "prefixItems": [
+                    {"allOf": [{"$ref": "#/$defs/scenario"}, {"properties": {"scenario_type": {"const": "scroll"}, "duration_seconds": {"minimum": 1}, "memory_rounds": {"const": 0}, "swipe_count": {"const": 0}}}]}
+                  ]
+                },
+                "allowed_uploads": {"const": ["scroll_trace", "agent_log"]}
+              }
+            }
+          ]
+        }
+      ]
     }
   ],
   "required": [
@@ -68,7 +150,7 @@
     "allowed_uploads"
   ],
   "properties": {
-    "schema_version": {"enum": ["1.0", "1.1"]},
+    "schema_version": {"enum": ["1.0", "1.1", "1.2"]},
     "aud": {"const": "perfpilot-agent"},
     "team_id": {"$ref": "#/$defs/uuid"},
     "agent_id": {"$ref": "#/$defs/uuid"},
@@ -78,22 +160,12 @@
     "analysis_id": {"$ref": "#/$defs/uuid"},
     "issued_at": {"type": "string", "format": "date-time"},
     "expires_at": {"type": "string", "format": "date-time"},
-    "package_name": {
-      "type": "string",
-      "minLength": 3,
-      "maxLength": 255,
-      "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
-    },
-    "launch_activity": {
-      "type": "string",
-      "minLength": 3,
-      "maxLength": 512,
-      "pattern": "^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$"
-    },
+    "package_name": {"anyOf": [{"$ref": "#/$defs/packageName"}, {"type": "null"}]},
+    "launch_activity": {"anyOf": [{"$ref": "#/$defs/launchActivity"}, {"type": "null"}]},
     "cleanup_policy": {"enum": ["keep_installed", "uninstall"]},
     "input_artifacts": {
       "type": "array",
-      "minItems": 1,
+      "minItems": 0,
       "maxItems": 8,
       "items": {"$ref": "#/$defs/inputArtifact"}
     },
@@ -111,9 +183,23 @@
       "items": {
         "enum": ["startup_trace", "scroll_trace", "memory_evidence", "agent_log"]
       }
-    }
+    },
+    "test_type": {"enum": ["cold_start", "hot_start", "scroll"]},
+    "launch_mode": {"enum": ["automatic", "manual"]}
   },
   "$defs": {
+    "packageName": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+    },
+    "launchActivity": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 512,
+      "pattern": "^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$"
+    },
     "uuid": {
       "type": "string",
       "format": "uuid",

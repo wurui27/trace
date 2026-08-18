@@ -89,3 +89,29 @@ def test_valid_config_is_immutable(tmp_path: Path) -> None:
 
     with pytest.raises(ValidationError):
         config.server_url = "https://example.com"
+
+
+def test_capture_script_root_must_be_an_absolute_real_directory(tmp_path: Path) -> None:
+    ca_bundle, workspace = valid_paths(tmp_path)
+    scripts = tmp_path / "capture-scripts"
+    scripts.mkdir()
+
+    config = AgentConfig(
+        schema_version="1.0",
+        server_url="https://10.166.0.125",
+        ca_bundle=ca_bundle,
+        workspace_root=workspace,
+        capture_script_root=scripts,
+    )
+    assert config.capture_script_root == scripts
+
+    alias = tmp_path / "capture-scripts-link"
+    alias.symlink_to(scripts, target_is_directory=True)
+    with pytest.raises(ValidationError):
+        AgentConfig(
+            schema_version="1.0",
+            server_url="https://10.166.0.125",
+            ca_bundle=ca_bundle,
+            workspace_root=workspace,
+            capture_script_root=alias,
+        )

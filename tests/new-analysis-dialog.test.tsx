@@ -69,7 +69,7 @@ it("submits the selected remote device id with a device analysis", async () => {
       memberships: [{ team: { id: "team-1", name: "Ray" }, role: "owner" }],
     }),
     devices: vi.fn().mockResolvedValue({
-      schema_version: "1.0",
+      schema_version: "1.1",
       devices: [
         {
           device_id: "device-ready-1",
@@ -84,6 +84,12 @@ it("submits the selected remote device id with a device analysis", async () => {
           adb_state: "device",
           state: "ready",
           last_seen_at: "2026-08-05T08:00:00Z",
+          launch_targets: [
+            {
+              package_name: "com.rivotek.mediacenter",
+              launch_activity: "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+            },
+          ],
         },
       ],
     }),
@@ -131,16 +137,19 @@ it("submits the selected remote device id with a device analysis", async () => {
   );
 
   await user.click(screen.getByRole("button", { name: "新建分析" }));
-  await user.click(screen.getByRole("button", { name: "真机自动测试" }));
+  await user.click(screen.getByRole("button", { name: "真机性能测试" }));
   await screen.findByText("UNISOC ums9620");
+  expect(screen.queryByText(/安装 APK/)).not.toBeInTheDocument();
   await user.selectOptions(
     await screen.findByLabelText("源码工作区"),
     "92000000-0000-4000-8000-000000000002",
   );
-  const apk = new File([new Uint8Array([1, 2, 3])], "demo.apk", {
-    type: "application/vnd.android.package-archive",
-  });
-  await user.upload(screen.getByLabelText("APK 文件"), apk);
+  expect(screen.queryByLabelText("APK 文件")).not.toBeInTheDocument();
+  expect(screen.getByLabelText("测试时长（秒）")).toHaveValue(15);
+  expect(screen.getByLabelText("包名")).toHaveValue("com.rivotek.mediacenter");
+  expect(screen.getByLabelText("启动类")).toHaveValue(
+    "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+  );
   await user.click(screen.getByRole("button", { name: "开始真机分析" }));
 
   await waitFor(() => {
@@ -148,7 +157,13 @@ it("submits the selected remote device id with a device analysis", async () => {
       expect.objectContaining({
         teamId: "team-1",
         deviceId: "device-ready-1",
-        apk,
+        testType: "cold_start",
+        launchMode: "automatic",
+        durationSeconds: 15,
+        target: {
+          package_name: "com.rivotek.mediacenter",
+          launch_activity: "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        },
         sourceBinding: {
           provider_kind: "agent_workspace",
           agent_id: "73000000-0000-4000-8000-000000000002",

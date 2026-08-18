@@ -58,8 +58,7 @@
     },
     "devices": {
       "type": "array",
-      "maxItems": 32,
-      "items": {"$ref": "#/$defs/device"}
+      "maxItems": 32
     },
     "workspaces": {
       "type": "array",
@@ -74,14 +73,38 @@
         "properties": {"schema_version": {"const": "1.0"}},
         "required": ["schema_version"]
       },
-      "then": {"properties": {"workspaces": false}}
+      "then": {
+        "properties": {
+          "workspaces": false,
+          "devices": {
+            "items": {
+              "allOf": [
+                {"$ref": "#/$defs/device"},
+                {"not": {"required": ["launch_targets"]}}
+              ]
+            }
+          }
+        }
+      }
     },
     {
       "if": {
         "properties": {"schema_version": {"const": "1.1"}},
         "required": ["schema_version"]
       },
-      "then": {"required": ["workspaces"]}
+      "then": {
+        "required": ["workspaces"],
+        "properties": {
+          "devices": {
+            "items": {
+              "allOf": [
+                {"$ref": "#/$defs/device"},
+                {"required": ["launch_targets"]}
+              ]
+            }
+          }
+        }
+      }
     }
   ],
   "$defs": {
@@ -229,6 +252,31 @@
             {"$ref": "#/$defs/stableCode"},
             {"type": "null"}
           ]
+        },
+        "launch_targets": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/launchTarget"}
+        }
+      }
+    },
+    "launchTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package_name", "launch_activity"],
+      "properties": {
+        "package_name": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+        },
+        "launch_activity": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$"
         }
       }
     }

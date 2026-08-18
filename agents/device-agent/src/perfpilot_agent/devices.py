@@ -24,6 +24,7 @@ from perfpilot_agent.control_client import (
     ControlClientError,
     ExecutionSlot,
     HeartbeatDevice,
+    HeartbeatLaunchTarget,
     HeartbeatRequest,
     HeartbeatResponse,
     HeartbeatWorkspace,
@@ -36,6 +37,11 @@ from perfpilot_agent.state import AgentRuntimeState, DeviceBinding, RuntimeState
 _BATTERY_LEVEL = re.compile(r"^\s*level:\s*(\d+)\s*$", re.MULTILINE)
 _BATTERY_TEMPERATURE = re.compile(r"^\s*temperature:\s*(-?\d+)\s*$", re.MULTILINE)
 _WIFI_SERIAL = re.compile(r"^(?:\d{1,3}\.){3}\d{1,3}:\d{1,5}$")
+_LAUNCH_TARGET = re.compile(
+    r"^\s*([A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+)/"
+    r"([A-Za-z0-9_.$]+)\s*$"
+)
+_MAXIMUM_LAUNCH_TARGETS = 128
 
 
 class DeviceObservation(HeartbeatDevice):
@@ -55,6 +61,7 @@ class DeviceProbeResult:
     abi: str | None
     fingerprint: str | None
     perfetto_available: bool
+    launch_targets: tuple[HeartbeatLaunchTarget, ...] = ()
     property_error_code: str | None = None
 
 
@@ -129,6 +136,22 @@ def _parse_storage(payload: str) -> int | None:
     return available_kib * 1024
 
 
+def _parse_launch_targets(payload: str) -> tuple[HeartbeatLaunchTarget, ...]:
+    targets: set[tuple[str, str]] = set()
+    for line in payload.splitlines():
+        match = _LAUNCH_TARGET.fullmatch(line)
+        if match is None:
+            continue
+        package_name, activity_name = match.groups()
+        targets.add((package_name, f"{package_name}/{activity_name}"))
+        if len(targets) > _MAXIMUM_LAUNCH_TARGETS:
+            raise AdbProtocolError
+    return tuple(
+        HeartbeatLaunchTarget(package_name=package, launch_activity=activity)
+        for package, activity in sorted(targets)
+    )
+
+
 class AdbDeviceProbe:
     def __init__(
         self,
@@ -187,6 +210,23 @@ class AdbDeviceProbe:
             perfetto_available = bool(await self._text(client, "shell", "which", "perfetto"))
         except AdbError:
             perfetto_available = False
+        try:
+            launch_targets = _parse_launch_targets(
+                await self._text(
+                    client,
+                    "shell",
+                    "cmd",
+                    "package",
+                    "query-activities",
+                    "--brief",
+                    "-a",
+                    "android.intent.action.MAIN",
+                    "-c",
+                    "android.intent.category.LAUNCHER",
+                )
+            )
+        except AdbError:
+            launch_targets = ()
         return DeviceProbeResult(
             manufacturer=manufacturer,
             model=model,
@@ -199,6 +239,7 @@ class AdbDeviceProbe:
             abi=abi,
             fingerprint=fingerprint,
             perfetto_available=perfetto_available,
+            launch_targets=launch_targets,
         )
 
 
@@ -291,6 +332,7 @@ class DeviceInventory:
                 temperature_c=details.temperature_c,
                 storage_available_bytes=details.storage_available_bytes,
                 property_error_code=details.property_error_code,
+                launch_targets=details.launch_targets,
             ),
             transport_id=device.transport_id,
             abi=details.abi,

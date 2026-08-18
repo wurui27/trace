@@ -216,6 +216,27 @@ class ExecutionSlot(BaseModel):
         return self
 
 
+class HeartbeatLaunchTarget(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    package_name: str = Field(
+        min_length=3,
+        max_length=255,
+        pattern=r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$",
+    )
+    launch_activity: str = Field(
+        min_length=3,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$",
+    )
+
+    @model_validator(mode="after")
+    def validate_component_package(self) -> Self:
+        if self.launch_activity.split("/", 1)[0] != self.package_name:
+            raise ValueError("launch target package is invalid")
+        return self
+
+
 class HeartbeatDevice(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -248,6 +269,20 @@ class HeartbeatDevice(BaseModel):
         max_length=96,
         pattern=r"^[a-z][a-z0-9_]*$",
     )
+    launch_targets: tuple[HeartbeatLaunchTarget, ...] = Field(
+        default=(),
+        max_length=128,
+    )
+
+    @field_validator("launch_targets")
+    @classmethod
+    def validate_unique_launch_targets(
+        cls,
+        value: tuple[HeartbeatLaunchTarget, ...],
+    ) -> tuple[HeartbeatLaunchTarget, ...]:
+        if len({item.launch_activity for item in value}) != len(value):
+            raise ValueError("launch targets must be unique")
+        return value
 
 
 class HeartbeatValidationProfile(BaseModel):
@@ -975,6 +1010,9 @@ class ControlClient:
             document = normalized.model_dump(mode="json")
             if normalized.workspaces is None:
                 document.pop("workspaces", None)
+            if normalized.schema_version == "1.0":
+                for device in document["devices"]:
+                    device.pop("launch_targets", None)
             payload = await self._authorized_request(
                 "POST",
                 "/v1/agent/heartbeat",

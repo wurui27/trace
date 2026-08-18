@@ -20,6 +20,7 @@ class AgentConfig(BaseModel):
     ca_bundle: Path
     adb_path: Path | None = None
     workspace_root: Path
+    capture_script_root: Path | None = None
 
     @property
     def source_registry_path(self) -> Path:
@@ -59,6 +60,12 @@ class AgentConfig(BaseModel):
             raise ValueError("workspace root must be absolute")
         if self.adb_path is not None and not self.adb_path.is_absolute():
             raise ValueError("ADB path must be absolute")
+        if self.capture_script_root is not None and (
+            not self.capture_script_root.is_absolute()
+            or not self.capture_script_root.is_dir()
+            or self.capture_script_root.is_symlink()
+        ):
+            raise ValueError("capture script root must be an absolute real directory")
         return self
 
 

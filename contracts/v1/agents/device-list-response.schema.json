@@ -5,13 +5,50 @@
   "additionalProperties": false,
   "required": ["schema_version", "devices"],
   "properties": {
-    "schema_version": {"const": "1.0"},
+    "schema_version": {"enum": ["1.0", "1.1"]},
     "devices": {
       "type": "array",
-      "maxItems": 256,
-      "items": {"$ref": "#/$defs/device"}
+      "maxItems": 256
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.0"}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "devices": {
+            "items": {
+              "allOf": [
+                {"$ref": "#/$defs/device"},
+                {"not": {"required": ["launch_targets"]}}
+              ]
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"schema_version": {"const": "1.1"}},
+        "required": ["schema_version"]
+      },
+      "then": {
+        "properties": {
+          "devices": {
+            "items": {
+              "allOf": [
+                {"$ref": "#/$defs/device"},
+                {"required": ["launch_targets"]}
+              ]
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "uuid": {
       "type": "string",
@@ -64,6 +101,31 @@
             {"type": "string", "format": "date-time"},
             {"type": "null"}
           ]
+        },
+        "launch_targets": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": {"$ref": "#/$defs/launchTarget"}
+        }
+      }
+    },
+    "launchTarget": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package_name", "launch_activity"],
+      "properties": {
+        "package_name": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 255,
+          "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+        },
+        "launch_activity": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$"
         }
       }
     }

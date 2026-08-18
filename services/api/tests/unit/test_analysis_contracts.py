@@ -172,6 +172,52 @@ def _remote_device_analysis_response() -> dict[str, object]:
     return payload
 
 
+def _script_device_analysis_response() -> dict[str, object]:
+    payload = {
+        key: value
+        for key, value in _remote_device_analysis_response().items()
+        if key != "apk_upload"
+    }
+    payload.update(
+        {
+            "schema_version": "1.2",
+            "state": "queued",
+            "version": 2,
+            "capture_configuration": {
+                "test_type": "cold_start",
+                "launch_mode": "automatic",
+                "duration_seconds": 15,
+                "target": {
+                    "package_name": "com.rivotek.mediacenter",
+                    "launch_activity": (
+                        "com.rivotek.mediacenter/.shell.MediaCenterActivity"
+                    ),
+                },
+            },
+            "scenarios": [
+                {
+                    "scenario_job_id": None,
+                    "scenario_type": "cold_start",
+                    "state": "queued",
+                    "version": 2,
+                    "device_group_id": None,
+                    "sample_verdict_counts": {
+                        "valid": 0,
+                        "invalid": 0,
+                        "pending": 0,
+                        "validation_error": 0,
+                        "total": 0,
+                    },
+                    "started_at": None,
+                    "completed_at": None,
+                    "failure": None,
+                }
+            ],
+        }
+    )
+    return payload
+
+
 def _memory_analysis_response(*, question: str | None = None) -> dict[str, object]:
     return {
         "schema_version": "1.0",
@@ -299,6 +345,50 @@ def test_device_create_request_has_one_server_parsed_apk_and_fixed_scenario_orde
             **payload,
             "apk": {**payload["apk"], "package_name": "client.claimed.package"},
         },
+    ):
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(mutation)
+
+
+def test_script_device_create_request_is_closed_without_apk_upload() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/create-request.schema.json", schemas)
+    target = {
+        "package_name": "com.rivotek.mediacenter",
+        "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+    }
+    automatic = {
+        "schema_version": "1.2",
+        "analysis_mode": "device",
+        "device_id": "72000000-0000-4000-8000-000000000001",
+        "test_type": "cold_start",
+        "launch_mode": "automatic",
+        "duration_seconds": 15,
+        "target": target,
+    }
+    validator.validate(automatic)
+    validator.validate(
+        {
+            **automatic,
+            "test_type": "hot_start",
+            "launch_mode": "manual",
+            "target": None,
+        }
+    )
+    validator.validate(
+        {
+            **automatic,
+            "test_type": "scroll",
+            "launch_mode": "manual",
+        }
+    )
+
+    for mutation in (
+        {**automatic, "apk": {}},
+        {**automatic, "scenarios": ["cold_start"]},
+        {**automatic, "duration_seconds": 0},
+        {**automatic, "launch_mode": "manual"},
+        {**automatic, "test_type": "scroll", "launch_mode": "automatic"},
     ):
         with pytest.raises(jsonschema.ValidationError):
             validator.validate(mutation)
@@ -469,6 +559,30 @@ def test_only_device_1_1_memory_cycle_may_be_not_requested() -> None:
     trace = _trace_analysis_response(input_state="pending")
     trace["scenarios"] = [payload["scenarios"][2]]  # type: ignore[index]
     for mutation in (legacy, wrong_active, private_memory, trace):
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate(mutation)
+
+
+def test_script_device_analysis_response_contains_one_requested_scenario() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/analysis-response.schema.json", schemas)
+    payload = _script_device_analysis_response()
+    validator.validate(payload)
+
+    for mutation in (
+        {**payload, "apk_upload": None},
+        {**payload, "capture_configuration": None},
+        {**payload, "scenarios": []},
+        {
+            **payload,
+            "scenarios": [
+                {
+                    **payload["scenarios"][0],  # type: ignore[index]
+                    "scenario_type": "scroll",
+                }
+            ],
+        },
+    ):
         with pytest.raises(jsonschema.ValidationError):
             validator.validate(mutation)
 

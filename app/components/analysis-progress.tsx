@@ -391,7 +391,7 @@ export function AnalysisProgressView({
           <dt>分析方式</dt>
           <dd>
             {deviceMode
-              ? "真机自动测试"
+              ? "真机性能测试"
               : analysis.analysis_profile === "auto"
                 ? "自动识别"
                 : analysis.analysis_profile === "startup"

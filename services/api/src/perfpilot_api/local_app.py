@@ -565,26 +565,69 @@ class _ApkDescriptor(_StrictModel):
         return _validated_checksum(value)
 
 
-class _CreateDeviceAnalysisRequest(_StrictModel):
-    schema_version: Literal["1.0", "1.1"]
-    analysis_mode: Literal["device"]
-    device_id: UUID = Field(strict=False)
-    scenarios: list[Literal["cold_start", "scroll", "memory_cycle"]]
-    apk: _ApkDescriptor
-    source_binding: _SourceBindingDescriptor | None = None
-
-    @field_validator("scenarios")
-    @classmethod
-    def valid_scenarios(
-        cls,
-        value: list[Literal["cold_start", "scroll", "memory_cycle"]],
-    ) -> list[Literal["cold_start", "scroll", "memory_cycle"]]:
-        if value != ["cold_start", "scroll", "memory_cycle"]:
-            raise ValueError("fixed device scenarios are required")
-        return value
+class _CaptureTargetDescriptor(_StrictModel):
+    package_name: str = Field(
+        min_length=3,
+        max_length=255,
+        pattern=r"^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$",
+    )
+    launch_activity: str = Field(
+        min_length=3,
+        max_length=512,
+        pattern=r"^[A-Za-z0-9_.$]+/[A-Za-z0-9_.$]+$",
+    )
 
     @model_validator(mode="after")
-    def valid_source_version(self) -> "_CreateDeviceAnalysisRequest":
+    def valid_component_binding(self) -> "_CaptureTargetDescriptor":
+        if self.launch_activity.split("/", 1)[0] != self.package_name:
+            raise ValueError("launch activity does not belong to package")
+        return self
+
+
+class _CreateDeviceAnalysisRequest(_StrictModel):
+    schema_version: Literal["1.0", "1.1", "1.2"]
+    analysis_mode: Literal["device"]
+    device_id: UUID = Field(strict=False)
+    scenarios: list[Literal["cold_start", "scroll", "memory_cycle"]] | None = None
+    apk: _ApkDescriptor | None = None
+    test_type: Literal["cold_start", "hot_start", "scroll"] | None = None
+    launch_mode: Literal["automatic", "manual"] | None = None
+    duration_seconds: int | None = Field(default=None, strict=True, ge=1, le=300)
+    target: _CaptureTargetDescriptor | None = None
+    source_binding: _SourceBindingDescriptor | None = None
+
+    @model_validator(mode="after")
+    def valid_device_request(self) -> "_CreateDeviceAnalysisRequest":
+        if self.schema_version in {"1.0", "1.1"}:
+            if (
+                self.scenarios != ["cold_start", "scroll", "memory_cycle"]
+                or self.apk is None
+                or self.test_type is not None
+                or self.launch_mode is not None
+                or self.duration_seconds is not None
+                or self.target is not None
+            ):
+                raise ValueError("fixed device scenarios are required")
+        elif (
+            self.scenarios is not None
+            or self.apk is not None
+            or self.test_type is None
+            or self.launch_mode is None
+            or self.duration_seconds is None
+            or (self.test_type == "scroll" and self.launch_mode != "manual")
+            or (
+                self.test_type in {"cold_start", "hot_start"}
+                and self.launch_mode == "automatic"
+                and self.target is None
+            )
+            or (
+                self.test_type in {"cold_start", "hot_start"}
+                and self.launch_mode == "manual"
+                and self.target is not None
+            )
+            or (self.test_type == "scroll" and self.target is None)
+        ):
+            raise ValueError("script capture configuration is invalid")
         if self.schema_version == "1.0" and self.source_binding is not None:
             raise ValueError("source binding requires schema 1.1")
         return self
@@ -817,6 +860,7 @@ class _LocalAnalysis:
     device_digest: str | None = field(default=None, repr=False)
     application_version_id: UUID | None = None
     application_metadata: dict[str, object] | None = None
+    capture_configuration: dict[str, object] | None = None
     remote_publication: Literal["not_requested", "publishing", "published"] = (
         "not_requested"
     )
@@ -886,6 +930,7 @@ _PERSISTED_STATE_KEYS = {
     "device_digest",
     "application_version_id",
     "application_metadata",
+    "capture_configuration",
     "remote_publication",
     "profile",
     "question",
@@ -919,6 +964,7 @@ _PERSISTED_OPTIONAL_STATE_KEYS = {
     "evidence_manifest",
     "smartperfetto_original",
     "remote_publication",
+    "capture_configuration",
 }
 _PERSISTED_STAGE_KEYS = {
     "input_validation",
@@ -1006,6 +1052,28 @@ def _validate_persisted_state_shape(document: Mapping[str, object]) -> None:
         },
     ):
         raise ValueError
+    capture_configuration = document.get("capture_configuration")
+    if capture_configuration is not None:
+        if not _has_exact_keys(
+            capture_configuration,
+            {
+                "test_type",
+                "launch_mode",
+                "duration_seconds",
+                "package_name",
+                "launch_activity",
+            },
+        ):
+            raise ValueError
+        if (
+            capture_configuration.get("test_type")
+            not in {"cold_start", "hot_start", "scroll"}
+            or capture_configuration.get("launch_mode")
+            not in {"automatic", "manual"}
+            or type(capture_configuration.get("duration_seconds")) is not int
+            or not 1 <= int(capture_configuration["duration_seconds"]) <= 300
+        ):
+            raise ValueError
     if document.get("remote_publication", "not_requested") not in {
         "not_requested",
         "publishing",
@@ -1493,6 +1561,7 @@ def _project_remote_capture_scenarios(
     completed_scenarios: frozenset[str],
     failures: Mapping[str, Literal["capture_failed", "smartperfetto_failed"]]
     | None = None,
+    requested_scenarios: frozenset[str] = frozenset({"startup", "scroll"}),
 ) -> NormalizedTraceReport:
     document = validate_contract("normalized-trace-report", report.document)
     selected = {
@@ -1500,12 +1569,14 @@ def _project_remote_capture_scenarios(
         for item in document["scenario_reports"]
         if isinstance(item, Mapping)
         and item.get("scenario_type") in completed_scenarios
-        and item.get("scenario_type") in {"startup", "scroll"}
+        and item.get("scenario_type") in requested_scenarios
     }
     limitations = [
         dict(item) for item in document["limitations"] if isinstance(item, Mapping)
     ]
     for scenario_type in ("startup", "scroll"):
+        if scenario_type not in requested_scenarios:
+            continue
         if scenario_type not in completed_scenarios:
             scenario, limitation = _missing_remote_capture_scenario(
                 team_id,
@@ -1520,7 +1591,7 @@ def _project_remote_capture_scenarios(
         **document,
         "core_state": (
             "partial"
-            if completed_scenarios != {"startup", "scroll"}
+            if completed_scenarios != requested_scenarios
             or any(item.get("core_state") == "partial" for item in scenarios)
             else "complete"
         ),
@@ -1683,6 +1754,14 @@ def _prepare_local_report(
                 normalized,
                 remote_completed_scenarios,
                 remote_scenario_failures,
+                (
+                    frozenset({"scroll"})
+                    if analysis.capture_configuration is not None
+                    and analysis.capture_configuration.get("test_type") == "scroll"
+                    else frozenset({"startup"})
+                    if analysis.capture_configuration is not None
+                    else frozenset({"startup", "scroll"})
+                ),
             )
         elif not include_memory:
             pass
@@ -2303,6 +2382,7 @@ class _LocalRuntime:
                 else None
             ),
             "application_metadata": analysis.application_metadata,
+            "capture_configuration": analysis.capture_configuration,
             "remote_publication": analysis.remote_publication,
             "profile": analysis.profile,
             "question": analysis.question,
@@ -2509,7 +2589,15 @@ class _LocalRuntime:
             normalized_results: dict[str, _NormalizedLocalResult] = {}
             failures: dict[str, Literal["capture_failed", "smartperfetto_failed"]] = {}
             artifacts = {item.artifact_id: item for item in manifest.artifacts}
-            for scenario_type in ("startup", "scroll"):
+            scenario_order = (
+                ("scroll",)
+                if analysis.capture_configuration is not None
+                and analysis.capture_configuration.get("test_type") == "scroll"
+                else ("startup",)
+                if analysis.capture_configuration is not None
+                else ("startup", "scroll")
+            )
+            for scenario_type in scenario_order:
                 scenario = next(
                     (
                         item
@@ -2830,6 +2918,11 @@ class _LocalRuntime:
                 if isinstance(document.get("application_metadata"), Mapping)
                 else None
             ),
+            capture_configuration=(
+                dict(document["capture_configuration"])
+                if isinstance(document.get("capture_configuration"), Mapping)
+                else None
+            ),
             remote_publication=(
                 str(document["remote_publication"])  # type: ignore[arg-type]
                 if "remote_publication" in document
@@ -2887,6 +2980,7 @@ class _LocalRuntime:
     async def start(self) -> None:
         persisted = await asyncio.to_thread(self.store.load_states)
         pending_remote_publications: list[tuple[_LocalAnalysis, _LocalUpload]] = []
+        pending_script_publications: list[_LocalAnalysis] = []
         pending_remote_analyses: list[
             tuple[_LocalAnalysis, AgentExecutionAccess, ValidatedAgentExecutionManifest]
         ] = []
@@ -3026,6 +3120,14 @@ class _LocalRuntime:
                     if upload is not None and upload.bytes_ready:
                         pending_remote_publications.append((analysis, upload))
             if (
+                analysis.capture_configuration is not None
+                and analysis.remote_publication in {"publishing", "published"}
+                and analysis.cancel_requested_at is None
+                and analysis.state in {"uploading", "queued", "scheduled", "running"}
+                and analysis.stages.get("smartperfetto") != "completed"
+            ):
+                pending_script_publications.append(analysis)
+            if (
                 analysis.analysis_mode == "device"
                 and analysis.remote_publication == "published"
                 and analysis.state == "analyzing"
@@ -3076,6 +3178,13 @@ class _LocalRuntime:
                 )
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)
+        for analysis in pending_script_publications:
+            await self.agent_tasks.enqueue(self._script_device_definition(analysis))
+            if analysis.remote_publication != "published" or analysis.state != "queued":
+                analysis.remote_publication = "published"
+                analysis.state = "queued"
+                analysis.version += 1
+                await self._persist(analysis)
         for analysis, access, manifest in pending_remote_analyses:
             self._schedule_remote_analysis(analysis, access, manifest)
 
@@ -3086,7 +3195,17 @@ class _LocalRuntime:
     ) -> tuple[AgentExecutionAccess, ValidatedAgentExecutionManifest]:
         if analysis.device_agent_id is None:
             raise ValueError
-        allowed_uploads = ("startup_trace", "scroll_trace", "agent_log")
+        scenario_types = (
+            ("scroll",)
+            if analysis.capture_configuration is not None
+            and analysis.capture_configuration.get("test_type") == "scroll"
+            else ("startup",)
+            if analysis.capture_configuration is not None
+            else ("startup", "scroll")
+        )
+        allowed_uploads = tuple(
+            (f"{scenario_type}_trace" for scenario_type in scenario_types)
+        ) + ("agent_log",)
         try:
             execution_id = UUID(str(value["execution_id"]))
             lease_version = int(value["lease_version"])
@@ -3099,7 +3218,7 @@ class _LocalRuntime:
             manifest_document,
             execution_id=execution_id,
             lease_version=lease_version,
-            expected_scenarios=("startup", "scroll"),
+            expected_scenarios=scenario_types,
             allowed_uploads=allowed_uploads,
             now=datetime.now(UTC),
         )
@@ -3111,7 +3230,7 @@ class _LocalRuntime:
             lease_version=lease_version,
             lease_expires_at=datetime.now(UTC) + timedelta(minutes=1),
             allowed_uploads=allowed_uploads,
-            scenario_types=("startup", "scroll"),
+            scenario_types=scenario_types,
         )
         return access, manifest
 
@@ -3164,22 +3283,45 @@ class _LocalRuntime:
         device_digest: str | None = None,
     ) -> _LocalAnalysis:
         if isinstance(request, _CreateDeviceAnalysisRequest):
-            descriptor = _InputDescriptor(
-                kind="apk",
-                mime=request.apk.mime,
-                size=request.apk.size,
-                sha256_b64=request.apk.sha256_b64,
+            script_capture = request.schema_version == "1.2"
+            descriptor = (
+                None
+                if request.apk is None
+                else _InputDescriptor(
+                    kind="apk",
+                    mime=request.apk.mime,
+                    size=request.apk.size,
+                    sha256_b64=request.apk.sha256_b64,
+                )
             )
+            target = request.target
             analysis = _LocalAnalysis(
                 team_id=team_id,
                 analysis_id=uuid4(),
-                profile="startup",
+                profile=("scroll" if request.test_type == "scroll" else "startup"),
                 question=None,
-                inputs={"apk": _LocalInput(descriptor)},
+                inputs=({} if descriptor is None else {"apk": _LocalInput(descriptor)}),
                 analysis_mode="device",
                 device_id=request.device_id,
                 device_agent_id=device_agent_id,
                 device_digest=device_digest,
+                capture_configuration=(
+                    {
+                        "test_type": request.test_type,
+                        "launch_mode": request.launch_mode,
+                        "duration_seconds": request.duration_seconds,
+                        "package_name": (
+                            target.package_name if target is not None else None
+                        ),
+                        "launch_activity": (
+                            target.launch_activity if target is not None else None
+                        ),
+                    }
+                    if script_capture
+                    else None
+                ),
+                remote_publication=("publishing" if script_capture else "not_requested"),
+                state=("uploading" if script_capture else "created"),
                 source_binding=(
                     request.source_binding.binding()
                     if request.source_binding is not None
@@ -3207,7 +3349,7 @@ class _LocalRuntime:
             analysis.source_binding
         )
         upload: _LocalUpload | None = None
-        if analysis.analysis_mode == "device":
+        if analysis.analysis_mode == "device" and analysis.capture_configuration is None:
             target = analysis.inputs["apk"]
             upload_id = str(uuid4())
             upload = _LocalUpload(
@@ -3247,6 +3389,30 @@ class _LocalRuntime:
                 if upload is not None:
                     self._unregister_upload(upload)
             raise
+        if analysis.capture_configuration is not None:
+            try:
+                await self.agent_tasks.enqueue(self._script_device_definition(analysis))
+                async with self.lock:
+                    analysis.remote_publication = "published"
+                    analysis.state = "queued"
+                    analysis.stages["input_validation"] = "completed"
+                    analysis.version += 1
+                await self._persist(analysis)
+            except BaseException:
+                async with self.lock:
+                    analysis.state = "failed"
+                    analysis.failure = {
+                        "code": "remote_capture_publication_failed",
+                        "message": "Remote capture task could not be queued",
+                        "retryable": True,
+                    }
+                    analysis.stages["input_validation"] = "failed"
+                    analysis.stages["smartperfetto"] = "not_requested"
+                    analysis.stages["perfpilot_ai"] = "not_requested"
+                    analysis.stages["report"] = "not_requested"
+                    analysis.version += 1
+                await self._persist(analysis)
+                raise
         return analysis
 
     async def recover(
@@ -4028,6 +4194,60 @@ class _LocalRuntime:
             schema_version="1.1",
         )
 
+    def _script_device_definition(
+        self,
+        analysis: _LocalAnalysis,
+    ) -> AgentTaskDefinition:
+        configuration = analysis.capture_configuration
+        if (
+            configuration is None
+            or analysis.device_agent_id is None
+            or analysis.device_id is None
+            or analysis.device_digest is None
+        ):
+            raise RuntimeError("Script capture publication is incomplete")
+        test_type = configuration.get("test_type")
+        launch_mode = configuration.get("launch_mode")
+        duration = configuration.get("duration_seconds")
+        package_name = configuration.get("package_name")
+        launch_activity = configuration.get("launch_activity")
+        if (
+            test_type not in {"cold_start", "hot_start", "scroll"}
+            or launch_mode not in {"automatic", "manual"}
+            or type(duration) is not int
+            or not 1 <= duration <= 300
+            or (package_name is not None and not isinstance(package_name, str))
+            or (launch_activity is not None and not isinstance(launch_activity, str))
+        ):
+            raise RuntimeError("Script capture publication is incomplete")
+        scenario_type = "scroll" if test_type == "scroll" else "startup"
+        return AgentTaskDefinition(
+            analysis_id=analysis.analysis_id,
+            team_id=analysis.team_id,
+            agent_id=analysis.device_agent_id,
+            device_id=analysis.device_id,
+            device_digest=analysis.device_digest,
+            package_name=package_name,
+            launch_activity=launch_activity,
+            cleanup_policy="keep_installed",
+            input_artifacts=(),
+            scenarios=(
+                TaskScenario(
+                    scenario_type=scenario_type,
+                    recipe_version=1,
+                    recipe_hash=hashlib.sha256(
+                        f"script-{test_type}-v1:{duration}".encode("ascii")
+                    ).hexdigest(),
+                    duration_seconds=duration,
+                    memory_rounds=0,
+                    swipe_count=0,
+                ),
+            ),
+            schema_version="1.2",
+            test_type=test_type,
+            launch_mode=launch_mode,
+        )
+
     async def _publish_remote_device(
         self,
         analysis: _LocalAnalysis,
@@ -4787,6 +5007,131 @@ class _LocalRuntime:
 
     def response(self, analysis: _LocalAnalysis) -> dict[str, object]:
         if analysis.analysis_mode == "device":
+            if analysis.capture_configuration is not None:
+                configuration = analysis.capture_configuration
+                test_type = str(configuration["test_type"])
+                verdicts = {
+                    "valid": 0,
+                    "invalid": 0,
+                    "pending": 0,
+                    "validation_error": 0,
+                    "total": 0,
+                }
+                if analysis.state in {"creating", "created", "uploading"}:
+                    scenario_state = "queued"
+                elif analysis.state in {"running", "analyzing"}:
+                    scenario_state = "analyzing"
+                elif analysis.state == "partially_completed":
+                    scenario_state = "completed"
+                else:
+                    scenario_state = analysis.state
+                report_scenario: Mapping[str, object] | None = None
+                if analysis.report is not None:
+                    raw_scenarios = analysis.report.get("scenario_reports")
+                    internal_type = "scroll" if test_type == "scroll" else "startup"
+                    if isinstance(raw_scenarios, list):
+                        report_scenario = next(
+                            (
+                                item
+                                for item in raw_scenarios
+                                if isinstance(item, Mapping)
+                                and item.get("scenario_type") == internal_type
+                            ),
+                            None,
+                        )
+                if (
+                    report_scenario is not None
+                    and report_scenario.get("result_state")
+                    in {"completed", "failed", "canceled"}
+                ):
+                    scenario_state = str(report_scenario["result_state"])
+                raw_failure = (
+                    report_scenario.get("failure")
+                    if report_scenario is not None
+                    else None
+                )
+                package_name = configuration.get("package_name")
+                launch_activity = configuration.get("launch_activity")
+                return {
+                    "schema_version": "1.2",
+                    "analysis_id": str(analysis.analysis_id),
+                    "team_id": str(analysis.team_id),
+                    "analysis_mode": "device",
+                    "device_id": str(analysis.device_id),
+                    "state": analysis.state,
+                    "version": analysis.version,
+                    "application_version_id": None,
+                    "application_metadata": None,
+                    "capture_configuration": {
+                        "test_type": test_type,
+                        "launch_mode": configuration["launch_mode"],
+                        "duration_seconds": configuration["duration_seconds"],
+                        "target": (
+                            None
+                            if package_name is None or launch_activity is None
+                            else {
+                                "package_name": package_name,
+                                "launch_activity": launch_activity,
+                            }
+                        ),
+                    },
+                    "scenarios": [
+                        {
+                            "scenario_job_id": (
+                                report_scenario.get("scenario_job_id")
+                                if report_scenario is not None
+                                else None
+                            ),
+                            "scenario_type": test_type,
+                            "state": scenario_state,
+                            "version": analysis.version,
+                            "device_group_id": (
+                                report_scenario.get("device_group_id")
+                                if report_scenario is not None
+                                else None
+                            ),
+                            "sample_verdict_counts": dict(verdicts),
+                            "started_at": (
+                                analysis.started_at.isoformat()
+                                if analysis.started_at is not None
+                                else None
+                            ),
+                            "completed_at": (
+                                analysis.completed_at.isoformat()
+                                if analysis.completed_at is not None
+                                else None
+                            ),
+                            "failure": (
+                                dict(raw_failure)
+                                if isinstance(raw_failure, Mapping)
+                                else analysis.failure
+                                if scenario_state == "failed"
+                                else None
+                            ),
+                        }
+                    ],
+                    "sample_verdict_counts": verdicts,
+                    "active_lease": None,
+                    "report_available": analysis.report is not None,
+                    "created_at": analysis.created_at.isoformat(),
+                    "started_at": (
+                        analysis.started_at.isoformat()
+                        if analysis.started_at is not None
+                        else None
+                    ),
+                    "completed_at": (
+                        analysis.completed_at.isoformat()
+                        if analysis.completed_at is not None
+                        else None
+                    ),
+                    "cancel_requested_at": (
+                        analysis.cancel_requested_at.isoformat()
+                        if analysis.cancel_requested_at is not None
+                        else None
+                    ),
+                    "failure": analysis.failure,
+                    "source_code_analysis": dict(analysis.source_code_analysis),
+                }
             device_schema_version = (
                 "1.1"
                 if analysis.device_agent_id is not None
@@ -5536,7 +5881,7 @@ def create_local_app(
         authorize_team(request, team_id)
         devices = await resolved_device_directory.list_devices(team_id=team_id)
         return {
-            "schema_version": "1.0",
+            "schema_version": "1.1",
             "devices": [
                 {
                     "device_id": str(device.device_id),
@@ -5555,6 +5900,13 @@ def create_local_app(
                         if device.last_seen_at is not None
                         else None
                     ),
+                    "launch_targets": [
+                        {
+                            "package_name": package,
+                            "launch_activity": activity,
+                        }
+                        for package, activity in device.launch_targets
+                    ],
                 }
                 for device in devices
             ],
@@ -5694,6 +6046,10 @@ def create_local_app(
                     battery_percent=device.battery_percent, temperature_c=device.temperature_c,
                     storage_available_bytes=device.storage_available_bytes,
                     property_error_code=device.property_error_code,
+                    launch_targets=tuple(
+                        (target.package_name, target.launch_activity)
+                        for target in device.launch_targets
+                    ),
                 ) for device in body.devices
             )
             receipt = await resolved_device_directory.replace_heartbeat(
@@ -5795,7 +6151,26 @@ def create_local_app(
             )
             if target is None:
                 raise ApiError("remote_device_capture_unavailable", "远端设备不可用", 409, False)
-            canonical_body = body.model_copy(update={"schema_version": "1.1"})
+            if (
+                body.schema_version == "1.2"
+                and body.target is not None
+                and (
+                    body.target.package_name,
+                    body.target.launch_activity,
+                )
+                not in selected.launch_targets
+            ):
+                raise ApiError(
+                    "launch_target_unavailable",
+                    "启动目标已变化，请重新选择",
+                    409,
+                    False,
+                )
+            canonical_body = (
+                body
+                if body.schema_version == "1.2"
+                else body.model_copy(update={"schema_version": "1.1"})
+            )
             return runtime.response(
                 await runtime.create(
                     team_id,

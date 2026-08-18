@@ -101,6 +101,12 @@ async def test_agent_credentials_and_source_capabilities_survive_reopen_without_
                 temperature_c=None,
                 storage_available_bytes=100,
                 property_error_code=None,
+                launch_targets=(
+                    (
+                        "com.rivotek.mediacenter",
+                        "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+                    ),
+                ),
             ),
         ),
         now=NOW,
@@ -117,6 +123,12 @@ async def test_agent_credentials_and_source_capabilities_survive_reopen_without_
     assert record is not None and record.id == AGENT_A
     assert sources[0].capabilities["source_workspaces"][0]["name"] == "RivotekMedia"
     assert devices[0].device_id == DEVICE_A
+    assert devices[0].launch_targets == (
+        (
+            "com.rivotek.mediacenter",
+            "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        ),
+    )
     payload = (tmp_path / "agents.json").read_text(encoding="utf-8")
     assert "registration plaintext" not in payload
     assert "access plaintext" not in payload

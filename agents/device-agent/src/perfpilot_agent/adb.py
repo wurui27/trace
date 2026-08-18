@@ -18,7 +18,7 @@ _PROPERTY_PATTERN = re.compile(r"^[a-zA-Z0-9._-]{1,128}$")
 _MAXIMUM_DEVICES = 32
 _DEFAULT_TIMEOUT_SECONDS = 5.0
 _DEFAULT_OUTPUT_LIMIT = 256 * 1024
-_ALLOWED_SHELL_COMMANDS = {"getprop", "dumpsys", "df", "which"}
+_ALLOWED_SHELL_COMMANDS = {"getprop", "dumpsys", "df", "which", "cmd"}
 
 
 class AdbError(RuntimeError):
@@ -227,6 +227,16 @@ def _validate_bound_arguments(arguments: tuple[str, ...]) -> None:
         valid = tail == ("-k", "/data")
     elif command == "which":
         valid = tail == ("perfetto",)
+    elif command == "cmd":
+        valid = tail == (
+            "package",
+            "query-activities",
+            "--brief",
+            "-a",
+            "android.intent.action.MAIN",
+            "-c",
+            "android.intent.category.LAUNCHER",
+        )
     if not valid:
         raise AdbCommandFailed
 
