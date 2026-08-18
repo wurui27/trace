@@ -1767,7 +1767,7 @@ def _prepare_local_report(
             normalized = _merge_local_smartperfetto_reports(
                 analysis.team_id, normalized, scroll.report
             )
-        else:
+        elif analysis.capture_configuration is None:
             normalized = _merge_local_smartperfetto_reports(
                 analysis.team_id, normalized, normalized
             )

@@ -9,7 +9,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -1853,6 +1853,7 @@ def test_script_capture_normalization_uses_completed_trace_digest_without_apk() 
         profile="startup",
         question=None,
         inputs={},
+        analysis_mode="device",
         capture_configuration={
             "test_type": "cold_start",
             "launch_mode": "automatic",
@@ -1868,8 +1869,42 @@ def test_script_capture_normalization_uses_completed_trace_digest_without_apk() 
         profile="startup",
         input_sha256_b64=digest,
     )
+    startup_only = normalized.report.document
+    startup_only["scenario_reports"] = [
+        item
+        for item in startup_only["scenario_reports"]
+        if item["scenario_type"] == "startup"
+    ]
+    startup_only["core_state"] = "complete"
+    startup_only_bytes = canonical_json_bytes(
+        validate_contract("normalized-trace-report", startup_only)
+    )
+    normalized = replace(
+        normalized,
+        report=NormalizedTraceReport(
+            canonical_bytes=startup_only_bytes,
+            sha256_b64=base64.b64encode(
+                hashlib.sha256(startup_only_bytes).digest()
+            ).decode(),
+        ),
+    )
+    prepared = _prepare_local_report(
+        analysis,
+        _smartperfetto_result(),
+        primary_profile="startup",
+        primary_normalized=normalized,
+        include_memory=False,
+        remote_completed_scenarios=frozenset({"startup"}),
+    )
 
     assert normalized.report.document["schema_version"] == "1.0"
+    assert [
+        item["scenario_type"] for item in prepared.core_document["scenario_reports"]
+    ] == ["startup"]
+    assert all(
+        "滑动" not in item["summary"]
+        for item in prepared.core_document["limitations"]
+    )
 
 
 def test_script_capture_question_fences_smartperfetto_to_selected_package() -> None:
@@ -1879,6 +1914,7 @@ def test_script_capture_question_fences_smartperfetto_to_selected_package() -> N
         profile="startup",
         question=None,
         inputs={},
+        analysis_mode="device",
         capture_configuration={
             "test_type": "cold_start",
             "launch_mode": "automatic",
