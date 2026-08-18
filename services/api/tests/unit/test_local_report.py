@@ -43,6 +43,9 @@ def _load(name: str) -> dict[str, object]:
 def _v2_candidate() -> dict[str, object]:
     document = _load("synthesis-output-v2.valid.json")
     document["source_fixes"] = []
+    for conclusion in document["conclusions"]:
+        conclusion["source_ref_ids"] = []
+        conclusion["source_root_cause"] = "当前没有足够源码证据定位具体实现。"
     document["verdict"] = "启动关键路径被同步初始化阻塞。"
     document["executive_summary"] = "将同步查询移到首帧之后，再重复相同的冷启动场景。"
     for item in document["top_findings"]:
@@ -239,6 +242,12 @@ async def test_report_synthesizer_uses_one_provider_request() -> None:
 async def test_report_synthesizer_retries_english_narrative_once_then_rejects() -> None:
     english = _load("synthesis-output-v2.valid.json")
     english["source_fixes"] = []
+    for conclusion in english["conclusions"]:
+        conclusion["source_ref_ids"] = []
+        conclusion["problem"] = "Startup is too slow."
+        conclusion["cause"] = "The trace shows blocking work on the main thread."
+        conclusion["source_root_cause"] = "Source evidence is not available."
+        conclusion["recommendation"] = "Move blocking work after the first frame."
     candidate = canonical_json_bytes(english)
     provider = FakeReportProvider([candidate, candidate])
 

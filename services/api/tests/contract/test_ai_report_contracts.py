@@ -714,6 +714,7 @@ def test_report_v12_state_mapping_is_deterministic_for_source_and_core_outcomes(
     weak = deepcopy(strong_without_fixes)
     weak["source_code"]["match_summary"] = "weak"  # type: ignore[index]
     weak["source_code"]["source_refs"][0]["match_grade"] = "weak"  # type: ignore[index]
+    weak["synthesis"]["output"]["conclusions"][0]["source_ref_ids"] = []  # type: ignore[index]
 
     no_source = deepcopy(strong_without_fixes)
     no_source["source_code"] = {
@@ -731,6 +732,7 @@ def test_report_v12_state_mapping_is_deterministic_for_source_and_core_outcomes(
         "fixes": [],
         "limitations": [],
     }
+    no_source["synthesis"]["output"]["conclusions"][0]["source_ref_ids"] = []  # type: ignore[index]
 
     unavailable = deepcopy(strong_without_fixes)
     unavailable["source_code"].update(  # type: ignore[union-attr]
@@ -743,6 +745,7 @@ def test_report_v12_state_mapping_is_deterministic_for_source_and_core_outcomes(
             "fixes": [],
         }
     )
+    unavailable["synthesis"]["output"]["conclusions"][0]["source_ref_ids"] = []  # type: ignore[index]
 
     pending = deepcopy(verified)
     _set_first_verification_state(pending, "pending")

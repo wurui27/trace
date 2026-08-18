@@ -98,17 +98,19 @@ class _ScenarioSmartPerfetto:
 
     async def fetch_result(self, run: LocalEngineRun) -> EngineResult:
         profile, trace = self._runs[run.run_id]
-        original = canonical_json_bytes(
-            {
-                "scenario": profile,
-                "trace_sha256": hashlib.sha256(trace).hexdigest(),
-            }
+        original = (
+            "<!doctype html><html><body>"
+            f"<h1>{profile}</h1><p>{hashlib.sha256(trace).hexdigest()}</p>"
+            "</body></html>"
+        ).encode(
+            "utf-8"
         )
         return EngineResult(
             contract=self.result.contract,
             state=self.result.state,
             payload=self.result.payload,
             original_report_bytes=original,
+            original_report_html_bytes=original,
         )
 
     async def cancel(self, run: LocalEngineRun) -> None:
@@ -131,6 +133,7 @@ class _OneRoundChineseProvider:
         self.calls += 1
         projected = projection.document
         findings = []
+        conclusions = []
         recommendations = []
         retest_plan = []
         key_metric_ids = []
@@ -145,6 +148,17 @@ class _OneRoundChineseProvider:
                     }
                 )
                 if finding["status"] in {"confirmed", "suspected"} and evidence_ids:
+                    conclusions.append(
+                        {
+                            "finding_id": finding["finding_id"],
+                            "evidence_ids": evidence_ids,
+                            "source_ref_ids": [],
+                            "problem": "SmartPerfetto 发现该路径存在性能问题。",
+                            "cause": "Trace 证据表明关键执行被阻塞。",
+                            "source_root_cause": "当前没有足够源码证据定位具体实现。",
+                            "recommendation": "缩短关键路径，并用相同场景复测。",
+                        }
+                    )
                     recommendations.append(
                         {
                             "priority": ("p0", "p1", "p2")[
@@ -180,6 +194,7 @@ class _OneRoundChineseProvider:
             "verdict": "存在证据支持的应用性能瓶颈。",
             "executive_summary": "单次 PerfPilot AI 已完成中文证据复核。",
             "key_metric_ids": key_metric_ids[:3],
+            "conclusions": conclusions,
             "top_findings": findings[:3],
             "recommendations": recommendations[:3],
             "source_fixes": [],
@@ -201,6 +216,15 @@ class _OneRoundChineseProvider:
         ):
             source_ref = source_context["fragments"][0]
             path = source_ref["relative_path"]
+            matching_conclusion = next(
+                item
+                for item in conclusions
+                if item["finding_id"] in source_ref["finding_ids"]
+            )
+            matching_conclusion["source_ref_ids"] = [source_ref["source_ref_id"]]
+            matching_conclusion["source_root_cause"] = (
+                "源码中的启动方法在主线程执行可延迟初始化。"
+            )
             document["source_fixes"] = [
                 {
                     "fix_id": "95000000-0000-4000-8000-000000000001",
@@ -813,13 +837,10 @@ def test_remote_agent_full_success_is_isolated_across_two_local_tenants(
             f"/v1/teams/{user_one.team_id}/analyses/{created['analysis_id']}"
             "/smartperfetto-original"
         )
-        downloads = {
-            scenario: client.get(
-                f"/v1/teams/{user_one.team_id}/analyses/{created['analysis_id']}"
-                f"/smartperfetto-original?scenario={scenario}&download=true"
-            )
-            for scenario in ("startup", "scroll")
-        }
+        downloaded = client.get(
+            f"/v1/teams/{user_one.team_id}/analyses/{created['analysis_id']}"
+            "/smartperfetto-original?download=true"
+        )
         manifest = app.state.local_runtime.store.load_document(
             user_one.team_id,
             UUID(str(created["analysis_id"])),
@@ -837,7 +858,7 @@ def test_remote_agent_full_success_is_isolated_across_two_local_tenants(
             ),
             client.get(
                 f"/v1/teams/{user_one.team_id}/analyses/{created['analysis_id']}"
-                "/smartperfetto-original?scenario=startup&download=true"
+                "/smartperfetto-original?download=true"
             ),
         )
 
@@ -901,22 +922,15 @@ def test_remote_agent_full_success_is_isolated_across_two_local_tenants(
     assert "scenario=scroll state=completed" in log
 
     assert originals_response.status_code == 200, originals_response.text
-    assert [
-        item["scenario_type"] for item in originals_response.json()["reports"]
-    ] == ["startup", "scroll"]
-    assert downloads["startup"].content == canonical_json_bytes(
-        {
-            "scenario": "startup",
-            "trace_sha256": hashlib.sha256(
-                b"team-one-startup-trace"
-            ).hexdigest(),
-        }
-    )
-    assert downloads["scroll"].content == canonical_json_bytes(
-        {
-            "scenario": "scroll",
-            "trace_sha256": hashlib.sha256(b"team-one-scroll-trace").hexdigest(),
-        }
+    expected_original = (
+        "<!doctype html><html><body><h1>startup</h1>"
+        f"<p>{hashlib.sha256(b'team-one-startup-trace').hexdigest()}</p>"
+        "</body></html>"
+    ).encode("utf-8")
+    assert originals_response.content == expected_original
+    assert downloaded.content == expected_original
+    assert downloaded.headers["content-disposition"] == (
+        f'attachment; filename="smartperfetto-{created["analysis_id"]}.html"'
     )
     cross_secrets = (
         TEAM_ONE_SERIAL,

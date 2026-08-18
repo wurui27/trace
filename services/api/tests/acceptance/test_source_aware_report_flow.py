@@ -76,6 +76,21 @@ class OnePassProvider:
         candidate = _load("synthesis-output-v2.valid.json")
         candidate["verdict"] = "启动关键路径被同步初始化阻塞。"
         candidate["executive_summary"] = "将同步查询移到首帧之后，再重复相同的冷启动场景。"
+        candidate["conclusions"] = [
+            {
+                "finding_id": finding["finding_id"],
+                "evidence_ids": finding["evidence_ids"],
+                "source_ref_ids": [],
+                "problem": "SmartPerfetto 发现启动关键路径存在阻塞。",
+                "cause": "Trace 证据显示主线程同步等待覆盖了启动关键区间。",
+                "source_root_cause": "当前没有足够源码证据定位具体实现。",
+                "recommendation": "移除关键路径中的同步等待，并按相同场景复测。",
+            }
+            for scenario in projection.document["scenarios"]
+            for finding in scenario["findings"]
+            if finding["status"] in {"confirmed", "suspected"}
+            and finding["evidence_ids"]
+        ]
         for finding in candidate["top_findings"]:
             finding["user_impact"] = "首屏显示时间晚于现有目标。"
         for index, recommendation in enumerate(candidate["recommendations"]):
@@ -93,6 +108,15 @@ class OnePassProvider:
         if isinstance(source_context, dict) and source_context.get("match_summary") == "strong":
             source_ref = source_context["fragments"][0]
             relative_path = source_ref["relative_path"]
+            matching_conclusion = next(
+                item
+                for item in candidate["conclusions"]
+                if item["finding_id"] in source_ref["finding_ids"]
+            )
+            matching_conclusion["source_ref_ids"] = [source_ref["source_ref_id"]]
+            matching_conclusion["source_root_cause"] = (
+                "源码中的启动方法在主线程同步读取设置，阻塞了首帧。"
+            )
             candidate["source_fixes"] = [
                 {
                     "fix_id": "96000000-0000-4000-8000-000000000001",
@@ -415,7 +439,7 @@ async def test_team_artifacts_reset_without_changing_persistent_users_or_agents(
         registration_code_expires_at=NOW.replace(year=2027),
         now=NOW,
     )
-    original_bytes = b'{ "summary": "SmartPerfetto original", "findings": [] }\n'
+    original_bytes = b"<!doctype html><html><body>SmartPerfetto original</body></html>\n"
     binding = persist_smartperfetto_original(
         root=analysis_root,
         team_id=user_a.team_id,

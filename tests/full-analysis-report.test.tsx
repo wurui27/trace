@@ -101,14 +101,18 @@ const report: AnalysisReport = {
 };
 
 describe("FullAnalysisReport", () => {
-  it("loads the original summary before printing without opening its tab", async () => {
-    const original = {
-      summary: { conclusion: "原始打印结论" },
-      findings: [{ title: "原始发现标题" }],
-    };
+  it("prints only the PerfPilot report without loading or rewriting the original HTML", async () => {
     const sourceAwareReport = {
       ...report,
       schema_version: "1.2",
+      smartperfetto_original: {
+        available: true,
+        artifact_id: "92000000-0000-4000-8000-000000000001",
+        version: 2,
+        mime: "text/html",
+        size: 128,
+        sha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      },
       source_code: {
         requested: false,
         provider_kind: null,
@@ -131,6 +135,7 @@ describe("FullAnalysisReport", () => {
           verdict: "PerfPilot 独立结论",
           executive_summary: "PerfPilot 独立摘要",
           key_metric_ids: [],
+          conclusions: [],
           top_findings: [],
           recommendations: [],
           source_fixes: [],
@@ -142,15 +147,15 @@ describe("FullAnalysisReport", () => {
     const loader = vi.fn(async (_id, _signal, onSnapshot) => {
       onSnapshot({ teamId: "team-1", analysis, report: sourceAwareReport, reportLoadFailed: false });
     });
-    const originalLoader = vi.fn().mockResolvedValue(original);
+    const originalUrl = vi.fn(() => "/original.html");
+    const originalDownloadUrl = vi.fn(() => "/original.html?download=true");
     const client = {
-      smartPerfettoOriginal: originalLoader,
-      smartPerfettoOriginalDownloadUrl: vi.fn(() => "/download"),
+      smartPerfettoOriginalUrl: originalUrl,
+      smartPerfettoOriginalDownloadUrl: originalDownloadUrl,
     } as unknown as PerfPilotClient;
     const printer = vi.fn(() => {
-      expect(screen.getByText("原始打印结论")).toBeInTheDocument();
-      expect(screen.getByText("原始发现标题")).toBeInTheDocument();
-      expect(screen.queryByText(/正在读取 SmartPerfetto 原始报告/)).not.toBeInTheDocument();
+      expect(screen.getByText("PerfPilot 独立结论")).toBeInTheDocument();
+      expect(screen.queryByTitle("SmartPerfetto 原始 HTML 报告")).not.toBeInTheDocument();
       return true;
     });
 
@@ -164,11 +169,9 @@ describe("FullAnalysisReport", () => {
     );
     await userEvent.setup().click(await screen.findByRole("button", { name: "下载 PDF" }));
 
-    expect(originalLoader).toHaveBeenCalledOnce();
     expect(printer).toHaveBeenCalledOnce();
-    expect(screen.getByText("查看完整 JSON").closest("details")).toHaveClass(
-      "smartperfetto-full-json",
-    );
+    expect(originalUrl).not.toHaveBeenCalled();
+    expect(originalDownloadUrl).not.toHaveBeenCalled();
   });
 
   it("offers an enabled PDF download after detecting print support", async () => {

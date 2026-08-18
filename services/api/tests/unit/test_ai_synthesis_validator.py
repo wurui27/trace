@@ -32,7 +32,34 @@ def _projection() -> AIProjection:
 def _candidate() -> dict[str, object]:
     document = _json_fixture("synthesis-output-v2.valid.json")
     document["source_fixes"] = []
+    document["conclusions"][0]["source_ref_ids"] = []  # type: ignore[index]
+    document["conclusions"][0]["source_root_cause"] = (  # type: ignore[index]
+        "本次没有足够强的源码匹配，暂不能定位到具体实现。"
+    )
     return document
+
+
+def test_v2_requires_a_four_part_conclusion_for_every_supported_problem() -> None:
+    candidate = _candidate()
+    candidate["conclusions"] = [
+        {
+            "finding_id": "85000000-0000-4000-8000-000000000001",
+            "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+            "source_ref_ids": [],
+            "problem": "启动首屏出现明显延迟。",
+            "cause": "主线程同步等待与启动区间重叠。",
+            "source_root_cause": "本次没有足够强的源码匹配，暂不能定位到具体实现。",
+            "recommendation": "把同步查询移出启动关键路径，并按相同冷启动场景复测。",
+        }
+    ]
+
+    validated = _validate(candidate)
+    assert validated.document["conclusions"] == candidate["conclusions"]  # type: ignore[attr-defined]
+
+    missing = deepcopy(candidate)
+    missing["conclusions"] = []
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(missing)
 
 
 def test_v2_rejects_unknown_key_metric_reference() -> None:
@@ -51,6 +78,19 @@ def test_v2_source_fix_must_match_server_validated_ref() -> None:
     )
     candidate = _json_fixture("synthesis-output-v2.valid.json")
     candidate["source_fixes"][0]["source_ref_ids"] = [UNKNOWN_ID]
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
+
+
+def test_v2_conclusion_uses_available_strong_source_reference() -> None:
+    projection_document = _json_fixture("analysis-projection-v2.valid.json")
+    projection = AIProjection(
+        canonical_bytes=canonical_json_bytes(projection_document),
+        sha256_b64="Y2hlY2tzdW0=",
+    )
+    candidate = _json_fixture("synthesis-output-v2.valid.json")
+    candidate["conclusions"][0]["source_ref_ids"] = []  # type: ignore[index]
 
     with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
         _validate(candidate, projection)

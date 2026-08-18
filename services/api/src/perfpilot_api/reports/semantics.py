@@ -177,6 +177,46 @@ def _enforce_report_source_coherence(
     ):
         raise SourceAwareSemanticError
 
+    conclusions = (
+        synthesis_output.get("conclusions")
+        if isinstance(synthesis_output, dict)
+        else []
+    )
+    if not isinstance(conclusions, list):
+        raise SourceAwareSemanticError
+    for conclusion in conclusions:
+        if not isinstance(conclusion, dict):
+            raise SourceAwareSemanticError
+        finding_id = conclusion.get("finding_id")
+        evidence_ids = conclusion.get("evidence_ids")
+        source_ref_ids = conclusion.get("source_ref_ids")
+        if (
+            not isinstance(evidence_ids, list)
+            or not isinstance(source_ref_ids, list)
+            or match_summary != "strong"
+            and source_ref_ids
+        ):
+            raise SourceAwareSemanticError
+        eligible_source_refs = {
+            source_ref_id
+            for source_ref_id, source_ref in ref_by_id.items()
+            if source_ref.get("match_grade") == "strong"
+            and finding_id in source_ref.get("finding_ids", [])
+            and set(evidence_ids).issubset(source_ref.get("evidence_ids", []))
+        }
+        if eligible_source_refs and not source_ref_ids:
+            raise SourceAwareSemanticError
+        for source_ref_id in source_ref_ids:
+            source_ref = ref_by_id.get(source_ref_id)
+            if source_ref is None:
+                raise SourceAwareSemanticError
+            if (
+                source_ref.get("match_grade") != "strong"
+                or finding_id not in source_ref.get("finding_ids", [])
+                or not set(evidence_ids).issubset(source_ref.get("evidence_ids", []))
+            ):
+                raise SourceAwareSemanticError
+
     synthesis_fixes = (
         synthesis_output.get("source_fixes")
         if isinstance(synthesis_output, dict)

@@ -1,4 +1,32 @@
-import type { SourceAwareAnalysisReport } from "../lib/perfpilot-api";
+import type {
+  ConciseSynthesisOutput,
+  SourceAwareAnalysisReport,
+} from "../lib/perfpilot-api";
+
+type Conclusion = ConciseSynthesisOutput["conclusions"][number];
+
+function ConclusionBody({ conclusion }: { readonly conclusion: Conclusion }) {
+  return (
+    <dl className="analysis-conclusion-grid">
+      <div>
+        <dt>1. 问题点</dt>
+        <dd>{conclusion.problem}</dd>
+      </div>
+      <div>
+        <dt>2. 为什么会有这个问题</dt>
+        <dd>{conclusion.cause}</dd>
+      </div>
+      <div>
+        <dt>3. 结合源码判断的根因是什么</dt>
+        <dd>{conclusion.source_root_cause}</dd>
+      </div>
+      <div>
+        <dt>4. 修改建议</dt>
+        <dd>{conclusion.recommendation}</dd>
+      </div>
+    </dl>
+  );
+}
 
 export function ConciseReportSummary({ report }: { readonly report: SourceAwareAnalysisReport }) {
   const output = report.synthesis.state === "completed" ? report.synthesis.output : null;
@@ -14,10 +42,8 @@ export function ConciseReportSummary({ report }: { readonly report: SourceAwareA
     scenario.bundle?.metrics ?? [],
   );
   const metricsById = new Map(metrics.map((metric) => [metric.metric_id, metric]));
-  const findings = report.scenario_reports.flatMap((scenario) =>
-    scenario.bundle?.findings ?? [],
-  );
-  const findingsById = new Map(findings.map((finding) => [finding.finding_id, finding]));
+  const primary = output.conclusions.slice(0, 3);
+  const additional = output.conclusions.slice(3);
 
   return (
     <section className="source-aware-conclusion" aria-label="结论">
@@ -48,40 +74,26 @@ export function ConciseReportSummary({ report }: { readonly report: SourceAwareA
       </section>
 
       <section className="analysis-report-section">
-        <h2>最痛的问题</h2>
-        <ol className="analysis-report-findings">
-          {output.top_findings.slice(0, 3).map((item) => {
-            const finding = findingsById.get(item.finding_id);
-            if (!finding) return null;
-            return (
-              <li key={item.finding_id} data-testid="top-finding">
-                <h3>{finding.title}</h3>
-                <p>{finding.summary}</p>
-                <p className="analysis-user-impact">用户影响：{item.user_impact}</p>
-              </li>
-            );
-          })}
-        </ol>
-      </section>
-
-      <section className="analysis-report-section">
-        <h2>优先优化方案</h2>
-        <ol className="analysis-recommendation-list">
-          {output.recommendations.slice(0, 3).map((recommendation) => (
-            <li key={recommendation.priority} data-testid="priority-action">
-              <span className={`analysis-priority is-${recommendation.priority}`}>
-                {recommendation.priority.toUpperCase()}
-              </span>
-              <div>
-                <h3>{recommendation.title}</h3>
-                <p>{recommendation.action}</p>
-                <p className="analysis-expected-effect">
-                  预期效果：{recommendation.expected_effect}
-                </p>
-              </div>
-            </li>
+        <h2>主要问题与优化方案</h2>
+        <div className="analysis-primary-conclusions">
+          {primary.map((conclusion, index) => (
+            <article key={conclusion.finding_id} data-testid="primary-conclusion">
+              <p className="section-label">主要问题 {index + 1}</p>
+              <ConclusionBody conclusion={conclusion} />
+            </article>
           ))}
-        </ol>
+        </div>
+        {additional.length ? (
+          <details className="analysis-additional-conclusions">
+            <summary>展开其余 {additional.length} 条问题与优化方案</summary>
+            {additional.map((conclusion) => (
+              <details key={conclusion.finding_id} data-testid="additional-conclusion">
+                <summary>{conclusion.problem}</summary>
+                <ConclusionBody conclusion={conclusion} />
+              </details>
+            ))}
+          </details>
+        ) : null}
       </section>
 
       {output.limitations[0] ? (

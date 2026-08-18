@@ -3,6 +3,17 @@
   "verdict": "Startup is blocked by synchronous main-thread initialization.",
   "executive_summary": "Move the launch-critical lookup after the first frame, then repeat the same cold-start scenario.",
   "key_metric_ids": ["84000000-0000-4000-8000-000000000001"],
+  "conclusions": [
+    {
+      "finding_id": "85000000-0000-4000-8000-000000000001",
+      "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+      "source_ref_ids": ["97000000-0000-4000-8000-000000000001"],
+      "problem": "启动首屏显示明显偏慢。",
+      "cause": "SmartPerfetto 证据显示主线程的同步 Binder 等待与启动关键区间重叠。",
+      "source_root_cause": "源码中的启动方法同步读取设置，阻塞了首帧之前的主线程。",
+      "recommendation": "把设置读取延迟到首帧之后，并按相同冷启动场景复测。"
+    }
+  ],
   "top_findings": [
     {
       "finding_id": "85000000-0000-4000-8000-000000000001",

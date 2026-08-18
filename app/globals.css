@@ -3870,12 +3870,81 @@ fieldset.new-analysis-field {
   color: var(--text);
 }
 
-.source-fix-card pre,
-.technical-appendix pre {
+.source-fix-card pre {
   max-width: 100%;
   overflow: auto;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
+}
+
+.analysis-primary-conclusions {
+  display: grid;
+  gap: 14px;
+}
+
+.analysis-primary-conclusions > article,
+.analysis-additional-conclusions > details {
+  padding: 18px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.analysis-conclusion-grid {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+}
+
+.analysis-conclusion-grid > div {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.34fr) minmax(0, 1fr);
+  gap: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--border);
+}
+
+.analysis-conclusion-grid dt {
+  color: var(--text-secondary);
+  font-weight: 760;
+}
+
+.analysis-conclusion-grid dd {
+  margin: 0;
+  color: var(--text);
+  line-height: 1.7;
+}
+
+.analysis-additional-conclusions {
+  margin-top: 16px;
+}
+
+.analysis-additional-conclusions > summary,
+.analysis-additional-conclusions > details > summary {
+  cursor: pointer;
+  font-weight: 720;
+}
+
+.analysis-additional-conclusions > details {
+  margin-top: 10px;
+}
+
+.analysis-additional-conclusions > details > .analysis-conclusion-grid {
+  margin-top: 14px;
+}
+
+.smartperfetto-original-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.smartperfetto-original-frame {
+  width: 100%;
+  min-height: 72vh;
+  border: 0;
+  background: white;
 }
 
 @media print {
@@ -3906,7 +3975,8 @@ fieldset.new-analysis-field {
   .analysis-memory-evidence-details > :not(summary),
   .analysis-report-evidence details > :not(summary),
   .analysis-report-provenance > :not(summary),
-  .technical-appendix details > :not(summary) {
+  .analysis-additional-conclusions > :not(summary),
+  .analysis-additional-conclusions > details > :not(summary) {
     display: block !important;
   }
 
@@ -3914,7 +3984,7 @@ fieldset.new-analysis-field {
   .analysis-memory-evidence-details > summary,
   .analysis-report-evidence summary,
   .analysis-report-provenance summary,
-  .technical-appendix summary {
+  .analysis-additional-conclusions summary {
     list-style: none;
     pointer-events: none;
   }
@@ -3923,7 +3993,7 @@ fieldset.new-analysis-field {
   .analysis-memory-evidence-details > summary::-webkit-details-marker,
   .analysis-report-evidence summary::-webkit-details-marker,
   .analysis-report-provenance summary::-webkit-details-marker,
-  .technical-appendix summary::-webkit-details-marker {
+  .analysis-additional-conclusions summary::-webkit-details-marker {
     display: none;
   }
 
@@ -3949,7 +4019,7 @@ fieldset.new-analysis-field {
     display: block !important;
   }
 
-  .smartperfetto-full-json {
+  [data-report-printing="true"] [data-report-layer="original"] {
     display: none !important;
   }
 }

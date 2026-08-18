@@ -48,6 +48,7 @@ it("closes after the backend accepts the uploaded Trace", async () => {
     screen.getByLabelText("Trace 文件"),
     new File([new Uint8Array([1, 2, 3])], "startup.trace"),
   );
+  await user.type(screen.getByLabelText("应用包名"), "com.rivotek.mediacenter");
   await user.click(screen.getByRole("button", { name: "开始分析" }));
 
   expect(onSubmitted).toHaveBeenCalledOnce();

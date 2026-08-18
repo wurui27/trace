@@ -178,6 +178,21 @@ def test_live_normalizer_namespaces_public_ids_by_scenario() -> None:
             "verdict": "已完成两个场景的证据校验。",
             "executive_summary": "已完成两个场景的证据校验。",
             "key_metric_ids": [],
+            "conclusions": [
+                {
+                    "finding_id": finding["finding_id"],
+                    "evidence_ids": finding["evidence_ids"],
+                    "source_ref_ids": [],
+                    "problem": "SmartPerfetto 发现性能问题。",
+                    "cause": "Trace 证据表明关键执行存在阻塞。",
+                    "source_root_cause": "当前没有源码证据定位具体实现。",
+                    "recommendation": "缩短关键路径并使用相同场景复测。",
+                }
+                for scenario in projection.document["scenarios"]
+                for finding in scenario["findings"]
+                if finding["status"] in {"confirmed", "suspected"}
+                and finding["evidence_ids"]
+            ],
             "top_findings": [],
             "recommendations": [],
             "source_fixes": [],

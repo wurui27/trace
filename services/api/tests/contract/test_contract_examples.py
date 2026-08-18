@@ -200,7 +200,8 @@ def _trace_create_request(schema_version: str) -> dict[str, object]:
     return {
         "schema_version": schema_version,
         "analysis_mode": "trace_upload",
-        "analysis_profile": "auto",
+        "test_type": "cold_start",
+        "package_name": "com.rivotek.mediacenter",
         "question": None,
         "inputs": [
             {
@@ -284,6 +285,10 @@ def _analysis_response_v11() -> dict[str, object]:
         "completed_at": None,
         "failure": None,
         "analysis_profile": "auto",
+        "test_type": "cold_start",
+        "package_name": "com.rivotek.mediacenter",
+        "custom_test_name": None,
+        "custom_test_description": None,
         "question": None,
         "input_uploads": [
             {

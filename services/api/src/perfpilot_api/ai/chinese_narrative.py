@@ -24,6 +24,12 @@ def _texts(document: Mapping[str, object]) -> list[str]:
 
     add(document.get("verdict"))
     add(document.get("executive_summary"))
+    for item in document.get("conclusions", []):
+        if isinstance(item, Mapping):
+            add(item.get("problem"))
+            add(item.get("cause"))
+            add(item.get("source_root_cause"))
+            add(item.get("recommendation"))
     for item in document.get("top_findings", []):
         if isinstance(item, Mapping):
             add(item.get("user_impact"))

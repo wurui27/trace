@@ -6514,6 +6514,11 @@ def create_local_app(
             ) from None
         headers = {
             "cache-control": "private, no-store",
+            "content-security-policy": (
+                "sandbox allow-scripts; default-src 'none'; "
+                "img-src data: blob:; style-src 'unsafe-inline'; "
+                "script-src 'unsafe-inline'"
+            ),
             "x-content-type-options": "nosniff",
         }
         if download == "true":

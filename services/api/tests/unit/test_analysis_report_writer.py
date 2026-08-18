@@ -111,6 +111,10 @@ def test_composer_builds_valid_ordered_v11_report_and_exact_provenance() -> None
 def test_composer_builds_v12_single_document_without_source_context() -> None:
     synthesis = _load("synthesis-output-v2.valid.json")
     synthesis["source_fixes"] = []
+    synthesis["conclusions"][0]["source_ref_ids"] = []
+    synthesis["conclusions"][0]["source_root_cause"] = (
+        "本次没有足够强的源码匹配，暂不能定位到具体实现。"
+    )
     source_code = {
         "requested": False,
         "provider_kind": None,

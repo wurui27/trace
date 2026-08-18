@@ -353,10 +353,6 @@
           "required": [
             "analysis_mode",
             "analysis_profile",
-            "test_type",
-            "package_name",
-            "custom_test_name",
-            "custom_test_description",
             "question",
             "input_uploads",
             "stages",
@@ -364,17 +360,37 @@
           ],
           "oneOf": [
             {
-              "properties": {
-                "test_type": {"const": "other"},
-                "custom_test_name": {"type": "string"},
-                "custom_test_description": {"type": "string"}
-              }
+              "required": [
+                "test_type",
+                "package_name",
+                "custom_test_name",
+                "custom_test_description"
+              ],
+              "oneOf": [
+                {
+                  "properties": {
+                    "test_type": {"const": "other"},
+                    "custom_test_name": {"type": "string"},
+                    "custom_test_description": {"type": "string"}
+                  }
+                },
+                {
+                  "properties": {
+                    "test_type": {"enum": ["cold_start", "hot_start", "scroll"]},
+                    "custom_test_name": {"type": "null"},
+                    "custom_test_description": {"type": "null"}
+                  }
+                }
+              ]
             },
             {
-              "properties": {
-                "test_type": {"enum": ["cold_start", "hot_start", "scroll"]},
-                "custom_test_name": {"type": "null"},
-                "custom_test_description": {"type": "null"}
+              "not": {
+                "anyOf": [
+                  {"required": ["test_type"]},
+                  {"required": ["package_name"]},
+                  {"required": ["custom_test_name"]},
+                  {"required": ["custom_test_description"]}
+                ]
               }
             }
           ],

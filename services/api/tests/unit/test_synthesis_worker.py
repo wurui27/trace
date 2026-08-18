@@ -73,6 +73,9 @@ def _provider_fixture(name: str) -> dict[str, object]:
 def _synthesis_v2_no_source() -> dict[str, object]:
     document = _load("synthesis-output-v2.valid.json")
     document["source_fixes"] = []
+    for conclusion in document["conclusions"]:
+        conclusion["source_ref_ids"] = []
+        conclusion["source_root_cause"] = "当前没有足够源码证据定位具体实现。"
     return document
 
 

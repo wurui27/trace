@@ -243,6 +243,7 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
             document.get("key_metric_ids"), index.metric_ids
         ):
             raise SynthesisValidationError
+        _validate_conclusions(document, index)
         _validate_source_fixes(document, index)
 
     for finding in top_findings:
@@ -311,6 +312,61 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
             raise SynthesisValidationError
 
 
+def _validate_conclusions(
+    document: dict[str, object], index: _ProjectionIndex
+) -> None:
+    conclusions = document.get("conclusions")
+    if not isinstance(conclusions, list):
+        raise SynthesisValidationError
+    expected = {
+        finding_id
+        for finding_id, state in index.finding_status.items()
+        if state in {"confirmed", "suspected"}
+        and index.finding_evidence[finding_id]
+    }
+    selected: set[str] = set()
+    for conclusion in conclusions:
+        if not isinstance(conclusion, dict):
+            raise SynthesisValidationError
+        finding_id = conclusion.get("finding_id")
+        evidence_ids = conclusion.get("evidence_ids")
+        source_ref_ids = conclusion.get("source_ref_ids")
+        if (
+            not isinstance(finding_id, str)
+            or finding_id in selected
+            or finding_id not in expected
+            or not isinstance(evidence_ids, list)
+            or not evidence_ids
+            or not _known_ids(evidence_ids, index.evidence_ids)
+            or not set(evidence_ids).issubset(index.finding_evidence[finding_id])
+            or not isinstance(source_ref_ids, list)
+            or not _known_ids(source_ref_ids, index.source_refs)
+            or index.source_match != "strong"
+            and source_ref_ids
+        ):
+            raise SynthesisValidationError
+        eligible_source_refs = {
+            source_ref_id
+            for source_ref_id, source_ref in index.source_refs.items()
+            if source_ref.get("match_grade") == "strong"
+            and finding_id in source_ref.get("finding_ids", [])
+            and set(evidence_ids).issubset(source_ref.get("evidence_ids", []))
+        }
+        if eligible_source_refs and not source_ref_ids:
+            raise SynthesisValidationError
+        for source_ref_id in source_ref_ids:
+            source_ref = index.source_refs[source_ref_id]
+            if (
+                source_ref.get("match_grade") != "strong"
+                or finding_id not in source_ref.get("finding_ids", [])
+                or not set(evidence_ids).issubset(source_ref.get("evidence_ids", []))
+            ):
+                raise SynthesisValidationError
+        selected.add(finding_id)
+    if selected != expected:
+        raise SynthesisValidationError
+
+
 def _validate_source_fixes(
     document: dict[str, object], index: _ProjectionIndex
 ) -> None:
@@ -372,6 +428,15 @@ def _narrative_fields(document: dict[str, object]) -> tuple[str, ...]:
     fields = [document["executive_summary"]]
     if document.get("schema_version") == "2.0":
         fields.append(document["verdict"])
+        for conclusion in document["conclusions"]:
+            fields.extend(
+                (
+                    conclusion["problem"],
+                    conclusion["cause"],
+                    conclusion["source_root_cause"],
+                    conclusion["recommendation"],
+                )
+            )
         for fix in document["source_fixes"]:
             fields.extend((fix["diagnosis"], fix["retest_target"]))
     for finding in document["top_findings"]:

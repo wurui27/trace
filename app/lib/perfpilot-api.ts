@@ -2,9 +2,7 @@ import { sha256 } from "@noble/hashes/sha2.js";
 
 const API_PREFIX = "/api/v1/";
 const MAX_JSON_BYTES = 10 * 1024 * 1024;
-const MAX_SMARTPERFETTO_ORIGINAL_BYTES = 2 * 1024 * 1024;
-const MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES =
-  2 * MAX_SMARTPERFETTO_ORIGINAL_BYTES + 64 * 1024;
+const MAX_SMARTPERFETTO_ORIGINAL_BYTES = 16 * 1024 * 1024;
 const MAX_UPLOAD_BYTES = 5 * 1024 * 1024 * 1024;
 const HASH_CHUNK_BYTES = 4 * 1024 * 1024;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]{0,126}\/[a-z0-9][a-z0-9!#$&^_.+-]{0,126}$/;
@@ -258,6 +256,15 @@ export interface ConciseSynthesisOutput {
   readonly verdict: string;
   readonly executive_summary: string;
   readonly key_metric_ids: readonly string[];
+  readonly conclusions: ReadonlyArray<{
+    readonly finding_id: string;
+    readonly evidence_ids: readonly string[];
+    readonly source_ref_ids: readonly string[];
+    readonly problem: string;
+    readonly cause: string;
+    readonly source_root_cause: string;
+    readonly recommendation: string;
+  }>;
   readonly top_findings: SynthesisOutput["top_findings"];
   readonly recommendations: SynthesisOutput["recommendations"];
   readonly source_fixes: readonly Omit<SourceFix, "verification">[];
@@ -410,39 +417,14 @@ export interface SourceAwareAnalysisReport extends AnalysisReportBase {
 
 export type AnalysisReport = LegacyAnalysisReport | SourceAwareAnalysisReport;
 
-export interface SmartPerfettoOriginalMetadataItem {
-  readonly scenario_type: SmartPerfettoScenario;
-  readonly label: "启动" | "滑动";
+export interface SmartPerfettoOriginalMetadata {
   readonly available: true;
   readonly artifact_id: string;
-  readonly version: 1;
-  readonly mime: "application/json";
+  readonly version: 2;
+  readonly mime: "text/html";
   readonly size: number;
   readonly sha256: string;
 }
-
-export type SmartPerfettoOriginalMetadata =
-  | Omit<SmartPerfettoOriginalMetadataItem, "scenario_type" | "label">
-  | Readonly<{
-      readonly available: true;
-      readonly mode: "scenario_collection";
-      readonly reports: readonly SmartPerfettoOriginalMetadataItem[];
-    }>;
-
-export type SmartPerfettoScenario = "startup" | "scroll";
-
-export interface SmartPerfettoScenarioOriginal {
-  readonly scenario_type: SmartPerfettoScenario;
-  readonly label: "启动" | "滑动";
-  readonly document: Readonly<Record<string, unknown>>;
-}
-
-export type SmartPerfettoOriginal =
-  | Readonly<Record<string, unknown>>
-  | Readonly<{
-      readonly mode: "scenario_collection";
-      readonly reports: readonly SmartPerfettoScenarioOriginal[];
-    }>;
 
 export interface SynthesisRunResponse {
   readonly schema_version: "1.0";
@@ -786,15 +768,10 @@ export interface PerfPilotClient {
     signal?: AbortSignal,
   ): Promise<AnalysisResponse>;
   report(teamId: string, analysisId: string, signal?: AbortSignal): Promise<AnalysisReport>;
-  smartPerfettoOriginal(
-    teamId: string,
-    analysisId: string,
-    signal?: AbortSignal,
-  ): Promise<SmartPerfettoOriginal>;
+  smartPerfettoOriginalUrl(teamId: string, analysisId: string): string;
   smartPerfettoOriginalDownloadUrl(
     teamId: string,
     analysisId: string,
-    scenario?: SmartPerfettoScenario,
   ): string;
   createSynthesisRun(
     teamId: string,
@@ -943,20 +920,6 @@ function object(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
-function safeJsonTree(value: unknown, depth = 0): boolean {
-  if (depth > 64) return false;
-  if (value === null || typeof value === "string" || typeof value === "boolean") return true;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (Array.isArray(value)) {
-    return value.length <= 100_000 && value.every((item) => safeJsonTree(item, depth + 1));
-  }
-  if (!object(value)) return false;
-  const keys = Object.keys(value);
-  return keys.length <= 100_000 && keys.every(
-    (key) => !["__proto__", "prototype", "constructor"].includes(key) && safeJsonTree(value[key], depth + 1),
-  );
-}
-
 function privateLanHostname(value: string): boolean {
   const hostname = value.toLowerCase().replace(/^\[|\]$/g, "");
   if (hostname === "localhost" || hostname === "::1") return true;
@@ -1009,62 +972,6 @@ export function validUploadUrl(
 function exactKeys(value: Record<string, unknown>, allowed: readonly string[]): boolean {
   const allowedKeys = new Set(allowed);
   return Object.keys(value).every((key) => allowedKeys.has(key));
-}
-
-function smartPerfettoOriginalResponse(value: unknown): SmartPerfettoOriginal {
-  if (!object(value) || !safeJsonTree(value)) {
-    throw new PerfPilotApiError(
-      "invalid_api_response",
-      "SmartPerfetto 原始报告无效",
-      false,
-      null,
-    );
-  }
-  if (value.mode !== "scenario_collection") return value;
-  if (
-    !exactKeys(value, ["mode", "reports"]) ||
-    !Array.isArray(value.reports) ||
-    value.reports.length < 1 ||
-    value.reports.length > 2
-  ) {
-    throw new PerfPilotApiError(
-      "invalid_api_response",
-      "SmartPerfetto 原始报告无效",
-      false,
-      null,
-    );
-  }
-  const scenarios: string[] = [];
-  for (const item of value.reports) {
-    if (
-      !object(item) ||
-      !exactKeys(item, ["scenario_type", "label", "document"]) ||
-      !["startup", "scroll"].includes(String(item.scenario_type)) ||
-      item.label !== (item.scenario_type === "startup" ? "启动" : "滑动") ||
-      !object(item.document) ||
-      !safeJsonTree(item.document)
-    ) {
-      throw new PerfPilotApiError(
-        "invalid_api_response",
-        "SmartPerfetto 原始报告无效",
-        false,
-        null,
-      );
-    }
-    scenarios.push(String(item.scenario_type));
-  }
-  if (
-    new Set(scenarios).size !== scenarios.length ||
-    scenarios.join(",") !== ["startup", "scroll"].filter((item) => scenarios.includes(item)).join(",")
-  ) {
-    throw new PerfPilotApiError(
-      "invalid_api_response",
-      "SmartPerfetto 原始报告无效",
-      false,
-      null,
-    );
-  }
-  return value as unknown as SmartPerfettoOriginal;
 }
 
 function validSourceWorkspace(value: unknown): value is SourceWorkspaceView {
@@ -1688,12 +1595,30 @@ function validConciseSynthesisOutput(value: unknown): value is ConciseSynthesisO
     object(value) &&
     exactKeys(value, [
       "schema_version", "verdict", "executive_summary", "key_metric_ids",
-      "top_findings", "recommendations", "source_fixes", "retest_plan", "limitations",
+      "conclusions", "top_findings", "recommendations", "source_fixes", "retest_plan", "limitations",
     ]) &&
     value.schema_version === "2.0" &&
     typeof value.verdict === "string" &&
     typeof value.executive_summary === "string" &&
     stringArray(value.key_metric_ids, 3) &&
+    Array.isArray(value.conclusions) &&
+    value.conclusions.length <= 300 &&
+    value.conclusions.every((conclusion) =>
+      object(conclusion) &&
+      exactKeys(conclusion, [
+        "finding_id", "evidence_ids", "source_ref_ids", "problem", "cause",
+        "source_root_cause", "recommendation",
+      ]) &&
+      CANONICAL_UUID.test(String(conclusion.finding_id)) &&
+      stringArray(conclusion.evidence_ids, 20, 1) &&
+      stringArray(conclusion.source_ref_ids, 2) &&
+      [
+        conclusion.problem,
+        conclusion.cause,
+        conclusion.source_root_cause,
+        conclusion.recommendation,
+      ].every((text) => typeof text === "string" && text.length >= 1 && text.length <= 2000)
+    ) &&
     Array.isArray(value.source_fixes) &&
     value.source_fixes.length <= 3 &&
     value.source_fixes.every((fix) => validSourceFix(fix, false)) &&
@@ -1798,46 +1723,21 @@ function validSynthesisProvenance(value: unknown): value is SynthesisProvenance 
   );
 }
 
-function validOriginalMetadataItem(
-  value: unknown,
-  scenarioQualified: boolean,
-): value is SmartPerfettoOriginalMetadataItem {
+function validOriginalMetadata(value: unknown): value is SmartPerfettoOriginalMetadata {
   return object(value) &&
     exactKeys(value, [
-      ...(scenarioQualified ? ["scenario_type", "label"] : []),
       "available", "artifact_id", "version", "mime", "size", "sha256",
     ]) &&
-    (!scenarioQualified ||
-      (["startup", "scroll"].includes(String(value.scenario_type)) &&
-        value.label === (value.scenario_type === "startup" ? "启动" : "滑动"))) &&
     value.available === true &&
     typeof value.artifact_id === "string" &&
     CANONICAL_UUID.test(value.artifact_id) &&
-    value.version === 1 &&
-    value.mime === "application/json" &&
+    value.version === 2 &&
+    value.mime === "text/html" &&
     Number.isSafeInteger(value.size) &&
     Number(value.size) >= 1 &&
     Number(value.size) <= MAX_SMARTPERFETTO_ORIGINAL_BYTES &&
     typeof value.sha256 === "string" &&
     /^[0-9a-f]{64}$/.test(value.sha256);
-}
-
-function validOriginalMetadata(value: unknown): value is SmartPerfettoOriginalMetadata {
-  if (!object(value)) return false;
-  if (value.mode !== "scenario_collection") {
-    return validOriginalMetadataItem(value, false);
-  }
-  if (
-    !exactKeys(value, ["available", "mode", "reports"]) ||
-    value.available !== true ||
-    !Array.isArray(value.reports) ||
-    value.reports.length < 1 ||
-    value.reports.length > 2 ||
-    !value.reports.every((item) => validOriginalMetadataItem(item, true))
-  ) return false;
-  const scenarios = value.reports.map((item) => item.scenario_type);
-  return new Set(scenarios).size === scenarios.length &&
-    scenarios.join(",") === ["startup", "scroll"].filter((item) => scenarios.includes(item)).join(",");
 }
 
 function analysisReportResponse(value: unknown): AnalysisReport {
@@ -3099,32 +2999,11 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
       }
       return report;
     },
-    async smartPerfettoOriginal(teamId, analysisId, signal) {
-      const path = `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/smartperfetto-original`;
-      aborted(signal);
-      let response: Response;
-      try {
-        response = await fetcher(path, {
-          headers: { accept: "application/json" },
-          credentials: "same-origin",
-          redirect: "error",
-          signal,
-        });
-      } catch (error) {
-        aborted(signal);
-        throw new PerfPilotApiError("network_unavailable", "网络连接不可用", true, null, { cause: error });
-      }
-      const payload = await readJson(response, MAX_SMARTPERFETTO_ORIGINAL_COLLECTION_BYTES);
-      if (!response.ok) {
-        throw new PerfPilotApiError("invalid_api_response", "SmartPerfetto 原始报告无效", false, null);
-      }
-      return smartPerfettoOriginalResponse(payload);
+    smartPerfettoOriginalUrl(teamId, analysisId) {
+      return `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/smartperfetto-original`;
     },
-    smartPerfettoOriginalDownloadUrl(teamId, analysisId, scenario) {
-      const query = scenario === undefined
-        ? "download=true"
-        : `scenario=${encodeURIComponent(scenario)}&download=true`;
-      return `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/smartperfetto-original?${query}`;
+    smartPerfettoOriginalDownloadUrl(teamId, analysisId) {
+      return `/api/v1/teams/${encodeURIComponent(teamId)}/analyses/${encodeURIComponent(analysisId)}/smartperfetto-original?download=true`;
     },
     async createSynthesisRun(teamId, analysisId, idempotencyKey, signal) {
       const run = synthesisRunResponse(

@@ -246,6 +246,15 @@ function sourceAwareReport(): AnalysisReport {
         schema_version: "2.0",
         verdict: "启动关键路径被主线程同步等待阻塞。",
         key_metric_ids: METRIC_IDS.slice(0, 3),
+        conclusions: FINDING_IDS.map((findingId, index) => ({
+          finding_id: findingId,
+          evidence_ids: [EVIDENCE_IDS[index]],
+          source_ref_ids: [],
+          problem: `问题点 ${index + 1}`,
+          cause: `SmartPerfetto 证据确认原因 ${index + 1}`,
+          source_root_cause: `源码根因判断 ${index + 1}`,
+          recommendation: `修改建议 ${index + 1}`,
+        })),
         top_findings: output.top_findings.slice(0, 3),
         recommendations: output.recommendations.slice(0, 3),
         source_fixes: [],
@@ -270,7 +279,7 @@ function sourceAwareReport(): AnalysisReport {
 }
 
 describe("AnalysisReportView", () => {
-  it("dispatches report 1.2 into conclusion, source fixes and appendix tabs", async () => {
+  it("shows three primary four-part conclusions and keeps every remaining conclusion collapsible", async () => {
     const user = userEvent.setup();
     render(
       <AnalysisReportView
@@ -285,44 +294,34 @@ describe("AnalysisReportView", () => {
       "true",
     );
     expect(screen.getByRole("tab", { name: "源码修复" })).toBeInTheDocument();
-    expect(screen.getByRole("tab", { name: "技术附录" })).toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "技术附录" })).not.toBeInTheDocument();
     expect(screen.getByRole("tab", { name: "SmartPerfetto 原始报告" })).toBeInTheDocument();
     expect(screen.getAllByTestId("key-metric")).toHaveLength(3);
-    expect(screen.getAllByTestId("top-finding")).toHaveLength(3);
-    expect(screen.getAllByTestId("priority-action")).toHaveLength(3);
-    expect(screen.getByText("辅助指标 4")).not.toBeVisible();
+    const primary = screen.getAllByTestId("primary-conclusion");
+    expect(primary).toHaveLength(3);
+    for (const conclusion of primary) {
+      expect(within(conclusion).getByText("1. 问题点")).toBeVisible();
+      expect(within(conclusion).getByText("2. 为什么会有这个问题")).toBeVisible();
+      expect(within(conclusion).getByText("3. 结合源码判断的根因是什么")).toBeVisible();
+      expect(within(conclusion).getByText("4. 修改建议")).toBeVisible();
+    }
+    const remainder = screen.getByText("展开其余 3 条问题与优化方案").closest("details");
+    expect(remainder).not.toHaveAttribute("open");
+    expect(screen.getAllByTestId("additional-conclusion")).toHaveLength(3);
+    expect(screen.getByText("修改建议 4")).not.toBeVisible();
 
-    await user.click(screen.getByRole("tab", { name: "源码修复" }));
-    expect(screen.getByText("本次分析未关联源码")).toBeInTheDocument();
-    await user.click(screen.getByRole("tab", { name: "技术附录" }));
-    await user.click(screen.getByText("startup"));
-    expect(screen.getByText("辅助指标 4")).toBeVisible();
+    await user.click(screen.getByText("展开其余 3 条问题与优化方案"));
+    const fourth = screen.getAllByTestId("additional-conclusion")[0];
+    await user.click(within(fourth).getByText("问题点 4", { selector: "summary" }));
+    expect(within(fourth).getByText("修改建议 4")).toBeVisible();
   });
 
-  it("lazily renders remote SmartPerfetto originals by scenario with independent downloads", async () => {
+  it("embeds the byte-faithful SmartPerfetto HTML without fetching or rendering JSON", async () => {
     const user = userEvent.setup();
-    const original = {
-      mode: "scenario_collection" as const,
-      reports: [
-        {
-          scenario_type: "startup" as const,
-          label: "启动",
-          document: { summary: "启动原始结论" },
-        },
-        {
-          scenario_type: "scroll" as const,
-          label: "滑动",
-          document: { summary: "滑动原始结论" },
-        },
-      ],
-    };
-    const originalLoader = vi.fn().mockResolvedValue(original);
-    const downloadUrl = vi.fn(
-      (_teamId: string, _analysisId: string, scenario?: "startup" | "scroll") =>
-        `/original?scenario=${scenario}`,
-    );
+    const originalUrl = vi.fn(() => "/original.html");
+    const downloadUrl = vi.fn(() => "/original.html?download=true");
     const client = {
-      smartPerfettoOriginal: originalLoader,
+      smartPerfettoOriginalUrl: originalUrl,
       smartPerfettoOriginalDownloadUrl: downloadUrl,
     } as unknown as import("../app/lib/perfpilot-api").PerfPilotClient;
     render(
@@ -335,16 +334,18 @@ describe("AnalysisReportView", () => {
       />,
     );
 
-    expect(originalLoader).not.toHaveBeenCalled();
+    expect(originalUrl).not.toHaveBeenCalled();
     await user.click(screen.getByRole("tab", { name: "SmartPerfetto 原始报告" }));
-    expect(originalLoader).toHaveBeenCalledOnce();
-    expect(await screen.findByRole("heading", { name: "启动原始报告" })).toBeVisible();
-    expect(screen.getByRole("heading", { name: "滑动原始报告" })).toBeVisible();
-    expect(screen.getByText("启动原始结论")).toBeVisible();
-    expect(screen.getByText("滑动原始结论")).toBeVisible();
-    expect(screen.getAllByRole("link", { name: "下载原始报告" })).toHaveLength(2);
-    expect(downloadUrl).toHaveBeenCalledWith("team-1", ANALYSIS_ID, "startup");
-    expect(downloadUrl).toHaveBeenCalledWith("team-1", ANALYSIS_ID, "scroll");
+    expect(originalUrl).toHaveBeenCalledWith("team-1", ANALYSIS_ID);
+    expect(screen.getByTitle("SmartPerfetto 原始 HTML 报告")).toHaveAttribute(
+      "src",
+      "/original.html",
+    );
+    expect(screen.getByRole("link", { name: "下载原始 HTML" })).toHaveAttribute(
+      "href",
+      "/original.html?download=true",
+    );
+    expect(screen.queryByText("查看完整 JSON")).not.toBeInTheDocument();
   });
 
   it("does not render source paths for weak source matches", async () => {
@@ -382,9 +383,9 @@ describe("AnalysisReportView", () => {
     };
     render(<AnalysisReportView report={weak} onRetrySynthesis={vi.fn()} retrying={false} />);
 
-    await user.click(screen.getByRole("tab", { name: "技术附录" }));
+    await user.click(screen.getByRole("tab", { name: "源码修复" }));
     expect(screen.queryByText(/private\/Startup\.kt/)).not.toBeInTheDocument();
-    expect(screen.getByText("源码匹配不足，未公开文件路径或行号。")).toBeVisible();
+    expect(screen.getByText("源码匹配证据不足")).toBeVisible();
   });
 
   it("renders the concise completed report in evidence-first order", () => {

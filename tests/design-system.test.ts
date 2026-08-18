@@ -106,10 +106,10 @@ describe("Focus Light design system", () => {
     expect(printBlock).toMatch(/\.analysis-report-evidence details\s*>\s*:not\(summary\)[\s\S]*display\s*:\s*block\s*!important/i);
     expect(printBlock).toMatch(/\.analysis-report-provenance\s*>\s*:not\(summary\)[\s\S]*display\s*:\s*block\s*!important/i);
     expect(printBlock).toMatch(
-      /\.analysis-report-metric-details\s*>\s*summary\s*,\s*\.analysis-memory-evidence-details\s*>\s*summary\s*,\s*\.analysis-report-evidence summary\s*,\s*\.analysis-report-provenance summary\s*,\s*\.technical-appendix summary\s*\{[^}]*list-style\s*:\s*none[^}]*pointer-events\s*:\s*none/i,
+      /\.analysis-report-metric-details\s*>\s*summary\s*,\s*\.analysis-memory-evidence-details\s*>\s*summary\s*,\s*\.analysis-report-evidence summary\s*,\s*\.analysis-report-provenance summary\s*,\s*\.analysis-additional-conclusions summary\s*\{[^}]*list-style\s*:\s*none[^}]*pointer-events\s*:\s*none/i,
     );
     expect(printBlock).toMatch(
-      /\.analysis-report-metric-details\s*>\s*summary::-webkit-details-marker\s*,\s*\.analysis-memory-evidence-details\s*>\s*summary::-webkit-details-marker\s*,\s*\.analysis-report-evidence summary::-webkit-details-marker\s*,\s*\.analysis-report-provenance summary::-webkit-details-marker\s*,\s*\.technical-appendix summary::-webkit-details-marker\s*\{[^}]*display\s*:\s*none/i,
+      /\.analysis-report-metric-details\s*>\s*summary::-webkit-details-marker\s*,\s*\.analysis-memory-evidence-details\s*>\s*summary::-webkit-details-marker\s*,\s*\.analysis-report-evidence summary::-webkit-details-marker\s*,\s*\.analysis-report-provenance summary::-webkit-details-marker\s*,\s*\.analysis-additional-conclusions summary::-webkit-details-marker\s*\{[^}]*display\s*:\s*none/i,
     );
     expect(printBlock).toMatch(
       /\.analysis-report-section\s*,\s*\.analysis-report-findings\s*>\s*li\s*,\s*\.analysis-recommendation-list\s*>\s*li\s*,\s*\.analysis-retest-list\s*>\s*li\s*,\s*\.analysis-report-evidence\s*>\s*div\s*\{[^}]*break-inside\s*:\s*avoid[^}]*page-break-inside\s*:\s*avoid/i,
