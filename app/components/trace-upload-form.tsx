@@ -10,9 +10,8 @@ import {
   type SubmittedTraceAnalysis,
   type PerfPilotClient,
   type SourceBinding,
-  type TraceInputKind,
-  type TraceProfile,
   type TraceSubmissionPhase,
+  type UploadedTraceTestType,
 } from "../lib/perfpilot-api";
 import { SourceWorkspaceField } from "./source-workspace-field";
 
@@ -64,9 +63,12 @@ export function TraceUploadForm({
   client,
   teamId,
 }: TraceUploadFormProps) {
-  const [profile, setProfile] = useState<TraceProfile>("auto");
+  const [testType, setTestType] = useState<UploadedTraceTestType>("cold_start");
+  const [packageName, setPackageName] = useState("");
+  const [customTestName, setCustomTestName] = useState("");
+  const [customTestDescription, setCustomTestDescription] = useState("");
   const [question, setQuestion] = useState("");
-  const [files, setFiles] = useState<Partial<Record<TraceInputKind, File>>>({});
+  const [trace, setTrace] = useState<File | null>(null);
   const [phase, setPhase] = useState<TraceSubmissionPhase | null>(null);
   const [phaseDetail, setPhaseDetail] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -81,22 +83,15 @@ export function TraceUploadForm({
     [],
   );
 
-  const selectFile = (kind: TraceInputKind, file: File | undefined) => {
-    setFiles((current) => {
-      const next = { ...current };
-      if (file) {
-        next[kind] = file;
-      } else {
-        delete next[kind];
-      }
-      return next;
-    });
-    setError(null);
-  };
-
   const handleSubmit = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
-    if (!files.trace || busy) {
+    if (
+      trace === null ||
+      packageName.trim() === "" ||
+      (testType === "other" &&
+        (customTestName.trim() === "" || customTestDescription.trim() === "")) ||
+      busy
+    ) {
       return;
     }
     const controller = new AbortController();
@@ -106,14 +101,14 @@ export function TraceUploadForm({
     setPhase("session");
     setPhaseDetail(null);
     try {
-      const selectedFiles = Object.entries(files).map(([kind, file]) => ({
-        kind: kind as TraceInputKind,
-        file,
-      }));
       const submitted = await submitter({
-        profile,
+        testType,
+        packageName,
+        customTestName: testType === "other" ? customTestName : undefined,
+        customTestDescription:
+          testType === "other" ? customTestDescription : undefined,
         question,
-        files: selectedFiles,
+        trace,
         sourceBinding: sourceBinding ?? undefined,
         signal: controller.signal,
         onProgress: (nextPhase, detail) => {
@@ -146,6 +141,12 @@ export function TraceUploadForm({
   };
 
   const disabled = busy;
+  const submitDisabled =
+    disabled ||
+    trace === null ||
+    packageName.trim() === "" ||
+    (testType === "other" &&
+      (customTestName.trim() === "" || customTestDescription.trim() === ""));
 
   return (
     <form
@@ -156,18 +157,65 @@ export function TraceUploadForm({
     >
       <div className="new-analysis-fields">
         <div className="new-analysis-field">
-          <label htmlFor="trace-analysis-profile">分析重点</label>
+          <label htmlFor="trace-test-type">测试类型</label>
           <select
-            id="trace-analysis-profile"
-            value={profile}
-            onChange={(event) => setProfile(event.target.value as TraceProfile)}
+            id="trace-test-type"
+            value={testType}
+            onChange={(event) =>
+              setTestType(event.target.value as UploadedTraceTestType)
+            }
             disabled={disabled}
           >
-            <option value="auto">自动识别关键问题</option>
-            <option value="startup">启动性能</option>
-            <option value="scroll">页面滑动与卡顿</option>
+            <option value="cold_start">冷启动</option>
+            <option value="hot_start">热启动</option>
+            <option value="scroll">滑动</option>
+            <option value="other">其他</option>
           </select>
         </div>
+
+        <div className="new-analysis-field new-analysis-field-required">
+          <label htmlFor="trace-package-name">应用包名</label>
+          <input
+            id="trace-package-name"
+            type="text"
+            value={packageName}
+            placeholder="例如：com.rivotek.mediacenter"
+            autoComplete="off"
+            required
+            disabled={disabled}
+            onChange={(event) => setPackageName(event.target.value)}
+          />
+        </div>
+
+        {testType === "other" ? (
+          <>
+            <div className="new-analysis-field new-analysis-field-required">
+              <label htmlFor="trace-custom-test-name">测试名称</label>
+              <input
+                id="trace-custom-test-name"
+                type="text"
+                value={customTestName}
+                maxLength={80}
+                required
+                disabled={disabled}
+                onChange={(event) => setCustomTestName(event.target.value)}
+              />
+            </div>
+            <div className="new-analysis-field new-analysis-field-required">
+              <label htmlFor="trace-custom-test-description">测试说明</label>
+              <textarea
+                id="trace-custom-test-description"
+                value={customTestDescription}
+                maxLength={500}
+                rows={3}
+                placeholder="说明测试做什么、关注哪段业务流程。"
+                required
+                disabled={disabled}
+                onChange={(event) => setCustomTestDescription(event.target.value)}
+              />
+            </div>
+          </>
+        ) : null}
 
         <div className="new-analysis-field">
           <label htmlFor="trace-question">补充问题（可选）</label>
@@ -190,68 +238,14 @@ export function TraceUploadForm({
             accept=".perfetto-trace,.trace,.ctrace,.pb"
             required
             disabled={disabled}
-            onChange={(event) => selectFile("trace", event.target.files?.[0])}
+            onChange={(event) => {
+              setTrace(event.target.files?.[0] ?? null);
+              setError(null);
+            }}
           />
           <span className="new-analysis-field-hint">
             支持 Perfetto Trace，SmartPerfetto 将首先解析这份数据。
           </span>
-        </div>
-
-        <div className="trace-optional-files" aria-label="可选辅助文件">
-          <div className="new-analysis-field">
-            <label htmlFor="memory-evidence-file">内存证据（可选）</label>
-            <input
-              id="memory-evidence-file"
-              type="file"
-              accept=".zip,.hprof,.json"
-              disabled={disabled}
-              onChange={(event) =>
-                selectFile("memory_evidence", event.target.files?.[0])
-              }
-            />
-          </div>
-          <div className="new-analysis-field">
-            <label htmlFor="trace-apk-file">APK 文件（可选）</label>
-            <input
-              id="trace-apk-file"
-              type="file"
-              accept=".apk"
-              disabled={disabled}
-              onChange={(event) => selectFile("apk", event.target.files?.[0])}
-            />
-          </div>
-          <div className="new-analysis-field">
-            <label htmlFor="mapping-file">Mapping 文件（可选）</label>
-            <input
-              id="mapping-file"
-              type="file"
-              accept=".txt"
-              disabled={disabled}
-              onChange={(event) => selectFile("mapping", event.target.files?.[0])}
-            />
-          </div>
-          <div className="new-analysis-field">
-            <label htmlFor="native-symbols-file">Native Symbols（可选）</label>
-            <input
-              id="native-symbols-file"
-              type="file"
-              accept=".zip,.tar,.tar.gz,.tgz,.so"
-              disabled={disabled}
-              onChange={(event) =>
-                selectFile("native_symbols", event.target.files?.[0])
-              }
-            />
-          </div>
-          <div className="new-analysis-field">
-            <label htmlFor="trace-log-file">日志文件（可选）</label>
-            <input
-              id="trace-log-file"
-              type="file"
-              accept=".txt,.log"
-              disabled={disabled}
-              onChange={(event) => selectFile("log", event.target.files?.[0])}
-            />
-          </div>
         </div>
 
         <SourceWorkspaceField
@@ -286,7 +280,7 @@ export function TraceUploadForm({
           <button
             type="submit"
             className="primary-action"
-            disabled={!files.trace || disabled}
+            disabled={submitDisabled}
           >
             {busy ? "处理中…" : "开始分析"}
           </button>

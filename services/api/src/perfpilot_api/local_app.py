@@ -15,6 +15,7 @@ import ipaddress
 import json
 import logging
 import os
+import re
 import secrets
 from collections.abc import Mapping
 from contextlib import asynccontextmanager
@@ -516,31 +517,66 @@ class _SourceBindingDescriptor(_StrictModel):
 class _CreateTraceAnalysisRequest(_StrictModel):
     schema_version: Literal["1.0", "1.1"]
     analysis_mode: Literal["trace_upload"]
-    analysis_profile: str
+    test_type: Literal["cold_start", "hot_start", "scroll", "other"]
+    package_name: str = Field(min_length=3, max_length=255)
+    custom_test_name: str | None = Field(default=None, min_length=1, max_length=80)
+    custom_test_description: str | None = Field(
+        default=None, min_length=1, max_length=500
+    )
     question: str | None = Field(default=None, max_length=2000)
-    inputs: list[_InputDescriptor] = Field(min_length=1, max_length=7)
+    inputs: list[_InputDescriptor] = Field(min_length=1, max_length=1)
     source_binding: _SourceBindingDescriptor | None = None
 
-    @field_validator("analysis_profile")
+    @field_validator("package_name")
     @classmethod
-    def valid_profile(cls, value: str) -> str:
-        if value not in _PROFILES:
-            raise ValueError("invalid analysis profile")
+    def valid_package_name(cls, value: str) -> str:
+        if not re.fullmatch(
+            r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+", value
+        ):
+            raise ValueError("invalid Android package name")
         return value
+
+    @field_validator("custom_test_name", "custom_test_description")
+    @classmethod
+    def valid_custom_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("custom test details must not be blank")
+        return normalized
 
     @field_validator("inputs")
     @classmethod
     def valid_inputs(cls, value: list[_InputDescriptor]) -> list[_InputDescriptor]:
-        kinds = [item.kind for item in value]
-        if "trace" not in kinds or len(kinds) != len(set(kinds)):
-            raise ValueError("one Trace and unique input kinds are required")
+        if (
+            len(value) != 1
+            or value[0].kind != "trace"
+            or value[0].mime != "application/octet-stream"
+        ):
+            raise ValueError("exactly one Trace input is required")
         return value
 
     @model_validator(mode="after")
-    def valid_source_version(self) -> "_CreateTraceAnalysisRequest":
+    def valid_request(self) -> "_CreateTraceAnalysisRequest":
         if self.schema_version == "1.0" and self.source_binding is not None:
             raise ValueError("source binding requires schema 1.1")
+        if self.schema_version == "1.1" and self.source_binding is None:
+            raise ValueError("schema 1.1 requires source binding")
+        if self.test_type == "other":
+            if self.custom_test_name is None or self.custom_test_description is None:
+                raise ValueError("custom test details are required")
+        elif self.custom_test_name is not None or self.custom_test_description is not None:
+            raise ValueError("custom test details are forbidden")
         return self
+
+    @property
+    def analysis_profile(self) -> Literal["auto", "startup", "scroll"]:
+        if self.test_type == "scroll":
+            return "scroll"
+        if self.test_type in {"cold_start", "hot_start"}:
+            return "startup"
+        return "auto"
 
 
 class _ApkDescriptor(_StrictModel):
@@ -844,6 +880,10 @@ class _LocalAnalysis:
     profile: str
     question: str | None
     inputs: dict[str, _LocalInput]
+    trace_test_type: Literal["cold_start", "hot_start", "scroll", "other"] | None = None
+    target_package_name: str | None = None
+    custom_test_name: str | None = None
+    custom_test_description: str | None = None
     analysis_mode: Literal["trace_upload", "device"] = "trace_upload"
     device_id: UUID | None = None
     device_agent_id: UUID | None = None
@@ -918,6 +958,10 @@ _PERSISTED_STATE_KEYS = {
     "application_version_id",
     "application_metadata",
     "capture_configuration",
+    "trace_test_type",
+    "target_package_name",
+    "custom_test_name",
+    "custom_test_description",
     "remote_publication",
     "profile",
     "question",
@@ -952,6 +996,10 @@ _PERSISTED_OPTIONAL_STATE_KEYS = {
     "smartperfetto_original",
     "remote_publication",
     "capture_configuration",
+    "trace_test_type",
+    "target_package_name",
+    "custom_test_name",
+    "custom_test_description",
 }
 _PERSISTED_STAGE_KEYS = {
     "input_validation",
@@ -1060,6 +1108,35 @@ def _validate_persisted_state_shape(document: Mapping[str, object]) -> None:
             or type(capture_configuration.get("duration_seconds")) is not int
             or not 1 <= int(capture_configuration["duration_seconds"]) <= 300
         ):
+            raise ValueError
+    trace_test_type = document.get("trace_test_type")
+    target_package_name = document.get("target_package_name")
+    custom_test_name = document.get("custom_test_name")
+    custom_test_description = document.get("custom_test_description")
+    trace_details = (
+        trace_test_type,
+        target_package_name,
+        custom_test_name,
+        custom_test_description,
+    )
+    if any(value is not None for value in trace_details):
+        if (
+            document.get("analysis_mode") != "trace_upload"
+            or trace_test_type not in {"cold_start", "hot_start", "scroll", "other"}
+            or not isinstance(target_package_name, str)
+            or re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+",
+                target_package_name,
+            )
+            is None
+        ):
+            raise ValueError
+        if trace_test_type == "other":
+            if not isinstance(custom_test_name, str) or not isinstance(
+                custom_test_description, str
+            ):
+                raise ValueError
+        elif custom_test_name is not None or custom_test_description is not None:
             raise ValueError
     if document.get("remote_publication", "not_requested") not in {
         "not_requested",
@@ -1372,6 +1449,45 @@ def _normalize_local_smartperfetto_result(
             loaded,
             analysis_mode=analysis.analysis_mode,
         )
+    if analysis.analysis_mode == "trace_upload" and analysis.target_package_name:
+        document = normalized.document
+        mismatched = False
+        for scenario in document["scenario_reports"]:
+            target = scenario["trace_health"]["target_resolution"]
+            observed = target["package_name"]
+            if observed == analysis.target_package_name:
+                continue
+            mismatched = True
+            scenario["core_state"] = "partial"
+            scenario["metrics"] = []
+            scenario["findings"] = []
+            scenario["evidence"] = []
+        if mismatched:
+            limitation_id = uuid5(
+                _LOCAL_RECOVERY_NAMESPACE,
+                f"{analysis.analysis_id}:target-package-mismatch",
+            )
+            document["core_state"] = "partial"
+            document["limitations"].append(
+                {
+                    "limitation_id": str(limitation_id),
+                    "code": "smartperfetto.target_package_mismatch",
+                    "summary": (
+                        "Trace 中识别到的目标应用与请求包名不一致；"
+                        f"仅接受 {analysis.target_package_name} 的证据，本次未输出其他应用的问题结论。"
+                    ),
+                    "evidence_ids": [],
+                }
+            )
+            document["limitations"].sort(key=lambda item: item["limitation_id"])
+            validated = validate_contract("normalized-trace-report", document)
+            canonical_bytes = canonical_json_bytes(validated)
+            normalized = NormalizedTraceReport(
+                canonical_bytes=canonical_bytes,
+                sha256_b64=base64.b64encode(
+                    hashlib.sha256(canonical_bytes).digest()
+                ).decode("ascii"),
+            )
     report_payload = result.payload.get("report")
     if not isinstance(report_payload, Mapping):
         raise ValueError("SmartPerfetto report is invalid")
@@ -1402,6 +1518,27 @@ def _remote_capture_question(
         f"请仅分析目标应用 {package_name} 的{scenario_name}性能；"
         "若 Trace 不包含该应用数据，请明确说明，不要替换成其他应用。"
     )
+
+
+def _trace_upload_question(analysis: _LocalAnalysis) -> str | None:
+    if analysis.target_package_name is None or analysis.trace_test_type is None:
+        return analysis.question
+    scenario = {
+        "cold_start": "cold start",
+        "hot_start": "hot start",
+        "scroll": "scrolling",
+        "other": analysis.custom_test_name or "custom workflow",
+    }[analysis.trace_test_type]
+    parts = [
+        f"Only analyze Android package {analysis.target_package_name}.",
+        f"The captured scenario is {scenario}.",
+        "Ignore unrelated processes and state when target evidence is insufficient.",
+    ]
+    if analysis.trace_test_type == "other" and analysis.custom_test_description:
+        parts.append(f"Custom workflow purpose: {analysis.custom_test_description}")
+    if analysis.question:
+        parts.append(f"Additional analysis context: {analysis.question}")
+    return "\n\n".join(parts)
 
 
 def _missing_scroll_scenario(
@@ -2369,6 +2506,10 @@ class _LocalRuntime:
             ),
             "application_metadata": analysis.application_metadata,
             "capture_configuration": analysis.capture_configuration,
+            "trace_test_type": analysis.trace_test_type,
+            "target_package_name": analysis.target_package_name,
+            "custom_test_name": analysis.custom_test_name,
+            "custom_test_description": analysis.custom_test_description,
             "remote_publication": analysis.remote_publication,
             "profile": analysis.profile,
             "question": analysis.question,
@@ -2913,6 +3054,26 @@ class _LocalRuntime:
                 if isinstance(document.get("capture_configuration"), Mapping)
                 else None
             ),
+            trace_test_type=(
+                str(document["trace_test_type"])  # type: ignore[arg-type]
+                if isinstance(document.get("trace_test_type"), str)
+                else None
+            ),
+            target_package_name=(
+                str(document["target_package_name"])
+                if isinstance(document.get("target_package_name"), str)
+                else None
+            ),
+            custom_test_name=(
+                str(document["custom_test_name"])
+                if isinstance(document.get("custom_test_name"), str)
+                else None
+            ),
+            custom_test_description=(
+                str(document["custom_test_description"])
+                if isinstance(document.get("custom_test_description"), str)
+                else None
+            ),
             remote_publication=(
                 str(document["remote_publication"])  # type: ignore[arg-type]
                 if "remote_publication" in document
@@ -3329,6 +3490,10 @@ class _LocalRuntime:
                     else None
                 ),
                 inputs={item.kind: _LocalInput(item) for item in request.inputs},
+                trace_test_type=request.test_type,
+                target_package_name=request.package_name,
+                custom_test_name=request.custom_test_name,
+                custom_test_description=request.custom_test_description,
                 source_binding=(
                     request.source_binding.binding()
                     if request.source_binding is not None
@@ -4364,7 +4529,7 @@ class _LocalRuntime:
             run = await self.gateway.submit(
                 trace_path=trace_path,
                 profile=analysis.profile,
-                question=analysis.question,
+                question=_trace_upload_question(analysis),
             )
             await self._register_source_run(analysis, run)
             await self._execute_run(analysis, run, generation=generation)
@@ -5282,6 +5447,10 @@ class _LocalRuntime:
             "team_id": str(analysis.team_id),
             "analysis_mode": "trace_upload",
             "analysis_profile": analysis.profile,
+            "test_type": analysis.trace_test_type,
+            "package_name": analysis.target_package_name,
+            "custom_test_name": analysis.custom_test_name,
+            "custom_test_description": analysis.custom_test_description,
             "question": analysis.question,
             "created_at": analysis.created_at.isoformat(),
             "state": analysis.state,

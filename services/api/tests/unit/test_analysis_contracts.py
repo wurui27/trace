@@ -296,6 +296,10 @@ def _trace_analysis_response(*, input_state: str) -> dict[str, object]:
         "completed_at": None,
         "failure": None,
         "analysis_profile": "auto",
+        "test_type": "other",
+        "package_name": "com.rivotek.mediacenter",
+        "custom_test_name": "自定义链路",
+        "custom_test_description": "验证自定义业务链路性能。",
         "question": "为什么滑动卡顿？",
         "input_uploads": [input_upload],
         "stages": [
@@ -418,13 +422,14 @@ def test_memory_create_request_is_closed_without_raw_question_length_limit() -> 
             validator.validate(mutation)
 
 
-def test_trace_create_request_requires_one_trace_and_closes_each_input_kind() -> None:
+def test_trace_create_request_is_package_targeted_and_trace_only() -> None:
     schemas = _schemas()
     validator = _validator("contracts/v1/analyses/create-request.schema.json", schemas)
     payload = {
         "schema_version": "1.0",
         "analysis_mode": "trace_upload",
-        "analysis_profile": "auto",
+        "test_type": "cold_start",
+        "package_name": "com.rivotek.mediacenter",
         "question": "为什么滑动卡顿？",
         "inputs": [
             {
@@ -432,29 +437,26 @@ def test_trace_create_request_requires_one_trace_and_closes_each_input_kind() ->
                 "mime": "application/octet-stream",
                 "size": 4_096,
                 "sha256_b64": _sha(),
-            },
-            {
-                "kind": "mapping",
-                "mime": "text/plain",
-                "size": 1_024,
-                "sha256_b64": "A" * 42 + "E=",
-            },
+            }
         ],
     }
 
     validator.validate(payload)
-    validator.validate({**payload, "analysis_profile": "startup", "question": None})
-    validator.validate(
-        {
-            **payload,
-            "analysis_profile": "scroll",
-            "inputs": list(reversed(payload["inputs"])),
-        }
-    )
+    validator.validate({**payload, "test_type": "hot_start", "question": None})
+    validator.validate({**payload, "test_type": "scroll"})
+    validator.validate({
+        **payload,
+        "test_type": "other",
+        "custom_test_name": "首页首帧",
+        "custom_test_description": "进入首页后等待首帧稳定，用于检查自定义业务链路。",
+    })
 
     invalid_payloads = (
-        {**payload, "analysis_profile": "memory"},
-        {**payload, "inputs": payload["inputs"][1:]},
+        {**payload, "test_type": "auto"},
+        {**payload, "package_name": ""},
+        {**payload, "package_name": "../app"},
+        {**payload, "package_name": "com.demo.app;rm"},
+        {**payload, "inputs": []},
         {**payload, "inputs": [payload["inputs"][0], payload["inputs"][0]]},
         {
             **payload,
@@ -486,6 +488,9 @@ def test_trace_create_request_requires_one_trace_and_closes_each_input_kind() ->
                 }
             ],
         },
+        {**payload, "test_type": "other"},
+        {**payload, "test_type": "other", "custom_test_name": "首页首帧"},
+        {**payload, "custom_test_name": "不应出现", "custom_test_description": "不应出现"},
         {**payload, "unexpected": True},
     )
     for mutation in invalid_payloads:
@@ -496,7 +501,11 @@ def test_trace_create_request_requires_one_trace_and_closes_each_input_kind() ->
 def test_memory_question_whitespace_matches_python_strip_across_regex_runtimes() -> None:
     schemas = _schemas()
     schema = schemas["contracts/v1/analyses/create-request.schema.json"]
-    memory_branch = schema["oneOf"][1]  # type: ignore[index]
+    memory_branch = next(  # type: ignore[union-attr]
+        branch
+        for branch in schema["oneOf"]  # type: ignore[index]
+        if branch["properties"]["analysis_mode"].get("const") == "memory_upload"
+    )
     pattern = memory_branch["properties"]["question"]["oneOf"][0]["pattern"]  # type: ignore[index]
     assert isinstance(pattern, str)
     validator = _validator("contracts/v1/analyses/create-request.schema.json", schemas)

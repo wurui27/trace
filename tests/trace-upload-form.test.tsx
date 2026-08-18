@@ -13,6 +13,23 @@ import {
 
 afterEach(cleanup);
 
+it("requires one targeted trace scenario and hides every auxiliary upload", async () => {
+  const user = userEvent.setup();
+  render(<TraceUploadForm submitter={vi.fn()} />);
+
+  expect(screen.getByLabelText("应用包名")).toBeRequired();
+  expect(screen.getByLabelText("测试类型")).toHaveValue("cold_start");
+  expect(screen.queryByLabelText("APK 文件（可选）")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("内存证据（可选）")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Mapping 文件（可选）")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("Native Symbols（可选）")).not.toBeInTheDocument();
+  expect(screen.queryByLabelText("日志文件（可选）")).not.toBeInTheDocument();
+
+  await user.selectOptions(screen.getByLabelText("测试类型"), "other");
+  expect(screen.getByLabelText("测试名称")).toBeRequired();
+  expect(screen.getByLabelText("测试说明")).toBeRequired();
+});
+
 it("selects an Agent workspace without rendering or reading an Android device", async () => {
   const user = userEvent.setup();
   const devices = vi.fn();
@@ -60,6 +77,7 @@ it("selects an Agent workspace without rendering or reading an Android device", 
     screen.getByLabelText("Trace 文件"),
     new File([new Uint8Array([1])], "startup.trace"),
   );
+  await user.type(screen.getByLabelText("应用包名"), "com.rivotek.mediacenter");
   await user.click(screen.getByRole("button", { name: "开始分析" }));
 
   expect(devices).not.toHaveBeenCalled();
@@ -88,6 +106,10 @@ it("hands the accepted analysis to the dashboard without keeping a result panel"
         team_id: "team-1",
         analysis_mode: "trace_upload" as const,
         analysis_profile: "startup" as const,
+        test_type: "cold_start" as const,
+        package_name: "com.rivotek.mediacenter",
+        custom_test_name: null,
+        custom_test_description: null,
         question: "首帧前为什么慢？",
         state: "analyzing" as const,
         version: 3,
@@ -106,7 +128,8 @@ it("hands the accepted analysis to the dashboard without keeping a result panel"
   const onSubmitted = vi.fn();
   render(<TraceUploadForm submitter={submitter} onSubmitted={onSubmitted} />);
 
-  await user.selectOptions(screen.getByLabelText("分析重点"), "startup");
+  await user.selectOptions(screen.getByLabelText("测试类型"), "cold_start");
+  await user.type(screen.getByLabelText("应用包名"), "com.rivotek.mediacenter");
   await user.type(screen.getByLabelText("补充问题（可选）"), "首帧前为什么慢？");
   await user.upload(
     screen.getByLabelText("Trace 文件"),
@@ -118,9 +141,10 @@ it("hands the accepted analysis to the dashboard without keeping a result panel"
 
   expect(submitter).toHaveBeenCalledOnce();
   expect(submitter.mock.calls[0][0]).toMatchObject({
-    profile: "startup",
+    testType: "cold_start",
+    packageName: "com.rivotek.mediacenter",
     question: "首帧前为什么慢？",
-    files: [{ kind: "trace" }],
+    trace: expect.any(File),
   });
   expect(onSubmitted).toHaveBeenCalledWith(
     expect.objectContaining({
@@ -143,6 +167,7 @@ it("explains when the local analysis service is not configured", async () => {
   });
   render(<TraceUploadForm submitter={submitter} />);
 
+  await user.type(screen.getByLabelText("应用包名"), "com.rivotek.mediacenter");
   await user.upload(
     screen.getByLabelText("Trace 文件"),
     new File([new Uint8Array([1, 2, 3])], "startup.trace"),

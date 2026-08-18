@@ -44,6 +44,7 @@ export type TraceInputKind =
   | "native_symbols"
   | "log";
 export type TraceProfile = "auto" | "startup" | "scroll";
+export type UploadedTraceTestType = "cold_start" | "hot_start" | "scroll" | "other";
 export type AnalysisMode = "device" | "trace_upload" | "memory_upload";
 export type AnalysisState =
   | "creating"
@@ -461,6 +462,10 @@ export interface AnalysisResponse {
   readonly team_id: string;
   readonly analysis_mode: AnalysisMode;
   readonly analysis_profile?: TraceProfile;
+  readonly test_type?: UploadedTraceTestType;
+  readonly package_name?: string;
+  readonly custom_test_name?: string | null;
+  readonly custom_test_description?: string | null;
   readonly question?: string | null;
   readonly state: AnalysisState;
   readonly version: number;
@@ -744,9 +749,12 @@ export interface PerfPilotClient {
   ): Promise<AnalysisResponse>;
   createTrace(
     teamId: string,
-    profile: TraceProfile,
+    testType: UploadedTraceTestType,
+    packageName: string,
+    customTestName: string | null,
+    customTestDescription: string | null,
     question: string | null,
-    inputs: readonly InputDescriptor[],
+    input: InputDescriptor,
     idempotencyKey: string,
     sourceBinding?: SourceBinding,
     signal?: AbortSignal,
@@ -2415,7 +2423,22 @@ function analysisResponse(value: unknown): AnalysisResponse {
   ] as const;
   const modeKeys = object(value)
     ? value.analysis_mode === "trace_upload"
-      ? ["analysis_profile", "question", "input_uploads", "stages", "ai_rounds", "source_analysis"]
+      ? [
+          "analysis_profile",
+          ...("test_type" in value
+            ? [
+                "test_type",
+                "package_name",
+                "custom_test_name",
+                "custom_test_description",
+              ]
+            : []),
+          "question",
+          "input_uploads",
+          "stages",
+          "ai_rounds",
+          "source_analysis",
+        ]
       : value.analysis_mode === "device"
         ? value.schema_version === "1.2"
           ? [
@@ -2468,8 +2491,21 @@ function analysisResponse(value: unknown): AnalysisResponse {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
   if (value.analysis_mode === "trace_upload") {
+    const hasTraceTarget = "test_type" in value;
+    const validTraceTarget =
+      !hasTraceTarget ||
+      (["cold_start", "hot_start", "scroll", "other"].includes(String(value.test_type)) &&
+        typeof value.package_name === "string" &&
+        /^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(value.package_name) &&
+        (value.test_type === "other"
+          ? typeof value.custom_test_name === "string" &&
+            value.custom_test_name.length > 0 &&
+            typeof value.custom_test_description === "string" &&
+            value.custom_test_description.length > 0
+          : value.custom_test_name === null && value.custom_test_description === null));
     if (
       !["auto", "startup", "scroll"].includes(String(value.analysis_profile)) ||
+      !validTraceTarget ||
       (value.question !== null && typeof value.question !== "string") ||
       !Array.isArray(value.input_uploads) ||
       !validStages(value.stages) ||
@@ -2847,9 +2883,12 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
     },
     async createTrace(
       teamId,
-      profile,
+      testType,
+      packageName,
+      customTestName,
+      customTestDescription,
       question,
-      inputs,
+      input,
       idempotencyKey,
       sourceBinding,
       signal,
@@ -2861,14 +2900,19 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
           body: JSON.stringify({
             schema_version: sourceBinding ? "1.1" : "1.0",
             analysis_mode: "trace_upload",
-            analysis_profile: profile,
+            test_type: testType,
+            package_name: packageName,
+            ...(customTestName === null ? {} : { custom_test_name: customTestName }),
+            ...(customTestDescription === null
+              ? {}
+              : { custom_test_description: customTestDescription }),
             question,
-            inputs: inputs.map((input) => ({
+            inputs: [{
               kind: input.kind,
               mime: input.mime,
               size: input.size,
               sha256_b64: input.sha256_b64,
-            })),
+            }],
             ...(sourceBinding ? { source_binding: sourceBinding } : {}),
           }),
         },
@@ -3099,23 +3143,6 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
   };
 }
 
-async function mapConcurrent<T, R>(
-  values: readonly T[],
-  limit: number,
-  task: (value: T, index: number) => Promise<R>,
-): Promise<R[]> {
-  const results = new Array<R>(values.length);
-  let cursor = 0;
-  async function worker(): Promise<void> {
-    while (cursor < values.length) {
-      const index = cursor++;
-      results[index] = await task(values[index], index);
-    }
-  }
-  await Promise.all(Array.from({ length: Math.min(limit, values.length) }, worker));
-  return results;
-}
-
 export type TraceSubmissionPhase =
   | "session"
   | "hashing"
@@ -3124,9 +3151,12 @@ export type TraceSubmissionPhase =
   | "submitted";
 
 export interface SubmitTraceInput {
-  readonly profile: TraceProfile;
+  readonly testType: UploadedTraceTestType;
+  readonly packageName: string;
+  readonly customTestName?: string;
+  readonly customTestDescription?: string;
   readonly question?: string;
-  readonly files: readonly TraceFileSelection[];
+  readonly trace: File;
   readonly sourceBinding?: SourceBinding;
   readonly signal?: AbortSignal;
   readonly onProgress?: (phase: TraceSubmissionPhase, detail?: string) => void;
@@ -3150,18 +3180,25 @@ export async function enqueueTraceAnalysis(
   const client = dependencies.client ?? createPerfPilotClient();
   const randomUUID = dependencies.randomUUID ?? createRandomUuid;
   const { signal, onProgress } = submission;
-  if (!["auto", "startup", "scroll"].includes(submission.profile)) {
-    throw new PerfPilotApiError("invalid_profile", "请选择分析重点", false, null);
+  if (!["cold_start", "hot_start", "scroll", "other"].includes(submission.testType)) {
+    throw new PerfPilotApiError("invalid_test_type", "请选择测试类型", false, null);
   }
-  const kinds = new Set<TraceInputKind>();
-  for (const selection of submission.files) {
-    if (kinds.has(selection.kind)) {
-      throw new PerfPilotApiError("duplicate_input", "同类文件只能选择一个", false, null);
-    }
-    kinds.add(selection.kind);
-  }
-  if (!kinds.has("trace")) {
+  if (!(submission.trace instanceof File)) {
     throw new PerfPilotApiError("trace_required", "请选择 Trace 文件", false, null);
+  }
+  const packageName = submission.packageName.trim();
+  if (!/^[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+$/.test(packageName)) {
+    throw new PerfPilotApiError("invalid_package_name", "请输入有效的 Android 包名", false, null);
+  }
+  const customTestName = submission.customTestName?.trim() || null;
+  const customTestDescription = submission.customTestDescription?.trim() || null;
+  if (
+    (submission.testType === "other" &&
+      (customTestName === null || customTestDescription === null)) ||
+    (submission.testType !== "other" &&
+      (customTestName !== null || customTestDescription !== null))
+  ) {
+    throw new PerfPilotApiError("invalid_custom_test", "请完整填写自定义测试说明", false, null);
   }
   const question = submission.question?.trim() || null;
   if (question !== null && Array.from(question).length > 2_000) {
@@ -3177,30 +3214,23 @@ export async function enqueueTraceAnalysis(
   }
 
   onProgress?.("hashing");
-  const descriptors = await mapConcurrent(submission.files, 2, async (selection) => ({
-    kind: selection.kind,
-    file: selection.file,
-    mime: inputMime(selection),
-    size: selection.file.size,
-    sha256_b64: await sha256Base64(selection.file, signal),
-  }));
-  const order: TraceInputKind[] = [
-    "trace",
-    "memory_evidence",
-    "apk",
-    "source_archive",
-    "mapping",
-    "native_symbols",
-    "log",
-  ];
-  descriptors.sort((left, right) => order.indexOf(left.kind) - order.indexOf(right.kind));
+  const descriptor = {
+    kind: "trace" as const,
+    file: submission.trace,
+    mime: inputMime({ kind: "trace", file: submission.trace }),
+    size: submission.trace.size,
+    sha256_b64: await sha256Base64(submission.trace, signal),
+  };
 
   onProgress?.("creating");
   const created = await client.createTrace(
     teamId,
-    submission.profile,
+    submission.testType,
+    packageName,
+    customTestName,
+    customTestDescription,
     question,
-    descriptors,
+    descriptor,
     randomUUID(),
     submission.sourceBinding,
     signal,
@@ -3210,15 +3240,18 @@ export async function enqueueTraceAnalysis(
   }
 
   onProgress?.("uploading");
-  await mapConcurrent(descriptors, 2, async (input) => {
-    onProgress?.("uploading", input.kind);
-    const slot = await client.reserveInput(teamId, created.analysis_id, input, signal);
-    if (slot.upload.state === "finalized") {
-      return;
-    }
-    await client.putInput(slot, input, signal);
-    await client.finalizeInput(teamId, created.analysis_id, input, slot.upload.upload_id, signal);
-  });
+  onProgress?.("uploading", descriptor.kind);
+  const slot = await client.reserveInput(teamId, created.analysis_id, descriptor, signal);
+  if (slot.upload.state !== "finalized") {
+    await client.putInput(slot, descriptor, signal);
+    await client.finalizeInput(
+      teamId,
+      created.analysis_id,
+      descriptor,
+      slot.upload.upload_id,
+      signal,
+    );
+  }
 
   const current = await client.analysis(teamId, created.analysis_id, signal);
   onProgress?.("submitted", created.analysis_id);

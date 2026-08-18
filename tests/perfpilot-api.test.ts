@@ -590,6 +590,14 @@ describe("PerfPilot browser API", () => {
   it("returns after upload acceptance without polling the Trace to a terminal state", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     let statusReads = 0;
+    const targetedAnalysis = (state: "created" | "analyzing" | "completed") => ({
+      ...sourceAwareAnalysis(state),
+      analysis_profile: "scroll",
+      test_type: "scroll",
+      package_name: "com.rivotek.mediacenter",
+      custom_test_name: null,
+      custom_test_description: null,
+    });
     const sourceBinding = {
       provider_kind: "agent_workspace" as const,
       agent_id: AGENT_ID,
@@ -630,7 +638,7 @@ describe("PerfPilot browser API", () => {
         });
       }
       if (url === `/api/v1/teams/${TEAM_ID}/analyses` && init.method === "POST") {
-        return Response.json(sourceAwareAnalysis("created"), { status: 201 });
+        return Response.json(targetedAnalysis("created"), { status: 201 });
       }
       const slot = url.match(/\/analyses\/[^/]+\/uploads$/);
       if (slot) {
@@ -683,26 +691,20 @@ describe("PerfPilot browser API", () => {
       if (url.endsWith(`/analyses/${ANALYSIS_ID}`)) {
         statusReads += 1;
         return Response.json(
-          sourceAwareAnalysis(statusReads === 1 ? "analyzing" : "completed"),
+          targetedAnalysis(statusReads === 1 ? "analyzing" : "completed"),
         );
       }
       throw new Error(`undeclared request: ${url}`);
     });
     const client = createPerfPilotClient({ fetcher });
     const trace = new File([new Uint8Array([1, 2, 3])], "scroll.trace");
-    const mapping = new File([new Uint8Array([4, 5])], "mapping.txt", {
-      type: "text/plain",
-    });
-
     const sleep = vi.fn(async () => undefined);
     const result = await submitTraceAnalysis(
       {
-        profile: "scroll",
+        testType: "scroll",
+        packageName: "com.rivotek.mediacenter",
         question: "为什么掉帧？",
-        files: [
-          { kind: "trace", file: trace },
-          { kind: "mapping", file: mapping },
-        ],
+        trace,
         sourceBinding,
       },
       {
@@ -723,21 +725,18 @@ describe("PerfPilot browser API", () => {
     expect(JSON.parse(String(create?.init.body))).toMatchObject({
       schema_version: "1.1",
       analysis_mode: "trace_upload",
-      analysis_profile: "scroll",
+      test_type: "scroll",
+      package_name: "com.rivotek.mediacenter",
       question: "为什么掉帧？",
-      inputs: [
-        { kind: "trace", mime: "application/octet-stream", size: 3 },
-        { kind: "mapping", mime: "text/plain", size: 2 },
-      ],
+      inputs: [{ kind: "trace", mime: "application/octet-stream", size: 3 }],
       source_binding: sourceBinding,
     });
     const slots = calls.filter((call) => call.url.endsWith("/uploads"));
     expect(slots.map((call) => new Headers(call.init.headers).get("idempotency-key"))).toEqual([
       "input-trace",
-      "input-mapping",
     ]);
     const puts = calls.filter((call) => call.url.startsWith("https://objects.example/"));
-    expect(puts).toHaveLength(2);
+    expect(puts).toHaveLength(1);
     expect(new Headers(puts[0].init.headers)).toEqual(
       new Headers({
         "Content-Type": "application/octet-stream",

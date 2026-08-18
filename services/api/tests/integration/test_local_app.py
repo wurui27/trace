@@ -753,7 +753,9 @@ def test_local_app_persists_team_owned_agents_and_source_workspaces(
             headers=first_headers,
             json={
                 "schema_version": "1.1", "analysis_mode": "trace_upload",
-                "analysis_profile": "auto", "inputs": [{
+                "test_type": "cold_start",
+                "package_name": "com.example",
+                "inputs": [{
                     "kind": "trace", "mime": "application/octet-stream", "size": 1,
                     "sha256_b64": base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
                 }],
@@ -1497,7 +1499,8 @@ def test_local_bound_trace_dispatches_signed_source_context_task(
             json={
                 "schema_version": "1.1",
                 "analysis_mode": "trace_upload",
-                "analysis_profile": "startup",
+                "test_type": "cold_start",
+                "package_name": "com.example",
                 "inputs": [
                     {
                         "kind": "trace",
@@ -1941,6 +1944,40 @@ def test_script_capture_question_fences_smartperfetto_to_selected_package() -> N
 
     assert "com.rivotek.mediacenter" in question
     assert "不要替换成其他应用" in question
+
+
+def test_uploaded_trace_drops_findings_for_another_target_package() -> None:
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={
+            "trace": _LocalInput(
+                _InputDescriptor(
+                    kind="trace",
+                    mime="application/octet-stream",
+                    size=1,
+                    sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+                )
+            )
+        },
+        trace_test_type="cold_start",
+        target_package_name="com.rivotek.mediacenter",
+    )
+
+    normalized = _normalize_local_smartperfetto_result(
+        analysis,
+        _live_smartperfetto_result(),
+        profile="startup",
+    ).report.document
+
+    assert normalized["core_state"] == "partial"
+    assert normalized["scenario_reports"][0]["findings"] == []
+    assert normalized["scenario_reports"][0]["metrics"] == []
+    assert {item["code"] for item in normalized["limitations"]} >= {
+        "smartperfetto.target_package_mismatch"
+    }
 
 
 def test_local_restart_degrades_waiting_source_and_finishes_persisted_report(
@@ -2992,7 +3029,8 @@ def _create_trace_analysis(
         json={
             "schema_version": "1.0",
             "analysis_mode": "trace_upload",
-            "analysis_profile": "startup",
+            "test_type": "cold_start",
+            "package_name": "com.example",
             "question": "首帧为什么慢？",
             "inputs": [
                 {
@@ -3148,7 +3186,8 @@ def test_local_source_binding_disabled_persistence_and_old_json_compatibility(
     body = {
         "schema_version": "1.1",
         "analysis_mode": "trace_upload",
-        "analysis_profile": "auto",
+        "test_type": "cold_start",
+        "package_name": "com.example",
         "question": None,
         "inputs": [
             {
@@ -3196,7 +3235,8 @@ def test_local_source_code_analysis_environment_enables_factory(
     body = {
         "schema_version": "1.1",
         "analysis_mode": "trace_upload",
-        "analysis_profile": "auto",
+        "test_type": "cold_start",
+        "package_name": "com.example",
         "question": None,
         "inputs": [
             {
@@ -5997,7 +6037,8 @@ def test_local_app_lists_one_active_analysis_and_rejects_a_second(
             json={
                 "schema_version": "1.0",
                 "analysis_mode": "trace_upload",
-                "analysis_profile": "auto",
+                "test_type": "cold_start",
+                "package_name": "com.example",
                 "question": None,
                 "inputs": [
                     {
@@ -6311,6 +6352,11 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
     expected_finding: str | None,
 ) -> None:
     trace = b"local-perfetto-trace"
+    target_package = (
+        "com.example.app"
+        if result_factory is _live_smartperfetto_result
+        else "com.example"
+    )
     checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
     gateway = _FakeSmartPerfettoGateway(result_factory())
     app = create_local_app(
@@ -6338,7 +6384,8 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
             json={
                 "schema_version": "1.0",
                 "analysis_mode": "trace_upload",
-                "analysis_profile": "startup",
+                "test_type": "cold_start",
+                "package_name": target_package,
                 "question": "首帧为什么慢？",
                 "inputs": [
                     {
@@ -6351,7 +6398,12 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
             },
         )
         assert created.status_code == 201
-        analysis_id = created.json()["analysis_id"]
+        created_document = created.json()
+        assert created_document["test_type"] == "cold_start"
+        assert created_document["package_name"] == target_package
+        assert created_document["custom_test_name"] is None
+        assert created_document["custom_test_description"] is None
+        analysis_id = created_document["analysis_id"]
 
         reserved = client.post(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/uploads",
@@ -6405,7 +6457,16 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
         assert terminal.json()["ai_rounds"] == [
             {"round": 1, "role": "report", "state": "completed", "attempts": 1}
         ]
-        assert gateway.submissions == [(trace, "startup", "首帧为什么慢？")]
+        assert gateway.submissions == [
+            (
+                trace,
+                "startup",
+                f"Only analyze Android package {target_package}.\n\n"
+                "The captured scenario is cold start.\n\n"
+                "Ignore unrelated processes and state when target evidence is insufficient.\n\n"
+                "Additional analysis context: 首帧为什么慢？",
+            )
+        ]
 
         report = client.get(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/report",
@@ -6734,7 +6795,8 @@ def test_local_app_restores_a_completed_report_after_restart(tmp_path: Path) -> 
             json={
                 "schema_version": "1.0",
                 "analysis_mode": "trace_upload",
-                "analysis_profile": "startup",
+                "test_type": "cold_start",
+                "package_name": "com.example",
                 "question": None,
                 "inputs": [
                     {

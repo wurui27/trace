@@ -101,6 +101,25 @@
       ]
     },
     "analysis_profile": {"enum": ["auto", "startup", "scroll"]},
+    "test_type": {"enum": ["cold_start", "hot_start", "scroll", "other"]},
+    "package_name": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 255,
+      "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+    },
+    "custom_test_name": {
+      "oneOf": [
+        {"type": "string", "minLength": 1, "maxLength": 80},
+        {"type": "null"}
+      ]
+    },
+    "custom_test_description": {
+      "oneOf": [
+        {"type": "string", "minLength": 1, "maxLength": 500},
+        {"type": "null"}
+      ]
+    },
     "input_uploads": {
       "type": "array",
       "maxItems": 7,
@@ -305,6 +324,13 @@
             "sample_verdict_counts": {"$ref": "#/$defs/zeroVerdictCounts"},
             "active_lease": {"type": "null"},
             "analysis_profile": {"enum": ["auto", "startup", "scroll"]},
+            "test_type": {"enum": ["cold_start", "hot_start", "scroll", "other"]},
+            "package_name": {
+              "type": "string",
+              "minLength": 3,
+              "maxLength": 255,
+              "pattern": "^[A-Za-z][A-Za-z0-9_]*(?:\\.[A-Za-z][A-Za-z0-9_]*)+$"
+            },
             "question": {
               "oneOf": [
                 {"type": "string", "maxLength": 2000},
@@ -313,7 +339,8 @@
             },
             "input_uploads": {
               "type": "array",
-              "maxItems": 7,
+              "minItems": 1,
+              "maxItems": 1,
               "items": {
                 "oneOf": [
                   {"$ref": "#/$defs/awaitingInputUpload"},
@@ -326,10 +353,30 @@
           "required": [
             "analysis_mode",
             "analysis_profile",
+            "test_type",
+            "package_name",
+            "custom_test_name",
+            "custom_test_description",
             "question",
             "input_uploads",
             "stages",
             "apk_upload"
+          ],
+          "oneOf": [
+            {
+              "properties": {
+                "test_type": {"const": "other"},
+                "custom_test_name": {"type": "string"},
+                "custom_test_description": {"type": "string"}
+              }
+            },
+            {
+              "properties": {
+                "test_type": {"enum": ["cold_start", "hot_start", "scroll"]},
+                "custom_test_name": {"type": "null"},
+                "custom_test_description": {"type": "null"}
+              }
+            }
           ],
           "not": {"required": ["device_id"]}
         }
