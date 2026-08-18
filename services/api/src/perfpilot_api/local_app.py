@@ -110,15 +110,11 @@ from perfpilot_api.reports.smartperfetto_live_normalizer import (
     normalize_live_smartperfetto_result,
 )
 from perfpilot_api.reports.smartperfetto_original import (
-    SmartPerfettoOriginalCollectionBinding,
     SmartPerfettoOriginalInvalid,
     SmartPerfettoOriginalNotFound,
     SmartPerfettoOriginalReference,
     persist_smartperfetto_original,
-    persist_smartperfetto_scenario_original,
     read_smartperfetto_original,
-    read_smartperfetto_original_collection,
-    read_smartperfetto_scenario_original,
     restore_smartperfetto_original,
 )
 from perfpilot_api.reports.projection import (
@@ -899,10 +895,7 @@ class _PreparedLocalReport:
     canonical_sha256_b64: str
     normalizer_version: str
     source_report: dict[str, object]
-    original_report_bytes: bytes | None = field(default=None, repr=False)
-    scenario_original_reports: tuple[
-        tuple[Literal["startup", "scroll"], dict[str, object], bytes | None], ...
-    ] = field(default=(), repr=False)
+    original_report_html_bytes: bytes | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -911,7 +904,7 @@ class _NormalizedLocalResult:
     artifact_id: UUID
     canonical_sha256_b64: str
     source_report: dict[str, object]
-    original_report_bytes: bytes | None = field(default=None, repr=False)
+    original_report_html_bytes: bytes | None = field(default=None, repr=False)
 
 
 _PERSISTED_STATE_KEYS = {
@@ -1387,7 +1380,7 @@ def _normalize_local_smartperfetto_result(
         artifact_id=artifact_id,
         canonical_sha256_b64=canonical.checksum_sha256_b64,
         source_report=dict(report_payload),
-        original_report_bytes=result.original_report_bytes,
+        original_report_html_bytes=result.original_report_html_bytes,
     )
 
 
@@ -1845,31 +1838,7 @@ def _prepare_local_report(
         canonical_sha256_b64=primary.canonical_sha256_b64,
         normalizer_version=normalizer_version,
         source_report=primary.source_report,
-        original_report_bytes=primary.original_report_bytes,
-        scenario_original_reports=(
-            tuple(
-                (
-                    scenario_type,  # type: ignore[misc]
-                    item.source_report,
-                    item.original_report_bytes,
-                )
-                for scenario_type, item in (
-                    (
-                        primary_profile
-                        or (
-                            "startup"
-                            if "startup" in remote_completed_scenarios
-                            else "scroll"
-                        ),
-                        primary,
-                    ),
-                    ("scroll", scroll),
-                )
-                if scenario_type in remote_completed_scenarios and item is not None
-            )
-            if remote_completed_scenarios is not None
-            else ()
-        ),
+        original_report_html_bytes=primary.original_report_html_bytes,
     )
 
 
@@ -4789,41 +4758,15 @@ class _LocalRuntime:
         )
         if analysis.smartperfetto_original is not None:
             original_binding = analysis.smartperfetto_original
-        elif prepared.scenario_original_reports:
-            scenario_bindings = []
-            for (
-                scenario_type,
-                source_report,
-                original_bytes,
-            ) in prepared.scenario_original_reports:
-                scenario_bindings.append(
-                    await asyncio.to_thread(
-                        persist_smartperfetto_scenario_original,
-                        root=self.data_root,
-                        team_id=analysis.team_id,
-                        analysis_id=analysis.analysis_id,
-                        scenario_type=scenario_type,
-                        **(
-                            {"payload": original_bytes}
-                            if original_bytes is not None
-                            else {"document": source_report}
-                        ),
-                    )
-                )
-            original_binding = SmartPerfettoOriginalCollectionBinding(
-                reports=tuple(scenario_bindings)
-            )
         else:
+            if prepared.original_report_html_bytes is None:
+                raise SmartPerfettoOriginalInvalid
             original_binding = await asyncio.to_thread(
                 persist_smartperfetto_original,
                 root=self.data_root,
                 team_id=analysis.team_id,
                 analysis_id=analysis.analysis_id,
-                **(
-                    {"payload": prepared.original_report_bytes}
-                    if prepared.original_report_bytes is not None
-                    else {"document": prepared.source_report}
-                ),
+                payload=prepared.original_report_html_bytes,
             )
         await asyncio.to_thread(
             self.store.save_document,
@@ -6330,7 +6273,6 @@ def create_local_app(
         team_id: UUID,
         analysis_id: UUID,
         download: Annotated[Literal["true"] | None, Query()] = None,
-        scenario: Annotated[Literal["startup", "scroll"] | None, Query()] = None,
     ) -> Response:
         authorize_team(request, team_id)
         analysis = await runtime.analysis(team_id, analysis_id)
@@ -6343,34 +6285,13 @@ def create_local_app(
                 False,
             )
         try:
-            if isinstance(binding, SmartPerfettoOriginalCollectionBinding):
-                if scenario is not None:
-                    entry = binding.for_scenario(scenario)
-                    payload = await asyncio.to_thread(
-                        read_smartperfetto_scenario_original,
-                        root=runtime.data_root,
-                        entry=entry,
-                        team_id=team_id,
-                        analysis_id=analysis_id,
-                    )
-                else:
-                    payload = await asyncio.to_thread(
-                        read_smartperfetto_original_collection,
-                        root=runtime.data_root,
-                        binding=binding,
-                        team_id=team_id,
-                        analysis_id=analysis_id,
-                    )
-            else:
-                if scenario is not None:
-                    raise SmartPerfettoOriginalNotFound
-                payload = await asyncio.to_thread(
-                    read_smartperfetto_original,
-                    root=runtime.data_root,
-                    binding=binding,
-                    team_id=team_id,
-                    analysis_id=analysis_id,
-                )
+            payload = await asyncio.to_thread(
+                read_smartperfetto_original,
+                root=runtime.data_root,
+                binding=binding,
+                team_id=team_id,
+                analysis_id=analysis_id,
+            )
         except SmartPerfettoOriginalNotFound:
             raise ApiError(
                 "smartperfetto_original_not_found",
@@ -6390,13 +6311,9 @@ def create_local_app(
             "x-content-type-options": "nosniff",
         }
         if download == "true":
-            filename = (
-                f"smartperfetto-{analysis_id}-{scenario}.json"
-                if scenario is not None
-                else f"smartperfetto-{analysis_id}.json"
-            )
+            filename = f"smartperfetto-{analysis_id}.html"
             headers["content-disposition"] = f'attachment; filename="{filename}"'
-        return Response(payload, media_type="application/json", headers=headers)
+        return Response(payload, media_type="text/html", headers=headers)
 
     @app.post(
         "/v1/teams/{team_id}/analyses/{analysis_id}/synthesis-runs",

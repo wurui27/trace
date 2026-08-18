@@ -63,6 +63,9 @@ from perfpilot_api.local_device_capture import (
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
+from perfpilot_api.reports.smartperfetto_original import (
+    persist_smartperfetto_original,
+)
 from perfpilot_api.reports.source_context import validate_source_context
 from perfpilot_api.security.task_snapshots import (
     validate_source_task_snapshot,
@@ -141,9 +144,21 @@ class TestClient(_RawTestClient):
 
 
 class _FakeSmartPerfettoGateway:
-    def __init__(self, result: EngineResult, *, original_report_bytes: bytes | None = None) -> None:
-        self.result = result
-        self.original_report_bytes = original_report_bytes
+    def __init__(
+        self,
+        result: EngineResult,
+        *,
+        original_report_html_bytes: bytes = (
+            b"<!DOCTYPE html><html><body>SmartPerfetto</body></html>"
+        ),
+    ) -> None:
+        self.original_report_html_bytes = original_report_html_bytes
+        self.result = EngineResult(
+            contract=result.contract,
+            state=result.state,
+            payload=result.payload,
+            original_report_html_bytes=original_report_html_bytes,
+        )
         self.submissions: list[tuple[bytes, str, str | None]] = []
         self.cancel_calls: list[LocalEngineRun] = []
 
@@ -163,14 +178,7 @@ class _FakeSmartPerfettoGateway:
 
     async def fetch_result(self, run: LocalEngineRun) -> EngineResult:
         assert run.run_id == "run-local-1"
-        if self.original_report_bytes is None:
-            return self.result
-        return EngineResult(
-            contract=self.result.contract,
-            state=self.result.state,
-            payload=self.result.payload,
-            original_report_bytes=self.original_report_bytes,
-        )
+        return self.result
 
     async def cancel(self, run: LocalEngineRun) -> None:
         self.cancel_calls.append(run)
@@ -304,10 +312,10 @@ class _ScenarioOriginalSmartPerfettoGateway(_FakeSmartPerfettoGateway):
         self,
         result: EngineResult,
         *,
-        original_report_bytes: dict[str, bytes],
+        original_report_html_bytes: dict[str, bytes],
     ) -> None:
         super().__init__(result)
-        self.original_report_bytes_by_profile = original_report_bytes
+        self.original_report_html_bytes_by_profile = original_report_html_bytes
         self._runs: dict[str, str] = {}
 
     async def submit(
@@ -335,7 +343,9 @@ class _ScenarioOriginalSmartPerfettoGateway(_FakeSmartPerfettoGateway):
             contract=self.result.contract,
             state=self.result.state,
             payload=self.result.payload,
-            original_report_bytes=self.original_report_bytes_by_profile[profile],
+            original_report_html_bytes=self.original_report_html_bytes_by_profile[
+                profile
+            ],
         )
 
 
@@ -345,9 +355,12 @@ class _ScenarioSubmitFailingSmartPerfettoGateway(_ScenarioOriginalSmartPerfettoG
         result: EngineResult,
         *,
         failed_profile: str,
-        original_report_bytes: dict[str, bytes],
+        original_report_html_bytes: dict[str, bytes],
     ) -> None:
-        super().__init__(result, original_report_bytes=original_report_bytes)
+        super().__init__(
+            result,
+            original_report_html_bytes=original_report_html_bytes,
+        )
         self.failed_profile = failed_profile
 
     async def submit(
@@ -1978,6 +1991,12 @@ def test_local_restart_degrades_waiting_source_and_finishes_persisted_report(
     source_result = _smartperfetto_result()
     prepared = _prepare_local_report(analysis, source_result)
     store = LocalAnalysisStore(data_root)
+    analysis.smartperfetto_original = persist_smartperfetto_original(
+        root=data_root,
+        team_id=user.team_id,
+        analysis_id=analysis.analysis_id,
+        payload=b"<!DOCTYPE html><html><body>SmartPerfetto</body></html>",
+    )
     store.save_document(
         user.team_id,
         analysis.analysis_id,
@@ -2785,6 +2804,9 @@ def _smartperfetto_result() -> EngineResult:
         contract="workspace-agent-v1",
         state="completed",
         payload=payload,
+        original_report_html_bytes=(
+            b"<!DOCTYPE html><html><body>SmartPerfetto</body></html>"
+        ),
     )
 
 
@@ -4531,20 +4553,13 @@ def test_local_remote_capture_report_runs_real_agent_lifecycle(
             "fields"
         ]["mapped_symbol"] = "demo.Startup.init"
     scenario_originals = {
-        scenario_type: json.dumps(
-            {
-                **smartperfetto_result.payload["report"],
-                "analysisNotes": [f"{scenario_type} original"],
-                **(
-                    {"boundedPayload": "x" * 1_100_000}
-                    if outcome == "completed"
-                    else {}
-                ),
-            },
-            ensure_ascii=True,
-            indent=2,
-        ).encode("utf-8")
-        + b"\n"
+        scenario_type: (
+            b"<!DOCTYPE html><html><body><h1>SmartPerfetto "
+            + scenario_type.encode("ascii")
+            + b"</h1>"
+            + (b"x" * 1_100_000 if outcome == "completed" else b"")
+            + b"</body></html>"
+        )
         for scenario_type in ("startup", "scroll")
     }
     smartperfetto = (
@@ -4559,7 +4574,7 @@ def test_local_remote_capture_report_runs_real_agent_lifecycle(
         smartperfetto = (
             _ScenarioOriginalSmartPerfettoGateway(
                 smartperfetto_result,
-                original_report_bytes=scenario_originals,
+                original_report_html_bytes=scenario_originals,
             )
             if outcome == "completed"
             else _BlockingRemoteSmartPerfettoGateway(smartperfetto_result)
@@ -4993,30 +5008,22 @@ def test_local_remote_capture_report_runs_real_agent_lifecycle(
         assert projected["state"] == "completed"
         assert projected["failure"] is None
         original_metadata = report["smartperfetto_original"]
-        assert original_metadata["mode"] == "scenario_collection"
-        assert [item["scenario_type"] for item in original_metadata["reports"]] == [
-            "startup",
-            "scroll",
-        ]
+        assert original_metadata["mime"] == "text/html"
+        assert original_metadata["version"] == 2
         originals = client.get(
             f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}/smartperfetto-original"
         )
         assert originals.status_code == 200, originals.text
-        assert [item["scenario_type"] for item in originals.json()["reports"]] == [
-            "startup",
-            "scroll",
-        ]
-        for scenario_type in ("startup", "scroll"):
-            downloaded = client.get(
-                f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
-                f"/smartperfetto-original?scenario={scenario_type}&download=true"
-            )
-            assert downloaded.status_code == 200, downloaded.text
-            assert downloaded.content == scenario_originals[scenario_type]
-            assert downloaded.headers["content-disposition"] == (
-                f'attachment; filename="smartperfetto-{created["analysis_id"]}-'
-                f'{scenario_type}.json"'
-            )
+        assert originals.content == scenario_originals["startup"]
+        downloaded = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
+            "/smartperfetto-original?download=true"
+        )
+        assert downloaded.status_code == 200, downloaded.text
+        assert downloaded.content == scenario_originals["startup"]
+        assert downloaded.headers["content-disposition"] == (
+            f'attachment; filename="smartperfetto-{created["analysis_id"]}.html"'
+        )
     elif outcome == "source_strong":
         assert report_response.status_code == 200, report_response.text
         report = report_response.json()
@@ -5055,16 +5062,14 @@ def test_local_remote_capture_report_runs_real_agent_lifecycle(
         assert projected["state"] == "partially_completed"
         assert projected["scenarios"][2]["state"] == "not_requested"
         original_metadata = report["smartperfetto_original"]
-        assert original_metadata["mode"] == "scenario_collection"
-        assert [item["scenario_type"] for item in original_metadata["reports"]] == [
-            "startup"
-        ]
-        missing_original = client.get(
+        assert original_metadata["mime"] == "text/html"
+        assert original_metadata["version"] == 2
+        original = client.get(
             f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
-            "/smartperfetto-original?scenario=scroll"
+            "/smartperfetto-original"
         )
-        assert missing_original.status_code == 404
-        assert "path" not in missing_original.text.lower()
+        assert original.status_code == 200
+        assert original.headers["content-type"].startswith("text/html")
     elif outcome == "smartperfetto_all_failed":
         assert projected["state"] == "failed"
         assert projected["failure"]["code"] == "smartperfetto_all_failed"
@@ -5409,19 +5414,23 @@ def test_local_remote_scenario_failure_preserves_other_scenario_report(
     successful = "scroll" if failed_profile == "startup" else "startup"
     result = _smartperfetto_scenario_result(successful)
     originals = {
-        scenario: json.dumps({"scenario": scenario}).encode()
+        scenario: (
+            b"<!DOCTYPE html><html><body><h1>SmartPerfetto "
+            + scenario.encode("ascii")
+            + b"</h1></body></html>"
+        )
         for scenario in ("startup", "scroll")
     }
     gateway = (
         _ScenarioSubmitFailingSmartPerfettoGateway(
             result,
             failed_profile=failed_profile,
-            original_report_bytes=originals,
+            original_report_html_bytes=originals,
         )
         if failure_boundary == "submit"
         else _ScenarioOriginalSmartPerfettoGateway(
             result,
-            original_report_bytes=originals,
+            original_report_html_bytes=originals,
         )
     )
     provider = _CountingProjectionReportProvider()
@@ -5566,11 +5575,7 @@ def test_local_remote_scenario_failure_preserves_other_scenario_report(
         )
         downloaded = client.get(
             f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
-            f"/smartperfetto-original?scenario={successful}&download=true"
-        )
-        missing_original = client.get(
-            f"/v1/teams/{user.team_id}/analyses/{created['analysis_id']}"
-            f"/smartperfetto-original?scenario={failed_profile}"
+            "/smartperfetto-original?download=true"
         )
         core = app.state.local_runtime.store.load_document(
             user.team_id,
@@ -5598,13 +5603,11 @@ def test_local_remote_scenario_failure_preserves_other_scenario_report(
     assert scenario_reports[failed_profile]["bundle"]["metrics"] == []
     assert [item[0] for item in gateway.submissions] == [f"{successful}-trace".encode()]
     assert provider.calls == 1
-    assert [
-        item["scenario_type"] for item in report["smartperfetto_original"]["reports"]
-    ] == [successful]
+    assert report["smartperfetto_original"]["mime"] == "text/html"
+    assert report["smartperfetto_original"]["version"] == 2
     assert analysis_response.json()["scenarios"][2]["state"] == "not_requested"
     assert downloaded.status_code == 200
     assert downloaded.content == originals[successful]
-    assert missing_original.status_code == 404
     assert "private" not in report_response.text.lower()
     assert core is not None
     assert {item["scenario_type"] for item in core["scenario_reports"]} == {
@@ -6429,13 +6432,14 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
             f"/v1/teams/{team_id}/analyses/{analysis_id}/smartperfetto-original?download=true"
         )
         assert original.status_code == 200
-        assert original.content == canonical_json_bytes(result_factory().payload["report"])
+        assert original.content == gateway.original_report_html_bytes
+        assert original.headers["content-type"].startswith("text/html")
         assert original.headers["cache-control"] == "private, no-store"
         assert original.headers["x-content-type-options"] == "nosniff"
         assert "content-disposition" not in original.headers
         assert downloaded.content == original.content
         assert downloaded.headers["content-disposition"] == (
-            f'attachment; filename="smartperfetto-{analysis_id}.json"'
+            f'attachment; filename="smartperfetto-{analysis_id}.html"'
         )
         analysis_directory = tmp_path / "teams" / team_id / "analyses" / analysis_id
         assert (analysis_directory / "round-1.json").is_file()
@@ -6451,23 +6455,19 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
             }
 
 
-def test_local_app_downloads_exact_upstream_smartperfetto_report_bytes(
+def test_local_app_downloads_exact_upstream_smartperfetto_html_bytes(
     tmp_path: Path,
 ) -> None:
     result = _smartperfetto_result()
-    source = result.payload["report"]
-    assert isinstance(source, dict)
-    reordered = {key: source[key] for key in reversed(source)}
-    reordered["analysisNotes"] = ["原始结论"]
-    raw = json.dumps(reordered, ensure_ascii=True, indent=2).encode("utf-8") + b"\n"
-    parsed = json.loads(raw)
-    result = EngineResult(
-        contract=result.contract,
-        state=result.state,
-        payload={"reportId": parsed["reportId"], "report": parsed},
+    raw = (
+        b'<!DOCTYPE html>\n<html><body data-order="b a">'
+        b'\xe4\xb8\xad\\u6587</body></html>\n'
     )
     app = create_local_app(
-        gateway=_FakeSmartPerfettoGateway(result, original_report_bytes=raw),
+        gateway=_FakeSmartPerfettoGateway(
+            result,
+            original_report_html_bytes=raw,
+        ),
         synthesizer=_test_synthesizer(),
         data_root=tmp_path,
         public_origin="http://localhost:8000",
@@ -6503,6 +6503,10 @@ def test_local_app_downloads_exact_upstream_smartperfetto_report_bytes(
 
     assert downloaded.status_code == 200
     assert downloaded.content == raw
+    assert downloaded.headers["content-type"].startswith("text/html")
+    assert downloaded.headers["content-disposition"] == (
+        f'attachment; filename="smartperfetto-{analysis_id}.html"'
+    )
     assert report["smartperfetto_original"]["size"] == len(raw)
     assert report["smartperfetto_original"]["sha256"] == hashlib.sha256(raw).hexdigest()
 
@@ -6633,7 +6637,9 @@ def test_local_app_persists_bounded_single_pass_failure(tmp_path: Path) -> None:
     assert provider.calls == 2
     assert published.status_code == 200
     assert original.status_code == 200
-    assert original.content == canonical_json_bytes(_smartperfetto_result().payload["report"])
+    assert original.content == (
+        b"<!DOCTYPE html><html><body>SmartPerfetto</body></html>"
+    )
     report = validate_contract("analysis-report", published.json())
     assert report["synthesis"]["state"] == "failed"
     assert report["synthesis"]["failure_code"] == "ai_output_invalid"

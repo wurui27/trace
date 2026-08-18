@@ -64,12 +64,7 @@
       }
     },
     "source_code": {"$ref": "#/$defs/sourceCode"},
-    "smartperfetto_original": {
-      "oneOf": [
-        {"$ref": "#/$defs/smartperfettoOriginal"},
-        {"$ref": "#/$defs/smartperfettoOriginalCollection"}
-      ]
-    }
+    "smartperfetto_original": {"$ref": "#/$defs/smartperfettoOriginal"}
   },
   "allOf": [
     {
@@ -199,12 +194,7 @@
           "state": {"enum": ["completed", "partially_completed"]},
           "synthesis": {"$ref": "#/$defs/synthesisV2"},
           "source_code": {"$ref": "#/$defs/sourceCode"},
-          "smartperfetto_original": {
-            "oneOf": [
-              {"$ref": "#/$defs/smartperfettoOriginal"},
-              {"$ref": "#/$defs/smartperfettoOriginalCollection"}
-            ]
-          },
+          "smartperfetto_original": {"$ref": "#/$defs/smartperfettoOriginal"},
           "scenario_reports": {
             "oneOf": [
               {"minItems": 1, "maxItems": 1, "prefixItems": [{"$ref": "#/$defs/startupScenarioReport"}], "items": false},
@@ -1646,39 +1636,9 @@
       "properties": {
         "available": {"const": true},
         "artifact_id": {"$ref": "#/$defs/sourceUuid"},
-        "version": {"const": 1},
-        "mime": {"const": "application/json"},
-        "size": {"type": "integer", "minimum": 1, "maximum": 2097152},
-        "sha256": {"$ref": "#/$defs/hex64"}
-      }
-    },
-    "smartperfettoOriginalCollection": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["available", "mode", "reports"],
-      "properties": {
-        "available": {"const": true},
-        "mode": {"const": "scenario_collection"},
-        "reports": {
-          "type": "array",
-          "minItems": 1,
-          "maxItems": 2,
-          "items": {"$ref": "#/$defs/smartperfettoScenarioOriginal"}
-        }
-      }
-    },
-    "smartperfettoScenarioOriginal": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["scenario_type", "label", "available", "artifact_id", "version", "mime", "size", "sha256"],
-      "properties": {
-        "scenario_type": {"enum": ["startup", "scroll"]},
-        "label": {"enum": ["启动", "滑动"]},
-        "available": {"const": true},
-        "artifact_id": {"$ref": "#/$defs/sourceUuid"},
-        "version": {"const": 1},
-        "mime": {"const": "application/json"},
-        "size": {"type": "integer", "minimum": 1, "maximum": 2097152},
+        "version": {"const": 2},
+        "mime": {"const": "text/html"},
+        "size": {"type": "integer", "minimum": 1, "maximum": 16777216},
         "sha256": {"$ref": "#/$defs/hex64"}
       }
     },
