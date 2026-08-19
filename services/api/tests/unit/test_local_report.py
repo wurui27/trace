@@ -457,6 +457,25 @@ async def test_report_synthesizer_discards_only_unsafe_diffs_after_retry() -> No
 
 
 @pytest.mark.asyncio
+async def test_report_synthesizer_restores_missing_strong_conclusion_reference() -> None:
+    candidate = _strong_v2_candidate()
+    candidate["source_fixes"] = []
+    candidate["conclusions"][0]["source_ref_ids"] = []  # type: ignore[index]
+    payload = canonical_json_bytes(candidate)
+    provider = FakeReportProvider([payload, payload])
+
+    result = await LocalReportSynthesizer(provider=provider).synthesize(
+        _source_projection()
+    )
+
+    assert provider.calls == 2
+    assert result.output.document["conclusions"][0]["source_ref_ids"] == [  # type: ignore[index]
+        "97000000-0000-4000-8000-000000000001"
+    ]
+    assert result.output.document["source_fixes"] == []
+
+
+@pytest.mark.asyncio
 async def test_report_synthesizer_stops_after_nonretryable_provider_error() -> None:
     provider = FailingReportProvider(
         [

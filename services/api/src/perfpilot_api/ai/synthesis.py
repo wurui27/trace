@@ -512,7 +512,7 @@ def validate_synthesis_output(
 def salvage_synthesis_source_fixes(
     *, projection: AIProjection, candidate: object
 ) -> AISynthesisOutput:
-    """Keep only independently valid source fixes from an otherwise valid candidate."""
+    """Restore safe source bindings and keep only independently valid source fixes."""
 
     try:
         if type(candidate) is bytes:
@@ -528,8 +528,37 @@ def salvage_synthesis_source_fixes(
         if not isinstance(document, dict) or document.get("schema_version") != "2.0":
             raise SynthesisValidationError
         reject_private_json(document)
+        index = _projection_index(projection)
+        conclusions = document.get("conclusions")
+        if not isinstance(conclusions, list):
+            raise SynthesisValidationError
+        repaired_conclusions: list[object] = []
+        for conclusion in conclusions:
+            if not isinstance(conclusion, dict):
+                raise SynthesisValidationError
+            repaired = dict(conclusion)
+            if repaired.get("source_ref_ids") == []:
+                finding_id = repaired.get("finding_id")
+                evidence_ids = repaired.get("evidence_ids")
+                if isinstance(finding_id, str) and isinstance(evidence_ids, list):
+                    eligible = next(
+                        (
+                            source_ref_id
+                            for source_ref_id, source_ref in index.source_refs.items()
+                            if source_ref.get("match_grade") == "strong"
+                            and finding_id in source_ref.get("finding_ids", [])
+                            and set(evidence_ids).issubset(
+                                source_ref.get("evidence_ids", [])
+                            )
+                        ),
+                        None,
+                    )
+                    if eligible is not None:
+                        repaired["source_ref_ids"] = [eligible]
+            repaired_conclusions.append(repaired)
+        document["conclusions"] = repaired_conclusions
         source_fixes = document.get("source_fixes")
-        if not isinstance(source_fixes, list) or not source_fixes:
+        if not isinstance(source_fixes, list):
             raise SynthesisValidationError
         base = dict(document)
         base["source_fixes"] = []
