@@ -18,12 +18,19 @@ bash scripts/bootstrap-ubuntu-user.sh
 Install `~/perfpilot/config/perfpilot-agent-ca.crt` on each browser and Agent
 host after verifying its SHA-256 fingerprint over SSH. Open
 `https://10.166.0.125:8443`; configure Agents with the same origin and CA file.
-The API and web processes listen only on loopback. Every test-stack restart permanently deletes
-all analysis data without creating a backup or archive. Persistent state stays
-unchanged. Always use the wrapper so all services stop before its reset gate reruns:
+The API and web processes listen only on loopback. Ordinary restarts preserve
+analysis data as well as persistent users, Agents, and source workspaces:
 
 ```bash
 bash scripts/restart-ubuntu-perfpilot.sh
+```
+
+Use the explicit destructive wrapper only when all analysis data should be
+permanently deleted without creating a backup or archive. Persistent users,
+Agents, and source workspaces remain unchanged:
+
+```bash
+bash scripts/reset-and-restart-ubuntu-perfpilot.sh
 ```
 
 Initial credentials for newly created `ray_wu` (administrator) and `user01`

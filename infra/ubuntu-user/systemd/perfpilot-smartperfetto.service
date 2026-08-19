@@ -1,9 +1,7 @@
 [Unit]
 Description=PerfPilot SmartPerfetto analysis engine
 Wants=network-online.target
-Requires=perfpilot-reset-analysis-data.service
 After=network-online.target
-After=perfpilot-reset-analysis-data.service
 PartOf=perfpilot.target
 RefuseManualStart=yes
 

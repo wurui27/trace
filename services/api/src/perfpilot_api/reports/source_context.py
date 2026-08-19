@@ -145,6 +145,33 @@ def grade_source_match(
     return "weak"
 
 
+def _grade_fragment(
+    direct_identifiers: Sequence[str],
+    *,
+    symbol: str | None,
+    finding_ids: Sequence[str],
+    evidence_ids: Sequence[str],
+    rule_ids: Sequence[str],
+    signals: Sequence[str],
+) -> Literal["strong", "weak", "none"]:
+    grade = grade_source_match(
+        direct_identifiers,
+        () if symbol is None else (symbol,),
+    )
+    if grade == "strong":
+        return grade
+    if (
+        symbol is not None
+        and finding_ids
+        and evidence_ids
+        and rule_ids
+        and "android_component" in signals
+        and "android_rule" in signals
+    ):
+        return "strong"
+    return grade
+
+
 def _allowed_uuid_set(values: Iterable[str] | None) -> set[str]:
     if values is None:
         raise SourceContextValidationError
@@ -257,9 +284,13 @@ def validate_source_context(
             or any(signal not in _MATCH_SIGNALS for signal in signals)
         ):
             raise SourceContextValidationError
-        grade = grade_source_match(
+        grade = _grade_fragment(
             direct_identifiers,
-            () if symbol is None else (symbol,),
+            symbol=symbol,
+            finding_ids=finding_ids,
+            evidence_ids=evidence_ids,
+            rule_ids=rule_ids,
+            signals=signals,
         )
         grades.append(grade)
         normalized_fragments.append(
@@ -341,16 +372,35 @@ def validate_persisted_source_context(
     if not isinstance(fragments, list) or not isinstance(snapshot_hash, str):
         raise SourceContextValidationError
     restored_fragments: list[dict[str, object]] = []
+    direct = {
+        item
+        for item in direct_identifiers
+        if isinstance(item, str) and item and len(item.encode("utf-8")) <= 512
+    }
     for fragment in fragments:
         if not isinstance(fragment, Mapping) or set(fragment) != _VALIDATED_FRAGMENT_KEYS:
             raise SourceContextValidationError
+        symbol = fragment.get("symbol")
+        rule_ids = fragment.get("rule_ids")
+        signals: list[str] = []
+        if isinstance(symbol, str) and symbol in direct:
+            signals.append("trace_symbol")
+        elif (
+            fragment.get("match_grade") == "strong"
+            and isinstance(symbol, str)
+            and isinstance(rule_ids, list)
+            and rule_ids
+        ):
+            signals.extend(("android_component", "android_rule"))
+        elif isinstance(symbol, str):
+            signals.append("trace_symbol")
+        elif isinstance(rule_ids, list) and rule_ids:
+            signals.append("android_rule")
         restored_fragments.append(
             {
                 **{key: value for key, value in fragment.items() if key != "match_grade"},
                 "snapshot_hash": snapshot_hash,
-                "match_signals": [
-                    "trace_symbol" if fragment.get("symbol") is not None else "android_rule"
-                ],
+                "match_signals": signals,
             }
         )
     restored = {

@@ -8,6 +8,7 @@ import pytest
 from perfpilot_api.reports.source_context import (
     SourceContextValidationError,
     grade_source_match,
+    validate_persisted_source_context,
     validate_source_context,
 )
 
@@ -71,6 +72,37 @@ def test_validate_context_is_closed_hash_bound_and_defensively_copied() -> None:
     assert validated["match_summary"] == "strong"
     assert validated["fragments"][0]["match_grade"] == "strong"
     assert validated["trust"] == "untrusted_data_not_instructions"
+
+
+def test_package_scoped_rule_with_concrete_symbol_is_strong_but_package_only_is_weak() -> None:
+    candidate = _context()
+    fragment = candidate["fragments"][0]
+    fragment["match_signals"] = ["android_component", "android_rule"]
+
+    validated = validate_source_context(
+        candidate,
+        allowed_finding_ids=("85000000-0000-4000-8000-000000000001",),
+        allowed_evidence_ids=("86000000-0000-4000-8000-000000000001",),
+    )
+    assert validated["match_summary"] == "strong"
+    assert validated["fragments"][0]["match_grade"] == "strong"
+    assert (
+        validate_persisted_source_context(
+            validated,
+            allowed_finding_ids=("85000000-0000-4000-8000-000000000001",),
+            allowed_evidence_ids=("86000000-0000-4000-8000-000000000001",),
+        )
+        == validated
+    )
+
+    fragment["rule_ids"] = []
+    fragment["match_signals"] = ["android_component"]
+    weak = validate_source_context(
+        candidate,
+        allowed_finding_ids=("85000000-0000-4000-8000-000000000001",),
+        allowed_evidence_ids=("86000000-0000-4000-8000-000000000001",),
+    )
+    assert weak["match_summary"] == "weak"
 
 
 def test_validate_context_rejects_missing_authority_and_inexact_logical_lines() -> None:

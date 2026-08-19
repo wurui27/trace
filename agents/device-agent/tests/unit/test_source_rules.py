@@ -41,6 +41,23 @@ def _snapshot(tmp_path: Path):
         "app/src/main/java/demo/Other.kt": (
             "package demo\nclass Other { fun warm() = Unit }\n"
         ),
+        "app/src/main/java/com/rivotek/mediacenter/PlaybackActivity.kt": (
+            "package com.rivotek.mediacenter\n"
+            "class PlaybackActivity {\n"
+            "  fun preparePlayback() {\n"
+            "    Thread.sleep(10)\n"
+            "  }\n"
+            "}\n"
+        ),
+        "app/src/main/java/com/rivotek/mediacenter/CommentOnly.kt": (
+            "package com.rivotek.mediacenter\n"
+            "import android.content.ContentProvider\n"
+            "// Application.onCreate and Thread.sleep are documentation only.\n"
+            "class CommentOnly\n"
+        ),
+        "library/src/main/java/com/example/Unrelated.kt": (
+            "package com.example\nclass Unrelated { fun pause() = Thread.sleep(10) }\n"
+        ),
     }
     for relative, content in files.items():
         path = repo / relative
@@ -122,6 +139,36 @@ def test_context_has_stable_file_order_and_enforces_file_and_byte_limits(
     assert first.total_bytes <= 80
     assert first.truncated is True
     assert b"api_key" not in first.canonical_bytes
+
+
+def test_package_hint_narrows_to_app_module_and_extracts_concrete_rule_symbol(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot(tmp_path)
+    hint = SourceFindingHint(
+        finding_id=UUID("85000000-0000-4000-8000-000000000003"),
+        evidence_ids=(UUID("86000000-0000-4000-8000-000000000003"),),
+        rule_id="startup.main_thread_blocked",
+        symbol_hints=("com.rivotek.mediacenter",),
+    )
+
+    context = select_source_context(snapshot, (hint,), max_files=12, max_bytes=98_304)
+
+    first = context.fragments[0]
+    assert first.relative_path == (
+        "app/src/main/java/com/rivotek/mediacenter/PlaybackActivity.kt"
+    )
+    assert first.symbol == "com.rivotek.mediacenter.PlaybackActivity.preparePlayback"
+    assert first.finding_ids == (hint.finding_id,)
+    assert first.evidence_ids == hint.evidence_ids
+    assert first.match_signals == ("android_component", "android_rule")
+    assert "Thread.sleep" in first.content
+    comment_only = next(
+        item for item in context.fragments if item.relative_path.endswith("CommentOnly.kt")
+    )
+    assert comment_only.rule_ids == ()
+    assert comment_only.match_signals == ("android_component",)
+    assert comment_only.symbol is None
 
 
 def test_direct_symbol_fragment_is_centered_on_a_late_match(tmp_path: Path) -> None:

@@ -377,5 +377,6 @@ printf '%s\n' \
   "网页：https://$SERVER_IP:8443" \
   "API：https://$SERVER_IP:8443/v1/health" \
   "Agent CA：$CONFIG_ROOT/perfpilot-agent-ca.crt" \
-  '重启（永久清空分析数据）：bash scripts/restart-ubuntu-perfpilot.sh' \
+  '普通重启（保留分析数据）：bash scripts/restart-ubuntu-perfpilot.sh' \
+  '清空当前所有账号的分析数据后重启：bash scripts/reset-and-restart-ubuntu-perfpilot.sh' \
   '状态：systemctl --user status perfpilot.target'

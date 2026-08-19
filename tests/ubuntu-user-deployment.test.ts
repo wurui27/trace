@@ -205,15 +205,18 @@ describe("Ubuntu user deployment", () => {
     ).rejects.toThrow();
   });
 
-  it("uses a unified restart target whose reset gate precedes all services", async () => {
+  it("keeps ordinary restarts non-destructive and exposes reset explicitly", async () => {
     const target = await source("infra/ubuntu-user/systemd/perfpilot.target");
     const reset = await source(
       "infra/ubuntu-user/systemd/perfpilot-reset-analysis-data.service",
     );
     const bootstrap = await source("scripts/bootstrap-ubuntu-user.sh");
     const restart = await source("scripts/restart-ubuntu-perfpilot.sh");
+    const resetAndRestart = await source(
+      "scripts/reset-and-restart-ubuntu-perfpilot.sh",
+    );
 
-    expect(target).toContain("Requires=perfpilot-reset-analysis-data.service");
+    expect(target).not.toContain("perfpilot-reset-analysis-data.service");
     expect(target).toContain(
       "Wants=perfpilot-smartperfetto.service perfpilot-api.service perfpilot-web.service perfpilot-gateway.service",
     );
@@ -225,6 +228,14 @@ describe("Ubuntu user deployment", () => {
     expect(bootstrap).toContain("restart-ubuntu-perfpilot.sh");
     expect(restart).toContain("systemctl --user stop perfpilot.target perfpilot-gateway.service");
     expect(restart).toContain("systemctl --user start perfpilot.target");
+    expect(restart).not.toContain("perfpilot-reset-analysis-data.service");
+    expect(resetAndRestart).toContain(
+      "systemctl --user start perfpilot-reset-analysis-data.service",
+    );
+    expect(resetAndRestart).toContain("systemctl --user start perfpilot.target");
+    expect(resetAndRestart.indexOf("perfpilot-reset-analysis-data.service")).toBeLessThan(
+      resetAndRestart.lastIndexOf("systemctl --user start perfpilot.target"),
+    );
     expect(bootstrap).not.toContain("systemctl --user restart perfpilot.target");
     expect(restart).not.toContain("systemctl --user restart perfpilot.target");
   });
@@ -286,7 +297,7 @@ describe("Ubuntu user deployment", () => {
     expect(service).toContain(marker);
     expect(service).toContain("PartOf=perfpilot.target");
     expect(service).toContain("RefuseManualStart=yes");
-    expect(service).toMatch(/After=.*perfpilot-reset-analysis-data\.service/);
+    expect(service).not.toContain("perfpilot-reset-analysis-data.service");
     expect(service).not.toMatch(/\bsudo\b/);
   });
 });

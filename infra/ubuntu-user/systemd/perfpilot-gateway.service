@@ -1,8 +1,7 @@
 [Unit]
 Description=PerfPilot HTTPS gateway
 Wants=network-online.target perfpilot-api.service perfpilot-web.service
-Requires=perfpilot-reset-analysis-data.service
-After=network-online.target perfpilot-reset-analysis-data.service perfpilot-api.service perfpilot-web.service
+After=network-online.target perfpilot-api.service perfpilot-web.service
 PartOf=perfpilot.target
 RefuseManualStart=yes
 

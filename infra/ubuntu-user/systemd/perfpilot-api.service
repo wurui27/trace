@@ -1,8 +1,7 @@
 [Unit]
 Description=PerfPilot server test API
 Wants=network-online.target perfpilot-smartperfetto.service
-Requires=perfpilot-reset-analysis-data.service
-After=network-online.target perfpilot-reset-analysis-data.service perfpilot-smartperfetto.service
+After=network-online.target perfpilot-smartperfetto.service
 PartOf=perfpilot.target
 RefuseManualStart=yes
 
