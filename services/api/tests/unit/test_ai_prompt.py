@@ -26,5 +26,7 @@ def test_synthesis_prompt_is_versioned_hashed_and_constrains_untrusted_input() -
     assert "only" in instruction
     assert "synthesis" in instruction
     assert "three" in instruction
+    assert "thirty-six" in instruction
     assert "strong" in instruction
     assert "diff" in instruction
+    assert "concrete recommendation" in instruction

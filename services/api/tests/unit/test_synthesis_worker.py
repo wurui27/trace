@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+from copy import deepcopy
 from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -20,7 +21,6 @@ from perfpilot_api.ai.openai_compatible import (
 )
 from perfpilot_api.ai.prompt import load_synthesis_prompt
 from perfpilot_api.ai.synthesis import (
-    SynthesisValidationError,
     validate_synthesis_output,
 )
 from perfpilot_api.reports.contracts import canonical_json_bytes
@@ -104,15 +104,17 @@ def test_strong_source_fix_does_not_require_an_automatic_validation_profile() ->
     assert validated.document["source_fixes"][0]["validation_profile_id"] is None
 
 
-def test_strong_eligible_source_context_requires_at_least_one_safe_fix() -> None:
+def test_strong_source_context_may_keep_manual_plan_without_safe_diff() -> None:
     candidate = _load("synthesis-output-v2.valid.json")
     candidate["source_fixes"] = []
 
-    with pytest.raises(SynthesisValidationError):
-        validate_synthesis_output(
-            projection=_source_projection(),
-            candidate=candidate,
-        )
+    validated = validate_synthesis_output(
+        projection=_source_projection(),
+        candidate=candidate,
+    )
+
+    assert validated.document["source_fixes"] == []
+    assert validated.document["conclusions"][0]["recommendation"]
 
 
 def _core(analysis_mode: str = "trace_upload") -> NormalizedTraceReport:
@@ -485,6 +487,49 @@ async def test_pipeline_projects_source_context_and_publishes_one_source_aware_r
     assert result.state == "succeeded"
     assert provider.retry_codes == [None]
     assert writer.requests[-1].source_code_document == source_document
+
+
+@pytest.mark.asyncio
+async def test_pipeline_discards_only_unsafe_source_diffs_after_retry() -> None:
+    source_document = _load("analysis-report-v1.2.valid.json")["source_code"]
+    projection_context = _load("analysis-projection-v2.valid.json")["source_context"]
+    fragment = projection_context["fragments"][0]
+    content_sha256 = hashlib.sha256(fragment["content"].encode("utf-8")).hexdigest()
+    fragment["content_sha256"] = content_sha256
+    source_document["source_refs"][0]["content_sha256"] = content_sha256
+    source_context = SynthesisSourceContext(
+        projection_context=projection_context,
+        report_document=source_document,
+    )
+    candidate = _load("synthesis-output-v2.valid.json")
+    unsafe = deepcopy(candidate["source_fixes"][0])
+    unsafe["fix_id"] = "96000000-0000-4000-8000-000000000002"
+    unsafe["diff"] += (
+        "--- a/app/src/main/java/demo/Other.kt\n"
+        "+++ b/app/src/main/java/demo/Other.kt\n"
+        "@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+    candidate["source_fixes"].append(unsafe)
+    provider = FakeProvider([candidate, candidate])
+    writer = FakeWriter()
+    repository = FakeRepository()
+
+    result = await _finish(
+        _pipeline(
+            repository,
+            provider,
+            FakeArtifactStore(),
+            writer,
+            FakeProjector(),
+            source_context=source_context,
+        )
+    )
+
+    assert result.state == "succeeded"
+    assert provider.retry_codes == [None, "ai_output_invalid"]
+    assert [
+        fix["fix_id"] for fix in writer.requests[-1].synthesis_document["source_fixes"]
+    ] == ["96000000-0000-4000-8000-000000000001"]
 
 
 @pytest.mark.asyncio

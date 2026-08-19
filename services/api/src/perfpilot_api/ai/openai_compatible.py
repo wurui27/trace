@@ -147,14 +147,17 @@ def _conclusion_coverage_instruction(projection: AIProjection) -> str | None:
         "CONCLUSION COVERAGE (mandatory): `conclusions` is not limited to three. "
         "Include exactly one conclusion for every required finding ID below and "
         "do not omit any. The three-item limit applies only to the primary "
-        "`top_findings`, recommendations, retest items, and source fixes. "
+        "`top_findings`, recommendations, and retest items. `source_fixes` may "
+        "contain up to thirty-six safe changes. "
         f"Required conclusion finding IDs: {' '.join(finding_ids) or '(none)'}"
     )
     if source_fix_required:
         instruction += (
             " SOURCE FIX COVERAGE (mandatory): strong fixable source references "
-            "are present, so source_fixes must contain at least one safe unified "
-            "diff. Set every source fix validation_profile_id to null."
+            "are present, so source_fixes must contain every safe feasible unified "
+            "diff. Keep the conclusion recommendation as the direct plan whenever "
+            "a safe diff cannot be produced. Set every source fix "
+            "validation_profile_id to null."
         )
     return instruction
 

@@ -2910,9 +2910,7 @@ class _ProjectionReportProvider:
                         "-fun init() = loadNow()\n"
                         "+fun init() = loadLazily()\n"
                     ),
-                    "validation_profile_id": (
-                        "96000000-0000-4000-8000-000000000001"
-                    ),
+                    "validation_profile_id": None,
                     "retest_target": "重复冷启动并对比首帧耗时。",
                 }
             ]

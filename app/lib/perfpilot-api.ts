@@ -1645,10 +1645,26 @@ function validConciseSynthesisOutput(value: unknown): value is ConciseSynthesisO
       ].every((text) => typeof text === "string" && text.length >= 1 && text.length <= 2000)
     ) &&
     Array.isArray(value.source_fixes) &&
-    value.source_fixes.length <= 3 &&
+    value.source_fixes.length <= 36 &&
     value.source_fixes.every((fix) => validSourceFix(fix, false)) &&
+    uniqueSourceFixBindings(value.source_fixes) &&
     validSynthesisItems(value)
   );
+}
+
+function uniqueSourceFixBindings(fixes: readonly unknown[]): boolean {
+  const bindings = new Set<string>();
+  for (const fix of fixes) {
+    if (!object(fix)) return false;
+    const binding = JSON.stringify([
+      fix.finding_id,
+      fix.relative_path,
+      fix.symbol,
+    ]);
+    if (bindings.has(binding)) return false;
+    bindings.add(binding);
+  }
+  return true;
 }
 
 function validSourceCodeReport(value: unknown): value is SourceCodeReport {
@@ -1664,7 +1680,7 @@ function validSourceCodeReport(value: unknown): value is SourceCodeReport {
     !["strong", "weak", "none"].includes(String(value.match_summary)) ||
     !Array.isArray(value.source_refs) || value.source_refs.length > 12 ||
     !Array.isArray(value.exclusions) || value.exclusions.length > 64 ||
-    !Array.isArray(value.fixes) || value.fixes.length > 3 ||
+    !Array.isArray(value.fixes) || value.fixes.length > 36 ||
     !Array.isArray(value.limitations) || value.limitations.length > 20
   ) return false;
   if (!value.requested) {
@@ -1694,7 +1710,8 @@ function validSourceCodeReport(value: unknown): value is SourceCodeReport {
   const exclusionsValid = value.exclusions.every((item) => object(item) && exactKeys(item, ["relative_path", "reason_code"]) &&
     (item.relative_path === null || typeof item.relative_path === "string") && typeof item.reason_code === "string");
   const limitationsValid = value.limitations.every((item) => object(item) && exactKeys(item, ["limitation_id", "summary"]) && typeof item.limitation_id === "string" && typeof item.summary === "string");
-  const fixesValid = value.fixes.every((fix) => validSourceFix(fix, true));
+  const fixesValid = value.fixes.every((fix) => validSourceFix(fix, true)) &&
+    uniqueSourceFixBindings(value.fixes);
   if (!snapshotValid || !refsValid || !exclusionsValid || !limitationsValid || !fixesValid) {
     return false;
   }

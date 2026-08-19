@@ -2,6 +2,10 @@ import type {
   ConciseSynthesisOutput,
   SourceAwareAnalysisReport,
 } from "../lib/perfpilot-api";
+import {
+  redactUnverifiedConclusion,
+  redactUnverifiedSourceNarrative,
+} from "../lib/source-report-privacy";
 
 type Conclusion = ConciseSynthesisOutput["conclusions"][number];
 
@@ -42,15 +46,20 @@ export function ConciseReportSummary({ report }: { readonly report: SourceAwareA
     scenario.bundle?.metrics ?? [],
   );
   const metricsById = new Map(metrics.map((metric) => [metric.metric_id, metric]));
-  const primary = output.conclusions.slice(0, 3);
-  const additional = output.conclusions.slice(3);
+  const conclusions = output.conclusions.map((conclusion) =>
+    redactUnverifiedConclusion(conclusion, report.source_code),
+  );
+  const redact = (value: string) =>
+    redactUnverifiedSourceNarrative(value, report.source_code);
+  const primary = conclusions.slice(0, 3);
+  const additional = conclusions.slice(3);
 
   return (
     <section className="source-aware-conclusion" aria-label="结论">
       <header className="analysis-report-section analysis-report-summary">
         <p className="section-label">PERFPILOT CONCLUSION</p>
-        <h2>{output.verdict}</h2>
-        <p>{output.executive_summary}</p>
+        <h2>{redact(output.verdict)}</h2>
+        <p>{redact(output.executive_summary)}</p>
       </header>
 
       <section className="analysis-report-section">
@@ -99,7 +108,7 @@ export function ConciseReportSummary({ report }: { readonly report: SourceAwareA
       {output.limitations[0] ? (
         <aside className="analysis-report-section source-aware-limitation">
           <strong>结论边界</strong>
-          <p>{output.limitations[0].summary}</p>
+          <p>{redact(output.limitations[0].summary)}</p>
         </aside>
       ) : null}
     </section>

@@ -68,6 +68,32 @@ def _projection() -> AIProjection:
     return build_ai_projection(core, analysis_profile="auto", question=None)
 
 
+def _source_projection() -> AIProjection:
+    document = _load("analysis-projection-v2.valid.json")
+    document["analysis_profile"] = "auto"
+    payload = canonical_json_bytes(document)
+    return AIProjection(
+        canonical_bytes=payload,
+        sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode(),
+    )
+
+
+def _strong_v2_candidate() -> dict[str, object]:
+    document = _v2_candidate()
+    source_fix = _load("synthesis-output-v2.valid.json")["source_fixes"][0]
+    document["source_fixes"] = [
+        {
+            **source_fix,
+            "diagnosis": "启动方法在主线程同步读取设置。",
+            "retest_target": "重复相同的冷启动场景并比较已有指标。",
+        }
+    ]
+    conclusion = document["conclusions"][0]
+    conclusion["source_ref_ids"] = ["97000000-0000-4000-8000-000000000001"]
+    conclusion["source_root_cause"] = "启动方法同步读取设置，阻塞了首帧之前的主线程。"
+    return document
+
+
 def _unchecked_projection(case: str) -> AIProjection:
     projection = _projection()
     if case == "checksum":
@@ -403,6 +429,31 @@ async def test_report_synthesizer_stops_after_second_invalid_output() -> None:
     assert captured.value.retryable is True
     assert captured.value.detail_code == "semantic_validation"
     assert observed[-1] == ("failed", 2)
+
+
+@pytest.mark.asyncio
+async def test_report_synthesizer_discards_only_unsafe_diffs_after_retry() -> None:
+    candidate = _strong_v2_candidate()
+    unsafe = dict(candidate["source_fixes"][0])  # type: ignore[index]
+    unsafe["fix_id"] = "96000000-0000-4000-8000-000000000002"
+    unsafe["diff"] += (
+        "--- a/app/src/main/java/demo/Other.kt\n"
+        "+++ b/app/src/main/java/demo/Other.kt\n"
+        "@@ -1,1 +1,1 @@\n-old\n+new\n"
+    )
+    candidate["source_fixes"].append(unsafe)  # type: ignore[union-attr]
+    payload = canonical_json_bytes(candidate)
+    provider = FakeReportProvider([payload, payload])
+
+    result = await LocalReportSynthesizer(provider=provider).synthesize(
+        _source_projection()
+    )
+
+    assert provider.calls == 2
+    assert [
+        fix["fix_id"] for fix in result.output.document["source_fixes"]
+    ] == ["96000000-0000-4000-8000-000000000001"]
+    assert result.output.document["conclusions"] == candidate["conclusions"]
 
 
 @pytest.mark.asyncio

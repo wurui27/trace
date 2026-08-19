@@ -1592,7 +1592,7 @@
         "conclusions": {"type": "array", "maxItems": 300, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisConclusion"}},
         "top_findings": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisFinding"}},
         "recommendations": {"$ref": "#/$defs/synthesisRecommendationsV2"},
-        "source_fixes": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisSourceFix"}},
+        "source_fixes": {"type": "array", "maxItems": 36, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisSourceFix"}},
         "retest_plan": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisRetest"}},
         "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisLimitation"}}
       }
@@ -1763,7 +1763,7 @@
         "match_summary": {"enum": ["strong", "weak", "none"]},
         "source_refs": {"type": "array", "maxItems": 12, "uniqueItems": true, "items": {"$ref": "#/$defs/reportSourceRef"}},
         "exclusions": {"type": "array", "maxItems": 64, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceExclusion"}},
-        "fixes": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/reportSourceFix"}},
+        "fixes": {"type": "array", "maxItems": 36, "uniqueItems": true, "items": {"$ref": "#/$defs/reportSourceFix"}},
         "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/synthesisLimitation"}}
       },
       "allOf": [

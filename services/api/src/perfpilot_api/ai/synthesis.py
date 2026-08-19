@@ -19,6 +19,10 @@ DEFAULT_MAX_CANDIDATE_BYTES = 128 * 1024
 _NUMERIC_TOKEN = re.compile(
     r"(?<![A-Za-z0-9_])[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?"
 )
+_SOURCE_PATH_TOKEN = re.compile(
+    r"(?:[A-Za-z0-9_.-]+[/\\])+(?:[A-Za-z0-9_.-]+\.(?:kt|java|xml|gradle|kts))",
+    re.IGNORECASE,
+)
 
 
 class SynthesisValidationError(ValueError):
@@ -310,6 +314,12 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
     for text in _narrative_fields(document):
         if any(token.group(0) not in index.numeric_spellings for token in _NUMERIC_TOKEN.finditer(text)):
             raise SynthesisValidationError
+        if index.source_match != "strong":
+            folded = text.casefold()
+            if _SOURCE_PATH_TOKEN.search(text) or any(
+                term and term in folded for term in _unverified_source_terms(index)
+            ):
+                raise SynthesisValidationError
 
 
 def _validate_conclusions(
@@ -367,6 +377,21 @@ def _validate_conclusions(
         raise SynthesisValidationError
 
 
+def _unverified_source_terms(index: _ProjectionIndex) -> frozenset[str]:
+    terms: set[str] = set()
+    for source_ref in index.source_refs.values():
+        relative_path = source_ref.get("relative_path")
+        symbol = source_ref.get("symbol")
+        if isinstance(relative_path, str) and relative_path:
+            terms.add(relative_path.casefold())
+            terms.add(
+                relative_path.replace("\\", "/").rsplit("/", 1)[-1].casefold()
+            )
+        if isinstance(symbol, str) and symbol:
+            terms.add(symbol.casefold())
+    return frozenset(terms)
+
+
 def _validate_source_fixes(
     document: dict[str, object], index: _ProjectionIndex
 ) -> None:
@@ -379,42 +404,8 @@ def _validate_source_fixes(
     recommendation_by_priority = {
         item.get("priority"): item for item in recommendations if isinstance(item, dict)
     }
-    recommended_finding_ids = {
-        finding_id
-        for item in recommendations
-        if isinstance(item, dict) and isinstance(item.get("finding_ids"), list)
-        for finding_id in item["finding_ids"]
-        if isinstance(finding_id, str)
-    }
-    fixable_finding_ids: set[str] = set()
-    for source_ref in index.source_refs.values():
-        relative_path = source_ref.get("relative_path")
-        symbol = source_ref.get("symbol")
-        finding_ids = source_ref.get("finding_ids")
-        evidence_ids = source_ref.get("evidence_ids")
-        rule_ids = source_ref.get("rule_ids")
-        if (
-            source_ref.get("match_grade") != "strong"
-            or not isinstance(relative_path, str)
-            or not relative_path.endswith((".kt", ".java", ".xml"))
-            or not isinstance(symbol, str)
-            or not symbol
-            or not isinstance(finding_ids, list)
-            or not isinstance(evidence_ids, list)
-            or not isinstance(rule_ids, list)
-            or not rule_ids
-        ):
-            continue
-        for finding_id in finding_ids:
-            if (
-                isinstance(finding_id, str)
-                and finding_id in index.finding_evidence
-                and set(evidence_ids).intersection(index.finding_evidence[finding_id])
-            ):
-                fixable_finding_ids.add(finding_id)
-    if fixable_finding_ids.intersection(recommended_finding_ids) and not source_fixes:
-        raise SynthesisValidationError
     fix_ids: set[str] = set()
+    fix_bindings: set[tuple[str, str, str | None]] = set()
     for fix in source_fixes:
         if not isinstance(fix, dict):
             raise SynthesisValidationError
@@ -439,6 +430,16 @@ def _validate_source_fixes(
             or fix.get("validation_profile_id") is not None
         ):
             raise SynthesisValidationError
+        relative_path = fix.get("relative_path")
+        symbol = fix.get("symbol")
+        if not isinstance(relative_path, str) or not (
+            isinstance(symbol, str) or symbol is None
+        ):
+            raise SynthesisValidationError
+        binding = (finding_id, relative_path, symbol)
+        if binding in fix_bindings:
+            raise SynthesisValidationError
+        fix_bindings.add(binding)
         fix_ids.add(fix_id)
         recommendation = recommendation_by_priority[priority]
         if (
@@ -508,6 +509,50 @@ def validate_synthesis_output(
     )
 
 
+def salvage_synthesis_source_fixes(
+    *, projection: AIProjection, candidate: object
+) -> AISynthesisOutput:
+    """Keep only independently valid source fixes from an otherwise valid candidate."""
+
+    try:
+        if type(candidate) is bytes:
+            if not 1 <= len(candidate) <= DEFAULT_MAX_CANDIDATE_BYTES:
+                raise SynthesisValidationError
+            document = json.loads(
+                candidate.decode("utf-8", errors="strict"),
+                object_pairs_hook=_reject_duplicate_pairs,
+                parse_constant=_reject_json_constant,
+            )
+        else:
+            document = json.loads(canonical_json_bytes(candidate))
+        if not isinstance(document, dict) or document.get("schema_version") != "2.0":
+            raise SynthesisValidationError
+        reject_private_json(document)
+        source_fixes = document.get("source_fixes")
+        if not isinstance(source_fixes, list) or not source_fixes:
+            raise SynthesisValidationError
+        base = dict(document)
+        base["source_fixes"] = []
+        result = validate_synthesis_output(projection=projection, candidate=base)
+        accepted: list[object] = []
+        for source_fix in source_fixes:
+            attempted = dict(base)
+            attempted["source_fixes"] = [*accepted, source_fix]
+            try:
+                result = validate_synthesis_output(
+                    projection=projection,
+                    candidate=attempted,
+                )
+            except SynthesisValidationError:
+                continue
+            accepted.append(source_fix)
+        return result
+    except SynthesisValidationError:
+        raise
+    except Exception:
+        raise SynthesisValidationError from None
+
+
 ValidatedSynthesisOutput = AISynthesisOutput
 
 __all__ = [
@@ -516,5 +561,6 @@ __all__ = [
     "SynthesisValidationError",
     "ValidatedSynthesisOutput",
     "parse_candidate",
+    "salvage_synthesis_source_fixes",
     "validate_synthesis_output",
 ]

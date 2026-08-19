@@ -99,6 +99,20 @@ def _validate_synthesis(document: dict[str, object]) -> None:
         limit=65_536,
     )
     _enforce_unified_diff_headers(source_fixes)
+    if not isinstance(source_fixes, list):
+        return
+    bindings: set[tuple[object, object, object]] = set()
+    for source_fix in source_fixes:
+        if not isinstance(source_fix, dict):
+            continue
+        binding = (
+            source_fix.get("finding_id"),
+            source_fix.get("relative_path"),
+            source_fix.get("symbol"),
+        )
+        if binding in bindings:
+            raise SourceAwareSemanticError
+        bindings.add(binding)
 
 
 def _validate_report(document: dict[str, object]) -> None:

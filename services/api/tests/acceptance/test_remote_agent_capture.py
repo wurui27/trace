@@ -245,7 +245,7 @@ class _OneRoundChineseProvider:
                         "-fun init() = loadNow()\n"
                         "+fun init() = loadLazily()\n"
                     ),
-                    "validation_profile_id": str(TEAM_ONE_PROFILE),
+                    "validation_profile_id": None,
                     "retest_target": "重复冷启动并对比首帧耗时。",
                 }
             ]

@@ -22,7 +22,11 @@ from sqlalchemy.dialects.postgresql import insert as postgresql_insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from perfpilot_api.ai.openai_compatible import AIProviderError, SynthesisCandidate
-from perfpilot_api.ai.synthesis import SynthesisValidationError, validate_synthesis_output
+from perfpilot_api.ai.synthesis import (
+    SynthesisValidationError,
+    salvage_synthesis_source_fixes,
+    validate_synthesis_output,
+)
 from perfpilot_api.db.control.models import (
     EngineExecution,
     GlobalJob,
@@ -1524,19 +1528,34 @@ class SynthesisPipeline:
                 return SynthesisStepResult("pending" if retry else "running", 1 if retry else None)
             except SynthesisValidationError:
                 retry = attempt < 2
-                await self._repository.finish_invocation_failure(
-                    team_id=record.team_id,
-                    analysis_id=record.analysis_id,
-                    execution_id=record.id,
-                    attempt_number=attempt,
-                    stable_error_code="ai_output_invalid",
-                    latency_ms=candidate.latency_ms,
-                    exhausted=not retry,
-                    generated_at=None if retry else now,
-                    now=now,
-                    fence=fence,
-                )
-                return SynthesisStepResult("pending" if retry else "running", 1 if retry else None)
+                recovered = False
+                if not retry:
+                    try:
+                        validated = salvage_synthesis_source_fixes(
+                            projection=projection,
+                            candidate=candidate.candidate_json,
+                        )
+                    except SynthesisValidationError:
+                        pass
+                    else:
+                        recovered = True
+                if not recovered:
+                    await self._repository.finish_invocation_failure(
+                        team_id=record.team_id,
+                        analysis_id=record.analysis_id,
+                        execution_id=record.id,
+                        attempt_number=attempt,
+                        stable_error_code="ai_output_invalid",
+                        latency_ms=candidate.latency_ms,
+                        exhausted=not retry,
+                        generated_at=None if retry else now,
+                        now=now,
+                        fence=fence,
+                    )
+                    return SynthesisStepResult(
+                        "pending" if retry else "running",
+                        1 if retry else None,
+                    )
             artifact_id = synthesis_artifact_id(record.id, validated.sha256_b64)
             await self._artifact_store.write(
                 SynthesisArtifactWrite(

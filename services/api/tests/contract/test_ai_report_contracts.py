@@ -446,10 +446,25 @@ def test_v2_synthesis_enforces_aggregate_diff_utf8_bytes(
         {
             **deepcopy(fix),
             "fix_id": "96000000-0000-4000-8000-000000000002",
-            "diff": _sized_unified_diff(path, 32_768),
+            "source_ref_ids": ["97000000-0000-4000-8000-000000000002"],
+            "relative_path": path.replace("MainActivity", "OtherActivity"),
+            "symbol": "demo.OtherActivity.onCreate",
+            "diff": _sized_unified_diff(
+                path.replace("MainActivity", "OtherActivity"),
+                32_768,
+            ),
         },
     ]
     if schema_name.startswith("reports/"):
+        source_ref = deepcopy(document["source_code"]["source_refs"][0])
+        source_ref.update(
+            {
+                "source_ref_id": "97000000-0000-4000-8000-000000000002",
+                "relative_path": path.replace("MainActivity", "OtherActivity"),
+                "symbol": "demo.OtherActivity.onCreate",
+            }
+        )
+        document["source_code"]["source_refs"].append(source_ref)
         verification = deepcopy(document["source_code"]["fixes"][0]["verification"])
         document["source_code"]["fixes"] = [
             {
@@ -465,7 +480,10 @@ def test_v2_synthesis_enforces_aggregate_diff_utf8_bytes(
             _bind_verified_patch_metadata(public_fix)
     _validate_ai_contract(schema_name, document)
 
-    output["source_fixes"][1]["diff"] = _sized_unified_diff(path, 32_769)
+    output["source_fixes"][1]["diff"] = _sized_unified_diff(
+        output["source_fixes"][1]["relative_path"],
+        32_769,
+    )
     if schema_name.startswith("reports/"):
         document["source_code"]["fixes"][1]["diff"] = output["source_fixes"][1][  # type: ignore[index]
             "diff"
@@ -485,9 +503,24 @@ def test_report_v12_enforces_aggregate_public_fix_diff_utf8_bytes() -> None:
         {
             **deepcopy(fix),
             "fix_id": "96000000-0000-4000-8000-000000000002",
-            "diff": _sized_unified_diff(path, 32_768),
+            "source_ref_ids": ["97000000-0000-4000-8000-000000000002"],
+            "relative_path": path.replace("MainActivity", "OtherActivity"),
+            "symbol": "demo.OtherActivity.onCreate",
+            "diff": _sized_unified_diff(
+                path.replace("MainActivity", "OtherActivity"),
+                32_768,
+            ),
         },
     ]
+    source_ref = deepcopy(report["source_code"]["source_refs"][0])  # type: ignore[index]
+    source_ref.update(
+        {
+            "source_ref_id": "97000000-0000-4000-8000-000000000002",
+            "relative_path": path.replace("MainActivity", "OtherActivity"),
+            "symbol": "demo.OtherActivity.onCreate",
+        }
+    )
+    report["source_code"]["source_refs"].append(source_ref)  # type: ignore[index]
     report["synthesis"]["output"]["source_fixes"] = [  # type: ignore[index]
         {
             **{field: deepcopy(public_fix[field]) for field in AI_SOURCE_FIX_FIELDS},
@@ -500,7 +533,7 @@ def test_report_v12_enforces_aggregate_public_fix_diff_utf8_bytes() -> None:
     _validate_ai_contract("reports/analysis-report.schema.json", report)
 
     report["source_code"]["fixes"][1]["diff"] = _sized_unified_diff(  # type: ignore[index]
-        path,
+        report["source_code"]["fixes"][1]["relative_path"],  # type: ignore[index]
         32_769,
     )
     report["synthesis"]["output"]["source_fixes"][1]["diff"] = (  # type: ignore[index]
@@ -527,7 +560,6 @@ def test_synthesis_v2_limits_paths_and_semantic_order() -> None:
         "key_metric_ids",
         "top_findings",
         "recommendations",
-        "source_fixes",
         "retest_plan",
     ):
         invalid = deepcopy(synthesis)
@@ -569,6 +601,40 @@ def test_synthesis_v2_limits_paths_and_semantic_order() -> None:
     )
     with pytest.raises(AssertionError):
         _assert_v2_synthesis_semantics(reversed_priority)
+
+
+@pytest.mark.parametrize(
+    ("schema_name", "example_name"),
+    [
+        ("ai/synthesis-output.schema.json", "synthesis-output-v2.valid.json"),
+        ("reports/analysis-report.schema.json", "analysis-report-v1.2.valid.json"),
+    ],
+)
+def test_v2_contract_accepts_more_than_three_source_fixes(
+    schema_name: str,
+    example_name: str,
+) -> None:
+    document = _example(example_name)
+    output = document if schema_name.startswith("ai/") else document["synthesis"]["output"]
+    source_fix = output["source_fixes"][0]
+    output["source_fixes"] = [
+        {
+            **deepcopy(source_fix),
+            "fix_id": f"96000000-0000-4000-8000-{index:012d}",
+        }
+        for index in range(1, 5)
+    ]
+    if schema_name.startswith("reports/"):
+        public_fix = document["source_code"]["fixes"][0]
+        document["source_code"]["fixes"] = [
+            {
+                **deepcopy(public_fix),
+                "fix_id": source_item["fix_id"],
+            }
+            for source_item in output["source_fixes"]
+        ]
+
+    _validator(schema_name).validate(document)
 def test_report_v12_source_states_never_erase_trace_facts() -> None:
     validator = _validator("reports/analysis-report.schema.json")
     report = _example("analysis-report-v1.2.valid.json")
@@ -1214,8 +1280,14 @@ def test_synthesis_v2_collection_maxima_are_exact() -> None:
         {
             **deepcopy(source_fix),
             "fix_id": f"96000000-0000-4000-8000-{index:012d}",
+            "relative_path": f"app/src/main/java/demo/Startup{index}.kt",
+            "symbol": f"demo.Startup{index}.run",
+            "diff": source_fix["diff"].replace(
+                source_fix["relative_path"],
+                f"app/src/main/java/demo/Startup{index}.kt",
+            ),
         }
-        for index in range(1, 4)
+        for index in range(1, 37)
     ]
     synthesis["retest_plan"] = [
         {
@@ -1236,7 +1308,6 @@ def test_synthesis_v2_collection_maxima_are_exact() -> None:
     for collection in (
         "top_findings",
         "recommendations",
-        "source_fixes",
         "retest_plan",
         "limitations",
     ):
@@ -1246,8 +1317,6 @@ def test_synthesis_v2_collection_maxima_are_exact() -> None:
             extra["finding_id"] = "85000000-0000-4000-8000-000000000004"
         elif collection == "recommendations":
             extra["title"] = "Recommendation 4"
-        elif collection == "source_fixes":
-            extra["fix_id"] = "96000000-0000-4000-8000-000000000004"
         elif collection == "retest_plan":
             extra["steps"] = "Retest step 4"
         else:
@@ -1256,6 +1325,24 @@ def test_synthesis_v2_collection_maxima_are_exact() -> None:
         errors = list(_validator(schema_name).iter_errors(invalid))
         assert errors
         assert "maxItems" in _validation_keywords(errors)
+
+    invalid = deepcopy(synthesis)
+    extra_fix = deepcopy(source_fix)
+    extra_fix.update(
+        {
+            "fix_id": "96000000-0000-4000-8000-000000000037",
+            "relative_path": "app/src/main/java/demo/Startup37.kt",
+            "symbol": "demo.Startup37.run",
+            "diff": source_fix["diff"].replace(
+                source_fix["relative_path"],
+                "app/src/main/java/demo/Startup37.kt",
+            ),
+        }
+    )
+    invalid["source_fixes"].append(extra_fix)
+    errors = list(_validator(schema_name).iter_errors(invalid))
+    assert errors
+    assert "maxItems" in _validation_keywords(errors)
 
 
 def test_report_v12_source_collection_maxima_are_exact() -> None:
@@ -1278,20 +1365,6 @@ def test_report_v12_source_collection_maxima_are_exact() -> None:
         for index in range(1, 65)
     ]
     source_fix = source_code["fixes"][0]
-    source_code["fixes"] = [
-        {
-            **deepcopy(source_fix),
-            "fix_id": f"96000000-0000-4000-8000-{index:012d}",
-        }
-        for index in range(1, 4)
-    ]
-    report["synthesis"]["output"]["source_fixes"] = [  # type: ignore[index]
-        {
-            **{field: deepcopy(public_fix[field]) for field in AI_SOURCE_FIX_FIELDS},
-            "validation_profile_id": None,
-        }
-        for public_fix in source_code["fixes"]
-    ]
     source_code["limitations"] = [
         {
             "limitation_id": f"87000000-0000-4000-8000-{index:012d}",
@@ -1301,21 +1374,43 @@ def test_report_v12_source_collection_maxima_are_exact() -> None:
     ]
     _validate_ai_contract(schema_name, report)
 
-    for collection in ("source_refs", "exclusions", "fixes", "limitations"):
+    for collection in ("source_refs", "exclusions", "limitations"):
         invalid = deepcopy(report)
         extra = deepcopy(invalid["source_code"][collection][0])  # type: ignore[index]
         if collection == "source_refs":
             extra["source_ref_id"] = "97000000-0000-4000-8000-000000000013"
         elif collection == "exclusions":
             extra["relative_path"] = "src/excluded-65.kt"
-        elif collection == "fixes":
-            extra["fix_id"] = "96000000-0000-4000-8000-000000000004"
         else:
             extra["limitation_id"] = "87000000-0000-4000-8000-000000000021"
         invalid["source_code"][collection].append(extra)  # type: ignore[index]
         errors = list(_validator(schema_name).iter_errors(invalid))
         assert errors
         assert "maxItems" in _validation_keywords(errors)
+
+    maximum = deepcopy(report)
+    maximum["source_code"]["fixes"] = [  # type: ignore[index]
+        {
+            **deepcopy(source_fix),
+            "fix_id": f"96000000-0000-4000-8000-{index:012d}",
+        }
+        for index in range(1, 37)
+    ]
+    maximum["synthesis"]["output"]["source_fixes"] = [  # type: ignore[index]
+        {
+            **{field: deepcopy(public_fix[field]) for field in AI_SOURCE_FIX_FIELDS},
+            "validation_profile_id": None,
+        }
+        for public_fix in maximum["source_code"]["fixes"]  # type: ignore[index]
+    ]
+    _validator(schema_name).validate(maximum)
+    invalid = deepcopy(maximum)
+    extra = deepcopy(invalid["source_code"]["fixes"][0])  # type: ignore[index]
+    extra["fix_id"] = "96000000-0000-4000-8000-000000000037"
+    invalid["source_code"]["fixes"].append(extra)  # type: ignore[index]
+    errors = list(_validator(schema_name).iter_errors(invalid))
+    assert errors
+    assert "maxItems" in _validation_keywords(errors)
 
 
 @pytest.mark.parametrize(

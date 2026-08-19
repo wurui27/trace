@@ -278,6 +278,74 @@ function sourceAwareReport(): AnalysisReport {
   } as unknown as AnalysisReport;
 }
 
+function sourceActionReport(): AnalysisReport {
+  const base = sourceAwareReport();
+  if (base.schema_version !== "1.2" || base.synthesis.state !== "completed") {
+    throw new Error("fixture requires source-aware synthesis");
+  }
+  const makeFix = (index: number, findingIndex: number, path: string) => ({
+    fix_id: `96000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    finding_id: FINDING_IDS[findingIndex],
+    evidence_ids: [EVIDENCE_IDS[findingIndex]],
+    recommendation_priority: "p0" as const,
+    source_ref_ids: [
+      `97000000-0000-4000-8000-${String(index).padStart(12, "0")}`,
+    ],
+    rule_id: "startup.main_thread_work",
+    match_grade: "strong" as const,
+    relative_path: path,
+    symbol: `demo.Startup.step${index}`,
+    diagnosis: `源码诊断 ${index}`,
+    diff: `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1,1 +1,1 @@\n-old\n+new${index}\n`,
+    validation_profile_id: null,
+    retest_target: "重复相同的冷启动场景。",
+    verification: {
+      state: "not_configured" as const,
+      exit_code: null,
+      duration_ms: null,
+      profile_id: null,
+      patch_sha256: String(index).repeat(64).slice(0, 64),
+      log_summary: null,
+      patch_artifact: null,
+    },
+  });
+  const fixes = [
+    makeFix(1, 0, "app/src/main/java/demo/StartupOne.kt"),
+    makeFix(2, 0, "app/src/main/java/demo/StartupTwo.kt"),
+    makeFix(3, 1, "app/src/main/java/demo/StartupThree.kt"),
+  ];
+  return {
+    ...base,
+    synthesis: {
+      ...base.synthesis,
+      output: {
+        ...base.synthesis.output,
+        source_fixes: fixes.map((sourceFix) => {
+          const { verification, ...fix } = sourceFix;
+          void verification;
+          return fix;
+        }),
+      },
+    },
+    source_code: {
+      ...base.source_code,
+      requested: true,
+      provider_kind: "agent_workspace",
+      agent_id: "71000000-0000-4000-8000-000000000001",
+      workspace_id: "92000000-0000-4000-8000-000000000001",
+      snapshot_policy: "tracked_worktree",
+      context_state: "available",
+      match_summary: "strong",
+      snapshot: {
+        snapshot_id: "93000000-0000-4000-8000-000000000001",
+        snapshot_hash: "b".repeat(64),
+        git_head: "c".repeat(40),
+      },
+      fixes,
+    },
+  };
+}
+
 describe("AnalysisReportView", () => {
   it("shows three primary four-part conclusions and keeps every remaining conclusion collapsible", async () => {
     const user = userEvent.setup();
@@ -308,12 +376,45 @@ describe("AnalysisReportView", () => {
     const remainder = screen.getByText("展开其余 3 条问题与优化方案").closest("details");
     expect(remainder).not.toHaveAttribute("open");
     expect(screen.getAllByTestId("additional-conclusion")).toHaveLength(3);
-    expect(screen.getByText("修改建议 4")).not.toBeVisible();
+    for (const recommendation of screen.getAllByText("修改建议 4")) {
+      expect(recommendation).not.toBeVisible();
+    }
 
     await user.click(screen.getByText("展开其余 3 条问题与优化方案"));
     const fourth = screen.getAllByTestId("additional-conclusion")[0];
     await user.click(within(fourth).getByText("问题点 4", { selector: "summary" }));
     expect(within(fourth).getByText("修改建议 4")).toBeVisible();
+  });
+
+  it("shows every source action, groups multiple diffs, and folds only actions after three", async () => {
+    const user = userEvent.setup();
+    render(
+      <AnalysisReportView
+        report={sourceActionReport()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    await user.click(screen.getByRole("tab", { name: "源码修复" }));
+
+    expect(
+      screen.getByText("修改建议仅供参考，请结合实际业务逻辑审查后再应用。"),
+    ).toBeVisible();
+    const primary = screen.getAllByTestId("source-action-group");
+    expect(primary).toHaveLength(6);
+    expect(within(primary[0]).getAllByLabelText("建议代码 Diff")).toHaveLength(2);
+    expect(within(primary[1]).getAllByLabelText("建议代码 Diff")).toHaveLength(1);
+    expect(within(primary[2]).getByText("修改方案")).toBeVisible();
+    expect(within(primary[2]).getByText("修改建议 3")).toBeVisible();
+    expect(within(primary[2]).queryByLabelText("建议代码 Diff")).not.toBeInTheDocument();
+    const remainder = screen.getByText("展开其余 3 项源码修改").closest("details");
+    expect(remainder).not.toHaveAttribute("open");
+    expect(within(primary[5]).getByText("修改建议 6")).not.toBeVisible();
+    expect(screen.queryByText("没有可安全生成的源码修复")).not.toBeInTheDocument();
+
+    await user.click(screen.getByText("展开其余 3 项源码修改"));
+    expect(within(primary[5]).getByText("修改建议 6")).toBeVisible();
   });
 
   it("embeds the byte-faithful SmartPerfetto HTML without fetching or rendering JSON", async () => {
@@ -354,6 +455,27 @@ describe("AnalysisReportView", () => {
     if (base.schema_version !== "1.2") throw new Error("expected report 1.2");
     const weak = {
       ...base,
+      synthesis: {
+        ...base.synthesis,
+        output: base.synthesis.state === "completed" ? {
+          ...base.synthesis.output,
+          verdict: "private/Startup.kt 存在启动等待。",
+          executive_summary: "需要调整 DEMO.STARTUP.RUN 的执行时机。",
+          conclusions: base.synthesis.output.conclusions.map((conclusion, index) =>
+            index === 0 ? {
+              ...conclusion,
+              problem: "private/Startup.kt 的启动实现存在等待。",
+              recommendation: "调整 demo.Startup.run 后重新采集启动场景。",
+            } : conclusion,
+          ),
+          limitations: base.synthesis.output.limitations.map((limitation, index) =>
+            index === 0 ? {
+              ...limitation,
+              summary: "private/Startup.kt 的证据仍不完整。",
+            } : limitation,
+          ),
+        } : null,
+      },
       source_code: {
         ...base.source_code,
         requested: true,
@@ -368,7 +490,7 @@ describe("AnalysisReportView", () => {
             source_ref_id: "95000000-0000-4000-8000-000000000001",
             relative_path: "private/Startup.kt",
             language: "kotlin" as const,
-            symbol: null,
+            symbol: "demo.Startup.run",
             start_line: 1,
             end_line: 2,
             content_sha256: "a".repeat(64),
@@ -385,7 +507,14 @@ describe("AnalysisReportView", () => {
 
     await user.click(screen.getByRole("tab", { name: "源码修复" }));
     expect(screen.queryByText(/private\/Startup\.kt/)).not.toBeInTheDocument();
+    expect(screen.queryByText(/demo\.Startup\.run/i)).not.toBeInTheDocument();
+    expect(screen.getAllByText(/对应源码位置/).length).toBeGreaterThanOrEqual(2);
     expect(screen.getByText("源码匹配证据不足")).toBeVisible();
+    expect(
+      within(screen.getByLabelText("源码修改动作")).getByText(
+        "调整 对应源码位置 后重新采集启动场景。",
+      ),
+    ).toBeVisible();
   });
 
   it("renders the concise completed report in evidence-first order", () => {

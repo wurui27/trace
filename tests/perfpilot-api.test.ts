@@ -1462,6 +1462,20 @@ describe("PerfPilot browser API", () => {
       validation_profile_id: null,
       retest_target: "重复相同的启动场景。",
     };
+    const sourceRefs = Array.from({ length: 4 }, (_, index) => ({
+      ...sourceRef,
+      source_ref_id: `97000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      relative_path: `app/src/main/java/demo/Startup${index + 1}.kt`,
+      symbol: `demo.Startup${index + 1}.run`,
+    }));
+    const synthesisFixes = sourceRefs.map((reference, index) => ({
+      ...synthesisFix,
+      fix_id: `96000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+      source_ref_ids: [reference.source_ref_id],
+      relative_path: reference.relative_path,
+      symbol: reference.symbol,
+      diff: synthesisFix.diff.replaceAll(sourceRef.relative_path, reference.relative_path),
+    }));
     report.source_code = {
       requested: true,
       provider_kind: "agent_workspace",
@@ -1476,37 +1490,91 @@ describe("PerfPilot browser API", () => {
       },
       context_state: "available",
       match_summary: "strong",
-      source_refs: [sourceRef],
+      source_refs: sourceRefs,
       exclusions: [],
-      fixes: [{
-        ...synthesisFix,
+      fixes: synthesisFixes.map((fix) => ({
+        ...fix,
         verification: {
-      state: "not_configured",
-      exit_code: null,
-      duration_ms: null,
-      profile_id: null,
+          state: "not_configured",
+          exit_code: null,
+          duration_ms: null,
+          profile_id: null,
           patch_sha256: "d".repeat(64),
-      log_summary: null,
-      patch_artifact: null,
+          log_summary: null,
+          patch_artifact: null,
         },
-      }],
+      })),
       limitations: [],
     };
-    report.synthesis.output.source_fixes = [synthesisFix];
+    report.synthesis.output.source_fixes = synthesisFixes;
 
     const client = createPerfPilotClient({
       fetcher: vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(report)),
     });
 
-    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
-      state: "completed",
-      source_code: {
-        validation_profile_id: null,
-        fixes: [{
-          validation_profile_id: null,
-          verification: { state: "not_configured", profile_id: null },
-        }],
+    const parsed = await client.report(TEAM_ID, ANALYSIS_ID);
+    expect(parsed.state).toBe("completed");
+    expect(parsed.schema_version).toBe("1.2");
+    if (parsed.schema_version !== "1.2") throw new Error("expected report 1.2");
+    expect(parsed.source_code.validation_profile_id).toBeNull();
+    expect(parsed.source_code.fixes).toHaveLength(4);
+    expect(parsed.source_code.fixes[0]).toMatchObject({
+      validation_profile_id: null,
+      verification: { state: "not_configured", profile_id: null },
+    });
+
+    const excessive = structuredClone(report);
+    const excessiveSource = excessive.source_code as Record<string, unknown>;
+    const excessiveSynthesis = (excessive.synthesis as Record<string, unknown>)
+      .output as Record<string, unknown>;
+    excessiveSource.fixes = Array.from({ length: 37 }, (_, index) => ({
+      ...structuredClone((report.source_code as Record<string, unknown>).fixes as object[])[0],
+      fix_id: `96000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    }));
+    excessiveSynthesis.source_fixes = Array.from({ length: 37 }, (_, index) => ({
+      ...structuredClone(synthesisFixes[0]),
+      fix_id: `96000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+    }));
+    const excessiveClient = createPerfPilotClient({
+      fetcher: vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(excessive)),
+    });
+    await expect(excessiveClient.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+
+    const duplicateSynthesis = structuredClone(report);
+    const duplicateSynthesisOutput = (duplicateSynthesis.synthesis as Record<string, unknown>)
+      .output as Record<string, unknown>;
+    duplicateSynthesisOutput.source_fixes = [
+      synthesisFixes[0],
+      {
+        ...structuredClone(synthesisFixes[0]),
+        fix_id: "96000000-0000-4000-8000-000000000099",
       },
+    ];
+    const duplicatePublic = structuredClone(report);
+    const duplicatePublicSource = duplicatePublic.source_code as Record<string, unknown>;
+    const publicFix = structuredClone(
+      (duplicatePublicSource.fixes as object[])[0],
+    ) as Record<string, unknown>;
+    duplicatePublicSource.fixes = [
+      publicFix,
+      {
+        ...structuredClone(publicFix),
+        fix_id: "96000000-0000-4000-8000-000000000099",
+      },
+    ];
+    const duplicateClient = createPerfPilotClient({
+      fetcher: vi
+        .fn<typeof fetch>()
+        .mockResolvedValueOnce(Response.json(duplicateSynthesis))
+        .mockResolvedValueOnce(Response.json(duplicatePublic)),
+    });
+    await expect(duplicateClient.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+    await expect(duplicateClient.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
     });
   });
 

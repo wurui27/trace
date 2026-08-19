@@ -28,6 +28,7 @@ from perfpilot_api.ai.prompt import SynthesisPrompt
 from perfpilot_api.ai.synthesis import (
     AISynthesisOutput,
     SynthesisValidationError,
+    salvage_synthesis_source_fixes,
     validate_synthesis_output,
 )
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
@@ -337,6 +338,27 @@ class LocalReportSynthesizer:
                     await on_report(1, "report", "completed", attempts, output)
                 return LocalSynthesisResult(output=output, rounds=(usage,))
             except SynthesisValidationError:
+                if attempts == 2:
+                    try:
+                        output = salvage_synthesis_source_fixes(
+                            projection=projection,
+                            candidate=candidate.candidate_json,
+                        )
+                        validate_simplified_chinese_narrative(output.document)
+                    except (SynthesisValidationError, ChineseNarrativeError):
+                        pass
+                    else:
+                        usage = LocalReportUsage(
+                            number=1,
+                            role="report",
+                            attempts=attempts,
+                            prompt_tokens=prompt_tokens,
+                            completion_tokens=completion_tokens,
+                            latency_ms=latency_ms,
+                        )
+                        if on_report is not None:
+                            await on_report(1, "report", "completed", attempts, output)
+                        return LocalSynthesisResult(output=output, rounds=(usage,))
                 failure_code = "ai_output_invalid"
                 retryable = True
                 detail_code = "semantic_validation"

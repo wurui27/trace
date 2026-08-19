@@ -83,6 +83,125 @@ def test_v2_source_fix_must_match_server_validated_ref() -> None:
         _validate(candidate, projection)
 
 
+def test_v2_rejects_duplicate_source_action_binding() -> None:
+    projection_document = _json_fixture("analysis-projection-v2.valid.json")
+    projection = AIProjection(
+        canonical_bytes=canonical_json_bytes(projection_document),
+        sha256_b64="Y2hlY2tzdW0=",
+    )
+    candidate = _json_fixture("synthesis-output-v2.valid.json")
+    duplicate = deepcopy(candidate["source_fixes"][0])  # type: ignore[index]
+    duplicate["fix_id"] = "96000000-0000-4000-8000-000000000002"
+    candidate["source_fixes"].append(duplicate)  # type: ignore[union-attr]
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
+
+
+def test_v2_allows_multiple_distinct_source_actions_for_one_finding() -> None:
+    projection_document = _json_fixture("analysis-projection-v2.valid.json")
+    second_ref = deepcopy(projection_document["source_context"]["fragments"][0])  # type: ignore[index]
+    second_ref.update(
+        {
+            "source_ref_id": "97000000-0000-4000-8000-000000000002",
+            "relative_path": "app/src/main/java/demo/StartupDelegate.kt",
+            "symbol": "demo.StartupDelegate.loadSettings",
+        }
+    )
+    projection_document["source_context"]["fragments"].append(second_ref)  # type: ignore[index]
+    projection = AIProjection(
+        canonical_bytes=canonical_json_bytes(projection_document),
+        sha256_b64="Y2hlY2tzdW0=",
+    )
+    candidate = _json_fixture("synthesis-output-v2.valid.json")
+    second_fix = deepcopy(candidate["source_fixes"][0])  # type: ignore[index]
+    second_fix.update(
+        {
+            "fix_id": "96000000-0000-4000-8000-000000000002",
+            "source_ref_ids": [second_ref["source_ref_id"]],
+            "relative_path": second_ref["relative_path"],
+            "symbol": second_ref["symbol"],
+            "diff": second_fix["diff"].replace(
+                "app/src/main/java/demo/MainActivity.kt",
+                "app/src/main/java/demo/StartupDelegate.kt",
+            ),
+        }
+    )
+    candidate["source_fixes"].append(second_fix)  # type: ignore[union-attr]
+
+    validated = _validate(candidate, projection)
+
+    assert len(validated.document["source_fixes"]) == 2  # type: ignore[attr-defined]
+
+
+def test_v2_strong_source_keeps_manual_plan_when_no_diff_is_safe() -> None:
+    projection_document = _json_fixture("analysis-projection-v2.valid.json")
+    projection = AIProjection(
+        canonical_bytes=canonical_json_bytes(projection_document),
+        sha256_b64="Y2hlY2tzdW0=",
+    )
+    candidate = _json_fixture("synthesis-output-v2.valid.json")
+    candidate["source_fixes"] = []
+
+    validated = _validate(candidate, projection)
+
+    assert validated.document["source_fixes"] == []  # type: ignore[attr-defined]
+    assert validated.document["conclusions"][0]["recommendation"]  # type: ignore[attr-defined]
+
+
+@pytest.mark.parametrize(
+    "leaked_location",
+    [
+        "app/src/main/java/demo/MainActivity.kt",
+        "demo.MainActivity.onCreate",
+    ],
+)
+def test_v2_weak_source_rejects_locations_in_manual_plan(
+    leaked_location: str,
+) -> None:
+    projection_document = _json_fixture("analysis-projection-v2.valid.json")
+    source_context = projection_document["source_context"]
+    source_context["match_summary"] = "weak"  # type: ignore[index]
+    source_context["fragments"][0]["match_grade"] = "weak"  # type: ignore[index]
+    projection = AIProjection(
+        canonical_bytes=canonical_json_bytes(projection_document),
+        sha256_b64="Y2hlY2tzdW0=",
+    )
+    candidate = _candidate()
+    candidate["conclusions"][0]["recommendation"] = (  # type: ignore[index]
+        f"调整 {leaked_location} 后重新采集启动场景。"
+    )
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
+
+
+@pytest.mark.parametrize(
+    ("field", "leaked_location"),
+    [
+        ("verdict", "app/src/main/java/demo/MainActivity.kt"),
+        ("executive_summary", "demo.MainActivity.onCreate"),
+    ],
+)
+def test_v2_weak_source_rejects_locations_in_every_narrative_field(
+    field: str,
+    leaked_location: str,
+) -> None:
+    projection_document = _json_fixture("analysis-projection-v2.valid.json")
+    source_context = projection_document["source_context"]
+    source_context["match_summary"] = "weak"  # type: ignore[index]
+    source_context["fragments"][0]["match_grade"] = "weak"  # type: ignore[index]
+    projection = AIProjection(
+        canonical_bytes=canonical_json_bytes(projection_document),
+        sha256_b64="Y2hlY2tzdW0=",
+    )
+    candidate = _candidate()
+    candidate[field] = leaked_location
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
+
+
 def test_v2_conclusion_uses_available_strong_source_reference() -> None:
     projection_document = _json_fixture("analysis-projection-v2.valid.json")
     projection = AIProjection(

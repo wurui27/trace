@@ -137,7 +137,7 @@ class OnePassProvider:
                         "-fun onCreate() = Thread.sleep(42)\n"
                         "+fun onCreate() = launchAfterFirstFrame()\n"
                     ),
-                    "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+                    "validation_profile_id": None,
                     "retest_target": "重复冷启动并对比首帧耗时。",
                 }
             ]

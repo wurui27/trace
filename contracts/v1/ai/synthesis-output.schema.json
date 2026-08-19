@@ -13,7 +13,7 @@
     "conclusions": {"type": "array", "maxItems": 300, "uniqueItems": true, "items": {"$ref": "#/$defs/conclusion"}},
     "top_findings": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/topFinding"}},
     "recommendations": {"type": "array", "maxItems": 10, "uniqueItems": true, "items": {"$ref": "#/$defs/recommendation"}},
-    "source_fixes": {"type": "array", "maxItems": 3, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceFix"}},
+    "source_fixes": {"type": "array", "maxItems": 36, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceFix"}},
     "retest_plan": {"type": "array", "maxItems": 5, "uniqueItems": true, "items": {"$ref": "#/$defs/retestItem"}},
     "limitations": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/limitation"}}
   },
