@@ -1,7 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { AgentManagement } from "../app/components/agent-management";
@@ -10,9 +9,7 @@ import type { PerfPilotClient } from "../app/lib/perfpilot-api";
 
 afterEach(cleanup);
 
-it("lists Agents and shows each registration code only after it is generated", async () => {
-  const user = userEvent.setup();
-  const registrationCode = `ppreg_${"A".repeat(43)}`;
+it("lists Agents and explains zero-touch automatic enrollment", async () => {
   const agent = {
     agent_id: "agent-1",
     name: "Ubuntu 实验室",
@@ -33,12 +30,6 @@ it("lists Agents and shows each registration code only after it is generated", a
     }),
     devices: vi.fn().mockResolvedValue({ schema_version: "1.0", devices: [] }),
     agents: vi.fn().mockResolvedValue({ schema_version: "1.0", agents: [agent] }),
-    createAgentRegistrationCode: vi.fn().mockResolvedValue({
-      schema_version: "1.0",
-      agent_id: "agent-2",
-      registration_code: registrationCode,
-      expires_at: "2026-08-05T08:10:00Z",
-    }),
   } as unknown as PerfPilotClient;
 
   render(
@@ -48,15 +39,8 @@ it("lists Agents and shows each registration code only after it is generated", a
   );
 
   expect(await screen.findByText("Ubuntu 实验室")).toBeInTheDocument();
-  expect(screen.queryByText(registrationCode)).not.toBeInTheDocument();
-  await user.type(screen.getByLabelText("Agent 名称"), "Mac Agent");
-  await user.click(screen.getByRole("button", { name: "生成注册码" }));
-
-  expect(client.createAgentRegistrationCode).toHaveBeenCalledWith(
-    "team-1",
-    "Mac Agent",
-    expect.any(AbortSignal),
-  );
-  expect(await screen.findByText(registrationCode)).toBeInTheDocument();
-  expect(screen.getByText(/有效期至/)).toBeInTheDocument();
+  expect(screen.getByText("自动接入已开启")).toBeInTheDocument();
+  expect(screen.getByText(/安装并启动 Agent 后/)).toBeInTheDocument();
+  expect(screen.queryByLabelText("Agent 名称")).not.toBeInTheDocument();
+  expect(screen.queryByRole("button", { name: "生成注册码" })).not.toBeInTheDocument();
 });

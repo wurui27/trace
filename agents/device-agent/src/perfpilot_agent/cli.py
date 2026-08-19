@@ -13,7 +13,6 @@ from perfpilot_agent.adb import AdbError, resolve_adb
 from perfpilot_agent.config import AgentConfig, load_config
 from perfpilot_agent.control_client import ControlClient, ControlClientError
 from perfpilot_agent.credentials import (
-    AgentCredentials,
     CredentialBackend,
     CredentialStore,
     CredentialStoreError,
@@ -102,13 +101,6 @@ def _parser() -> argparse.ArgumentParser:
 
 def _write_json(document: object) -> None:
     print(json.dumps(document, ensure_ascii=False, separators=(",", ":"), sort_keys=True))
-
-
-def _load_registered(store: CredentialStore) -> AgentCredentials:
-    credentials = store.load()
-    if credentials is None:
-        raise CredentialStoreError
-    return credentials
 
 
 async def _register(config_path: Path | None, replace: bool) -> int:
@@ -339,7 +331,14 @@ class _LazyCaptureExecutor:
 async def _run(config_path: Path | None) -> int:
     config = load_config(config_path)
     store = CredentialStore(_credential_backend())
-    credentials = _load_registered(store)
+    credentials = store.load()
+    if credentials is None:
+        async with ControlClient(config) as registration_client:
+            credentials = await RegistrationService(
+                store=store,
+                client=registration_client,
+                metadata=current_platform_metadata(),
+            ).auto_register()
     config.workspace_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     adb = _LazyAdb(config=config)
     metadata = current_platform_metadata()

@@ -38,6 +38,7 @@ describe("Ubuntu user deployment", () => {
     expect(script).toContain('STATE_ROOT="$INSTALL_ROOT/state"');
     expect(script).toContain("PERFPILOT_LOCAL_STATE_DIR");
     expect(script).toContain("PERFPILOT_LOCAL_SOURCE_CODE_ANALYSIS_ENABLED=true");
+    expect(script).toContain("PERFPILOT_LOCAL_AUTO_AGENT_ENROLLMENT=true");
     expect(script).toContain("PERFPILOT_RESET_ANALYSIS_DATA=true");
     expect(script).toContain("PERFPILOT_EXPECTED_ANALYSIS_ROOT");
     expect(script).toContain("bootstrap-local-users.py");

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 import subprocess
@@ -166,6 +167,52 @@ def test_status_json_never_contains_credentials(tmp_path, monkeypatch, capsys) -
     assert credentials.access_token not in output
     assert credentials.refresh_token not in output
     assert credentials.private_key_b64 not in output
+
+
+def test_run_auto_registers_once_before_starting_the_agent_service(
+    tmp_path, monkeypatch
+) -> None:
+    backend = InMemoryCredentialBackend()
+    credentials = _credentials()
+    calls: list[str] = []
+
+    class FakeControlClient:
+        def __init__(self, *_args, credentials=None, **_kwargs) -> None:
+            self.bound_credentials = credentials
+
+        async def __aenter__(self):
+            calls.append("control")
+            return self
+
+        async def __aexit__(self, *_args) -> None:
+            return None
+
+    class FakeRegistrationService:
+        def __init__(self, *, store, **_kwargs) -> None:
+            self.store = store
+
+        async def auto_register(self):
+            calls.append("register")
+            self.store.save(credentials)
+            return credentials
+
+    class FakeAgentService:
+        def __init__(self, **_kwargs) -> None:
+            pass
+
+        async def run(self) -> None:
+            calls.append("run")
+
+    monkeypatch.setattr(cli, "_credential_backend", lambda: backend)
+    monkeypatch.setattr(cli, "ControlClient", FakeControlClient)
+    monkeypatch.setattr(cli, "RegistrationService", FakeRegistrationService)
+    monkeypatch.setattr(cli, "AgentService", FakeAgentService)
+
+    result = asyncio.run(cli._run(Path(_config(tmp_path))))
+
+    assert result == 0
+    assert calls == ["control", "register", "control", "run"]
+    assert CredentialStore(backend).load() == credentials
 
 
 def test_local_unregister_requires_typed_confirmation(tmp_path, monkeypatch) -> None:

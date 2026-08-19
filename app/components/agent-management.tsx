@@ -1,10 +1,9 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
-import { Check, Copy, Pencil, RefreshCw, ShieldOff } from "lucide-react";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Pencil, RefreshCw, ShieldOff } from "lucide-react";
 
 import type {
-  AgentRegistrationCodeResponse,
   AgentState,
   AgentView,
 } from "../lib/perfpilot-api";
@@ -39,10 +38,6 @@ export function AgentManagement() {
   const [agents, setAgents] = useState<readonly AgentView[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [name, setName] = useState("");
-  const [issuing, setIssuing] = useState(false);
-  const [issued, setIssued] = useState<AgentRegistrationCodeResponse | null>(null);
-  const [copied, setCopied] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
   const [mutationError, setMutationError] = useState<string | null>(null);
@@ -90,37 +85,6 @@ export function AgentManagement() {
     },
     [],
   );
-
-  const createCode = async (event: FormEvent<HTMLFormElement>) => {
-    event.preventDefault();
-    if (!canManage || team === null || issuing || !name.trim()) return;
-    const controller = new AbortController();
-    mutationController.current?.abort();
-    mutationController.current = controller;
-    setIssuing(true);
-    setIssued(null);
-    setCopied(false);
-    setMutationError(null);
-    try {
-      const result = await client.createAgentRegistrationCode(
-        team.id,
-        name,
-        controller.signal,
-      );
-      if (controller.signal.aborted) return;
-      setIssued(result);
-      setName("");
-    } catch {
-      if (!controller.signal.aborted) {
-        setMutationError("注册码生成失败，请检查名称后重试。");
-      }
-    } finally {
-      if (mutationController.current === controller) {
-        mutationController.current = null;
-        setIssuing(false);
-      }
-    }
-  };
 
   const rename = async (agent: AgentView) => {
     if (!canManage || team === null || !editingName.trim()) return;
@@ -179,16 +143,6 @@ export function AgentManagement() {
     }
   };
 
-  const copyCode = async () => {
-    if (issued === null) return;
-    try {
-      await navigator.clipboard.writeText(issued.registration_code);
-      setCopied(true);
-    } catch {
-      setMutationError("无法自动复制，请手动选择注册码。");
-    }
-  };
-
   return (
     <div className="agent-management">
       <header className="page-header agent-page-header">
@@ -203,40 +157,13 @@ export function AgentManagement() {
 
       <section className="agent-registration-panel" aria-labelledby="agent-register-title">
         <div>
-          <h2 id="agent-register-title">连接新 Agent</h2>
-          <p>注册码仅显示一次，有效期为 10 分钟。</p>
+          <h2 id="agent-register-title">自动接入已开启</h2>
+          <p>
+            在任意 macOS、Windows 或 Linux 电脑安装并启动 Agent 后，
+            服务器会自动注册、保存凭证并建立连接。
+          </p>
         </div>
-        <form className="agent-registration-form" onSubmit={createCode}>
-          <label htmlFor="agent-registration-name">Agent 名称</label>
-          <div>
-            <input
-              id="agent-registration-name"
-              value={name}
-              maxLength={200}
-              placeholder="例如：Ubuntu 实验室"
-              disabled={!canManage || issuing}
-              onChange={(event) => setName(event.target.value)}
-            />
-            <button type="submit" className="primary-action" disabled={!canManage || issuing || !name.trim()}>
-              {issuing ? "正在生成…" : "生成注册码"}
-            </button>
-          </div>
-        </form>
       </section>
-
-      {issued ? (
-        <section className="agent-registration-code" aria-live="polite">
-          <div>
-            <strong>请立即复制注册码</strong>
-            <span>有效期至 {timeLabel(issued.expires_at)}</span>
-          </div>
-          <code>{issued.registration_code}</code>
-          <button type="button" className="secondary-action" onClick={copyCode}>
-            {copied ? <Check aria-hidden="true" /> : <Copy aria-hidden="true" />}
-            {copied ? "已复制" : "复制"}
-          </button>
-        </section>
-      ) : null}
 
       {mutationError ? <p className="agent-management-error" role="alert">{mutationError}</p> : null}
 
@@ -266,9 +193,7 @@ export function AgentManagement() {
         {loadError ? <p className="agent-list-state is-error" role="alert">{loadError}</p> : null}
         {!loading && !loadError && agents.length === 0 ? (
           <div className="agent-list-state">
-            <p>尚未注册 Agent，请先生成注册码，然后在开发机完成源码接入：</p>
-            <code>{'perfpilot-agent source add --name "RivotekMedia" --path "$PWD"'}</code>
-            <code>perfpilot-agent run</code>
+            <p>尚未发现 Agent。安装并启动后，这里会自动出现，无需注册码。</p>
           </div>
         ) : null}
 

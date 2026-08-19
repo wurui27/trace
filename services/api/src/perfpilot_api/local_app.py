@@ -457,6 +457,15 @@ class _StrictModel(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
 
+class _AutoRegisterAgentRequest(_StrictModel):
+    schema_version: Literal["1.1"]
+    public_key_b64: str = Field(min_length=44, max_length=44, repr=False)
+    platform: Literal["macos", "windows", "linux"]
+    agent_version: str = Field(min_length=1, max_length=64)
+    hostname: str = Field(min_length=1, max_length=200)
+    os_version: str = Field(min_length=1, max_length=128)
+
+
 class _LoginRequest(_StrictModel):
     username: str = Field(min_length=1, max_length=128)
     password: str = Field(min_length=1, max_length=1024)
@@ -5566,6 +5575,7 @@ def create_local_app(
     poll_interval_seconds: float = 2.0,
     source_code_analysis_enabled: bool | None = None,
     source_wait_seconds: float = 120.0,
+    auto_agent_enrollment: bool | None = None,
 ) -> FastAPI:
     resolved_source_code_analysis_enabled = (
         _environment_boolean(
@@ -5574,6 +5584,14 @@ def create_local_app(
         )
         if source_code_analysis_enabled is None
         else source_code_analysis_enabled
+    )
+    resolved_auto_agent_enrollment = (
+        _environment_boolean(
+            "PERFPILOT_LOCAL_AUTO_AGENT_ENROLLMENT",
+            default=False,
+        )
+        if auto_agent_enrollment is None
+        else auto_agent_enrollment
     )
     resolved_gateway = gateway or SmartPerfettoLocalGateway(
         base_url=os.getenv("PERFPILOT_LOCAL_SMARTPERFETTO_URL", "http://127.0.0.1:3001")
@@ -6164,6 +6182,56 @@ def create_local_app(
             )
         except AgentRegistrationRejected:
             raise ApiError("registration_rejected", "Agent 注册失败", 401, False) from None
+        response.headers["cache-control"] = "no-store"
+        return _credentials_payload(credentials, body.schema_version)
+
+    @app.post("/v1/agent/auto-register", status_code=201)
+    async def auto_register_local_agent(
+        body: _AutoRegisterAgentRequest,
+        response: Response,
+    ) -> dict[str, object]:
+        if not resolved_auto_agent_enrollment:
+            raise ApiError("resource_not_found", "资源不存在", 404, False)
+        principal = resolved_control_store.unique_platform_admin()
+        if principal is None:
+            raise ApiError(
+                "auto_enrollment_unavailable",
+                "Agent 自动接入暂不可用",
+                503,
+                True,
+            )
+        safe_name = f"自动接入-{body.platform}-{uuid4().hex[:8]}"
+        try:
+            issued = await resolved_agent_service.create_registration_code(
+                team_id=principal.team_id,
+                owner_user_id=principal.user_id,
+                name=safe_name,
+            )
+            credentials = await resolved_agent_service.register(
+                AgentRegistration(
+                    registration_code=issued.registration_code,
+                    public_key_b64=body.public_key_b64,
+                    platform=body.platform,
+                    agent_version=body.agent_version,
+                    hostname=body.hostname,
+                    os_version=body.os_version,
+                )
+            )
+            try:
+                await resolved_agent_service.rename(
+                    team_id=principal.team_id,
+                    agent_id=credentials.agent_id,
+                    name=body.hostname,
+                )
+            except AgentNameConflictError:
+                pass
+        except (AgentRegistrationRejected, AgentInvalidRequestError):
+            raise ApiError(
+                "auto_registration_rejected",
+                "Agent 自动注册失败",
+                401,
+                False,
+            ) from None
         response.headers["cache-control"] = "no-store"
         return _credentials_payload(credentials, body.schema_version)
 

@@ -10,7 +10,11 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from pydantic import ValidationError
 
 from perfpilot_agent import __version__
-from perfpilot_agent.control_client import RegistrationRequest, RegistrationResponse
+from perfpilot_agent.control_client import (
+    AutoRegistrationRequest,
+    RegistrationRequest,
+    RegistrationResponse,
+)
 from perfpilot_agent.credentials import AgentCredentials, CredentialStore, TaskSigningKey
 from perfpilot_agent.platform.base import PlatformMetadata
 
@@ -35,6 +39,10 @@ class ReplacementConfirmationRequired(RegistrationError):
 class RegistrationClient(Protocol):
     async def register(self, request: RegistrationRequest) -> RegistrationResponse: ...
 
+    async def auto_register(
+        self, request: AutoRegistrationRequest
+    ) -> RegistrationResponse: ...
+
 
 class RegistrationService:
     def __init__(
@@ -49,6 +57,45 @@ class RegistrationService:
         self._client = client
         self.metadata = metadata
         self._private_key_factory = private_key_factory
+
+    def _new_key_material(self) -> tuple[str, str]:
+        private_key = self._private_key_factory()
+        private_raw = private_key.private_bytes(
+            serialization.Encoding.Raw,
+            serialization.PrivateFormat.Raw,
+            serialization.NoEncryption(),
+        )
+        public_raw = private_key.public_key().public_bytes(
+            serialization.Encoding.Raw,
+            serialization.PublicFormat.Raw,
+        )
+        return (
+            base64.b64encode(private_raw).decode("ascii"),
+            base64.b64encode(public_raw).decode("ascii"),
+        )
+
+    def _save_credentials(
+        self,
+        response: RegistrationResponse,
+        private_key_b64: str,
+    ) -> AgentCredentials:
+        credentials = AgentCredentials(
+            schema_version=response.schema_version,
+            agent_id=response.agent_id,
+            team_id=response.team_id,
+            private_key_b64=private_key_b64,
+            access_token=response.access_token,
+            access_token_expires_at=response.access_token_expires_at,
+            refresh_token=response.refresh_token,
+            refresh_token_expires_at=response.refresh_token_expires_at,
+            task_signing_key=TaskSigningKey(
+                kid=response.task_signing_key.kid,
+                public_key_b64=response.task_signing_key.public_key_b64,
+            ),
+            heartbeat_interval_seconds=response.heartbeat_interval_seconds,
+        )
+        self._store.save(credentials)
+        return credentials
 
     async def register(
         self,
@@ -66,43 +113,18 @@ class RegistrationService:
             raw_code = bytes(registration_code)
             if _REGISTRATION_CODE.fullmatch(raw_code) is None:
                 raise RegistrationError
-            private_key = self._private_key_factory()
-            private_raw = private_key.private_bytes(
-                serialization.Encoding.Raw,
-                serialization.PrivateFormat.Raw,
-                serialization.NoEncryption(),
-            )
-            public_raw = private_key.public_key().public_bytes(
-                serialization.Encoding.Raw,
-                serialization.PublicFormat.Raw,
-            )
+            private_key_b64, public_key_b64 = self._new_key_material()
             request = RegistrationRequest(
                 schema_version="1.1",
                 registration_code=raw_code.decode("ascii"),
-                public_key_b64=base64.b64encode(public_raw).decode("ascii"),
+                public_key_b64=public_key_b64,
                 platform=self.metadata.platform,
                 agent_version=__version__,
                 hostname=self.metadata.hostname,
                 os_version=self.metadata.os_version,
             )
             response = await self._client.register(request)
-            credentials = AgentCredentials(
-                schema_version=response.schema_version,
-                agent_id=response.agent_id,
-                team_id=response.team_id,
-                private_key_b64=base64.b64encode(private_raw).decode("ascii"),
-                access_token=response.access_token,
-                access_token_expires_at=response.access_token_expires_at,
-                refresh_token=response.refresh_token,
-                refresh_token_expires_at=response.refresh_token_expires_at,
-                task_signing_key=TaskSigningKey(
-                    kid=response.task_signing_key.kid,
-                    public_key_b64=response.task_signing_key.public_key_b64,
-                ),
-                heartbeat_interval_seconds=response.heartbeat_interval_seconds,
-            )
-            self._store.save(credentials)
-            return credentials
+            return self._save_credentials(response, private_key_b64)
         except (RegistrationAlreadyExists, ReplacementConfirmationRequired):
             raise
         except (RegistrationError, ValidationError, UnicodeError, ValueError, TypeError):
@@ -110,6 +132,27 @@ class RegistrationService:
         finally:
             for index in range(len(registration_code)):
                 registration_code[index] = 0
+
+    async def auto_register(self) -> AgentCredentials:
+        try:
+            if self._store.load() is not None:
+                raise RegistrationAlreadyExists
+            private_key_b64, public_key_b64 = self._new_key_material()
+            response = await self._client.auto_register(
+                AutoRegistrationRequest(
+                    schema_version="1.1",
+                    public_key_b64=public_key_b64,
+                    platform=self.metadata.platform,
+                    agent_version=__version__,
+                    hostname=self.metadata.hostname,
+                    os_version=self.metadata.os_version,
+                )
+            )
+            return self._save_credentials(response, private_key_b64)
+        except RegistrationAlreadyExists:
+            raise
+        except (RegistrationError, ValidationError, UnicodeError, ValueError, TypeError):
+            raise RegistrationError from None
 
 
 __all__ = [

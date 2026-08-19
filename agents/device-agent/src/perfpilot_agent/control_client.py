@@ -139,6 +139,29 @@ class RegistrationRequest(BaseModel):
         return value
 
 
+class AutoRegistrationRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    schema_version: Literal["1.1"]
+    public_key_b64: str = Field(repr=False)
+    platform: AgentPlatform
+    agent_version: str
+    hostname: str = Field(min_length=1, max_length=200, pattern=r"^[^\x00-\x1f\x7f]+$")
+    os_version: str = Field(min_length=1, max_length=128, pattern=r"^[^\x00-\x1f\x7f]+$")
+
+    @field_validator("public_key_b64")
+    @classmethod
+    def validate_public_key(cls, value: str) -> str:
+        return _validate_raw_public_key(value)
+
+    @field_validator("agent_version")
+    @classmethod
+    def validate_agent_version(cls, value: str) -> str:
+        if len(value) > 64 or _AGENT_VERSION.fullmatch(value) is None:
+            raise ValueError("Agent version is invalid")
+        return value
+
+
 class TaskSigningKeyResponse(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -929,6 +952,25 @@ class ControlClient:
         except (ValidationError, ValueError, TypeError, UnicodeError):
             raise ControlClientError from None
 
+    async def auto_register(
+        self,
+        request: AutoRegistrationRequest | Mapping[str, object],
+    ) -> RegistrationResponse:
+        try:
+            normalized = AutoRegistrationRequest.model_validate(request)
+            payload = await self._request(
+                "POST",
+                "/v1/agent/auto-register",
+                expected_status=201,
+                json=normalized.model_dump(mode="json"),
+                retry=False,
+            )
+            return RegistrationResponse.model_validate_json(payload)
+        except ControlClientError:
+            raise
+        except (ValidationError, ValueError, TypeError, UnicodeError):
+            raise ControlClientError from None
+
     async def _refresh_after_unauthorized(self, failed_access_token: str) -> None:
         async with self._refresh_lock:
             if self.credentials.access_token != failed_access_token:
@@ -1399,6 +1441,7 @@ class ControlClient:
 
 
 __all__ = [
+    "AutoRegistrationRequest",
     "CancellationAcknowledgementResponse",
     "CompletionAcknowledgementResponse",
     "ControlClient",

@@ -42,6 +42,10 @@ class FakeClient:
         self.requests.append(request)
         return self.response
 
+    async def auto_register(self, request):
+        self.requests.append(request)
+        return self.response
+
 
 def registration_response(signing_key: Ed25519PrivateKey) -> RegistrationResponse:
     now = datetime(2026, 8, 5, 8, 0, tzinfo=UTC)
@@ -91,6 +95,35 @@ async def test_registration_generates_key_saves_credentials_and_zeroes_code(
     assert saved.schema_version == "1.1"
     assert saved.team_id == TEAM_ID
     assert client.requests[0].schema_version == "1.1"
+
+
+@pytest.mark.asyncio
+async def test_auto_registration_generates_key_and_saves_server_credentials(
+    signing_key: Ed25519PrivateKey,
+) -> None:
+    store = CredentialStore(InMemoryCredentialBackend())
+    client = FakeClient(registration_response(signing_key))
+    registration_key = Ed25519PrivateKey.generate()
+    service = RegistrationService(
+        store=store,
+        client=client,
+        metadata=PlatformMetadata(
+            platform="windows",
+            hostname="qa-windows",
+            os_version="Windows 11",
+        ),
+        private_key_factory=lambda: registration_key,
+    )
+
+    saved = await service.auto_register()
+
+    assert len(client.requests) == 1
+    assert client.requests[0].schema_version == "1.1"
+    assert client.requests[0].public_key_b64 == public_key_b64(registration_key)
+    assert client.requests[0].hostname == "qa-windows"
+    assert not hasattr(client.requests[0], "registration_code")
+    assert store.load() == saved
+    assert saved.team_id == TEAM_ID
 
 
 @pytest.mark.asyncio
@@ -172,3 +205,46 @@ async def test_control_client_rejects_open_registration_response(tmp_path) -> No
                     "os_version": "Ubuntu 24.04",
                 }
             )
+
+
+@pytest.mark.asyncio
+async def test_control_client_auto_registration_sends_no_manual_code(
+    tmp_path, signing_key: Ed25519PrivateKey
+) -> None:
+    ca_bundle = tmp_path / "ca.crt"
+    ca_bundle.write_text("unused-by-mock", encoding="utf-8")
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    config = AgentConfig(
+        schema_version="1.0",
+        server_url="https://control.example.test",
+        ca_bundle=ca_bundle,
+        workspace_root=workspace,
+    )
+    expected = registration_response(signing_key)
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/agent/auto-register"
+        document = request.read().decode("utf-8")
+        assert "registration_code" not in document
+        return httpx.Response(
+            201,
+            request=request,
+            content=expected.model_dump_json(),
+            headers={"content-type": "application/json"},
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = ControlClient(config, http_client=http_client)
+        response = await client.auto_register(
+            {
+                "schema_version": "1.1",
+                "public_key_b64": public_key_b64(Ed25519PrivateKey.generate()),
+                "platform": "linux",
+                "agent_version": "0.1.0",
+                "hostname": "ubuntu-lab",
+                "os_version": "Ubuntu 24.04",
+            }
+        )
+
+    assert response == expected

@@ -194,6 +194,17 @@ class LocalControlStore:
             user = self._find_user(document, normalized)
             return None if user is None else self._principal_from_user(document, user)
 
+    def unique_platform_admin(self) -> LocalPrincipal | None:
+        """Return the sole platform administrator used by explicit auto-enrollment."""
+        with self._exclusive_lock():
+            document = self._read_document()
+            admins = [
+                user for user in document["users"] if user["is_platform_admin"] is True
+            ]
+            if len(admins) != 1:
+                return None
+            return self._principal_from_user(document, admins[0])
+
     def authenticate(self, username: str, password: str) -> LocalPrincipal | None:
         if not isinstance(username, str) or not isinstance(password, str):
             return None
