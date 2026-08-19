@@ -56,8 +56,7 @@ const scenarioStates = {
 } as const;
 
 export function activeAnalysisStageLabel(analysis: AnalysisResponse): string {
-  if (analysis.state === "completed") return "分析已完成";
-  if (analysis.state === "partially_completed") return "分析完成，部分证据不足";
+  if (["completed", "partially_completed"].includes(analysis.state)) return "分析完成";
   if (analysis.state === "failed") return "分析未能完成";
   if (analysis.state === "canceled") return "分析已取消";
   if (analysis.state === "deleted") return "分析已删除";
@@ -143,10 +142,11 @@ export function ActiveAnalysisTaskCard({
   }, [now]);
 
   const isActive = activeStates.has(analysis.state);
+  const isSuccessful = ["completed", "partially_completed"].includes(analysis.state);
   const title = isActive ? "正在分析" : activeAnalysisStageLabel(analysis);
   const terminalDescription: Partial<Record<AnalysisState, string>> = {
     completed: "最终报告已经生成",
-    partially_completed: "可验证结果已生成，部分证据仍缺失",
+    partially_completed: "最终报告已经生成",
     failed: "任务已停止，可查看详情定位失败阶段",
     canceled: "后端已确认任务停止",
     deleted: "该任务已不再可用",
@@ -175,7 +175,7 @@ export function ActiveAnalysisTaskCard({
           <p className="latest-report-label">当前任务</p>
           <span>{elapsedLabel(analysis.created_at, now ?? clock)}</span>
         </div>
-        <h2>{title}</h2>
+        <h2 className={isSuccessful ? "is-success" : undefined}>{title}</h2>
         <p className="active-analysis-stage">{stage}</p>
         {isActive ? (
           <p className="active-analysis-estimate">

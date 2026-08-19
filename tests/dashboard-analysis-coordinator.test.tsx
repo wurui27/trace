@@ -227,7 +227,7 @@ describe("Dashboard analysis coordinator", () => {
     );
     releasePoll?.();
 
-    expect(await screen.findByText("分析已完成")).toBeInTheDocument();
+    expect(await screen.findByText("分析完成")).toHaveClass("is-success");
     await waitFor(() => expect(latestReportLoader).toHaveBeenCalledTimes(2));
   });
 

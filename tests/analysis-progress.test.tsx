@@ -99,8 +99,8 @@ describe("AnalysisProgress", () => {
     ["created", "等待上传 Trace"],
     ["uploading", "正在接收分析文件"],
     ["analyzing", "SmartPerfetto 正在分析"],
-    ["completed", "分析已完成"],
-    ["partially_completed", "分析完成，部分证据不足"],
+    ["completed", "分析完成"],
+    ["partially_completed", "分析完成"],
     ["failed", "分析未能完成"],
     ["canceled", "分析已取消"],
   ] as const)("renders the real %s state", (state, label) => {
@@ -109,6 +109,13 @@ describe("AnalysisProgress", () => {
     expect(screen.getByRole("heading", { name: label })).toBeInTheDocument();
     expect(screen.getByText("Trace")).toBeInTheDocument();
     expect(screen.getByText("analysis-live-1")).toBeInTheDocument();
+  });
+
+  it("presents a partially completed report as a green completed analysis", () => {
+    render(<AnalysisProgressView analysis={analysis("partially_completed")} />);
+
+    expect(screen.getByRole("heading", { name: "分析完成" })).toHaveClass("is-success");
+    expect(screen.queryByText(/部分证据不足|证据仍缺失/)).not.toBeInTheDocument();
   });
 
   it("shows an honest unavailable state without demo findings", async () => {

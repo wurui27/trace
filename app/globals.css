@@ -957,6 +957,10 @@ select:disabled {
   font-weight: 730;
 }
 
+.active-analysis-task h2.is-success {
+  color: var(--success);
+}
+
 .active-analysis-stage,
 .active-analysis-estimate,
 .active-analysis-warning {

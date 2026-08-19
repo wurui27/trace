@@ -57,14 +57,14 @@ const stateCopy: Record<
     tone: "active",
   },
   completed: {
-    title: "分析已完成",
+    title: "分析完成",
     description: "SmartPerfetto 证据与 PerfPilot 建议已经生成并安全归档。",
     tone: "success",
   },
   partially_completed: {
-    title: "分析完成，部分证据不足",
-    description: "已保留可验证结论，并明确标记缺少的证据。",
-    tone: "warning",
+    title: "分析完成",
+    description: "SmartPerfetto 证据与 PerfPilot 建议已经生成并安全归档。",
+    tone: "success",
   },
   failed: {
     title: "分析未能完成",

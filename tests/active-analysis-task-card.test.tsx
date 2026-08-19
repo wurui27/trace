@@ -133,6 +133,25 @@ function activeDeviceAnalysis(): AnalysisResponse {
 }
 
 describe("ActiveAnalysisTaskCard", () => {
+  it("shows a partially completed analysis as a green completed task", () => {
+    render(
+      <ActiveAnalysisTaskCard
+        analysis={{
+          ...activeAnalysis(),
+          state: "partially_completed",
+          report_available: true,
+        }}
+        now={new Date("2026-08-04T08:08:00Z").valueOf()}
+        canceling={false}
+        stale={false}
+        onCancel={vi.fn()}
+      />,
+    );
+
+    expect(screen.getByRole("heading", { name: "分析完成" })).toHaveClass("is-success");
+    expect(screen.queryByText(/部分证据不足|证据仍缺失/)).not.toBeInTheDocument();
+  });
+
   it("shows the real stage, elapsed time, honest estimate and actions", async () => {
     const user = userEvent.setup();
     const cancel = vi.fn();
