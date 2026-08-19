@@ -251,7 +251,12 @@ class LocalAgentStore:
             records = [self._agent_from_document(item) for item in document["agents"]]
             if len(records) >= _MAX_AGENTS:
                 raise LocalAgentStoreError("local agent persistence failed")
-            if any(record.team_id == team_id and record.name == name for record in records):
+            if any(
+                record.team_id == team_id
+                and record.name == name
+                and record.state != "revoked"
+                for record in records
+            ):
                 raise AgentNameConflictError
             record = AgentRecord(
                 id=self._new_uuid(),

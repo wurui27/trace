@@ -196,6 +196,28 @@ async def test_repository_enforces_team_scope_one_time_codes_rotation_and_stale_
     assert (await store.get_source_agent(AGENT_A)).state == "offline"  # type: ignore[union-attr]
 
 
+@pytest.mark.asyncio
+async def test_revoked_agent_releases_its_name_for_a_new_user_enrollment(
+    tmp_path: Path,
+) -> None:
+    store = await _registered_store(tmp_path)
+    revoked = await store.revoke(team_id=TEAM_A, agent_id=AGENT_A, now=NOW)
+    assert revoked is not None and revoked.state == "revoked"
+
+    replacement = await store.create_pending(
+        team_id=TEAM_A,
+        owner_user_id=USER_A,
+        name="Rivotek Agent",
+        registration_code_digest="d" * 64,
+        registration_code_expires_at=NOW + timedelta(minutes=10),
+        now=NOW + timedelta(seconds=1),
+    )
+
+    assert replacement.id != AGENT_A
+    assert replacement.name == "Rivotek Agent"
+    assert replacement.state == "pending"
+
+
 def test_store_rejects_unknown_schema_fifo_and_absolute_path_capabilities(tmp_path: Path) -> None:
     tmp_path.mkdir(exist_ok=True)
     (tmp_path / "agents.json").write_text(
