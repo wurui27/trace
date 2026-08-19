@@ -85,7 +85,7 @@
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
         "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate source-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file and one leading ---/+++ pair whose four header paths equal relative_path, rejects later file headers, .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk ranges or old-lines to source."},
-        "validation_profile_id": {"$ref": "#/$defs/uuid"},
+        "validation_profile_id": {"type": "null"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000}
       }
     },

@@ -379,6 +379,41 @@ def _validate_source_fixes(
     recommendation_by_priority = {
         item.get("priority"): item for item in recommendations if isinstance(item, dict)
     }
+    recommended_finding_ids = {
+        finding_id
+        for item in recommendations
+        if isinstance(item, dict) and isinstance(item.get("finding_ids"), list)
+        for finding_id in item["finding_ids"]
+        if isinstance(finding_id, str)
+    }
+    fixable_finding_ids: set[str] = set()
+    for source_ref in index.source_refs.values():
+        relative_path = source_ref.get("relative_path")
+        symbol = source_ref.get("symbol")
+        finding_ids = source_ref.get("finding_ids")
+        evidence_ids = source_ref.get("evidence_ids")
+        rule_ids = source_ref.get("rule_ids")
+        if (
+            source_ref.get("match_grade") != "strong"
+            or not isinstance(relative_path, str)
+            or not relative_path.endswith((".kt", ".java", ".xml"))
+            or not isinstance(symbol, str)
+            or not symbol
+            or not isinstance(finding_ids, list)
+            or not isinstance(evidence_ids, list)
+            or not isinstance(rule_ids, list)
+            or not rule_ids
+        ):
+            continue
+        for finding_id in finding_ids:
+            if (
+                isinstance(finding_id, str)
+                and finding_id in index.finding_evidence
+                and set(evidence_ids).intersection(index.finding_evidence[finding_id])
+            ):
+                fixable_finding_ids.add(finding_id)
+    if fixable_finding_ids.intersection(recommended_finding_ids) and not source_fixes:
+        raise SynthesisValidationError
     fix_ids: set[str] = set()
     for fix in source_fixes:
         if not isinstance(fix, dict):
@@ -401,6 +436,7 @@ def _validate_source_fixes(
             or not all(ref_id in index.source_refs for ref_id in source_ref_ids)
             or not isinstance(rule_id, str)
             or priority not in recommendation_by_priority
+            or fix.get("validation_profile_id") is not None
         ):
             raise SynthesisValidationError
         fix_ids.add(fix_id)

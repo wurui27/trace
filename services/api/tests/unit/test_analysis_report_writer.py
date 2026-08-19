@@ -163,7 +163,33 @@ def test_composer_enriches_strong_source_fix_in_the_same_v12_document() -> None:
     assert public_fix["fix_id"] == result.document["synthesis"]["output"][
         "source_fixes"
     ][0]["fix_id"]
+    assert result.document["synthesis"]["output"]["source_fixes"][0][
+        "validation_profile_id"
+    ] is None
+    assert public_fix["validation_profile_id"] == source_code[
+        "validation_profile_id"
+    ]
     assert public_fix["verification"]["state"] == "not_requested"
+
+
+def test_composer_keeps_source_diff_when_validation_profile_is_not_configured() -> None:
+    source_code = _load("analysis-report-v1.2.valid.json")["source_code"]
+    source_code["validation_profile_id"] = None
+    source_code["fixes"] = []
+
+    result = compose_analysis_report(
+        replace(
+            _request(),
+            synthesis_document=_load("synthesis-output-v2.valid.json"),
+            source_code_document=source_code,
+        ),
+        report_version=4,
+    )
+
+    public_fix = result.document["source_code"]["fixes"][0]
+    assert public_fix["validation_profile_id"] is None
+    assert public_fix["verification"]["state"] == "not_configured"
+    assert public_fix["verification"]["profile_id"] is None
 
 
 def test_composer_preserves_device_mode_in_v11_report() -> None:

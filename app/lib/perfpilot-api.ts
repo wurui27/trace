@@ -299,13 +299,13 @@ export interface SourceFix {
   readonly symbol: string | null;
   readonly diagnosis: string;
   readonly diff: string;
-  readonly validation_profile_id: string;
+  readonly validation_profile_id: string | null;
   readonly retest_target: string;
   readonly verification: {
     readonly state: PatchVerificationState;
     readonly exit_code: number | null;
     readonly duration_ms: number | null;
-    readonly profile_id: string;
+    readonly profile_id: string | null;
     readonly patch_sha256: string;
     readonly log_summary: string | null;
     readonly patch_artifact: {
@@ -1566,7 +1566,10 @@ function validSourceFix(value: unknown, verification: boolean): boolean {
     (value.symbol !== null && typeof value.symbol !== "string") ||
     typeof value.diagnosis !== "string" ||
     typeof value.diff !== "string" ||
-    !CANONICAL_UUID.test(String(value.validation_profile_id)) ||
+    (verification
+      ? value.validation_profile_id !== null &&
+        !CANONICAL_UUID.test(String(value.validation_profile_id))
+      : value.validation_profile_id !== null) ||
     typeof value.retest_target !== "string"
   ) {
     return false;
@@ -1591,7 +1594,9 @@ function validSourceFix(value: unknown, verification: boolean): boolean {
     ].includes(String(result.state)) ||
     (result.exit_code !== null && !Number.isSafeInteger(result.exit_code)) ||
     (result.duration_ms !== null && !Number.isSafeInteger(result.duration_ms)) ||
-    !CANONICAL_UUID.test(String(result.profile_id)) ||
+    (result.state === "not_configured"
+      ? result.profile_id !== null
+      : !CANONICAL_UUID.test(String(result.profile_id))) ||
     typeof result.patch_sha256 !== "string" ||
     !/^[0-9a-f]{64}$/.test(result.patch_sha256) ||
     (result.log_summary !== null && typeof result.log_summary !== "string")

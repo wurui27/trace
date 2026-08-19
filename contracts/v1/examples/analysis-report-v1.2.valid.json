@@ -76,7 +76,7 @@
           "symbol": "demo.MainActivity.onCreate",
           "diagnosis": "The matched startup method performs a synchronous settings lookup.",
           "diff": "diff --git a/app/src/main/java/demo/MainActivity.kt b/app/src/main/java/demo/MainActivity.kt\n--- a/app/src/main/java/demo/MainActivity.kt\n+++ b/app/src/main/java/demo/MainActivity.kt\n@@ -10,1 +10,1 @@\n-        loadSettings()\n+        deferSettingsLoad()\n",
-          "validation_profile_id": "94000000-0000-4000-8000-000000000001",
+          "validation_profile_id": null,
           "retest_target": "Repeat the cold-start scenario and compare the existing display metric."
         }
       ],

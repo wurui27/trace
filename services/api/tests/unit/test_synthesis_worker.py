@@ -19,10 +19,15 @@ from perfpilot_api.ai.openai_compatible import (
     SynthesisCandidate,
 )
 from perfpilot_api.ai.prompt import load_synthesis_prompt
+from perfpilot_api.ai.synthesis import (
+    SynthesisValidationError,
+    validate_synthesis_output,
+)
 from perfpilot_api.reports.contracts import canonical_json_bytes
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.privacy import ProjectionPrivacyError
 from perfpilot_api.reports.projection import (
+    AIProjection,
     ProjectionQuestionError,
     ProjectionSizeError,
 )
@@ -77,6 +82,37 @@ def _synthesis_v2_no_source() -> dict[str, object]:
         conclusion["source_ref_ids"] = []
         conclusion["source_root_cause"] = "当前没有足够源码证据定位具体实现。"
     return document
+
+
+def _source_projection() -> AIProjection:
+    payload = canonical_json_bytes(_load("analysis-projection-v2.valid.json"))
+    return AIProjection(
+        canonical_bytes=payload,
+        sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii"),
+    )
+
+
+def test_strong_source_fix_does_not_require_an_automatic_validation_profile() -> None:
+    candidate = _load("synthesis-output-v2.valid.json")
+    candidate["source_fixes"][0]["validation_profile_id"] = None
+
+    validated = validate_synthesis_output(
+        projection=_source_projection(),
+        candidate=candidate,
+    )
+
+    assert validated.document["source_fixes"][0]["validation_profile_id"] is None
+
+
+def test_strong_eligible_source_context_requires_at_least_one_safe_fix() -> None:
+    candidate = _load("synthesis-output-v2.valid.json")
+    candidate["source_fixes"] = []
+
+    with pytest.raises(SynthesisValidationError):
+        validate_synthesis_output(
+            projection=_source_projection(),
+            candidate=candidate,
+        )
 
 
 def _core(analysis_mode: str = "trace_upload") -> NormalizedTraceReport:

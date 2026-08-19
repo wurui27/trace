@@ -1430,6 +1430,86 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("accepts a source diff when automatic validation is not configured", async () => {
+    const report = sourceAwareReportPayload();
+    report.state = "completed";
+    const sourceRef = {
+      source_ref_id: "97000000-0000-4000-8000-000000000001",
+      relative_path: "app/src/main/java/demo/Startup.kt",
+      language: "kotlin",
+      symbol: "demo.Startup.run",
+      start_line: 1,
+      end_line: 2,
+      content_sha256: "a".repeat(64),
+      snapshot_hash: "b".repeat(64),
+      match_grade: "strong",
+      finding_ids: ["85000000-0000-4000-8000-000000000001"],
+      evidence_ids: ["86000000-0000-4000-8000-000000000001"],
+      rule_ids: ["android.ui.blocking_wait"],
+    };
+    const synthesisFix = {
+      fix_id: "96000000-0000-4000-8000-000000000001",
+      finding_id: "85000000-0000-4000-8000-000000000001",
+      evidence_ids: ["86000000-0000-4000-8000-000000000001"],
+      recommendation_priority: "p0",
+      source_ref_ids: [sourceRef.source_ref_id],
+      rule_id: "android.ui.blocking_wait",
+      match_grade: "strong",
+      relative_path: sourceRef.relative_path,
+      symbol: sourceRef.symbol,
+      diagnosis: "主线程执行了同步等待。",
+      diff: "diff --git a/app/src/main/java/demo/Startup.kt b/app/src/main/java/demo/Startup.kt\n--- a/app/src/main/java/demo/Startup.kt\n+++ b/app/src/main/java/demo/Startup.kt\n@@ -1,1 +1,1 @@\n-old\n+new\n",
+      validation_profile_id: null,
+      retest_target: "重复相同的启动场景。",
+    };
+    report.source_code = {
+      requested: true,
+      provider_kind: "agent_workspace",
+      agent_id: AGENT_ID,
+      workspace_id: "92000000-0000-4000-8000-000000000001",
+      snapshot_policy: "tracked_worktree",
+      validation_profile_id: null,
+      snapshot: {
+        snapshot_id: "93000000-0000-4000-8000-000000000001",
+        snapshot_hash: sourceRef.snapshot_hash,
+        git_head: "c".repeat(40),
+      },
+      context_state: "available",
+      match_summary: "strong",
+      source_refs: [sourceRef],
+      exclusions: [],
+      fixes: [{
+        ...synthesisFix,
+        verification: {
+      state: "not_configured",
+      exit_code: null,
+      duration_ms: null,
+      profile_id: null,
+          patch_sha256: "d".repeat(64),
+      log_summary: null,
+      patch_artifact: null,
+        },
+      }],
+      limitations: [],
+    };
+    report.synthesis.output.source_fixes = [synthesisFix];
+
+    const client = createPerfPilotClient({
+      fetcher: vi.fn<typeof fetch>().mockResolvedValueOnce(Response.json(report)),
+    });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      state: "completed",
+      source_code: {
+        validation_profile_id: null,
+        fixes: [{
+          validation_profile_id: null,
+          verification: { state: "not_configured", profile_id: null },
+        }],
+      },
+    });
+  });
+
   it("rejects source refs for none and fixes for weak source matches", async () => {
     const sourceRef = {
       source_ref_id: "95000000-0000-4000-8000-000000000001",

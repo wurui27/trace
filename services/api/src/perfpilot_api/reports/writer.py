@@ -176,15 +176,26 @@ def _source_code_v12(
         if isinstance(existing, dict):
             public_fixes.append(existing)
             continue
-        profile_id = raw.get("validation_profile_id")
+        candidate_profile_id = raw.get("validation_profile_id")
+        profile_id = document.get("validation_profile_id")
         diff = raw.get("diff")
-        if not isinstance(profile_id, str) or not isinstance(diff, str):
+        if (
+            candidate_profile_id is not None
+            or profile_id is not None
+            and not isinstance(profile_id, str)
+            or not isinstance(diff, str)
+        ):
             raise ReportSourceError("report source is invalid")
         public_fixes.append(
             {
                 **raw,
+                "validation_profile_id": profile_id,
                 "verification": {
-                    "state": "not_requested",
+                    "state": (
+                        "not_requested"
+                        if isinstance(profile_id, str)
+                        else "not_configured"
+                    ),
                     "exit_code": None,
                     "duration_ms": None,
                     "profile_id": profile_id,

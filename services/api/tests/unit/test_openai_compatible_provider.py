@@ -212,6 +212,7 @@ async def test_v2_provider_requires_all_conclusions_while_only_three_are_primary
         )
         assert "exactly one conclusion for every required finding ID" in coverage
         assert "not limited to three" in coverage
+        assert "source_fixes must contain at least one safe unified diff" in coverage
         assert required_ids.issubset(set(coverage.split()))
 
 

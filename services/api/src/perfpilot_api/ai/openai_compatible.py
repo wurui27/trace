@@ -120,15 +120,43 @@ def _conclusion_coverage_instruction(projection: AIProjection) -> str | None:
                     and evidence_ids
                 ):
                     finding_ids.append(finding_id)
+        source_context = document.get("source_context")
+        fragments = (
+            source_context.get("fragments")
+            if isinstance(source_context, dict)
+            else []
+        )
+        source_fix_required = isinstance(fragments, list) and any(
+            isinstance(fragment, dict)
+            and fragment.get("match_grade") == "strong"
+            and isinstance(fragment.get("relative_path"), str)
+            and str(fragment["relative_path"]).endswith((".kt", ".java", ".xml"))
+            and isinstance(fragment.get("symbol"), str)
+            and bool(fragment.get("symbol"))
+            and isinstance(fragment.get("finding_ids"), list)
+            and bool(fragment.get("finding_ids"))
+            and isinstance(fragment.get("evidence_ids"), list)
+            and bool(fragment.get("evidence_ids"))
+            and isinstance(fragment.get("rule_ids"), list)
+            and bool(fragment.get("rule_ids"))
+            for fragment in fragments
+        )
     except (TypeError, ValueError):
         return None
-    return (
+    instruction = (
         "CONCLUSION COVERAGE (mandatory): `conclusions` is not limited to three. "
         "Include exactly one conclusion for every required finding ID below and "
         "do not omit any. The three-item limit applies only to the primary "
         "`top_findings`, recommendations, retest items, and source fixes. "
         f"Required conclusion finding IDs: {' '.join(finding_ids) or '(none)'}"
     )
+    if source_fix_required:
+        instruction += (
+            " SOURCE FIX COVERAGE (mandatory): strong fixable source references "
+            "are present, so source_fixes must contain at least one safe unified "
+            "diff. Set every source fix validation_profile_id to null."
+        )
+    return instruction
 
 
 class OpenAICompatibleSynthesisProvider:

@@ -115,6 +115,10 @@ def _set_first_verification_state(
             "patch_artifact": None,
         }
     )
+    if state == "not_configured":
+        report["source_code"]["validation_profile_id"] = None  # type: ignore[index]
+        report["source_code"]["fixes"][0]["validation_profile_id"] = None  # type: ignore[index]
+        verification["profile_id"] = None
 
 
 def _bind_verified_patch_metadata(public_fix: dict[str, object]) -> None:
@@ -448,7 +452,13 @@ def test_v2_synthesis_enforces_aggregate_diff_utf8_bytes(
     if schema_name.startswith("reports/"):
         verification = deepcopy(document["source_code"]["fixes"][0]["verification"])
         document["source_code"]["fixes"] = [
-            {**deepcopy(source_fix), "verification": deepcopy(verification)}
+            {
+                **deepcopy(source_fix),
+                "validation_profile_id": document["source_code"][
+                    "validation_profile_id"
+                ],
+                "verification": deepcopy(verification),
+            }
             for source_fix in output["source_fixes"]
         ]
         for public_fix in document["source_code"]["fixes"]:
@@ -479,7 +489,10 @@ def test_report_v12_enforces_aggregate_public_fix_diff_utf8_bytes() -> None:
         },
     ]
     report["synthesis"]["output"]["source_fixes"] = [  # type: ignore[index]
-        {field: deepcopy(public_fix[field]) for field in AI_SOURCE_FIX_FIELDS}
+        {
+            **{field: deepcopy(public_fix[field]) for field in AI_SOURCE_FIX_FIELDS},
+            "validation_profile_id": None,
+        }
         for public_fix in report["source_code"]["fixes"]  # type: ignore[index]
     ]
     for public_fix in report["source_code"]["fixes"]:  # type: ignore[index]
@@ -811,7 +824,7 @@ def test_report_v12_every_verification_state_maps_to_exactly_one_report_state(
         _set_first_verification_state(report, verification_state)
     expected_state = (
         "completed"
-        if verification_state in {"not_requested", "verified"}
+        if verification_state in {"not_requested", "not_configured", "verified"}
         else "partially_completed"
     )
     _assert_only_report_v12_state(report, expected_state)
@@ -1273,7 +1286,10 @@ def test_report_v12_source_collection_maxima_are_exact() -> None:
         for index in range(1, 4)
     ]
     report["synthesis"]["output"]["source_fixes"] = [  # type: ignore[index]
-        {field: deepcopy(public_fix[field]) for field in AI_SOURCE_FIX_FIELDS}
+        {
+            **{field: deepcopy(public_fix[field]) for field in AI_SOURCE_FIX_FIELDS},
+            "validation_profile_id": None,
+        }
         for public_fix in source_code["fixes"]
     ]
     source_code["limitations"] = [

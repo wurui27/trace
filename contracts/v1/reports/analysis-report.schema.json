@@ -219,7 +219,7 @@
           "synthesis": {"properties": {"state": {"const": "completed"}}},
           "scenario_reports": {"items": {"properties": {"result_state": {"const": "completed"}}}},
           "source_code": {
-            "$comment": "Report 1.2 state mapping is deterministic: no-source and available zero-fix outcomes are completed; executable fixes are completed when verification is either verified or explicitly not_requested.",
+            "$comment": "Report 1.2 state mapping is deterministic: no-source and available zero-fix outcomes are completed; executable fixes are completed when verification is verified, explicitly not requested, or has no configured automatic validation profile.",
             "oneOf": [
               {
                 "properties": {"requested": {"const": false}},
@@ -243,7 +243,7 @@
                     "items": {
                       "properties": {
                         "verification": {
-                          "properties": {"state": {"enum": ["verified", "not_requested"]}},
+                          "properties": {"state": {"enum": ["verified", "not_requested", "not_configured"]}},
                           "required": ["state"]
                         }
                       },
@@ -284,7 +284,6 @@
                                 "apply_failed",
                                 "validation_failed",
                                 "source_changed",
-                                "not_configured",
                                 "timeout",
                                 "canceled",
                                 "unavailable"
@@ -1549,7 +1548,7 @@
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
         "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate synthesis-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file and one leading ---/+++ pair whose four header paths equal relative_path, rejects later file headers, .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk ranges or old-lines to source."},
-        "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
+        "validation_profile_id": {"type": "null"},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000}
       }
     },
@@ -1704,7 +1703,7 @@
         "state": {"enum": ["not_requested", "pending", "validating", "verified", "apply_failed", "validation_failed", "source_changed", "not_configured", "timeout", "canceled", "unavailable"]},
         "exit_code": {"oneOf": [{"type": "integer", "minimum": -255, "maximum": 255}, {"type": "null"}]},
         "duration_ms": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 1200000}, {"type": "null"}]},
-        "profile_id": {"$ref": "#/$defs/sourceUuid"},
+        "profile_id": {"oneOf": [{"$ref": "#/$defs/sourceUuid"}, {"type": "null"}]},
         "patch_sha256": {"$ref": "#/$defs/hex64"},
         "log_summary": {"oneOf": [{"type": "string", "minLength": 1, "maxLength": 2000}, {"type": "null"}]},
         "patch_artifact": {"oneOf": [{"$ref": "#/$defs/patchArtifact"}, {"type": "null"}]}
@@ -1718,6 +1717,11 @@
         {
           "if": {"properties": {"state": {"enum": ["not_requested", "pending", "validating"]}}, "required": ["state"]},
           "then": {"properties": {"exit_code": {"type": "null"}, "duration_ms": {"type": "null"}, "log_summary": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"state": {"const": "not_configured"}}, "required": ["state"]},
+          "then": {"properties": {"profile_id": {"type": "null"}, "exit_code": {"type": "null"}, "duration_ms": {"type": "null"}, "log_summary": {"type": "null"}}},
+          "else": {"properties": {"profile_id": {"$ref": "#/$defs/sourceUuid"}}}
         }
       ]
     },
@@ -1737,7 +1741,7 @@
         "symbol": {"type": "string", "minLength": 1, "maxLength": 512},
         "diagnosis": {"type": "string", "minLength": 1, "maxLength": 2000},
         "diff": {"type": "string", "minLength": 1, "maxLength": 65536, "pattern": "^diff --git a/[^\\r\\n]+ b/[^\\r\\n]+\\n--- a/[^\\r\\n]+\\n\\+\\+\\+ b/[^\\r\\n]+(?:\\n|$)", "$comment": "Also subject to the 65,536 UTF-8 byte aggregate public-fix budget. Semantic validation parses the complete diff, requires exactly one changed .kt/.java/.xml file and one leading ---/+++ pair whose four header paths equal relative_path, rejects later file headers, .git and unsafe paths plus binary/new/delete/rename/copy/mode/symlink metadata, and intentionally does not match hunk ranges or old-lines to source."},
-        "validation_profile_id": {"$ref": "#/$defs/sourceUuid"},
+        "validation_profile_id": {"oneOf": [{"$ref": "#/$defs/sourceUuid"}, {"type": "null"}]},
         "retest_target": {"type": "string", "minLength": 1, "maxLength": 2000},
         "verification": {"$ref": "#/$defs/patchVerification"}
       }

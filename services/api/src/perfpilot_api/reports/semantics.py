@@ -24,7 +24,6 @@ _AI_SOURCE_FIX_FIELDS = (
     "symbol",
     "diagnosis",
     "diff",
-    "validation_profile_id",
     "retest_target",
 )
 _ALLOWED_SOURCE_FIX_EXTENSIONS = (".kt", ".java", ".xml")
