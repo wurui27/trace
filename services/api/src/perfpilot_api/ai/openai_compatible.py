@@ -91,6 +91,46 @@ def _nonnegative_int(value: object) -> int | None:
     return value
 
 
+def _conclusion_coverage_instruction(projection: AIProjection) -> str | None:
+    """Return an ID-only checklist for the uncapped detailed conclusion list."""
+
+    try:
+        document = projection.document
+        if document.get("schema_version") != "2.0":
+            return None
+        scenarios = document.get("scenarios")
+        if not isinstance(scenarios, list):
+            return None
+        finding_ids: list[str] = []
+        for scenario in scenarios:
+            if not isinstance(scenario, dict):
+                return None
+            findings = scenario.get("findings")
+            if not isinstance(findings, list):
+                return None
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    return None
+                finding_id = finding.get("finding_id")
+                evidence_ids = finding.get("evidence_ids")
+                if (
+                    finding.get("status") in {"confirmed", "suspected"}
+                    and isinstance(finding_id, str)
+                    and isinstance(evidence_ids, list)
+                    and evidence_ids
+                ):
+                    finding_ids.append(finding_id)
+    except (TypeError, ValueError):
+        return None
+    return (
+        "CONCLUSION COVERAGE (mandatory): `conclusions` is not limited to three. "
+        "Include exactly one conclusion for every required finding ID below and "
+        "do not omit any. The three-item limit applies only to the primary "
+        "`top_findings`, recommendations, retest items, and source fixes. "
+        f"Required conclusion finding IDs: {' '.join(finding_ids) or '(none)'}"
+    )
+
+
 class OpenAICompatibleSynthesisProvider:
     def __init__(
         self,
@@ -291,6 +331,9 @@ class OpenAICompatibleSynthesisProvider:
             {"role": "system", "content": self._prompt.system_instruction},
             {"role": "user", "content": projection_text},
         ]
+        coverage_instruction = _conclusion_coverage_instruction(projection)
+        if coverage_instruction is not None:
+            messages.append({"role": "user", "content": coverage_instruction})
         if retry_code is not None:
             # The rejected candidate is deliberately not retained or reflected.
             messages.append(

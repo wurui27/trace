@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 
 import httpx
 import pytest
@@ -11,8 +12,48 @@ from perfpilot_api.ai.prompt import load_synthesis_prompt
 from perfpilot_api.reports.projection import AIProjection
 
 
+ROOT = Path(__file__).resolve().parents[4]
+
+
 def _projection() -> AIProjection:
     return AIProjection(canonical_bytes=b'{"schema_version":"1.0"}', sha256_b64="checksum")
+
+
+def _projection_with_five_findings() -> AIProjection:
+    document = json.loads(
+        (ROOT / "contracts/v1/examples/analysis-projection-v2.valid.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    scenario = document["scenarios"][0]
+    original_finding = scenario["findings"][0]
+    original_evidence = scenario["evidence"][0]
+    for suffix in range(2, 6):
+        finding_id = f"85000000-0000-4000-8000-{suffix:012d}"
+        evidence_id = f"86000000-0000-4000-8000-{suffix:012d}"
+        scenario["findings"].append(
+            {
+                **original_finding,
+                "finding_id": finding_id,
+                "evidence_ids": [evidence_id],
+            }
+        )
+        scenario["evidence"].append(
+            {
+                **original_evidence,
+                "evidence_id": evidence_id,
+            }
+        )
+    return AIProjection(
+        canonical_bytes=json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8"),
+        sha256_b64="checksum",
+    )
 
 
 def _response(content: str = '{"schema_version":"1.0"}') -> httpx.Response:
@@ -131,6 +172,47 @@ async def test_invalid_output_retry_sends_safe_instructions_without_prior_candid
     assert body["messages"][2:] == [retry_message]
     assert re.search(r"[0-9]", retry_message["content"]) is None
     assert rejected_candidate not in requests[1].content.decode("utf-8")
+
+
+@pytest.mark.asyncio
+async def test_v2_provider_requires_all_conclusions_while_only_three_are_primary() -> None:
+    from perfpilot_api.ai.openai_compatible import OpenAICompatibleSynthesisProvider
+
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return _response()
+
+    projection = _projection_with_five_findings()
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), follow_redirects=False
+    ) as client:
+        provider = OpenAICompatibleSynthesisProvider(
+            base_url=SecretStr("https://provider.example.com/openai/v1/"),
+            model="provider-model-1",
+            token=SecretStr("private-provider-token"),
+            prompt=load_synthesis_prompt(),
+            max_response_bytes=128 * 1024,
+            response_format="json_object",
+            client=client,
+        )
+        await provider.synthesize(projection)
+        await provider.synthesize(projection, retry_code="ai_output_invalid")
+
+    required_ids = {
+        f"85000000-0000-4000-8000-{suffix:012d}" for suffix in range(1, 6)
+    }
+    for request in requests:
+        messages = json.loads(request.content)["messages"]
+        coverage = next(
+            message["content"]
+            for message in messages
+            if "CONCLUSION COVERAGE" in message["content"]
+        )
+        assert "exactly one conclusion for every required finding ID" in coverage
+        assert "not limited to three" in coverage
+        assert required_ids.issubset(set(coverage.split()))
 
 
 @pytest.mark.asyncio
