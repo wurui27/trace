@@ -168,6 +168,7 @@ from perfpilot_api.services.source_workspaces import (
     SourceWorkspaceService,
 )
 from perfpilot_api.services.agent_tasks import (
+    ActiveAgentTask,
     AgentExecutionAccess,
     AgentTaskError,
     AgentTaskDefinition,
@@ -2725,6 +2726,19 @@ class _LocalRuntime:
         if completed:
             self._schedule_remote_analysis(analysis, access, manifest)
 
+    async def observe_agent_activity(self, task: ActiveAgentTask) -> None:
+        analysis = await self.analysis(
+            task.definition.team_id,
+            task.definition.analysis_id,
+        )
+        async with self.lock:
+            if analysis.state != "queued" or analysis.cancel_requested_at is not None:
+                return
+            analysis.state = "scheduled"
+            analysis.started_at = analysis.started_at or datetime.now(UTC)
+            analysis.version += 1
+        await self._persist(analysis)
+
     def _schedule_remote_analysis(
         self,
         analysis: _LocalAnalysis,
@@ -3949,92 +3963,98 @@ class _LocalRuntime:
         async with self.lock:
             if analysis.state in _TERMINAL_ANALYSIS_STATES:
                 return analysis, False
-            if analysis.cancel_requested_at is not None:
-                return analysis, True
-            analysis.cancel_requested_at = datetime.now(UTC)
-            analysis.version += 1
-            requested_at = analysis.cancel_requested_at
+            requested_at = analysis.cancel_requested_at or datetime.now(UTC)
+            analysis.cancel_requested_at = requested_at
             task = analysis.task
             run = (
                 analysis.source_run
                 if analysis.stages.get("smartperfetto") == "running"
                 else None
             )
+            analysis.state = "canceled"
+            analysis.completed_at = requested_at
+            analysis.failure = None
+            for stage_name, stage_state in analysis.stages.items():
+                if stage_state not in {"completed", "failed", "not_requested"}:
+                    analysis.stages[stage_name] = "canceled"
+            analysis.version += 1
         await self._persist(analysis)
 
-        publication_lock = (
-            self._remote_publication_lock(analysis)
-            if analysis.analysis_mode == "device"
-            else None
-        )
-        if publication_lock is not None:
-            await publication_lock.acquire()
-
-        try:
-            if analysis.analysis_mode == "device" and analysis.inputs["apk"].finalized:
-                try:
-                    cancellation = await self.agent_tasks.request_cancel(
+        if analysis.analysis_mode == "device":
+            try:
+                await self.agent_tasks.request_cancel(
+                    team_id=analysis.team_id,
+                    analysis_id=analysis.analysis_id,
+                )
+            except AgentTaskNotFound:
+                pass
+            except Exception as error:
+                _LOGGER.warning(
+                    "Remote capture cancellation deferred type=%s",
+                    type(error).__name__,
+                )
+                retry = asyncio.create_task(
+                    self._retry_agent_cancellation(
                         team_id=analysis.team_id,
                         analysis_id=analysis.analysis_id,
                     )
-                except AgentTaskNotFound:
-                    cancellation = None
-                except Exception:
-                    raise HTTPException(
-                        status.HTTP_503_SERVICE_UNAVAILABLE,
-                        "Remote capture cancellation failed",
-                    ) from None
-                if cancellation is not None and cancellation.execution_id is not None:
-                    return analysis, True
+                )
+                self.tasks.add(retry)
+                retry.add_done_callback(self.tasks.discard)
 
-            if analysis.source_binding is not None:
-                try:
-                    await self.source_tasks.request_cancel(
-                        team_id=analysis.team_id,
-                        analysis_id=analysis.analysis_id,
-                    )
-                except SourceTaskError:
-                    pass
+        if analysis.source_binding is not None:
+            try:
+                await self.source_tasks.request_cancel(
+                    team_id=analysis.team_id,
+                    analysis_id=analysis.analysis_id,
+                )
+            except SourceTaskError:
+                pass
 
-            if run is not None:
-                try:
-                    await self.gateway.cancel(run)
-                except Exception as error:
-                    async with self.lock:
-                        if (
-                            analysis.state in _ACTIVE_ANALYSIS_STATES
-                            and analysis.cancel_requested_at == requested_at
-                        ):
-                            analysis.cancel_requested_at = None
-                            analysis.version += 1
-                    await self._persist(analysis)
-                    raise HTTPException(
-                        status.HTTP_502_BAD_GATEWAY,
-                        "SmartPerfetto cancellation failed",
-                    ) from error
+        if run is not None:
+            try:
+                await self.gateway.cancel(run)
+            except Exception as error:
+                _LOGGER.warning(
+                    "SmartPerfetto cancellation failed after local cancellation type=%s",
+                    type(error).__name__,
+                )
 
-            if (
-                task is not None
-                and task is not asyncio.current_task()
-                and not task.done()
-            ):
-                task.cancel()
-                await asyncio.gather(task, return_exceptions=True)
+        if (
+            task is not None
+            and task is not asyncio.current_task()
+            and not task.done()
+        ):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
-            async with self.lock:
-                if analysis.state in _TERMINAL_ANALYSIS_STATES:
-                    return analysis, False
-                analysis.state = "canceled"
-                analysis.failure = None
-                for stage_name, stage_state in analysis.stages.items():
-                    if stage_state not in {"completed", "failed", "not_requested"}:
-                        analysis.stages[stage_name] = "canceled"
-                analysis.version += 1
-            await self._persist(analysis)
-            return analysis, True
-        finally:
-            if publication_lock is not None:
-                publication_lock.release()
+        return analysis, True
+
+    async def _retry_agent_cancellation(
+        self,
+        *,
+        team_id: UUID,
+        analysis_id: UUID,
+    ) -> None:
+        delay = 0.05
+        while True:
+            await asyncio.sleep(delay)
+            try:
+                await self.agent_tasks.request_cancel(
+                    team_id=team_id,
+                    analysis_id=analysis_id,
+                )
+                return
+            except AgentTaskNotFound:
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _LOGGER.warning(
+                    "Remote capture cancellation retry deferred type=%s",
+                    type(error).__name__,
+                )
+                delay = min(delay * 2, 5.0)
 
     async def reserve(
         self,
@@ -4555,10 +4575,13 @@ class _LocalRuntime:
         definition: AgentTaskDefinition,
         registered: bool,
     ) -> None:
-        await self.agent_tasks.request_cancel(
-            team_id=analysis.team_id,
-            analysis_id=analysis.analysis_id,
-        )
+        try:
+            await self.agent_tasks.request_cancel(
+                team_id=analysis.team_id,
+                analysis_id=analysis.analysis_id,
+            )
+        except AgentTaskNotFound:
+            pass
         self.agent_artifacts.unregister_input(
             team_id=analysis.team_id,
             analysis_id=analysis.analysis_id,
@@ -5646,6 +5669,13 @@ def create_local_app(
         ),
     )
     resolved_source_artifacts = SourceArtifactService.in_memory()
+    runtime_holder: list[_LocalRuntime] = []
+
+    async def observe_agent_activity(task: ActiveAgentTask) -> None:
+        if not runtime_holder:
+            raise RuntimeError("Local runtime is unavailable")
+        await runtime_holder[0].observe_agent_activity(task)
+
     resolved_agent_task_service = AgentTaskService(
         repository=InMemoryAgentTaskRepository(
             capture_lease_projection=resolved_agent_store,
@@ -5655,8 +5685,8 @@ def create_local_app(
             kid="local-agent-v1",
         ),
         wakeup=InMemoryAgentTaskWakeup(),
+        activity_observer=observe_agent_activity,
     )
-    runtime_holder: list[_LocalRuntime] = []
 
     async def observe_agent_completion(
         access: AgentExecutionAccess,

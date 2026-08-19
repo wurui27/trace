@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import json
 import secrets
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache
@@ -1173,11 +1173,13 @@ class AgentTaskService:
         signer: TaskSnapshotSigner,
         wakeup: AgentTaskWakeup,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
+        activity_observer: Callable[[ActiveAgentTask], Awaitable[None]] | None = None,
     ) -> None:
         self._repository = repository
         self._signer = signer
         self._wakeup = wakeup
         self._clock = clock
+        self._activity_observer = activity_observer
 
     async def enqueue(self, definition: AgentTaskDefinition) -> bool:
         queued = await self._repository.enqueue(
@@ -1242,6 +1244,8 @@ class AgentTaskService:
             task = await self._repository.load_active(agent_id=agent_id, now=now)
         if task is None:
             return None
+        if self._activity_observer is not None:
+            await self._activity_observer(task)
         claims = _task_claims(task, issued_at=now)
         compact = self._signer.sign(claims)
         await self._repository.record_snapshot_digest(

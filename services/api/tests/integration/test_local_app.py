@@ -87,6 +87,7 @@ from perfpilot_agent.uploads import InputDownloader, MultipartUploader
 from perfpilot_api.services.agent_tasks import (
     AgentExecutionAccess,
     AgentExecutionScenario,
+    AgentTaskCancellation,
     ValidatedAgentExecutionManifest,
 )
 from perfpilot_api.services.source_workspaces import SourceBinding
@@ -4015,6 +4016,90 @@ def test_local_script_capture_queues_without_apk_upload(
         assert [item["scenario_type"] for item in claims["scenarios"]] == [
             expected_scenario
         ]
+        browser_headers = _authenticated_client(
+            client, "user01", "established user password"
+        )
+        running = client.get(
+            f"/v1/teams/{user.team_id}/analyses/{document['analysis_id']}",
+            headers=browser_headers,
+        )
+        assert running.status_code == 200, running.text
+        assert running.json()["state"] == "scheduled"
+
+
+@pytest.mark.asyncio
+async def test_script_capture_cancel_is_immediate_after_agent_lease(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+    )
+    runtime = app.state.local_runtime
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("30000000-0000-4000-8000-000000000001")
+    agent_id = UUID("71000000-0000-4000-8000-000000000001")
+    analysis = _LocalAnalysis(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        profile="startup",
+        question=None,
+        inputs={},
+        analysis_mode="device",
+        device_id=UUID("72000000-0000-4000-8000-000000000001"),
+        device_agent_id=agent_id,
+        device_digest="device-digest",
+        capture_configuration={
+            "test_type": "cold_start",
+            "launch_mode": "automatic",
+            "duration_seconds": 15,
+            "package_name": "com.rivotek.mediacenter",
+            "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+        },
+        remote_publication="published",
+        state="queued",
+    )
+    runtime.analyses[(team_id, analysis_id)] = analysis
+    runtime.agent_tasks._repository._capture_lease_projection = None
+    await runtime.agent_tasks.enqueue(runtime._script_device_definition(analysis))
+    scheduled = await runtime.agent_tasks.schedule(
+        analysis_id=analysis_id,
+        agent_id=agent_id,
+    )
+    assert scheduled is not None
+    original_request_cancel = runtime.agent_tasks.request_cancel
+    cancel_calls = 0
+
+    async def fail_once_request_cancel(**kwargs: object):
+        nonlocal cancel_calls
+        cancel_calls += 1
+        if cancel_calls == 1:
+            raise RuntimeError("transient cancellation dispatch failure")
+        return await original_request_cancel(**kwargs)
+
+    runtime.agent_tasks.request_cancel = fail_once_request_cancel
+
+    canceled, accepted = await runtime.cancel(analysis)
+    renewed = None
+    for _ in range(100):
+        renewed = await runtime.agent_tasks.renew(
+            agent_id=agent_id,
+            execution_id=scheduled.execution_id,
+            lease_version=scheduled.lease_version,
+        )
+        if isinstance(renewed, AgentTaskCancellation):
+            break
+        await asyncio.sleep(0.01)
+    await runtime.close()
+    app.state.agent_upload_service.close()
+    app.state.local_agent_store.close()
+
+    assert accepted is True
+    assert canceled.state == "canceled"
+    assert canceled.cancel_requested_at is not None
+    assert cancel_calls == 2
+    assert isinstance(renewed, AgentTaskCancellation)
 
 
 def test_local_remote_capture_finalizes_apk_and_publishes_agent_task(
@@ -4703,9 +4788,13 @@ async def test_analysis_cancel_wins_race_with_remote_apk_inspection(
             break
         await asyncio.sleep(0.001)
     assert analysis.cancel_requested_at is not None
+    canceled, accepted = await asyncio.wait_for(
+        asyncio.shield(cancellation),
+        timeout=0.2,
+    )
+    assert inspector.release.is_set() is False
     inspector.release.set()
     result = await asyncio.gather(finalize, return_exceptions=True)
-    canceled, accepted = await cancellation
     await runtime.close()
     app.state.agent_upload_service.close()
     app.state.local_agent_store.close()

@@ -712,6 +712,7 @@ class LocalAgentArtifactService:
                     raise AgentUploadInvalidRequest(
                         "upload kind was reused with different metadata"
                     )
+                self._refresh_pending_upload(existing, access=access, now=now)
                 return self._slot(existing)
             artifact_id = self._uuid_source()
             upload_id = self._uuid_source()
@@ -775,9 +776,11 @@ class LocalAgentArtifactService:
             lease_version=lease_version,
             now=now,
         )
-        upload = self._owned_upload(access, upload_id)
-        if upload.finalized_at is not None or upload.expires_at <= now:
-            raise AgentUploadExpired("upload has expired")
+        async with self._lock:
+            upload = self._owned_upload(access, upload_id)
+            self._refresh_pending_upload(upload, access=access, now=now)
+            if upload.finalized_at is not None or upload.expires_at <= now:
+                raise AgentUploadExpired("upload has expired")
         if (
             isinstance(part_number, bool)
             or not isinstance(part_number, int)
@@ -970,7 +973,9 @@ class LocalAgentArtifactService:
             lease_version=lease_version,
             now=now,
         )
-        upload = self._owned_upload(access, upload_id)
+        async with self._lock:
+            upload = self._owned_upload(access, upload_id)
+            self._refresh_pending_upload(upload, access=access, now=now)
         canonical = tuple(parts)
         if len(canonical) != upload.part_count or any(
             not isinstance(part, MultipartPart)
@@ -982,15 +987,26 @@ class LocalAgentArtifactService:
         if upload.finalized_at is not None:
             await asyncio.to_thread(self._verify_completed, upload)
             return self._slot(upload)
-        if upload.expires_at <= now:
-            raise AgentUploadExpired("upload has expired")
         upload_lock = self._upload_locks.setdefault(upload.upload_id, asyncio.Lock())
         async with upload_lock:
             if upload.finalized_at is not None:
                 await asyncio.to_thread(self._verify_completed, upload)
                 return self._slot(upload)
-            if upload.expires_at <= self._now():
-                raise AgentUploadExpired("upload has expired")
+            refreshed_at = self._now()
+            refreshed_access = await self._authorize(
+                agent_id=agent_id,
+                execution_id=execution_id,
+                lease_version=lease_version,
+                now=refreshed_at,
+            )
+            async with self._lock:
+                self._refresh_pending_upload(
+                    upload,
+                    access=refreshed_access,
+                    now=refreshed_at,
+                )
+                if upload.expires_at <= refreshed_at:
+                    raise AgentUploadExpired("upload has expired")
             parts_fd = self._upload_parts_fd(upload, create=False)
             completed_fd = self._completed_fd(upload, create=False)
             temporary = f".{upload.artifact_id}.{uuid4().hex}.tmp"
@@ -1161,6 +1177,28 @@ class LocalAgentArtifactService:
             expires_at=upload.expires_at,
             finalized_at=upload.finalized_at,
         )
+
+    def _refresh_pending_upload(
+        self,
+        upload: _Upload,
+        *,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> None:
+        if upload.finalized_at is not None:
+            return
+        expires_at = min(now + timedelta(minutes=15), access.lease_expires_at)
+        if expires_at <= upload.expires_at:
+            return
+        previous = upload.expires_at
+        upload.expires_at = expires_at
+        try:
+            self._save_state(upload.team_id, upload.analysis_id)
+        except AgentUploadCommittedError:
+            raise
+        except AgentUploadError:
+            upload.expires_at = previous
+            raise
 
     def _save_state(self, team_id: UUID, analysis_id: UUID) -> None:
         uploads = [

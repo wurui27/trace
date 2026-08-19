@@ -425,6 +425,58 @@ async def test_agent_multipart_create_put_complete_publishes_exact_artifact(
 
 
 @pytest.mark.asyncio
+async def test_pending_upload_tracks_renewed_execution_lease_until_completion(
+    tmp_path: Path,
+) -> None:
+    payload = b"slow trace bytes"
+    current = [NOW]
+    authorizer = FixedExecutionAuthorizer(
+        lease_expires_at=NOW + timedelta(minutes=1)
+    )
+    service = LocalAgentArtifactService(
+        root=tmp_path,
+        public_origin="http://testserver",
+        execution_authorizer=authorizer,
+        clock=lambda: current[0],
+        uuid_source=iter((ARTIFACT_ID, UPLOAD_ID)).__next__,
+        token_source=iter(("slow-part-grant",)).__next__,
+    )
+    slot = await service.create_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        artifact_kind="startup_trace",
+        mime="application/x-perfetto-trace",
+        size=len(payload),
+        sha256_b64=_checksum(payload),
+    )
+    part = await service.authorize_part(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=slot.upload_id,
+        part_number=1,
+    )
+    etag = await service.put_part(
+        urlsplit(part.url).path.rsplit("/", 1)[-1],
+        (payload,),
+    )
+
+    current[0] = NOW + timedelta(minutes=1, seconds=1)
+    authorizer.lease_expires_at = current[0] + timedelta(minutes=1)
+    completed = await service.complete_upload(
+        agent_id=AGENT_ID,
+        execution_id=EXECUTION_ID,
+        lease_version=3,
+        upload_id=slot.upload_id,
+        parts=(MultipartPart(part_number=1, etag=etag),),
+    )
+
+    assert completed.state == "finalized"
+    assert _completed_path(tmp_path, completed.artifact_id).read_bytes() == payload
+
+
+@pytest.mark.asyncio
 async def test_wrong_lease_is_rejected_before_upload_filesystem_write(tmp_path: Path) -> None:
     service = _service(tmp_path)
 
