@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
 import { cleanup, render, screen } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { AgentManagement } from "../app/components/agent-management";
@@ -9,7 +10,8 @@ import type { PerfPilotClient } from "../app/lib/perfpilot-api";
 
 afterEach(cleanup);
 
-it("lists Agents and explains zero-touch automatic enrollment", async () => {
+it("lets the user open one automatic enrollment slot and delete an Agent", async () => {
+  const user = userEvent.setup();
   const agent = {
     agent_id: "agent-1",
     name: "Ubuntu 实验室",
@@ -30,6 +32,19 @@ it("lists Agents and explains zero-touch automatic enrollment", async () => {
     }),
     devices: vi.fn().mockResolvedValue({ schema_version: "1.0", devices: [] }),
     agents: vi.fn().mockResolvedValue({ schema_version: "1.0", agents: [agent] }),
+    agentEnrollment: vi.fn().mockResolvedValue({
+      schema_version: "1.0",
+      enrollment: null,
+    }),
+    openAgentEnrollment: vi.fn().mockResolvedValue({
+      schema_version: "1.0",
+      enrollment: {
+        enrollment_id: "98000000-0000-4000-8000-000000000001",
+        name: "新测试电脑",
+        expires_at: "2026-08-19T11:10:00Z",
+      },
+    }),
+    revokeAgent: vi.fn().mockResolvedValue({ ...agent, state: "revoked" }),
   } as unknown as PerfPilotClient;
 
   render(
@@ -39,8 +54,22 @@ it("lists Agents and explains zero-touch automatic enrollment", async () => {
   );
 
   expect(await screen.findByText("Ubuntu 实验室")).toBeInTheDocument();
-  expect(screen.getByText("自动接入已开启")).toBeInTheDocument();
-  expect(screen.getByText(/安装并启动 Agent 后/)).toBeInTheDocument();
-  expect(screen.queryByLabelText("Agent 名称")).not.toBeInTheDocument();
+  await user.type(screen.getByLabelText("Agent 名称"), "新测试电脑");
+  await user.click(screen.getByRole("button", { name: "添加 Agent" }));
+  expect(client.openAgentEnrollment).toHaveBeenCalledWith(
+    "team-1",
+    "新测试电脑",
+    expect.any(AbortSignal),
+  );
+  expect(await screen.findByText(/等待 Agent 自动连接/)).toBeInTheDocument();
   expect(screen.queryByRole("button", { name: "生成注册码" })).not.toBeInTheDocument();
+
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  await user.click(screen.getByRole("button", { name: "删除 Ubuntu 实验室" }));
+  expect(client.revokeAgent).toHaveBeenCalledWith(
+    "team-1",
+    "agent-1",
+    expect.any(AbortSignal),
+  );
+  expect(screen.queryByText("Ubuntu 实验室")).not.toBeInTheDocument();
 });

@@ -589,6 +589,17 @@ export interface AgentRegistrationCodeResponse {
   readonly expires_at: string;
 }
 
+export interface AgentEnrollment {
+  readonly enrollment_id: string;
+  readonly name: string;
+  readonly expires_at: string;
+}
+
+export interface AgentEnrollmentResponse {
+  readonly schema_version: "1.0";
+  readonly enrollment: AgentEnrollment | null;
+}
+
 export type RemoteDeviceState =
   | "ready"
   | "busy"
@@ -709,6 +720,15 @@ export interface PerfPilotClient {
     signal?: AbortSignal,
   ): Promise<SourceWorkspaceListResponse>;
   agents(teamId: string, signal?: AbortSignal): Promise<AgentListResponse>;
+  agentEnrollment(
+    teamId: string,
+    signal?: AbortSignal,
+  ): Promise<AgentEnrollmentResponse>;
+  openAgentEnrollment(
+    teamId: string,
+    name: string,
+    signal?: AbortSignal,
+  ): Promise<AgentEnrollmentResponse>;
   createAgentRegistrationCode(
     teamId: string,
     name: string,
@@ -1956,6 +1976,32 @@ function registrationCodeResponse(value: unknown): AgentRegistrationCodeResponse
   return value as unknown as AgentRegistrationCodeResponse;
 }
 
+function agentEnrollmentResponse(value: unknown): AgentEnrollmentResponse {
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "enrollment"]) ||
+    value.schema_version !== "1.0"
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  if (value.enrollment === null) {
+    return { schema_version: "1.0", enrollment: null };
+  }
+  if (
+    !object(value.enrollment) ||
+    !exactKeys(value.enrollment, ["enrollment_id", "name", "expires_at"]) ||
+    typeof value.enrollment.enrollment_id !== "string" ||
+    !CANONICAL_UUID.test(value.enrollment.enrollment_id) ||
+    typeof value.enrollment.name !== "string" ||
+    value.enrollment.name.length < 1 ||
+    value.enrollment.name.length > 200 ||
+    !validDateTime(value.enrollment.expires_at)
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as AgentEnrollmentResponse;
+}
+
 function agentMutationResponse(value: unknown): AgentView {
   if (
     !object(value) ||
@@ -2735,6 +2781,30 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         await requestJson(
           `/api/v1/teams/${encodeURIComponent(teamId)}/agents`,
           {},
+          signal,
+        ),
+      );
+    },
+    async agentEnrollment(teamId, signal) {
+      return agentEnrollmentResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/agent-enrollment`,
+          {},
+          signal,
+        ),
+      );
+    },
+    async openAgentEnrollment(teamId, name, signal) {
+      return agentEnrollmentResponse(
+        await requestJson(
+          `/api/v1/teams/${encodeURIComponent(teamId)}/agent-enrollment`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              schema_version: "1.0",
+              name: normalizedAgentName(name),
+            }),
+          },
           signal,
         ),
       );

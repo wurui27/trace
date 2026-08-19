@@ -1,9 +1,10 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type FormEvent } from "react";
 import { Pencil, RefreshCw, ShieldOff } from "lucide-react";
 
 import type {
+  AgentEnrollment,
   AgentState,
   AgentView,
 } from "../lib/perfpilot-api";
@@ -38,6 +39,9 @@ export function AgentManagement() {
   const [agents, setAgents] = useState<readonly AgentView[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [name, setName] = useState("");
+  const [opening, setOpening] = useState(false);
+  const [enrollment, setEnrollment] = useState<AgentEnrollment | null>(null);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editingName, setEditingName] = useState("");
   const [mutationError, setMutationError] = useState<string | null>(null);
@@ -65,9 +69,13 @@ export function AgentManagement() {
     const controller = new AbortController();
     void (async () => {
       try {
-        const response = await client.agents(team.id, controller.signal);
+        const [response, enrollmentResponse] = await Promise.all([
+          client.agents(team.id, controller.signal),
+          client.agentEnrollment(team.id, controller.signal),
+        ]);
         if (controller.signal.aborted) return;
         setAgents(response.agents);
+        setEnrollment(enrollmentResponse.enrollment);
       } catch {
         if (!controller.signal.aborted) {
           setLoadError("Agent 列表读取失败，请稍后重试。");
@@ -79,12 +87,68 @@ export function AgentManagement() {
     return () => controller.abort();
   }, [client, status, team]);
 
+  useEffect(() => {
+    if (status !== "ready" || team === null || enrollment === null) return;
+    const controller = new AbortController();
+    const timer = window.setInterval(() => {
+      void (async () => {
+        try {
+          const [agentsResponse, enrollmentResponse] = await Promise.all([
+            client.agents(team.id, controller.signal),
+            client.agentEnrollment(team.id, controller.signal),
+          ]);
+          if (controller.signal.aborted) return;
+          setAgents(agentsResponse.agents);
+          setEnrollment(enrollmentResponse.enrollment);
+          if (enrollmentResponse.enrollment === null) refreshDevices();
+        } catch {
+          if (!controller.signal.aborted) {
+            setMutationError("Agent 连接状态读取失败，请稍后重试。");
+          }
+        }
+      })();
+    }, 2_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(timer);
+    };
+  }, [client, enrollment, refreshDevices, status, team]);
+
   useEffect(
     () => () => {
       mutationController.current?.abort();
     },
     [],
   );
+
+  const openEnrollment = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!canManage || team === null || opening || !name.trim()) return;
+    const controller = new AbortController();
+    mutationController.current?.abort();
+    mutationController.current = controller;
+    setOpening(true);
+    setMutationError(null);
+    try {
+      const response = await client.openAgentEnrollment(
+        team.id,
+        name,
+        controller.signal,
+      );
+      if (controller.signal.aborted) return;
+      setEnrollment(response.enrollment);
+      setName("");
+    } catch {
+      if (!controller.signal.aborted) {
+        setMutationError("暂时无法添加 Agent，请稍后重试。");
+      }
+    } finally {
+      if (mutationController.current === controller) {
+        mutationController.current = null;
+        setOpening(false);
+      }
+    }
+  };
 
   const rename = async (agent: AgentView) => {
     if (!canManage || team === null || !editingName.trim()) return;
@@ -117,7 +181,7 @@ export function AgentManagement() {
       !canManage ||
       team === null ||
       agent.state === "revoked" ||
-      !window.confirm(`确定撤销 ${agent.name} 吗？该 Agent 将立即停止接收任务。`)
+      !window.confirm(`确定删除 ${agent.name} 吗？删除后该 Agent 将立即断开连接。`)
     ) {
       return;
     }
@@ -126,18 +190,16 @@ export function AgentManagement() {
     mutationController.current = controller;
     setMutationError(null);
     try {
-      const updated = await client.revokeAgent(
+      await client.revokeAgent(
         team.id,
         agent.agent_id,
         controller.signal,
       );
       if (controller.signal.aborted) return;
-      setAgents((current) =>
-        current.map((item) => (item.agent_id === updated.agent_id ? updated : item)),
-      );
+      setAgents((current) => current.filter((item) => item.agent_id !== agent.agent_id));
       refreshDevices();
     } catch {
-      if (!controller.signal.aborted) setMutationError("Agent 撤销失败，请稍后重试。");
+      if (!controller.signal.aborted) setMutationError("Agent 删除失败，请稍后重试。");
     } finally {
       if (mutationController.current === controller) mutationController.current = null;
     }
@@ -157,13 +219,40 @@ export function AgentManagement() {
 
       <section className="agent-registration-panel" aria-labelledby="agent-register-title">
         <div>
-          <h2 id="agent-register-title">自动接入已开启</h2>
-          <p>
-            在任意 macOS、Windows 或 Linux 电脑安装并启动 Agent 后，
-            服务器会自动注册、保存凭证并建立连接。
-          </p>
+          <h2 id="agent-register-title">添加 Agent</h2>
+          <p>填写名称后启动 Agent，服务器会自动注册并连接，无需注册码。</p>
         </div>
+        <form className="agent-registration-form" onSubmit={openEnrollment}>
+          <label htmlFor="agent-registration-name">Agent 名称</label>
+          <div>
+            <input
+              id="agent-registration-name"
+              value={name}
+              maxLength={200}
+              placeholder="例如：Ubuntu 实验室"
+              disabled={!canManage || opening || enrollment !== null}
+              onChange={(event) => setName(event.target.value)}
+            />
+            <button
+              type="submit"
+              className="primary-action"
+              disabled={!canManage || opening || enrollment !== null || !name.trim()}
+            >
+              {opening ? "正在添加…" : "添加 Agent"}
+            </button>
+          </div>
+        </form>
       </section>
+
+      {enrollment ? (
+        <section className="agent-registration-code" aria-live="polite">
+          <div>
+            <strong>等待 Agent 自动连接</strong>
+            <span>{enrollment.name} · 有效期至 {timeLabel(enrollment.expires_at)}</span>
+          </div>
+          <p>在目标电脑启动 Agent 即可，其余步骤由服务器自动完成。</p>
+        </section>
+      ) : null}
 
       {mutationError ? <p className="agent-management-error" role="alert">{mutationError}</p> : null}
 
@@ -243,12 +332,12 @@ export function AgentManagement() {
                     </button>
                     <button
                       type="button"
-                      aria-label={`撤销 ${agent.name}`}
+                      aria-label={`删除 ${agent.name}`}
                       disabled={agent.state === "revoked"}
                       onClick={() => void revoke(agent)}
                     >
                       <ShieldOff aria-hidden="true" />
-                      撤销
+                      删除
                     </button>
                   </div>
                 ) : null}

@@ -73,6 +73,11 @@ from perfpilot_api.local_analysis_store import (
     LocalAnalysisStoreError,
 )
 from perfpilot_api.local_agent_store import LocalAgentStore, LocalDeviceDirectoryRepository
+from perfpilot_api.local_agent_enrollment import (
+    LocalAgentEnrollmentBroker,
+    LocalAgentEnrollmentBusy,
+    LocalAgentEnrollmentError,
+)
 from perfpilot_api.local_agent_artifacts import LocalAgentArtifactService
 from perfpilot_api.local_control_store import (
     LOCAL_SESSION_TTL,
@@ -464,6 +469,11 @@ class _AutoRegisterAgentRequest(_StrictModel):
     agent_version: str = Field(min_length=1, max_length=64)
     hostname: str = Field(min_length=1, max_length=200)
     os_version: str = Field(min_length=1, max_length=128)
+
+
+class _OpenAgentEnrollmentRequest(_StrictModel):
+    schema_version: Literal["1.0"]
+    name: str = Field(min_length=1, max_length=200)
 
 
 class _LoginRequest(_StrictModel):
@@ -5619,6 +5629,7 @@ def create_local_app(
             public_key_b64=encode_ed25519_public_key(task_key.public_key()),
         ),
     )
+    resolved_agent_enrollment = LocalAgentEnrollmentBroker()
     resolved_device_directory = DeviceDirectory(
         repository=LocalDeviceDirectoryRepository(resolved_agent_store),
         serial_hmac_key=runtime_secret,
@@ -5779,6 +5790,7 @@ def create_local_app(
     app.state.local_control_store = resolved_control_store
     app.state.local_agent_store = resolved_agent_store
     app.state.agent_service = resolved_agent_service
+    app.state.agent_enrollment = resolved_agent_enrollment
     app.state.device_directory = resolved_device_directory
     app.state.source_workspace_service = resolved_source_workspace_service
     app.state.agent_task_service = resolved_agent_task_service
@@ -5851,6 +5863,18 @@ def create_local_app(
             ),
             "created_at": agent.created_at.isoformat(),
             "updated_at": agent.updated_at.isoformat(),
+        }
+
+    def _agent_enrollment_payload(value: dict[str, object] | None) -> dict[str, object]:
+        if value is None:
+            return {"schema_version": "1.0", "enrollment": None}
+        return {
+            "schema_version": "1.0",
+            "enrollment": {
+                "enrollment_id": str(value["enrollment_id"]),
+                "name": value["name"],
+                "expires_at": value["expires_at"].isoformat(),
+            },
         }
 
     def _agent_auth(request: Request):
@@ -6122,12 +6146,52 @@ def create_local_app(
             "expires_at": issued.expires_at.isoformat(),
         }
 
+    @app.get("/v1/teams/{team_id}/agent-enrollment")
+    async def get_agent_enrollment(
+        request: Request,
+        team_id: UUID,
+    ) -> dict[str, object]:
+        authorize_team(request, team_id)
+        return _agent_enrollment_payload(
+            await resolved_agent_enrollment.status(team_id)
+        )
+
+    @app.post("/v1/teams/{team_id}/agent-enrollment", status_code=201)
+    async def open_agent_enrollment(
+        request: Request,
+        team_id: UUID,
+        body: _OpenAgentEnrollmentRequest,
+        x_csrf_token: Annotated[str | None, Header()] = None,
+    ) -> dict[str, object]:
+        principal = authorize_team(request, team_id)
+        _require_csrf(request, x_csrf_token)
+        try:
+            enrollment = await resolved_agent_enrollment.open(
+                team_id=team_id,
+                owner_user_id=principal.user_id,
+                name=body.name,
+            )
+        except LocalAgentEnrollmentBusy:
+            raise ApiError(
+                "agent_enrollment_busy",
+                "另一台 Agent 正在接入，请稍后重试",
+                409,
+                True,
+            ) from None
+        except LocalAgentEnrollmentError:
+            raise ApiError("invalid_request", "Agent 请求无效", 422, False) from None
+        return _agent_enrollment_payload(enrollment.public_view())
+
     @app.get("/v1/teams/{team_id}/agents")
     async def list_team_agents(request: Request, team_id: UUID) -> dict[str, object]:
         authorize_team(request, team_id)
         return {
             "schema_version": "1.0",
-            "agents": [_agent_payload(agent) for agent in await resolved_agent_service.list_agents(team_id=team_id)],
+            "agents": [
+                _agent_payload(agent)
+                for agent in await resolved_agent_service.list_agents(team_id=team_id)
+                if agent.state != "revoked"
+            ],
         }
 
     @app.patch("/v1/teams/{team_id}/agents/{agent_id}")
@@ -6160,6 +6224,11 @@ def create_local_app(
         authorize_team(request, team_id)
         _require_csrf(request, x_csrf_token)
         try:
+            await resolved_agent_service.rename(
+                team_id=team_id,
+                agent_id=agent_id,
+                name=f"已删除-{agent_id}",
+            )
             agent = await resolved_agent_service.revoke(team_id=team_id, agent_id=agent_id)
         except AgentNotFoundError:
             raise ApiError("resource_not_found", "资源不存在", 404, False) from None
@@ -6192,20 +6261,19 @@ def create_local_app(
     ) -> dict[str, object]:
         if not resolved_auto_agent_enrollment:
             raise ApiError("resource_not_found", "资源不存在", 404, False)
-        principal = resolved_control_store.unique_platform_admin()
-        if principal is None:
+        enrollment = await resolved_agent_enrollment.claim()
+        if enrollment is None:
             raise ApiError(
-                "auto_enrollment_unavailable",
-                "Agent 自动接入暂不可用",
-                503,
+                "agent_enrollment_closed",
+                "请先在网页添加 Agent",
+                409,
                 True,
             )
-        safe_name = f"自动接入-{body.platform}-{uuid4().hex[:8]}"
         try:
             issued = await resolved_agent_service.create_registration_code(
-                team_id=principal.team_id,
-                owner_user_id=principal.user_id,
-                name=safe_name,
+                team_id=enrollment.team_id,
+                owner_user_id=enrollment.owner_user_id,
+                name=enrollment.name,
             )
             credentials = await resolved_agent_service.register(
                 AgentRegistration(
@@ -6217,21 +6285,18 @@ def create_local_app(
                     os_version=body.os_version,
                 )
             )
-            try:
-                await resolved_agent_service.rename(
-                    team_id=principal.team_id,
-                    agent_id=credentials.agent_id,
-                    name=body.hostname,
-                )
-            except AgentNameConflictError:
-                pass
-        except (AgentRegistrationRejected, AgentInvalidRequestError):
+        except (AgentRegistrationRejected, AgentInvalidRequestError, AgentNameConflictError):
+            await resolved_agent_enrollment.release(enrollment.enrollment_id)
             raise ApiError(
                 "auto_registration_rejected",
                 "Agent 自动注册失败",
                 401,
                 False,
             ) from None
+        except BaseException:
+            await resolved_agent_enrollment.release(enrollment.enrollment_id)
+            raise
+        await resolved_agent_enrollment.complete(enrollment.enrollment_id)
         response.headers["cache-control"] = "no-store"
         return _credentials_payload(credentials, body.schema_version)
 

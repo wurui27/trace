@@ -930,18 +930,16 @@ def test_local_agent_control_refresh_unregister_and_team_devices(
         )
 
 
-def test_local_agent_auto_registration_joins_the_single_admin_team(
+def test_users_open_one_auto_enrollment_slot_and_delete_their_own_agent(
     tmp_path: Path,
 ) -> None:
     control = LocalControlStore(tmp_path / "control")
-    admin = control.ensure_user("admin", "initial admin password", True).principal
-    user = control.ensure_user("user01", "initial user password", False).principal
-    control.change_password(
-        admin.user_id, "initial admin password", "established admin password"
-    )
-    control.change_password(
-        user.user_id, "initial user password", "established user password"
-    )
+    first = control.ensure_user("user01", "initial user password", False).principal
+    second = control.ensure_user("user02", "initial user password", False).principal
+    for principal in (first, second):
+        control.change_password(
+            principal.user_id, "initial user password", "established user password"
+        )
     app = create_local_app(
         data_root=tmp_path / "data",
         state_root=tmp_path / "state",
@@ -950,8 +948,31 @@ def test_local_agent_auto_registration_joins_the_single_admin_team(
     )
     private_key = Ed25519PrivateKey.generate()
 
-    with _RawTestClient(app) as client:
-        registered = client.post(
+    with (
+        _RawTestClient(app) as first_client,
+        _RawTestClient(app) as second_client,
+        _RawTestClient(app) as agent_client,
+    ):
+        first_headers = _authenticated_client(
+            first_client, "user01", "established user password"
+        )
+        second_headers = _authenticated_client(
+            second_client, "user02", "established user password"
+        )
+        opened = first_client.post(
+            f"/v1/teams/{first.team_id}/agent-enrollment",
+            headers=first_headers,
+            json={"schema_version": "1.0", "name": "测试电脑"},
+        )
+        assert opened.status_code == 201, opened.text
+        assert opened.json()["enrollment"]["name"] == "测试电脑"
+        assert second_client.post(
+            f"/v1/teams/{second.team_id}/agent-enrollment",
+            headers=second_headers,
+            json={"schema_version": "1.0", "name": "另一台电脑"},
+        ).status_code == 409
+
+        registered = agent_client.post(
             "/v1/agent/auto-register",
             json={
                 "schema_version": "1.1",
@@ -966,8 +987,8 @@ def test_local_agent_auto_registration_joins_the_single_admin_team(
         assert registered.status_code == 201, registered.text
         credentials = registered.json()
         assert credentials["schema_version"] == "1.1"
-        assert credentials["team_id"] == str(admin.team_id)
-        heartbeat = client.post(
+        assert credentials["team_id"] == str(first.team_id)
+        heartbeat = agent_client.post(
             "/v1/agent/heartbeat",
             headers={"Authorization": f"Bearer {credentials['access_token']}"},
             json={
@@ -985,27 +1006,40 @@ def test_local_agent_auto_registration_joins_the_single_admin_team(
         )
         assert heartbeat.status_code == 200, heartbeat.text
 
-        admin_headers = _authenticated_client(
-            client, "admin", "established admin password"
-        )
-        agents = client.get(
-            f"/v1/teams/{admin.team_id}/agents", headers=admin_headers
+        agents = first_client.get(
+            f"/v1/teams/{first.team_id}/agents", headers=first_headers
         ).json()["agents"]
         assert [(item["name"], item["hostname"], item["state"]) for item in agents] == [
-            ("ubuntu-lab", "ubuntu-lab", "online")
+            ("测试电脑", "ubuntu-lab", "online")
         ]
-
-        client.post(
-            "/v1/auth/logout",
-            headers=admin_headers,
+        assert second_client.get(
+            f"/v1/teams/{second.team_id}/agents", headers=second_headers
+        ).json()["agents"] == []
+        deleted = first_client.post(
+            f"/v1/teams/{first.team_id}/agents/{credentials['agent_id']}/revoke",
+            headers=first_headers,
             json={"schema_version": "1.0"},
         )
-        user_headers = _authenticated_client(
-            client, "user01", "established user password"
-        )
-        assert client.get(
-            f"/v1/teams/{user.team_id}/agents", headers=user_headers
+        assert deleted.status_code == 200, deleted.text
+        assert first_client.get(
+            f"/v1/teams/{first.team_id}/agents", headers=first_headers
         ).json()["agents"] == []
+        assert agent_client.post(
+            "/v1/agent/heartbeat",
+            headers={"Authorization": f"Bearer {credentials['access_token']}"},
+            json={
+                "schema_version": "1.1",
+                "agent_version": "0.1.0",
+                "platform": "linux",
+                "hostname": "ubuntu-lab",
+                "observed_at": datetime.now().astimezone().isoformat(),
+                "clock_skew_ms": 0,
+                "disk_available_bytes": 1024,
+                "execution_slot": {"state": "idle", "execution_id": None},
+                "devices": [],
+                "workspaces": [],
+            },
+        ).status_code == 401
 
 
 def test_local_agent_auto_registration_is_disabled_without_explicit_server_opt_in(
@@ -1035,6 +1069,36 @@ def test_local_agent_auto_registration_is_disabled_without_explicit_server_opt_i
         )
 
     assert response.status_code == 404
+
+
+def test_local_agent_auto_registration_waits_for_a_user_opened_slot(
+    tmp_path: Path,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    control.ensure_user("admin", "initial admin password", True)
+    app = create_local_app(
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+        auto_agent_enrollment=True,
+    )
+
+    with _RawTestClient(app) as client:
+        response = client.post(
+            "/v1/agent/auto-register",
+            json={
+                "schema_version": "1.1",
+                "public_key_b64": encode_ed25519_public_key(
+                    Ed25519PrivateKey.generate().public_key()
+                ),
+                "platform": "linux",
+                "agent_version": "0.1.0",
+                "hostname": "ubuntu-lab",
+                "os_version": "Ubuntu 24.04",
+            },
+        )
+
+    assert response.status_code == 409
 
 
 @pytest.mark.parametrize("value", ["/tmp/agent", r"C:\\agent", r"\\\\server\\agent", "~/agent", "../agent"])

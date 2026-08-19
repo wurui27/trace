@@ -378,6 +378,74 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("opens a strictly validated automatic Agent enrollment slot", async () => {
+    const enrollment = {
+      enrollment_id: "11111111-1111-4111-8111-111111111111",
+      name: "客厅测试机",
+      expires_at: "2026-08-05T08:10:00Z",
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", csrf_token: "csrf-enrollment" }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", enrollment: null }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", enrollment }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await client.csrf();
+    await expect(client.agentEnrollment(TEAM_ID)).resolves.toEqual({
+      schema_version: "1.0",
+      enrollment: null,
+    });
+    await expect(client.openAgentEnrollment(TEAM_ID, " 客厅测试机 ")).resolves.toEqual({
+      schema_version: "1.0",
+      enrollment,
+    });
+
+    expect(fetcher).toHaveBeenNthCalledWith(
+      2,
+      `/api/v1/teams/${TEAM_ID}/agent-enrollment`,
+      expect.objectContaining({ credentials: "same-origin" }),
+    );
+    expect(JSON.parse(String(fetcher.mock.calls[2]?.[1]?.body))).toEqual({
+      schema_version: "1.0",
+      name: "客厅测试机",
+    });
+    expect(new Headers(fetcher.mock.calls[2]?.[1]?.headers).get("x-csrf-token")).toBe(
+      "csrf-enrollment",
+    );
+  });
+
+  it("rejects private fields in an Agent enrollment response", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        Response.json({ schema_version: "1.0", csrf_token: "csrf-enrollment" }),
+      )
+      .mockResolvedValueOnce(
+        Response.json({
+          schema_version: "1.0",
+          enrollment: {
+            enrollment_id: "11111111-1111-4111-8111-111111111111",
+            name: "客厅测试机",
+            expires_at: "2026-08-05T08:10:00Z",
+            private_path: "/Users/private",
+          },
+        }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await client.csrf();
+    await expect(client.agentEnrollment(TEAM_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
   it("creates a no-source remote device 1.2 script capture without uploading an APK", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const deviceAnalysis = {
