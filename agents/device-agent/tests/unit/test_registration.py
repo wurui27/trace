@@ -127,6 +127,34 @@ async def test_auto_registration_generates_key_and_saves_server_credentials(
 
 
 @pytest.mark.asyncio
+async def test_auto_registration_replaces_server_revoked_credentials_only_when_requested(
+    signing_key: Ed25519PrivateKey,
+) -> None:
+    store = CredentialStore(InMemoryCredentialBackend())
+    client = FakeClient(registration_response(signing_key))
+    service = RegistrationService(
+        store=store,
+        client=client,
+        metadata=PlatformMetadata(
+            platform="macos",
+            hostname="ray-mac",
+            os_version="macOS 15",
+        ),
+    )
+    original = await service.auto_register()
+
+    with pytest.raises(RegistrationAlreadyExists):
+        await service.auto_register()
+    replaced = await service.auto_register(replace=True)
+
+    assert len(client.requests) == 2
+    assert store.load() == replaced
+    assert replaced.agent_id == original.agent_id
+    assert replaced.team_id == original.team_id
+    assert replaced.private_key_b64 != original.private_key_b64
+
+
+@pytest.mark.asyncio
 async def test_registration_refuses_existing_credentials_without_replace(
     signing_key: Ed25519PrivateKey,
 ) -> None:

@@ -650,3 +650,70 @@ async def test_agent_service_runs_heartbeat_task_and_refresh_loops_together() ->
     await asyncio.wait_for(service.run(), timeout=1)
 
     assert called == {"heartbeat", "task", "refresh"}
+
+
+@pytest.mark.asyncio
+async def test_agent_service_reenrolls_once_after_server_revokes_credentials(
+    signing_key,
+) -> None:
+    stop = asyncio.Event()
+    now = datetime.now().astimezone()
+    original = _credentials(
+        signing_key,
+        "task-key-2026-08",
+        UUID("71000000-0000-4000-8000-000000000001"),
+        now,
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+    )
+    replacement = original.model_copy(
+        update={
+            "agent_id": UUID("71000000-0000-4000-8000-000000000002"),
+            "access_token": "ppat_" + "C" * 43,
+            "refresh_token": "pprt_" + "D" * 43,
+        }
+    )
+
+    class Heartbeat:
+        calls = 0
+
+        async def publish(self):
+            self.calls += 1
+            if self.calls == 1:
+                raise ControlClientError(status_code=401)
+            stop.set()
+            return type("HeartbeatReceipt", (), {"next_heartbeat_seconds": 10})()
+
+    class Tasks:
+        async def poll_once(self):
+            await stop.wait()
+
+    class Credentials:
+        credentials = original
+
+        async def refresh_credentials(self, *, force: bool = False):
+            await stop.wait()
+            return self.credentials
+
+    heartbeat = Heartbeat()
+    credentials = Credentials()
+    recovery_calls = 0
+
+    async def recover_credentials() -> AgentCredentials:
+        nonlocal recovery_calls
+        recovery_calls += 1
+        credentials.credentials = replacement
+        return replacement
+
+    service = AgentService(
+        heartbeat=heartbeat,
+        tasks=Tasks(),
+        credentials=credentials,
+        credential_recovery=recover_credentials,
+        stop_event=stop,
+    )
+
+    await asyncio.wait_for(service.run(), timeout=1)
+
+    assert recovery_calls == 1
+    assert heartbeat.calls == 2
+    assert credentials.credentials == replacement

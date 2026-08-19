@@ -133,9 +133,9 @@ class RegistrationService:
             for index in range(len(registration_code)):
                 registration_code[index] = 0
 
-    async def auto_register(self) -> AgentCredentials:
+    async def auto_register(self, *, replace: bool = False) -> AgentCredentials:
         try:
-            if self._store.load() is not None:
+            if self._store.load() is not None and not replace:
                 raise RegistrationAlreadyExists
             private_key_b64, public_key_b64 = self._new_key_material()
             response = await self._client.auto_register(

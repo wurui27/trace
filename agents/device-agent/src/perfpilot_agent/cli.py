@@ -13,6 +13,7 @@ from perfpilot_agent.adb import AdbError, resolve_adb
 from perfpilot_agent.config import AgentConfig, load_config
 from perfpilot_agent.control_client import ControlClient, ControlClientError
 from perfpilot_agent.credentials import (
+    AgentCredentials,
     CredentialBackend,
     CredentialStore,
     CredentialStoreError,
@@ -377,10 +378,21 @@ async def _run(config_path: Path | None) -> int:
             source_executor=_source_task_runner(config=config, control=control),
             state=state,
         )
+
+        async def recover_credentials() -> AgentCredentials:
+            replacement = await RegistrationService(
+                store=store,
+                client=control,
+                metadata=metadata,
+            ).auto_register(replace=True)
+            control.bind_credentials(replacement, store=store)
+            return replacement
+
         await AgentService(
             heartbeat=heartbeat,
             tasks=tasks,
             credentials=control,
+            credential_recovery=recover_credentials,
         ).run()
     return 0
 

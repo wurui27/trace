@@ -197,6 +197,9 @@ class HeartbeatLoopPublisher(Protocol):
 
 
 class CredentialRefreshControl(Protocol):
+    @property
+    def credentials(self) -> AgentCredentials: ...
+
     async def refresh_credentials(self, *, force: bool = False) -> AgentCredentials: ...
 
 
@@ -207,11 +210,14 @@ class AgentService:
         heartbeat: HeartbeatLoopPublisher,
         tasks: TaskLoop,
         credentials: CredentialRefreshControl,
+        credential_recovery: Callable[[], Awaitable[AgentCredentials]] | None = None,
         stop_event: asyncio.Event | None = None,
     ) -> None:
         self._heartbeat = heartbeat
         self._tasks = tasks
         self._credentials = credentials
+        self._credential_recovery = credential_recovery
+        self._credential_recovery_lock = asyncio.Lock()
         self._stop_event = stop_event or asyncio.Event()
 
     def stop(self) -> None:
@@ -224,22 +230,60 @@ class AgentService:
         except TimeoutError:
             pass
 
+    def _access_token(self) -> str | None:
+        try:
+            return self._credentials.credentials.access_token
+        except (AttributeError, ControlClientError, CredentialStoreError):
+            return None
+
+    async def _recover_credentials(
+        self,
+        error: ControlClientError,
+        failed_access_token: str | None,
+    ) -> bool:
+        if (
+            error.status_code != 401
+            or failed_access_token is None
+            or self._credential_recovery is None
+        ):
+            return False
+        async with self._credential_recovery_lock:
+            current_access_token = self._access_token()
+            if current_access_token != failed_access_token:
+                return current_access_token is not None
+            try:
+                replacement = await self._credential_recovery()
+            except (ControlClientError, CredentialStoreError, OSError, ValueError):
+                return False
+            return replacement.access_token != failed_access_token
+
     async def _heartbeat_loop(self) -> None:
         while not self._stop_event.is_set():
+            failed_access_token = self._access_token()
             try:
                 response = await self._heartbeat.publish()
                 delay = response.next_heartbeat_seconds
-            except (ControlClientError, RuntimeStateError, OSError, ValueError):
+            except ControlClientError as error:
+                if await self._recover_credentials(error, failed_access_token):
+                    continue
+                _LOGGER.warning("Agent heartbeat failed")
+                delay = 1
+            except (RuntimeStateError, OSError, ValueError):
                 _LOGGER.warning("Agent heartbeat failed")
                 delay = 1
             await self._pause(delay)
 
     async def _task_loop(self) -> None:
         while not self._stop_event.is_set():
+            failed_access_token = self._access_token()
             try:
                 await self._tasks.poll_once()
+            except ControlClientError as error:
+                if await self._recover_credentials(error, failed_access_token):
+                    continue
+                _LOGGER.warning("Agent task cycle failed")
+                await self._pause(1)
             except (
-                ControlClientError,
                 CredentialStoreError,
                 LeaseLost,
                 RuntimeStateError,
@@ -253,10 +297,16 @@ class AgentService:
 
     async def _credential_loop(self) -> None:
         while not self._stop_event.is_set():
+            failed_access_token = self._access_token()
             try:
                 await self._credentials.refresh_credentials()
                 delay = 30
-            except (ControlClientError, CredentialStoreError, OSError, ValueError):
+            except ControlClientError as error:
+                if await self._recover_credentials(error, failed_access_token):
+                    continue
+                _LOGGER.warning("Agent credential refresh failed")
+                delay = 1
+            except (CredentialStoreError, OSError, ValueError):
                 _LOGGER.warning("Agent credential refresh failed")
                 delay = 1
             await self._pause(delay)
