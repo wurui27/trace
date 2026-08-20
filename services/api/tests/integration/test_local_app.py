@@ -5608,6 +5608,10 @@ def test_local_remote_capture_report_runs_real_agent_lifecycle(
     elif outcome == "analyzing_canceled":
         assert projected["state"] == "canceled"
         assert provider.calls == 0
+        for _ in range(100):
+            if smartperfetto.cancel_calls:
+                break
+            time.sleep(0.01)
         assert len(smartperfetto.cancel_calls) == 1
         assert (
             client.get(

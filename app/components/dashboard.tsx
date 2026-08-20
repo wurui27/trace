@@ -172,16 +172,6 @@ export function Dashboard({
     return () => controller.abort();
   }, [activeAnalysisId, client, pollDelay, teamId]);
 
-  useEffect(() => {
-    if (currentAnalysis?.state !== "canceled") return;
-    const timer = window.setTimeout(() => {
-      setCurrentAnalysis((value) =>
-        value?.analysis_id === currentAnalysis.analysis_id ? null : value,
-      );
-    }, 3_000);
-    return () => window.clearTimeout(timer);
-  }, [currentAnalysis]);
-
   useEffect(
     () => () => {
       cancelController.current?.abort();

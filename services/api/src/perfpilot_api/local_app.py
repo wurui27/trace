@@ -79,6 +79,7 @@ from perfpilot_api.local_analysis_lifecycle import (
     AnalysisState,
     LifecycleSnapshot,
 )
+from perfpilot_api.local_cancellation import CancellationTarget, cancel_targets
 from perfpilot_api.local_agent_store import LocalAgentStore, LocalDeviceDirectoryRepository
 from perfpilot_api.local_agent_enrollment import (
     LocalAgentEnrollmentBroker,
@@ -4249,82 +4250,119 @@ class _LocalRuntime:
                     analysis.stages[stage_name] = "canceled"
             analysis.version += 1
         await self._persist(analysis)
+        cleanup_started = asyncio.Event()
+        cleanup = asyncio.create_task(
+            self._cleanup_cancellation(
+                analysis,
+                task=task,
+                run=run,
+                started=cleanup_started,
+            )
+        )
+        self.tasks.add(cleanup)
+        cleanup.add_done_callback(self.tasks.discard)
+        await cleanup_started.wait()
+
+        return analysis, True
+
+    async def _cleanup_cancellation(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        task: asyncio.Task[None] | None,
+        run: LocalEngineRun | None,
+        started: asyncio.Event,
+    ) -> None:
+        targets: list[CancellationTarget] = []
 
         if analysis.analysis_mode == "device":
-            try:
-                await self.agent_tasks.request_cancel(
-                    team_id=analysis.team_id,
-                    analysis_id=analysis.analysis_id,
-                )
-            except AgentTaskNotFound:
-                pass
-            except Exception as error:
-                _LOGGER.warning(
-                    "Remote capture cancellation deferred type=%s",
-                    type(error).__name__,
-                )
-                retry = asyncio.create_task(
-                    self._retry_agent_cancellation(
+
+            async def cancel_agent_capture() -> None:
+                last_error: Exception | None = None
+                for attempt in range(2):
+                    try:
+                        await self.agent_tasks.request_cancel(
+                            team_id=analysis.team_id,
+                            analysis_id=analysis.analysis_id,
+                        )
+                        return
+                    except AgentTaskNotFound:
+                        return
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as error:
+                        last_error = error
+                        if attempt == 0:
+                            await asyncio.sleep(0.05)
+                assert last_error is not None
+                raise last_error
+
+            targets.append(CancellationTarget("agent_capture", cancel_agent_capture))
+
+        if analysis.source_binding is not None:
+
+            async def cancel_source() -> None:
+                try:
+                    await self.source_tasks.request_cancel(
                         team_id=analysis.team_id,
                         analysis_id=analysis.analysis_id,
                     )
-                )
-                self.tasks.add(retry)
-                retry.add_done_callback(self.tasks.discard)
+                except SourceTaskError:
+                    return
 
-        if analysis.source_binding is not None:
-            try:
-                await self.source_tasks.request_cancel(
-                    team_id=analysis.team_id,
-                    analysis_id=analysis.analysis_id,
-                )
-            except SourceTaskError:
-                pass
+            targets.append(CancellationTarget("source_code", cancel_source))
 
         if run is not None:
-            try:
-                await self.gateway.cancel(run)
-            except Exception as error:
-                _LOGGER.warning(
-                    "SmartPerfetto cancellation failed after local cancellation type=%s",
-                    type(error).__name__,
+            targets.append(
+                CancellationTarget(
+                    "smartperfetto",
+                    lambda: self.gateway.cancel(run),
                 )
+            )
 
         if (
             task is not None
             and task is not asyncio.current_task()
             and not task.done()
         ):
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
-        return analysis, True
+            async def cancel_local_task() -> None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
 
-    async def _retry_agent_cancellation(
-        self,
-        *,
-        team_id: UUID,
-        analysis_id: UUID,
-    ) -> None:
-        delay = 0.05
-        while True:
-            await asyncio.sleep(delay)
-            try:
-                await self.agent_tasks.request_cancel(
-                    team_id=team_id,
-                    analysis_id=analysis_id,
-                )
+            targets.append(CancellationTarget("local_task", cancel_local_task))
+
+        cancellation = asyncio.create_task(cancel_targets(tuple(targets)))
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        started.set()
+        result = await cancellation
+        incomplete = tuple(sorted((*result.failed, *result.pending_cleanup)))
+        async with self.lock:
+            if analysis.state != "canceled":
                 return
-            except AgentTaskNotFound:
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                _LOGGER.warning(
-                    "Remote capture cancellation retry deferred type=%s",
-                    type(error).__name__,
-                )
-                delay = min(delay * 2, 5.0)
+            _record_progress(
+                analysis,
+                stage=str((analysis.runtime_status or {}).get("current_stage", "report")),
+                state="canceled",
+                summary=(
+                    "分析已取消"
+                    if not incomplete
+                    else "分析已取消；部分后台清理未完成"
+                ),
+                waiting_for=None,
+                now=datetime.now(UTC),
+            )
+            analysis.version += 1
+        try:
+            await self._persist(analysis)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            _LOGGER.warning(
+                "Cancellation cleanup persistence failed type=%s",
+                type(error).__name__,
+            )
 
     async def reserve(
         self,

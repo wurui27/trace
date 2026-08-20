@@ -1,7 +1,13 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
-import userEvent from "@testing-library/user-event";
+import {
+  act,
+  cleanup,
+  fireEvent,
+  render,
+  screen,
+  waitFor,
+} from "@testing-library/react";
 import type { ComponentType } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -14,7 +20,10 @@ import type {
   PerfPilotClient,
 } from "../app/lib/perfpilot-api";
 
-afterEach(cleanup);
+afterEach(() => {
+  cleanup();
+  vi.useRealTimers();
+});
 
 const active: AnalysisListItem = {
   schema_version: "1.0",
@@ -232,7 +241,6 @@ describe("Dashboard analysis coordinator", () => {
   });
 
   it("confirms and displays cancellation only after the backend returns canceled", async () => {
-    const user = userEvent.setup();
     const canceled: AnalysisResponse = {
       ...active,
       state: "canceled",
@@ -255,7 +263,13 @@ describe("Dashboard analysis coordinator", () => {
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "取消分析" }));
+    const cancelButton = await screen.findByRole("button", { name: "取消分析" });
+    vi.useFakeTimers();
+    fireEvent.click(cancelButton);
+    await act(async () => {
+      await Promise.resolve();
+      await Promise.resolve();
+    });
 
     expect(confirmCancel).toHaveBeenCalledOnce();
     expect(client.cancelAnalysis).toHaveBeenCalledWith(
@@ -263,6 +277,9 @@ describe("Dashboard analysis coordinator", () => {
       "analysis-active-1",
       expect.any(AbortSignal),
     );
-    expect(await screen.findByText("分析已取消")).toBeInTheDocument();
+    expect(screen.getByText("分析已取消")).toBeInTheDocument();
+    act(() => vi.advanceTimersByTime(3_000));
+    expect(screen.getByText("分析已取消")).toBeInTheDocument();
+    vi.useRealTimers();
   });
 });
