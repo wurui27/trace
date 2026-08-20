@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
 
-from perfpilot_api.reports.contracts import canonical_json_bytes
+from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.privacy import ProjectionPrivacyError, reject_private_json
 from perfpilot_api.reports.projection import (
+    ProjectionContractError,
     ProjectionQuestionError,
     build_ai_projection,
 )
@@ -49,6 +51,21 @@ def test_projection_is_allowlisted_and_uses_only_authoritative_question() -> Non
     }
 
 
+def test_contract_failure_is_not_misreported_as_private_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_contract(_name: str, _document: object) -> object:
+        raise ValueError("contract rejected")
+
+    monkeypatch.setattr(
+        "perfpilot_api.reports.projection.validate_contract",
+        reject_contract,
+    )
+
+    with pytest.raises(ProjectionContractError, match="projection contract is invalid"):
+        build_ai_projection(_core(), analysis_profile="auto", question=None)
+
+
 def test_v2_projection_is_default_even_without_source_context() -> None:
     projection = build_ai_projection(
         _core(), analysis_profile="auto", question=None
@@ -84,6 +101,280 @@ def test_projection_v21_contains_server_owned_quality_and_workbench() -> None:
     }
     assert len(document["workbench"]["primary_finding_ids"]) <= 3
     assert document["workbench"]["evidence"][0]["locator"]["start_ns"] >= 0
+
+
+def test_projection_v21_bounds_realistic_metric_and_evidence_links() -> None:
+    document = _core().document
+    scenario = document["scenario_reports"][0]
+    metric = scenario["metrics"][0]
+    evidence = scenario["evidence"][0]
+    scenario["metrics"] = []
+    scenario["evidence"] = []
+    for index in range(25):
+        next_metric = deepcopy(metric)
+        next_metric["metric_id"] = (
+            f"84000000-0000-4000-8000-{index + 1:012d}"
+        )
+        scenario["metrics"].append(next_metric)
+        next_evidence = deepcopy(evidence)
+        next_evidence["evidence_id"] = (
+            f"86000000-0000-4000-8000-{index + 1:012d}"
+        )
+        next_metric["sample_ids"] = [next_evidence["evidence_id"]]
+        scenario["evidence"].append(next_evidence)
+    scenario["findings"][0]["evidence_ids"] = [
+        scenario["evidence"][0]["evidence_id"]
+    ]
+    core = NormalizedTraceReport(
+        canonical_bytes=canonical_json_bytes(document),
+        sha256_b64="Y2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2NjY2M=",
+    )
+
+    projection = build_ai_projection(
+        core,
+        analysis_profile="startup",
+        question=None,
+        source_context=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+
+    workbench = projection.document["workbench"]
+    assert len(workbench["metrics"]) == 25
+    assert len(workbench["evidence"]) == 25
+    assert all(len(item["evidence_ids"]) == 1 for item in workbench["metrics"])
+    assert all(len(item["metric_ids"]) == 1 for item in workbench["evidence"])
+    assert len(workbench["findings"][0]["metric_ids"]) == 1
+    assert workbench["retest_plans"][0]["metric_ids"] == workbench["findings"][0][
+        "metric_ids"
+    ]
+    assert len(projection.canonical_bytes) <= 256 * 1024
+
+
+def test_projection_v21_applies_metric_fallback_only_after_finding_merge() -> None:
+    document = _core().document
+    scenario = document["scenario_reports"][0]
+    direct_evidence = scenario["evidence"][0]
+    direct_finding = scenario["findings"][0]
+    metric_template = scenario["metrics"][0]
+
+    unlinked_evidence = deepcopy(direct_evidence)
+    unlinked_evidence["evidence_id"] = "86000000-0000-4000-8000-000000000002"
+    scenario["evidence"].append(unlinked_evidence)
+    duplicate_finding = deepcopy(direct_finding)
+    duplicate_finding["finding_id"] = "85000000-0000-4000-8000-000000000002"
+    duplicate_finding["evidence_ids"] = [unlinked_evidence["evidence_id"]]
+    scenario["findings"].append(duplicate_finding)
+
+    scenario["metrics"] = []
+    direct_metric = deepcopy(metric_template)
+    direct_metric["name"] = "startup.other_metric"
+    direct_metric["sample_ids"] = [direct_evidence["evidence_id"]]
+    scenario["metrics"].append(direct_metric)
+    for index, name in enumerate(
+        (
+            "startup.get_startups.dur_ms",
+            "startup.time_to_initial_display",
+            "startup.time_to_full_display",
+        ),
+        start=2,
+    ):
+        metric = deepcopy(metric_template)
+        metric["metric_id"] = f"84000000-0000-4000-8000-{index:012d}"
+        metric["name"] = name
+        metric["sample_ids"] = []
+        scenario["metrics"].append(metric)
+
+    projection = build_ai_projection(
+        NormalizedTraceReport(
+            canonical_bytes=canonical_json_bytes(document),
+            sha256_b64=_core().sha256_b64,
+        ),
+        analysis_profile="startup",
+        question=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+
+    finding = projection.document["workbench"]["findings"][0]
+    assert finding["metric_ids"] == [direct_metric["metric_id"]]
+    assert projection.document["workbench"]["retest_plans"][0]["metric_ids"] == [
+        direct_metric["metric_id"]
+    ]
+
+
+def test_projection_v21_bounds_merged_finding_evidence_deterministically() -> None:
+    document = _core().document
+    scenario = document["scenario_reports"][0]
+    evidence_template = deepcopy(scenario["evidence"][0])
+    finding_template = deepcopy(scenario["findings"][0])
+    evidence_ids = [
+        f"86000000-0000-4000-8000-{index:012d}" for index in range(1, 22)
+    ]
+    scenario["evidence"] = []
+    for evidence_id in evidence_ids:
+        evidence = deepcopy(evidence_template)
+        evidence["evidence_id"] = evidence_id
+        scenario["evidence"].append(evidence)
+    first = deepcopy(finding_template)
+    first["evidence_ids"] = evidence_ids[:11]
+    second = deepcopy(finding_template)
+    second["finding_id"] = "85000000-0000-4000-8000-000000000002"
+    second["evidence_ids"] = evidence_ids[11:]
+    scenario["findings"] = [first, second]
+    scenario["metrics"][0]["sample_ids"] = [evidence_ids[0]]
+    validate_contract("normalized-trace-report", document)
+    core = NormalizedTraceReport(
+        canonical_bytes=canonical_json_bytes(document),
+        sha256_b64=_core().sha256_b64,
+    )
+
+    first_projection = build_ai_projection(
+        core,
+        analysis_profile="startup",
+        question=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+    second_projection = build_ai_projection(
+        core,
+        analysis_profile="startup",
+        question=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+
+    finding = first_projection.document["workbench"]["findings"][0]
+    assert finding["evidence_ids"] == evidence_ids[:20]
+    assert first_projection.canonical_bytes == second_projection.canonical_bytes
+    assert len(first_projection.canonical_bytes) <= 256 * 1024
+
+
+def test_projection_v21_recomputes_metric_links_after_evidence_truncation() -> None:
+    document = _core().document
+    scenario = document["scenario_reports"][0]
+    evidence_template = deepcopy(scenario["evidence"][0])
+    finding_template = deepcopy(scenario["findings"][0])
+    metric_template = deepcopy(scenario["metrics"][0])
+    retained_evidence_ids = [
+        f"86000000-0000-4000-8000-{index:012d}" for index in range(1, 21)
+    ]
+    discarded_evidence_id = "86000000-0000-4000-8000-000000000999"
+    scenario["evidence"] = []
+    for evidence_id in [*retained_evidence_ids, discarded_evidence_id]:
+        evidence = deepcopy(evidence_template)
+        evidence["evidence_id"] = evidence_id
+        scenario["evidence"].append(evidence)
+
+    direct_finding = deepcopy(finding_template)
+    direct_finding["evidence_ids"] = [discarded_evidence_id]
+    unlinked_finding = deepcopy(finding_template)
+    unlinked_finding["finding_id"] = "85000000-0000-4000-8000-000000000002"
+    unlinked_finding["evidence_ids"] = retained_evidence_ids
+    scenario["findings"] = [direct_finding, unlinked_finding]
+
+    direct_metric = deepcopy(metric_template)
+    direct_metric["name"] = "startup.other_metric"
+    direct_metric["sample_ids"] = [discarded_evidence_id]
+    scenario["metrics"] = [direct_metric]
+    fallback_metric_ids: list[str] = []
+    for index, name in enumerate(
+        (
+            "startup.get_startups.dur_ms",
+            "startup.time_to_initial_display",
+            "startup.time_to_full_display",
+        ),
+        start=2,
+    ):
+        metric = deepcopy(metric_template)
+        metric["metric_id"] = f"84000000-0000-4000-8000-{index:012d}"
+        metric["name"] = name
+        metric["sample_ids"] = []
+        scenario["metrics"].append(metric)
+        fallback_metric_ids.append(metric["metric_id"])
+
+    projection = build_ai_projection(
+        NormalizedTraceReport(
+            canonical_bytes=canonical_json_bytes(document),
+            sha256_b64=_core().sha256_b64,
+        ),
+        analysis_profile="startup",
+        question=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+
+    finding = projection.document["workbench"]["findings"][0]
+    assert finding["evidence_ids"] == retained_evidence_ids
+    assert direct_metric["metric_id"] not in finding["metric_ids"]
+    assert finding["metric_ids"] == fallback_metric_ids
+
+
+def test_projection_v21_uses_one_bounded_bidirectional_edge_set() -> None:
+    document = _core().document
+    scenario = document["scenario_reports"][0]
+    metric_template = deepcopy(scenario["metrics"][0])
+    evidence = scenario["evidence"][0]
+    scenario["metrics"] = []
+    for index in range(1, 26):
+        metric = deepcopy(metric_template)
+        metric["metric_id"] = f"84000000-0000-4000-8000-{index:012d}"
+        metric["name"] = f"startup.metric_{index}"
+        metric["sample_ids"] = [evidence["evidence_id"]]
+        scenario["metrics"].append(metric)
+    core = NormalizedTraceReport(
+        canonical_bytes=canonical_json_bytes(document),
+        sha256_b64=_core().sha256_b64,
+    )
+
+    projection = build_ai_projection(
+        core,
+        analysis_profile="startup",
+        question=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+
+    workbench = projection.document["workbench"]
+    metric_edges = {
+        (metric["metric_id"], evidence_id)
+        for metric in workbench["metrics"]
+        for evidence_id in metric["evidence_ids"]
+    }
+    evidence_edges = {
+        (metric_id, evidence_item["evidence_id"])
+        for evidence_item in workbench["evidence"]
+        for metric_id in evidence_item["metric_ids"]
+    }
+    assert metric_edges == evidence_edges
+    assert len(metric_edges) == 20
+    assert {metric_id for metric_id, _ in metric_edges} == {
+        f"84000000-0000-4000-8000-{index:012d}" for index in range(1, 21)
+    }
 
 
 def test_projection_v20_explicit_version_remains_byte_stable() -> None:

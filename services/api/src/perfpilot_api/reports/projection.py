@@ -24,6 +24,11 @@ class ProjectionQuestionError(ValueError):
         super().__init__("authoritative question is invalid")
 
 
+class ProjectionContractError(ValueError):
+    def __init__(self, _detail: object = None) -> None:
+        super().__init__("projection contract is invalid")
+
+
 class ProjectionSizeError(ValueError):
     def __init__(self, _detail: object = None) -> None:
         super().__init__("AI projection exceeds the configured limit")
@@ -240,7 +245,7 @@ def build_ai_projection(
     try:
         validated = validate_contract("analysis-projection", document)
     except Exception:
-        raise ProjectionPrivacyError from None
+        raise ProjectionContractError from None
     payload = canonical_json_bytes(validated)
     if len(payload) > max_bytes:
         raise ProjectionSizeError
@@ -249,6 +254,7 @@ def build_ai_projection(
 
 __all__ = [
     "AIProjection",
+    "ProjectionContractError",
     "ProjectionPrivacyError",
     "ProjectionQuestionError",
     "ProjectionSizeError",

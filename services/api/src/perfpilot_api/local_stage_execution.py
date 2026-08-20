@@ -27,6 +27,7 @@ from perfpilot_api.reports.normalizer import (
 )
 from perfpilot_api.reports.projection import (
     AIProjection,
+    ProjectionContractError,
     ProjectionPrivacyError,
     ProjectionQuestionError,
     ProjectionSizeError,
@@ -1042,6 +1043,13 @@ def _prepare_local_report(
         )
     except ProjectionPrivacyError:
         projection_failure_code = "ai_projection_private_data"
+        projection = _blocked_ai_projection(
+            analysis_id=analysis.analysis_id,
+            analysis_profile=analysis.profile,
+            canonical_artifact_id=primary.artifact_id,
+        )
+    except ProjectionContractError:
+        projection_failure_code = "ai_projection_contract_invalid"
         projection = _blocked_ai_projection(
             analysis_id=analysis.analysis_id,
             analysis_profile=analysis.profile,

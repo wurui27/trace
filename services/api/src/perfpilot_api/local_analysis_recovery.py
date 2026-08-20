@@ -9,6 +9,7 @@ class RecoveryAction(str, Enum):
     CLOSE_CANCELED = "close_canceled"
     RECONCILE_PUBLICATION = "reconcile_publication"
     RESUME_REMOTE_ANALYSIS = "resume_remote_analysis"
+    RESUME_SMARTPERFETTO = "resume_smartperfetto"
     RESUME_SYNTHESIS = "resume_synthesis"
     CLOSE_COMPLETED = "close_completed"
     FAIL_INVALID_RECOVERY = "fail_invalid_recovery"
@@ -25,6 +26,7 @@ class RecoverySnapshot:
     report_present: bool
     source_state: str
     remote_publication: Literal["not_requested", "publishing", "published"]
+    upstream_run_resumable: bool = False
     identity_valid: bool = True
     artifacts_valid: bool = True
 
@@ -60,6 +62,13 @@ def plan_recovery(snapshot: RecoverySnapshot) -> tuple[RecoveryAction, ...]:
         and snapshot.smartperfetto_state in {"pending", "running"}
     ):
         return (RecoveryAction.RESUME_REMOTE_ANALYSIS,)
+    if (
+        snapshot.remote_publication == "not_requested"
+        and snapshot.smartperfetto_state in {"running", "completed"}
+        and not snapshot.evidence_manifest_present
+        and snapshot.upstream_run_resumable
+    ):
+        return (RecoveryAction.RESUME_SMARTPERFETTO,)
     if snapshot.remote_publication in {"publishing", "published"}:
         return (RecoveryAction.RECONCILE_PUBLICATION,)
     return (RecoveryAction.NOOP,)

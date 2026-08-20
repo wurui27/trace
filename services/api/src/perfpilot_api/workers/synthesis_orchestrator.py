@@ -58,6 +58,7 @@ from perfpilot_api.reports.normalizer import (
 from perfpilot_api.reports.privacy import ProjectionPrivacyError
 from perfpilot_api.reports.projection import (
     AIProjection,
+    ProjectionContractError,
     ProjectionQuestionError,
     ProjectionSizeError,
     build_ai_projection,
@@ -1444,7 +1445,12 @@ class SynthesisPipeline:
                     execution=record,
                     source=source,
                 )
-            except (ProjectionSizeError, ProjectionPrivacyError, ProjectionQuestionError):
+            except (
+                ProjectionContractError,
+                ProjectionSizeError,
+                ProjectionPrivacyError,
+                ProjectionQuestionError,
+            ):
                 return await self._record_projection_failure(
                     record=record,
                     now=now,
@@ -1483,7 +1489,12 @@ class SynthesisPipeline:
                     execution=record,
                     source=source,
                 )
-            except (ProjectionSizeError, ProjectionPrivacyError, ProjectionQuestionError):
+            except (
+                ProjectionContractError,
+                ProjectionSizeError,
+                ProjectionPrivacyError,
+                ProjectionQuestionError,
+            ):
                 return await self._record_projection_failure(
                     record=record,
                     now=now,

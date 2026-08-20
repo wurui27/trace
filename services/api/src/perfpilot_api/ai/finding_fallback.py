@@ -10,14 +10,18 @@ from perfpilot_api.reports.projection import AIProjection
 
 
 _CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+_FREE_WRITTEN_NUMBER = re.compile(r"[0-9０-９零〇一二三四五六七八九十百千万亿两]")
 
 
 def _safe_chinese(value: object, fallback: str) -> str:
     if not isinstance(value, str):
         return fallback
     text = value.strip()
-    if not text or len(text) > 2000 or not _CJK.search(text) or any(
-        character.isdigit() for character in text
+    if (
+        not text
+        or len(text) > 2000
+        or not _CJK.search(text)
+        or _FREE_WRITTEN_NUMBER.search(text)
     ):
         return fallback
     return text
@@ -149,6 +153,35 @@ def _recommendations(
     return sorted(result, key=lambda item: ("p0", "p1", "p2").index(str(item["priority"])))
 
 
+def _retest_plan(
+    retest_by_finding: Mapping[str, Mapping[str, object]],
+    primary_ids: list[str],
+) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for finding_id in primary_ids:
+        retest = retest_by_finding.get(finding_id)
+        if (
+            not retest
+            or not retest["metric_ids"]
+            or retest["scenario_type"] not in {"startup", "scroll", "memory_cycle"}
+        ):
+            continue
+        item = {
+            "mode": "verify_metric",
+            "scenario_type": retest["scenario_type"],
+            "metric_ids": list(retest["metric_ids"]),  # type: ignore[arg-type]
+            "limitation_ids": [],
+            "steps": "按相同应用、环境、测试场景和采集方式重新执行测试。",
+            "success_condition": "improve_from_baseline",
+            "failure_condition": "threshold_missed",
+        }
+        if item not in result:
+            result.append(item)
+        if len(result) == 3:
+            break
+    return result
+
+
 def build_deterministic_finding_synthesis(
     projection: AIProjection,
 ) -> AISynthesisOutput:
@@ -202,22 +235,7 @@ def build_deterministic_finding_synthesis(
             conclusions, findings_by_id, primary_ids
         ),
         "source_fixes": [],
-        "retest_plan": [
-            {
-                "mode": "verify_metric",
-                "scenario_type": retest_by_finding[finding_id]["scenario_type"],
-                "metric_ids": list(retest_by_finding[finding_id]["metric_ids"]),
-                "limitation_ids": [],
-                "steps": "按相同应用、环境、测试场景和采集方式重新执行测试。",
-                "success_condition": "improve_from_baseline",
-                "failure_condition": "threshold_missed",
-            }
-            for finding_id in primary_ids
-            if finding_id in retest_by_finding
-            and retest_by_finding[finding_id]["metric_ids"]
-            and retest_by_finding[finding_id]["scenario_type"]
-            in {"startup", "scroll", "memory_cycle"}
-        ],
+        "retest_plan": _retest_plan(retest_by_finding, primary_ids),
         "limitations": [
             {
                 "limitation_id": limitation["limitation_id"],

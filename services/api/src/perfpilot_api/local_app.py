@@ -1154,6 +1154,10 @@ class _LocalRuntime:
                 )
             ),
             remote_publication=analysis.remote_publication,
+            upstream_run_resumable=(
+                analysis.analysis_mode == "trace_upload"
+                and analysis.source_run is not None
+            ),
             identity_valid=identity_valid,
             artifacts_valid=artifacts_valid,
         )
@@ -2402,27 +2406,43 @@ class _LocalRuntime:
                 RecoveryAction.RESUME_SYNTHESIS in recovery_actions
                 and analysis.task is None
             )
-            if resume_from_prepared:
+            resume_smartperfetto = (
+                RecoveryAction.RESUME_SMARTPERFETTO in recovery_actions
+                and analysis.source_run is not None
+                and analysis.task is None
+            )
+            if resume_from_prepared or resume_smartperfetto:
                 resume_gate = asyncio.Event()
                 generation = analysis.generation
 
-                async def resume_persisted_synthesis(
+                async def resume_persisted_work(
                     current: _LocalAnalysis = analysis,
                     current_generation: int = generation,
                     gate: asyncio.Event = resume_gate,
+                    resume_run: LocalEngineRun | None = (
+                        analysis.source_run if resume_smartperfetto else None
+                    ),
                 ) -> None:
                     await gate.wait()
-                    await self._execute_persisted_synthesis(
-                        current,
-                        generation=current_generation,
-                    )
+                    if resume_run is not None:
+                        await self._execute_run(
+                            current,
+                            resume_run,
+                            generation=current_generation,
+                        )
+                    else:
+                        await self._execute_persisted_synthesis(
+                            current,
+                            generation=current_generation,
+                        )
 
-                task = asyncio.create_task(resume_persisted_synthesis())
+                task = asyncio.create_task(resume_persisted_work())
                 analysis.task = task
                 self.tasks.add(task)
                 task.add_done_callback(self.tasks.discard)
-                analysis.stages["perfpilot_ai"] = "running"
-                analysis.version += 1
+                if resume_from_prepared:
+                    analysis.stages["perfpilot_ai"] = "running"
+                    analysis.version += 1
             if (
                 migrate_created_at
                 or migrate_runtime_contract

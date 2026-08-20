@@ -3457,6 +3457,110 @@ def test_local_analysis_v13_persists_authoritative_runtime_status(
     assert restored.json()["runtime_status"] == payload["runtime_status"]
 
 
+@pytest.mark.parametrize("persisted_smartperfetto_state", ["running", "completed"])
+def test_local_restart_resumes_inflight_trace_without_resubmitting(
+    tmp_path: Path,
+    persisted_smartperfetto_state: str,
+) -> None:
+    first_gateway = _BlockingSmartPerfettoGateway(_smartperfetto_result())
+    first_app = create_local_app(
+        gateway=first_gateway,
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    trace = b"restart-inflight-trace"
+    checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
+
+    with TestClient(first_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        created = client.post(
+            f"/v1/teams/{team_id}/analyses",
+            headers=headers,
+            json={
+                "schema_version": "1.3",
+                "analysis_mode": "trace_upload",
+                "test_type": "cold_start",
+                "package_name": "com.rivotek.mediacenter",
+                "question": "分析冷启动关键路径。",
+                "inputs": [
+                    {
+                        "kind": "trace",
+                        "mime": "application/octet-stream",
+                        "size": len(trace),
+                        "sha256_b64": checksum,
+                    }
+                ],
+            },
+        ).json()
+        analysis_id = created["analysis_id"]
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+            trace=trace,
+        )
+        assert client.portal is not None
+        client.portal.call(asyncio.sleep, 0.01)
+        running = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}"
+        ).json()
+        assert running["state"] == "analyzing"
+        assert running["stages"][1]["state"] == "running"
+        assert running["source_analysis"]["run_id"] == "run-local-1"
+
+    if persisted_smartperfetto_state == "completed":
+        store = LocalAnalysisStore(tmp_path)
+        team_uuid = UUID(team_id)
+        analysis_uuid = UUID(analysis_id)
+        state_document = store.load_document(
+            team_uuid,
+            analysis_uuid,
+            "state.json",
+        )
+        assert state_document is not None
+        assert state_document.get("evidence_manifest") is None
+        stages = state_document.get("stages")
+        assert isinstance(stages, dict)
+        stages["smartperfetto"] = "completed"
+        stages["perfpilot_ai"] = "running"
+        store.save_state(team_uuid, analysis_uuid, state_document)
+        store.close()
+
+    restarted_gateway = _FakeSmartPerfettoGateway(_smartperfetto_result())
+    restarted_provider = _CountingProjectionReportProvider()
+    restarted = create_local_app(
+        gateway=restarted_gateway,
+        synthesizer=LocalReportSynthesizer(provider=restarted_provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(restarted) as client:
+        report = None
+        for _ in range(200):
+            report = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+            )
+            if report.status_code == 200:
+                break
+            time.sleep(0.01)
+        restored = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}"
+        ).json()
+
+    assert report is not None
+    assert report.status_code == 200, report.text
+    assert restored["state"] in {"completed", "partially_completed"}
+    assert restarted_gateway.submissions == []
+    assert 1 <= restarted_provider.calls <= 2
+    assert len(restored["ai_rounds"]) == 1
+
+
 def test_local_supervisor_marks_idle_upstream_without_failing_analysis(
     tmp_path: Path,
 ) -> None:

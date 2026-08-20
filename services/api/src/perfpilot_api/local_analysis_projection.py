@@ -26,6 +26,7 @@ from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contr
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import (
     AIProjection,
+    ProjectionContractError,
     ProjectionPrivacyError,
     ProjectionQuestionError,
     ProjectionSizeError,
@@ -790,11 +791,13 @@ def _prepared_from_persisted_documents(
                 ),
             )
         except (
+            ProjectionContractError,
             ProjectionPrivacyError,
             ProjectionQuestionError,
             ProjectionSizeError,
         ) as error:
             projection_failure_code = {
+                ProjectionContractError: "ai_projection_contract_invalid",
                 ProjectionPrivacyError: "ai_projection_private_data",
                 ProjectionQuestionError: "ai_projection_invalid_question",
                 ProjectionSizeError: "ai_projection_too_large",

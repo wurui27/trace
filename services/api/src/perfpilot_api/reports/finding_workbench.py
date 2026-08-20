@@ -20,6 +20,21 @@ _SOURCE_STATES = {
     "weak": "mismatch",
     "none": "mismatch",
 }
+_MAX_LINKED_IDS = 20
+_MAX_FALLBACK_METRICS = 3
+_PRIMARY_METRIC_TERMS = {
+    "startup": (
+        "get_startups.dur_ms",
+        "time_to_initial_display",
+        "ttid",
+        "time_to_full_display",
+        "ttfd",
+        "startup_duration",
+    ),
+    "scroll": ("jank", "frame", "fps", "scroll"),
+    "memory_cycle": ("pss", "rss", "heap", "memory"),
+    "other": (),
+}
 
 
 def _invalid() -> ValueError:
@@ -221,6 +236,10 @@ def _merge_findings(
     strong_fragments: list[Mapping[str, object]],
 ) -> list[dict[str, object]]:
     merged: dict[str, dict[str, object]] = {}
+    scenario_by_finding: dict[str, Mapping[str, object]] = {}
+    original_ids_by_finding: dict[str, set[str]] = {}
+    impact_points_by_finding: dict[str, int] = {}
+    attribution_by_finding: dict[str, str] = {}
     for scenario in scenarios:
         if not isinstance(scenario, Mapping):
             raise _invalid()
@@ -255,12 +274,25 @@ def _merge_findings(
                 root_cause_domain=str(kind),
                 responsible_component=component,
             )
-            evidence_ids = _string_ids(raw.get("evidence_ids"))
+            scenario_by_finding.setdefault(finding_id, scenario)
+            original_ids_by_finding.setdefault(finding_id, set()).add(str(original_id))
+            evidence_ids = _string_ids(raw.get("evidence_ids"))[:_MAX_LINKED_IDS]
             grade = _evidence_grade(raw, evidence_ids, evidence_by_id)
             attribution = _CONFIDENCE.get(str(raw.get("confidence")))
             severity = str(raw.get("severity"))
             if attribution is None or severity not in _IMPACT_POINTS:
                 raise _invalid()
+            impact_points_by_finding[finding_id] = max(
+                impact_points_by_finding.get(finding_id, 0),
+                _IMPACT_POINTS[severity],
+            )
+            previous_attribution = attribution_by_finding.get(finding_id)
+            if (
+                previous_attribution is None
+                or _ATTRIBUTION_POINTS[attribution]
+                > _ATTRIBUTION_POINTS[previous_attribution]
+            ):
+                attribution_by_finding[finding_id] = attribution
             contribution = _critical_path_contribution(
                 evidence_ids,
                 evidence_by_id=evidence_by_id,
@@ -272,18 +304,6 @@ def _merge_findings(
                 attribution=attribution,
                 critical_path_points=round(contribution * 20),
                 reproducibility_points=4,
-            )
-            source_refs = sorted(
-                str(fragment["source_ref_id"])
-                for fragment in strong_fragments
-                if isinstance(fragment.get("source_ref_id"), str)
-                and original_id in fragment.get("finding_ids", [])
-                and set(evidence_ids).intersection(fragment.get("evidence_ids", []))
-            )
-            metric_ids = sorted(
-                str(metric["metric_id"])
-                for metric in metrics
-                if isinstance(metric, Mapping) and isinstance(metric.get("metric_id"), str)
             )
             confirmed = raw.get("status") == "confirmed" and grade in {"E2", "E3", "E4"}
             candidate: dict[str, object] = {
@@ -302,8 +322,8 @@ def _merge_findings(
                 "priority": _priority(score),
                 "priority_score": score,
                 "evidence_ids": evidence_ids,
-                "metric_ids": metric_ids,
-                "source_ref_ids": source_refs,
+                "metric_ids": [],
+                "source_ref_ids": [],
                 "status": "confirmed" if confirmed else "hypothesis",
                 "confidence": {
                     "data_completeness": _scenario_completeness(scenario),
@@ -325,13 +345,9 @@ def _merge_findings(
                 continue
             current["evidence_ids"] = sorted(
                 set(_string_ids(current["evidence_ids"])) | set(evidence_ids)
-            )
-            current["metric_ids"] = sorted(
-                set(_string_ids(current["metric_ids"])) | set(metric_ids)
-            )
-            current["source_ref_ids"] = sorted(
-                set(_string_ids(current["source_ref_ids"])) | set(source_refs)
-            )
+            )[:_MAX_LINKED_IDS]
+            if candidate["status"] == "confirmed":
+                current["status"] = "confirmed"
             current["critical_path_contribution"] = _critical_path_contribution(
                 _string_ids(current["evidence_ids"]),
                 evidence_by_id=evidence_by_id,
@@ -353,6 +369,58 @@ def _merge_findings(
             current["confidence"]["evidence_grade"] = _merged_evidence_grade(  # type: ignore[index]
                 _string_ids(current["evidence_ids"]), evidence_by_id
             )
+    for finding_id, finding in merged.items():
+        scenario = scenario_by_finding[finding_id]
+        evidence = scenario.get("evidence")
+        metrics = scenario.get("metrics")
+        if not isinstance(evidence, list) or not isinstance(metrics, list):
+            raise _invalid()
+        evidence_by_id = {
+            item["evidence_id"]: item
+            for item in evidence
+            if isinstance(item, Mapping) and isinstance(item.get("evidence_id"), str)
+        }
+        evidence_ids = _string_ids(finding["evidence_ids"])
+        direct_metrics = _metric_ids_for_evidence(
+            scenario, evidence_ids, fallback=False
+        )
+        finding["metric_ids"] = (
+            direct_metrics
+            if direct_metrics
+            else _primary_metric_ids(scenario, metrics)
+        )
+        original_ids = original_ids_by_finding[finding_id]
+        finding["source_ref_ids"] = sorted(
+            {
+                str(fragment["source_ref_id"])
+                for fragment in strong_fragments
+                if isinstance(fragment.get("source_ref_id"), str)
+                and original_ids.intersection(fragment.get("finding_ids", []))
+                and set(evidence_ids).intersection(fragment.get("evidence_ids", []))
+            }
+        )[:_MAX_LINKED_IDS]
+        grade = _evidence_grade(finding, evidence_ids, evidence_by_id)
+        contribution = _critical_path_contribution(
+            evidence_ids,
+            evidence_by_id=evidence_by_id,
+            scenario=scenario,
+        )
+        attribution = attribution_by_finding[finding_id]
+        score = priority_score(
+            impact_points=impact_points_by_finding[finding_id],
+            evidence_grade=grade,
+            attribution=attribution,
+            critical_path_points=round(contribution * 20),
+            reproducibility_points=4,
+        )
+        finding["critical_path_contribution"] = contribution
+        finding["priority_score"] = score
+        finding["priority"] = _priority(score)
+        confidence = finding.get("confidence")
+        if not isinstance(confidence, dict):
+            raise _invalid()
+        confidence["evidence_grade"] = grade
+        confidence["attribution"] = attribution
     return list(merged.values())
 
 
@@ -557,11 +625,7 @@ def _metric_views(scenarios: list[object]) -> list[dict[str, object]]:
     for scenario in scenarios:
         if not isinstance(scenario, Mapping) or not isinstance(scenario.get("metrics"), list):
             raise _invalid()
-        evidence_ids = sorted(
-            str(item["evidence_id"])
-            for item in scenario.get("evidence", [])
-            if isinstance(item, Mapping) and isinstance(item.get("evidence_id"), str)
-        )
+        evidence_by_metric, _ = _bounded_metric_evidence_links(scenario)
         for metric in scenario["metrics"]:
             if not isinstance(metric, Mapping) or not isinstance(metric.get("metric_id"), str):
                 raise _invalid()
@@ -576,7 +640,7 @@ def _metric_views(scenarios: list[object]) -> list[dict[str, object]]:
                     "aggregation": "single_sample",
                     "scenario_type": scenario.get("scenario_type"),
                     "source": "smartperfetto",
-                    "evidence_ids": evidence_ids,
+                    "evidence_ids": evidence_by_metric[str(metric["metric_id"])],
                     "quality": "available"
                     if metric.get("status") == "available"
                     else "unavailable",
@@ -609,11 +673,7 @@ def _evidence_views(scenarios: list[object]) -> list[dict[str, object]]:
     for scenario in scenarios:
         if not isinstance(scenario, Mapping) or not isinstance(scenario.get("evidence"), list):
             raise _invalid()
-        metric_ids = sorted(
-            str(item["metric_id"])
-            for item in scenario.get("metrics", [])
-            if isinstance(item, Mapping) and isinstance(item.get("metric_id"), str)
-        )
+        _, metrics_by_evidence = _bounded_metric_evidence_links(scenario)
         for evidence in scenario["evidence"]:
             if not isinstance(evidence, Mapping) or not isinstance(evidence.get("evidence_id"), str):
                 raise _invalid()
@@ -622,7 +682,7 @@ def _evidence_views(scenarios: list[object]) -> list[dict[str, object]]:
                     "evidence_id": evidence["evidence_id"],
                     "kind": "trace_interval" if _has_interval(evidence) else "metric",
                     "scenario_type": scenario.get("scenario_type"),
-                    "metric_ids": metric_ids,
+                    "metric_ids": metrics_by_evidence[str(evidence["evidence_id"])],
                     "summary": f"Trace 证据来自 {evidence.get('source')}。",
                     "source": str(evidence.get("source")),
                     "locator": _locator(evidence) if _has_interval(evidence) else None,
@@ -678,6 +738,101 @@ def _string_ids(value: object) -> list[str]:
     if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
         raise _invalid()
     return sorted(set(value))
+
+
+def _bounded_metric_evidence_links(
+    scenario: Mapping[str, object],
+) -> tuple[dict[str, list[str]], dict[str, list[str]]]:
+    metrics = scenario.get("metrics")
+    evidence = scenario.get("evidence")
+    if not isinstance(metrics, list) or not isinstance(evidence, list):
+        raise _invalid()
+    metric_ids: list[str] = []
+    evidence_ids: list[str] = []
+    for metric in metrics:
+        if not isinstance(metric, Mapping) or not isinstance(metric.get("metric_id"), str):
+            raise _invalid()
+        metric_ids.append(str(metric["metric_id"]))
+    for item in evidence:
+        if not isinstance(item, Mapping) or not isinstance(item.get("evidence_id"), str):
+            raise _invalid()
+        evidence_ids.append(str(item["evidence_id"]))
+    available_evidence = frozenset(evidence_ids)
+    candidates = sorted(
+        {
+            (evidence_id, str(metric["metric_id"]))
+            for metric in metrics
+            if isinstance(metric, Mapping)
+            for evidence_id in _string_ids(metric.get("sample_ids"))
+            if evidence_id in available_evidence
+        }
+    )
+    evidence_by_metric = {metric_id: [] for metric_id in metric_ids}
+    metrics_by_evidence = {evidence_id: [] for evidence_id in evidence_ids}
+    for evidence_id, metric_id in candidates:
+        metric_links = evidence_by_metric[metric_id]
+        evidence_links = metrics_by_evidence[evidence_id]
+        if (
+            len(metric_links) >= _MAX_LINKED_IDS
+            or len(evidence_links) >= _MAX_LINKED_IDS
+        ):
+            continue
+        metric_links.append(evidence_id)
+        evidence_links.append(metric_id)
+    return evidence_by_metric, metrics_by_evidence
+
+
+def _metric_ids_for_evidence(
+    scenario: Mapping[str, object],
+    evidence_ids: list[str],
+    *,
+    fallback: bool = True,
+) -> list[str]:
+    metrics = scenario.get("metrics")
+    if not isinstance(metrics, list):
+        raise _invalid()
+    _, metrics_by_evidence = _bounded_metric_evidence_links(scenario)
+    direct = sorted(
+        {
+            metric_id
+            for evidence_id in evidence_ids
+            for metric_id in metrics_by_evidence.get(evidence_id, [])
+        }
+    )
+    if direct or not fallback:
+        return direct[:_MAX_LINKED_IDS]
+    return _primary_metric_ids(scenario, metrics)
+
+
+def _primary_metric_ids(
+    scenario: Mapping[str, object],
+    metrics: list[object],
+) -> list[str]:
+    scenario_type = scenario.get("scenario_type")
+    if not isinstance(scenario_type, str) or scenario_type not in _PRIMARY_METRIC_TERMS:
+        raise _invalid()
+    terms = _PRIMARY_METRIC_TERMS[scenario_type]
+    available: list[tuple[int, int, str, str]] = []
+    for metric in metrics:
+        if (
+            not isinstance(metric, Mapping)
+            or not isinstance(metric.get("metric_id"), str)
+            or not isinstance(metric.get("name"), str)
+            or metric.get("status") != "available"
+        ):
+            continue
+        name = str(metric["name"])
+        normalized_name = name.casefold()
+        term_rank = next(
+            (index for index, term in enumerate(terms) if term in normalized_name),
+            len(terms),
+        )
+        threshold_rank = 0 if metric.get("threshold") is not None else 1
+        available.append(
+            (term_rank, threshold_rank, normalized_name, str(metric["metric_id"]))
+        )
+    available.sort()
+    return [item[3] for item in available[:_MAX_FALLBACK_METRICS]]
 
 
 def _priority(score: int) -> str:

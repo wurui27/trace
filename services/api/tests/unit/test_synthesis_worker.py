@@ -28,6 +28,7 @@ from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.privacy import ProjectionPrivacyError
 from perfpilot_api.reports.projection import (
     AIProjection,
+    ProjectionContractError,
     ProjectionQuestionError,
     ProjectionSizeError,
 )
@@ -738,6 +739,7 @@ async def test_pipeline_enforces_the_configured_projection_limit() -> None:
 @pytest.mark.parametrize(
     "projection_error",
     [
+        ProjectionContractError(),
         ProjectionSizeError(),
         ProjectionPrivacyError(),
         ProjectionQuestionError(),

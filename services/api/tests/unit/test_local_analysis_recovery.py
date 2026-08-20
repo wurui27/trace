@@ -19,6 +19,7 @@ def _snapshot(**overrides: object) -> RecoverySnapshot:
         "report_present": False,
         "source_state": "not_requested",
         "remote_publication": "not_requested",
+        "upstream_run_resumable": False,
         "identity_valid": True,
         "artifacts_valid": True,
     }
@@ -37,6 +38,29 @@ def test_completed_smartperfetto_resumes_synthesis_without_recapture() -> None:
     )
 
     assert actions == (RecoveryAction.RESUME_SYNTHESIS,)
+
+
+def test_running_smartperfetto_with_persisted_run_resumes_polling() -> None:
+    actions = plan_recovery(
+        _snapshot(
+            smartperfetto_state="running",
+            upstream_run_resumable=True,
+        )
+    )
+
+    assert actions == (RecoveryAction.RESUME_SMARTPERFETTO,)
+
+
+def test_completed_smartperfetto_refetches_when_evidence_was_not_committed() -> None:
+    actions = plan_recovery(
+        _snapshot(
+            smartperfetto_state="completed",
+            evidence_manifest_present=False,
+            upstream_run_resumable=True,
+        )
+    )
+
+    assert actions == (RecoveryAction.RESUME_SMARTPERFETTO,)
 
 
 @pytest.mark.parametrize(

@@ -88,6 +88,20 @@ def test_fallback_does_not_free_write_measurement_values() -> None:
     assert "700" not in narratives
 
 
+def test_fallback_does_not_free_write_chinese_number_words() -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+
+    document = deepcopy(_projection().document)
+    document["workbench"]["findings"][0]["engine_recommendation"] = (
+        "下一轮采集需要补充阻塞原因。"
+    )
+
+    result = build_deterministic_finding_synthesis(_projection(document))
+
+    narratives = canonical_json_bytes(result.document).decode("utf-8")
+    assert "下一轮" not in narratives
+
+
 def test_fallback_claims_only_the_three_selected_key_metrics() -> None:
     from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
 
@@ -126,6 +140,45 @@ def test_fallback_claims_only_the_three_selected_key_metrics() -> None:
     }
     assert len(selected) == 3
     assert claimed == selected
+
+
+def test_fallback_deduplicates_identical_primary_retest_plans() -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+
+    document = deepcopy(_projection().document)
+    workbench = document["workbench"]
+    finding_template = workbench["findings"][0]
+    retest_template = workbench["retest_plans"][0]
+    finding_ids = [
+        f"85000000-0000-4000-8000-{index:012d}" for index in range(1, 4)
+    ]
+    retest_ids = [
+        f"89000000-0000-4000-8000-{index:012d}" for index in range(1, 4)
+    ]
+    workbench["findings"] = [
+        {
+            **deepcopy(finding_template),
+            "finding_id": finding_id,
+            "priority": "p0" if index == 0 else "p1",
+            "priority_score": 88 - index,
+            "retest_plan_id": retest_ids[index],
+        }
+        for index, finding_id in enumerate(finding_ids)
+    ]
+    workbench["retest_plans"] = [
+        {
+            **deepcopy(retest_template),
+            "retest_plan_id": retest_id,
+            "finding_id": finding_ids[index],
+        }
+        for index, retest_id in enumerate(retest_ids)
+    ]
+    workbench["primary_finding_ids"] = finding_ids
+
+    result = build_deterministic_finding_synthesis(_projection(document))
+
+    assert len(result.document["top_findings"]) == 3
+    assert len(result.document["retest_plan"]) == 1
 
 
 def test_fallback_keeps_clear_server_owned_problem_and_action_text() -> None:
