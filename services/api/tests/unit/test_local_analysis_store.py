@@ -11,12 +11,63 @@ import pytest
 from perfpilot_api.local_analysis_store import (
     LocalAnalysisStore,
     LocalAnalysisStoreError,
+    migrate_analysis_runtime_status,
+    validate_analysis_runtime_status,
 )
 
 
 ANALYSIS_ID = UUID("91000000-0000-4000-8000-000000000001")
 TEAM_ID = UUID("82000000-0000-4000-8000-000000000001")
 OTHER_TEAM_ID = UUID("82000000-0000-4000-8000-000000000002")
+
+
+def test_legacy_state_migrates_to_deterministic_runtime_activity() -> None:
+    updated_at = "2026-08-20T08:06:24+00:00"
+
+    runtime_status = migrate_analysis_runtime_status(
+        None,
+        state="analyzing",
+        generation=2,
+        updated_at=updated_at,
+        stages={
+            "input_validation": "completed",
+            "smartperfetto": "completed",
+            "perfpilot_ai": "running",
+            "report": "pending",
+        },
+    )
+
+    assert runtime_status == {
+        "current_stage": "perfpilot_ai",
+        "stage_state": "running",
+        "started_at": updated_at,
+        "updated_at": updated_at,
+        "last_progress_at": updated_at,
+        "attempt": 1,
+        "max_attempts": 2,
+        "generation": 2,
+        "waiting_for": None,
+        "progress_summary": "正在生成中文分析结论",
+        "available_actions": ["cancel"],
+    }
+
+
+def test_persisted_runtime_activity_rejects_unknown_fields() -> None:
+    status = migrate_analysis_runtime_status(
+        None,
+        state="created",
+        generation=1,
+        updated_at="2026-08-20T08:00:00+00:00",
+        stages={
+            "input_validation": "running",
+            "smartperfetto": "pending",
+            "perfpilot_ai": "pending",
+            "report": "pending",
+        },
+    )
+
+    with pytest.raises(ValueError, match="analysis runtime status rejected"):
+        validate_analysis_runtime_status({**status, "private_path": "/private/source"})
 
 
 def test_store_round_trips_team_scoped_analysis_state_and_documents(

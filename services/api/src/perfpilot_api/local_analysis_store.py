@@ -7,6 +7,7 @@ import os
 import re
 import stat
 from collections.abc import Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
@@ -17,6 +18,74 @@ _DOCUMENT_NAME = re.compile(
     r"(?:state|projection|report|smartperfetto-report|normalized-core|android-memory-result|source-context|agent-capture-manifest|round-[123])\.json\Z"
 )
 _MAX_DOCUMENT_BYTES = 12 * 1024 * 1024
+_RUNTIME_STATUS_KEYS = {
+    "current_stage",
+    "stage_state",
+    "started_at",
+    "updated_at",
+    "last_progress_at",
+    "attempt",
+    "max_attempts",
+    "generation",
+    "waiting_for",
+    "progress_summary",
+    "available_actions",
+}
+_RUNTIME_STAGES = frozenset(
+    {
+        "input_validation",
+        "device_claim",
+        "device_capture",
+        "smartperfetto",
+        "source_code",
+        "perfpilot_ai",
+        "report",
+    }
+)
+_RUNTIME_STAGE_STATES = frozenset(
+    {
+        "pending",
+        "running",
+        "waiting",
+        "slow",
+        "waiting_for_upstream",
+        "completed",
+        "failed",
+        "canceled",
+        "cancel_requested",
+        "not_requested",
+    }
+)
+_RUNTIME_WAITING_FOR = frozenset(
+    {
+        "agent",
+        "device",
+        "smartperfetto",
+        "source_agent",
+        "ai_provider",
+        "storage",
+        "report_publish",
+    }
+)
+_RUNTIME_ACTIONS = frozenset({"cancel", "retry"})
+_LEGACY_STAGE_ORDER = (
+    "input_validation",
+    "smartperfetto",
+    "perfpilot_ai",
+    "report",
+)
+_TERMINAL_STATES = frozenset(
+    {"completed", "partially_completed", "failed", "canceled", "deleted"}
+)
+_STAGE_SUMMARIES = {
+    "input_validation": "正在校验分析输入",
+    "device_claim": "正在等待设备",
+    "device_capture": "正在采集真机 Trace",
+    "smartperfetto": "正在分析 Trace",
+    "source_code": "正在读取并匹配源码",
+    "perfpilot_ai": "正在生成中文分析结论",
+    "report": "正在生成分析报告",
+}
 
 
 class LocalAnalysisStoreError(RuntimeError):
@@ -44,6 +113,121 @@ def _require_uuid(value: UUID, name: str) -> UUID:
     if not isinstance(value, UUID):
         raise TypeError(f"{name} must be a UUID")
     return value
+
+
+def _utc_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value.endswith(("Z", "+00:00")):
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None and parsed.astimezone(UTC).utcoffset() == parsed.utcoffset()
+
+
+def validate_analysis_runtime_status(value: object) -> dict[str, object]:
+    try:
+        if not isinstance(value, Mapping) or set(value) != _RUNTIME_STATUS_KEYS:
+            raise ValueError
+        current_stage = value["current_stage"]
+        stage_state = value["stage_state"]
+        attempt = value["attempt"]
+        max_attempts = value["max_attempts"]
+        generation = value["generation"]
+        waiting_for = value["waiting_for"]
+        progress_summary = value["progress_summary"]
+        actions = value["available_actions"]
+        if current_stage not in _RUNTIME_STAGES or stage_state not in _RUNTIME_STAGE_STATES:
+            raise ValueError
+        if any(
+            not _utc_timestamp(value[key])
+            for key in ("started_at", "updated_at", "last_progress_at")
+        ):
+            raise ValueError
+        if (
+            type(attempt) is not int
+            or type(max_attempts) is not int
+            or type(generation) is not int
+            or not 1 <= attempt <= max_attempts
+            or generation < 1
+        ):
+            raise ValueError
+        if waiting_for is not None and waiting_for not in _RUNTIME_WAITING_FOR:
+            raise ValueError
+        if not isinstance(progress_summary, str) or len(progress_summary) > 240:
+            raise ValueError
+        if (
+            not isinstance(actions, list)
+            or len(actions) != len(set(actions))
+            or any(action not in _RUNTIME_ACTIONS for action in actions)
+        ):
+            raise ValueError
+        return {
+            "current_stage": current_stage,
+            "stage_state": stage_state,
+            "started_at": value["started_at"],
+            "updated_at": value["updated_at"],
+            "last_progress_at": value["last_progress_at"],
+            "attempt": attempt,
+            "max_attempts": max_attempts,
+            "generation": generation,
+            "waiting_for": waiting_for,
+            "progress_summary": progress_summary,
+            "available_actions": list(actions),
+        }
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("analysis runtime status rejected") from None
+
+
+def migrate_analysis_runtime_status(
+    value: object,
+    *,
+    state: str,
+    generation: int,
+    updated_at: str,
+    stages: Mapping[str, object],
+) -> dict[str, object]:
+    if value is not None:
+        return validate_analysis_runtime_status(value)
+    if type(generation) is not int or generation < 1 or not _utc_timestamp(updated_at):
+        raise ValueError("analysis runtime status rejected")
+    current_stage = "report"
+    stage_state = "pending"
+    if state in _TERMINAL_STATES:
+        stage_state = (
+            "completed"
+            if state in {"completed", "partially_completed"}
+            else state
+        )
+    else:
+        for candidate in _LEGACY_STAGE_ORDER:
+            candidate_state = stages.get(candidate)
+            if candidate_state == "running":
+                current_stage = candidate
+                stage_state = "running"
+                break
+        else:
+            for candidate in _LEGACY_STAGE_ORDER:
+                candidate_state = stages.get(candidate)
+                if candidate_state == "pending":
+                    current_stage = candidate
+                    stage_state = "pending"
+                    break
+    return validate_analysis_runtime_status(
+        {
+            "current_stage": current_stage,
+            "stage_state": stage_state,
+            "started_at": updated_at,
+            "updated_at": updated_at,
+            "last_progress_at": updated_at,
+            "attempt": 1,
+            "max_attempts": 2,
+            "generation": generation,
+            "waiting_for": None,
+            "progress_summary": _STAGE_SUMMARIES[current_stage],
+            "available_actions": [] if state in _TERMINAL_STATES else ["cancel"],
+        }
+    )
 
 
 class LocalAnalysisStore:
@@ -416,4 +600,6 @@ __all__ = [
     "LocalAnalysisStore",
     "LocalAnalysisStoreDurabilityError",
     "LocalAnalysisStoreError",
+    "migrate_analysis_runtime_status",
+    "validate_analysis_runtime_status",
 ]

@@ -1,0 +1,22 @@
+{
+  "schema_version": "1.3",
+  "analysis_mode": "trace_upload",
+  "test_type": "cold_start",
+  "package_name": "com.rivotek.mediacenter",
+  "question": "请结合源码说明冷启动瓶颈。",
+  "inputs": [
+    {
+      "kind": "trace",
+      "mime": "application/octet-stream",
+      "size": 4096,
+      "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+    }
+  ],
+  "source_binding": {
+    "provider_kind": "agent_workspace",
+    "agent_id": "91000000-0000-4000-8000-000000000001",
+    "workspace_id": "92000000-0000-4000-8000-000000000001",
+    "snapshot_policy": "tracked_worktree",
+    "validation_profile_id": null
+  }
+}

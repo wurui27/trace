@@ -315,6 +315,41 @@ def _trace_analysis_response(*, input_state: str) -> dict[str, object]:
     }
 
 
+def _runtime_status() -> dict[str, object]:
+    return {
+        "current_stage": "source_code",
+        "stage_state": "running",
+        "started_at": "2026-08-20T08:00:00Z",
+        "updated_at": "2026-08-20T08:06:24Z",
+        "last_progress_at": "2026-08-20T08:06:12Z",
+        "attempt": 1,
+        "max_attempts": 2,
+        "generation": 1,
+        "waiting_for": None,
+        "progress_summary": "已读取 1247 个文件，找到 18 个相关源码片段",
+        "available_actions": ["cancel"],
+    }
+
+
+def _analysis_response_v13() -> dict[str, object]:
+    payload = _trace_analysis_response(input_state="pending")
+    payload["schema_version"] = "1.3"
+    payload["source_code_analysis"] = {
+        "requested": False,
+        "provider_kind": None,
+        "agent_id": None,
+        "workspace_id": None,
+        "snapshot_policy": None,
+        "validation_profile_id": None,
+        "context_state": "not_requested",
+        "match_summary": "none",
+        "verification_state": "not_requested",
+        "failure_code": None,
+    }
+    payload["runtime_status"] = _runtime_status()
+    return payload
+
+
 def test_analysis_contract_schemas_are_valid_and_close_declared_objects() -> None:
     schemas = _schemas()
 
@@ -504,7 +539,10 @@ def test_memory_question_whitespace_matches_python_strip_across_regex_runtimes()
     memory_branch = next(  # type: ignore[union-attr]
         branch
         for branch in schema["oneOf"]  # type: ignore[index]
-        if branch["properties"]["analysis_mode"].get("const") == "memory_upload"
+        if branch.get("properties", {})
+        .get("analysis_mode", {})
+        .get("const")
+        == "memory_upload"
     )
     pattern = memory_branch["properties"]["question"]["oneOf"][0]["pattern"]  # type: ignore[index]
     assert isinstance(pattern, str)
@@ -638,6 +676,90 @@ def test_trace_analysis_response_projects_declared_inputs_without_minting_urls()
     del missing_stages["stages"]
     with pytest.raises(jsonschema.ValidationError):
         validator.validate(missing_stages)
+
+
+def test_analysis_response_v13_requires_closed_runtime_status() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/analysis-response.schema.json", schemas)
+    payload = _analysis_response_v13()
+    validator.validate(payload)
+
+    missing = dict(payload)
+    del missing["runtime_status"]
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate(missing)
+
+    mutations = (
+        {**_runtime_status(), "current_stage": "unknown"},
+        {**_runtime_status(), "stage_state": "unknown"},
+        {**_runtime_status(), "available_actions": ["cancel", "unknown"]},
+        {**_runtime_status(), "attempt": 0},
+        {**_runtime_status(), "generation": -1},
+        {**_runtime_status(), "progress_summary": "x" * 241},
+        {**_runtime_status(), "updated_at": "2026-08-20T16:06:24+08:00"},
+        {**_runtime_status(), "private_path": "/private/source"},
+    )
+    for runtime_status in mutations:
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate({**payload, "runtime_status": runtime_status})
+
+
+def test_legacy_analysis_responses_forbid_v13_runtime_status() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/analysis-response.schema.json", schemas)
+    for payload in (
+        _trace_analysis_response(input_state="pending"),
+        _remote_device_analysis_response(),
+        _script_device_analysis_response(),
+    ):
+        validator.validate(payload)
+        with pytest.raises(jsonschema.ValidationError):
+            validator.validate({**payload, "runtime_status": _runtime_status()})
+
+
+def test_create_request_v13_supports_trace_and_script_device_modes() -> None:
+    schemas = _schemas()
+    validator = _validator("contracts/v1/analyses/create-request.schema.json", schemas)
+    trace = {
+        "schema_version": "1.3",
+        "analysis_mode": "trace_upload",
+        "test_type": "cold_start",
+        "package_name": "com.rivotek.mediacenter",
+        "question": None,
+        "inputs": [
+            {
+                "kind": "trace",
+                "mime": "application/octet-stream",
+                "size": 4096,
+                "sha256_b64": _sha(),
+            }
+        ],
+    }
+    validator.validate(trace)
+    validator.validate({**trace, "source_binding": {
+        "provider_kind": "agent_workspace",
+        "agent_id": "91000000-0000-4000-8000-000000000001",
+        "workspace_id": "92000000-0000-4000-8000-000000000001",
+        "snapshot_policy": "tracked_worktree",
+        "validation_profile_id": None,
+    }})
+    validator.validate(
+        {
+            "schema_version": "1.3",
+            "analysis_mode": "device",
+            "device_id": "72000000-0000-4000-8000-000000000001",
+            "test_type": "cold_start",
+            "launch_mode": "automatic",
+            "duration_seconds": 15,
+            "target": {
+                "package_name": "com.rivotek.mediacenter",
+                "launch_activity": "com.rivotek.mediacenter/.shell.MediaCenterActivity",
+            },
+        }
+    )
+
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate({**trace, "analysis_profile": "startup"})
 
 
 def test_scenario_execution_manifest_never_claims_server_sample_validity() -> None:

@@ -3285,6 +3285,80 @@ def _upload_and_finalize_trace(
     )
 
 
+def test_local_analysis_v13_persists_authoritative_runtime_status(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+    )
+    trace = b"runtime-status-trace"
+    checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        created = client.post(
+            f"/v1/teams/{team_id}/analyses",
+            headers=headers,
+            json={
+                "schema_version": "1.3",
+                "analysis_mode": "trace_upload",
+                "test_type": "cold_start",
+                "package_name": "com.rivotek.mediacenter",
+                "question": None,
+                "inputs": [
+                    {
+                        "kind": "trace",
+                        "mime": "application/octet-stream",
+                        "size": len(trace),
+                        "sha256_b64": checksum,
+                    }
+                ],
+            },
+        )
+
+        assert created.status_code == 201, created.text
+        payload = created.json()
+        analysis_id = payload["analysis_id"]
+        assert payload["schema_version"] == "1.3"
+        assert payload["runtime_status"] == {
+            "current_stage": "input_validation",
+            "stage_state": "running",
+            "started_at": payload["created_at"],
+            "updated_at": payload["created_at"],
+            "last_progress_at": payload["created_at"],
+            "attempt": 1,
+            "max_attempts": 2,
+            "generation": 1,
+            "waiting_for": None,
+            "progress_summary": "正在校验分析输入",
+            "available_actions": ["cancel"],
+        }
+
+    persisted = LocalAnalysisStore(tmp_path).load_document(
+        UUID(team_id),
+        UUID(analysis_id),
+        "state.json",
+    )
+    assert persisted is not None
+    assert persisted["response_schema_version"] == "1.3"
+    assert persisted["runtime_status"] == payload["runtime_status"]
+
+    restarted = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+    )
+    with TestClient(restarted) as client:
+        restored = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}")
+
+    assert restored.status_code == 200
+    assert restored.json()["schema_version"] == "1.3"
+    assert restored.json()["runtime_status"] == payload["runtime_status"]
+
+
 def test_successful_trace_submission_removes_only_current_team_previous_analysis(
     tmp_path: Path,
 ) -> None:

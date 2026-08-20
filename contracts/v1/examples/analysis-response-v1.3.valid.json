@@ -1,0 +1,82 @@
+{
+  "schema_version": "1.3",
+  "analysis_id": "31000000-0000-4000-8000-000000000001",
+  "team_id": "21000000-0000-4000-8000-000000000001",
+  "analysis_mode": "trace_upload",
+  "state": "analyzing",
+  "version": 3,
+  "application_version_id": null,
+  "application_metadata": null,
+  "apk_upload": null,
+  "scenarios": [],
+  "sample_verdict_counts": {
+    "valid": 0,
+    "invalid": 0,
+    "pending": 0,
+    "validation_error": 0,
+    "total": 0
+  },
+  "active_lease": null,
+  "report_available": false,
+  "created_at": "2026-08-20T08:00:00Z",
+  "started_at": "2026-08-20T08:01:00Z",
+  "completed_at": null,
+  "cancel_requested_at": null,
+  "failure": null,
+  "analysis_profile": "startup",
+  "test_type": "cold_start",
+  "package_name": "com.rivotek.mediacenter",
+  "custom_test_name": null,
+  "custom_test_description": null,
+  "question": "请结合源码说明冷启动瓶颈。",
+  "input_uploads": [
+    {
+      "state": "finalized",
+      "upload_id": "41000000-0000-4000-8000-000000000001",
+      "artifact_id": "51000000-0000-4000-8000-000000000001",
+      "artifact_kind": "trace",
+      "mime": "application/octet-stream",
+      "size": 4096,
+      "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "finalized_at": "2026-08-20T08:00:30Z"
+    }
+  ],
+  "stages": [
+    {"stage": "input_validation", "state": "completed", "failure": null},
+    {"stage": "smartperfetto", "state": "completed", "failure": null},
+    {"stage": "perfpilot_ai", "state": "running", "failure": null},
+    {"stage": "report", "state": "pending", "failure": null}
+  ],
+  "source_analysis": {
+    "engine": "smartperfetto",
+    "rounds": 53,
+    "verification": "passed",
+    "session_id": "session-local-1",
+    "run_id": "run-local-1"
+  },
+  "source_code_analysis": {
+    "requested": true,
+    "provider_kind": "agent_workspace",
+    "agent_id": "91000000-0000-4000-8000-000000000001",
+    "workspace_id": "92000000-0000-4000-8000-000000000001",
+    "snapshot_policy": "tracked_worktree",
+    "validation_profile_id": null,
+    "context_state": "available",
+    "match_summary": "strong",
+    "verification_state": "verified",
+    "failure_code": null
+  },
+  "runtime_status": {
+    "current_stage": "source_code",
+    "stage_state": "running",
+    "started_at": "2026-08-20T08:00:00Z",
+    "updated_at": "2026-08-20T08:06:24Z",
+    "last_progress_at": "2026-08-20T08:06:12Z",
+    "attempt": 1,
+    "max_attempts": 2,
+    "generation": 1,
+    "waiting_for": null,
+    "progress_summary": "已读取 1247 个文件，找到 18 个相关源码片段",
+    "available_actions": ["cancel"]
+  }
+}

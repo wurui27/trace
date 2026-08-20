@@ -71,6 +71,8 @@ from perfpilot_api.local_analysis_store import (
     LocalAnalysisStore,
     LocalAnalysisStoreDurabilityError,
     LocalAnalysisStoreError,
+    migrate_analysis_runtime_status,
+    validate_analysis_runtime_status,
 )
 from perfpilot_api.local_agent_store import LocalAgentStore, LocalDeviceDirectoryRepository
 from perfpilot_api.local_agent_enrollment import (
@@ -535,7 +537,7 @@ class _SourceBindingDescriptor(_StrictModel):
 
 
 class _CreateTraceAnalysisRequest(_StrictModel):
-    schema_version: Literal["1.0", "1.1"]
+    schema_version: Literal["1.0", "1.1", "1.3"]
     analysis_mode: Literal["trace_upload"]
     test_type: Literal["cold_start", "hot_start", "scroll", "other"]
     package_name: str = Field(min_length=3, max_length=255)
@@ -631,7 +633,7 @@ class _CaptureTargetDescriptor(_StrictModel):
 
 
 class _CreateDeviceAnalysisRequest(_StrictModel):
-    schema_version: Literal["1.0", "1.1", "1.2"]
+    schema_version: Literal["1.0", "1.1", "1.2", "1.3"]
     analysis_mode: Literal["device"]
     device_id: UUID = Field(strict=False)
     scenarios: list[Literal["cold_start", "scroll", "memory_cycle"]] | None = None
@@ -944,6 +946,78 @@ class _LocalAnalysis:
             "report": "pending",
         }
     )
+    response_schema_version: Literal["1.0", "1.1", "1.2", "1.3"] | None = None
+    runtime_status: dict[str, object] | None = None
+
+    def __post_init__(self) -> None:
+        if self.response_schema_version is None:
+            if self.analysis_mode == "device":
+                self.response_schema_version = (
+                    "1.2"
+                    if self.capture_configuration is not None
+                    else "1.1"
+                    if self.device_agent_id is not None or self.source_binding is not None
+                    else "1.0"
+                )
+            else:
+                self.response_schema_version = (
+                    "1.1" if self.source_binding is not None else "1.0"
+                )
+        if self.runtime_status is None:
+            self.runtime_status = migrate_analysis_runtime_status(
+                None,
+                state=self.state,
+                generation=self.generation,
+                updated_at=self.created_at.isoformat(),
+                stages=self.stages,
+            )
+        else:
+            self.runtime_status = validate_analysis_runtime_status(
+                self.runtime_status
+            )
+
+
+def _record_progress(
+    analysis: _LocalAnalysis,
+    *,
+    stage: str,
+    state: str,
+    summary: str,
+    waiting_for: str | None,
+    now: datetime,
+) -> None:
+    if len(summary) > 240:
+        raise ValueError("analysis progress rejected")
+    previous = analysis.runtime_status or {}
+    timestamp = now.astimezone(UTC).isoformat()
+    started_at = (
+        previous.get("started_at")
+        if previous.get("current_stage") == stage
+        else timestamp
+    )
+    analysis.runtime_status = validate_analysis_runtime_status(
+        {
+            "current_stage": stage,
+            "stage_state": state,
+            "started_at": started_at,
+            "updated_at": timestamp,
+            "last_progress_at": timestamp,
+            "attempt": (
+                int(previous.get("attempt", 1))
+                if previous.get("current_stage") == stage
+                else 1
+            ),
+            "max_attempts": int(previous.get("max_attempts", 2)),
+            "generation": analysis.generation,
+            "waiting_for": waiting_for,
+            "progress_summary": summary,
+            "available_actions": (
+                []
+                if analysis.state in _TERMINAL_ANALYSIS_STATES
+                else ["cancel"]
+            ),
+        }
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -1005,6 +1079,8 @@ _PERSISTED_STATE_KEYS = {
     "evidence_format_version",
     "evidence_manifest",
     "smartperfetto_original",
+    "response_schema_version",
+    "runtime_status",
 }
 _PERSISTED_OPTIONAL_STATE_KEYS = {
     "created_at",
@@ -1020,6 +1096,8 @@ _PERSISTED_OPTIONAL_STATE_KEYS = {
     "target_package_name",
     "custom_test_name",
     "custom_test_description",
+    "response_schema_version",
+    "runtime_status",
 }
 _PERSISTED_STAGE_KEYS = {
     "input_validation",
@@ -1064,6 +1142,16 @@ def _validate_persisted_state_shape(document: Mapping[str, object]) -> None:
             raise ValueError
     if not _has_exact_keys(document.get("stages"), _PERSISTED_STAGE_KEYS):
         raise ValueError
+    response_schema_version = document.get("response_schema_version")
+    if response_schema_version is not None and response_schema_version not in {
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+    }:
+        raise ValueError
+    if "runtime_status" in document:
+        validate_analysis_runtime_status(document["runtime_status"])
     source_run = document.get("source_run")
     if source_run is not None and not _has_exact_keys(
         source_run, {"session_id", "run_id"}
@@ -2545,6 +2633,8 @@ class _LocalRuntime:
             "state": analysis.state,
             "version": analysis.version,
             "generation": analysis.generation,
+            "response_schema_version": analysis.response_schema_version,
+            "runtime_status": dict(analysis.runtime_status or {}),
             "inputs": [
                 {
                     "descriptor": item.descriptor.model_dump(mode="json"),
@@ -3078,6 +3168,20 @@ class _LocalRuntime:
             evidence_manifest = _restore_evidence_manifest(
                 document["evidence_manifest"]
             )
+        generation = int(document.get("generation", 1))
+        runtime_updated_at = (
+            completed_at
+            or started_at
+            or created_at
+            or _EARLIEST_LOCAL_ANALYSIS_TIME
+        ).isoformat()
+        runtime_status = migrate_analysis_runtime_status(
+            document.get("runtime_status"),
+            state=str(document["state"]),
+            generation=generation,
+            updated_at=runtime_updated_at,
+            stages=stages,
+        )
         analysis = _LocalAnalysis(
             team_id=team_id,
             analysis_id=analysis_id,
@@ -3155,7 +3259,7 @@ class _LocalRuntime:
             completed_at=completed_at,
             state=str(document["state"]),
             version=int(document["version"]),
-            generation=int(document.get("generation", 1)),
+            generation=generation,
             failure=(
                 dict(document["failure"])
                 if isinstance(document.get("failure"), Mapping)
@@ -3190,6 +3294,12 @@ class _LocalRuntime:
             ),
             ai_rounds=ai_rounds,
             stages={key: str(value) for key, value in stages.items()},
+            response_schema_version=(
+                str(document["response_schema_version"])  # type: ignore[arg-type]
+                if isinstance(document.get("response_schema_version"), str)
+                else None
+            ),
+            runtime_status=runtime_status,
         )
         return analysis
 
@@ -3203,6 +3313,10 @@ class _LocalRuntime:
         for (team_id, analysis_id), document in persisted.items():
             analysis = self._restore_analysis(document)
             migrate_created_at = document.get("created_at") is None
+            migrate_runtime_contract = (
+                document.get("response_schema_version") is None
+                or document.get("runtime_status") is None
+            )
             source_degraded = False
             resume_gate: asyncio.Event | None = None
             if analysis.team_id != team_id or analysis.analysis_id != analysis_id:
@@ -3310,7 +3424,12 @@ class _LocalRuntime:
                 task.add_done_callback(self.tasks.discard)
                 analysis.stages["perfpilot_ai"] = "running"
                 analysis.version += 1
-            if migrate_created_at or restore_canceled or source_degraded:
+            if (
+                migrate_created_at
+                or migrate_runtime_contract
+                or restore_canceled
+                or source_degraded
+            ):
                 try:
                     await self._persist(analysis)
                 except BaseException:
@@ -3499,7 +3618,7 @@ class _LocalRuntime:
         device_digest: str | None = None,
     ) -> _LocalAnalysis:
         if isinstance(request, _CreateDeviceAnalysisRequest):
-            script_capture = request.schema_version == "1.2"
+            script_capture = request.schema_version in {"1.2", "1.3"}
             descriptor = (
                 None
                 if request.apk is None
@@ -3538,6 +3657,7 @@ class _LocalRuntime:
                 ),
                 remote_publication=("publishing" if script_capture else "not_requested"),
                 state=("uploading" if script_capture else "created"),
+                response_schema_version=request.schema_version,
                 source_binding=(
                     request.source_binding.binding()
                     if request.source_binding is not None
@@ -3559,6 +3679,7 @@ class _LocalRuntime:
                 target_package_name=request.package_name,
                 custom_test_name=request.custom_test_name,
                 custom_test_description=request.custom_test_description,
+                response_schema_version=request.schema_version,
                 source_binding=(
                     request.source_binding.binding()
                     if request.source_binding is not None
@@ -5214,6 +5335,14 @@ class _LocalRuntime:
         await self._persist(analysis)
 
     def response(self, analysis: _LocalAnalysis) -> dict[str, object]:
+        response_schema_version = analysis.response_schema_version
+        if response_schema_version is None:
+            raise RuntimeError("local analysis response schema is unavailable")
+        runtime_status_fragment = (
+            {"runtime_status": dict(analysis.runtime_status or {})}
+            if response_schema_version == "1.3"
+            else {}
+        )
         if analysis.analysis_mode == "device":
             if analysis.capture_configuration is not None:
                 configuration = analysis.capture_configuration
@@ -5261,7 +5390,7 @@ class _LocalRuntime:
                 package_name = configuration.get("package_name")
                 launch_activity = configuration.get("launch_activity")
                 return {
-                    "schema_version": "1.2",
+                    "schema_version": response_schema_version,
                     "analysis_id": str(analysis.analysis_id),
                     "team_id": str(analysis.team_id),
                     "analysis_mode": "device",
@@ -5339,13 +5468,9 @@ class _LocalRuntime:
                     ),
                     "failure": analysis.failure,
                     "source_code_analysis": dict(analysis.source_code_analysis),
+                    **runtime_status_fragment,
                 }
-            device_schema_version = (
-                "1.1"
-                if analysis.device_agent_id is not None
-                or analysis.source_binding is not None
-                else "1.0"
-            )
+            device_schema_version = response_schema_version
             target = analysis.inputs["apk"]
             if target.upload_id is None:
                 raise RuntimeError("local APK upload is unavailable")
@@ -5487,6 +5612,7 @@ class _LocalRuntime:
                     if device_schema_version == "1.1"
                     else {}
                 ),
+                **runtime_status_fragment,
             }
         stage_failure = analysis.failure
         input_uploads: list[dict[str, object]] = []
@@ -5521,7 +5647,7 @@ class _LocalRuntime:
                 }
             )
         return {
-            "schema_version": "1.1" if analysis.source_binding is not None else "1.0",
+            "schema_version": response_schema_version,
             "analysis_id": str(analysis.analysis_id),
             "team_id": str(analysis.team_id),
             "analysis_mode": "trace_upload",
@@ -5563,9 +5689,10 @@ class _LocalRuntime:
             },
             **(
                 {"source_code_analysis": dict(analysis.source_code_analysis)}
-                if analysis.source_binding is not None
+                if response_schema_version in {"1.1", "1.3"}
                 else {}
             ),
+            **runtime_status_fragment,
         }
 
     def slot(self, upload: _LocalUpload, *, finalized: bool) -> dict[str, object]:
@@ -6485,7 +6612,7 @@ def create_local_app(
             if target is None:
                 raise ApiError("remote_device_capture_unavailable", "远端设备不可用", 409, False)
             if (
-                body.schema_version == "1.2"
+                body.schema_version in {"1.2", "1.3"}
                 and body.target is not None
                 and (
                     body.target.package_name,
@@ -6501,7 +6628,7 @@ def create_local_app(
                 )
             canonical_body = (
                 body
-                if body.schema_version == "1.2"
+                if body.schema_version in {"1.2", "1.3"}
                 else body.model_copy(update={"schema_version": "1.1"})
             )
             return runtime.response(

@@ -214,6 +214,15 @@ def _trace_create_request(schema_version: str) -> dict[str, object]:
     }
 
 
+def test_analysis_v13_examples_match_closed_contracts() -> None:
+    validator(load("contracts/v1/analyses/create-request.schema.json")).validate(
+        load("contracts/v1/examples/analysis-create-v1.3.valid.json")
+    )
+    validator(load("contracts/v1/analyses/analysis-response.schema.json")).validate(
+        load("contracts/v1/examples/analysis-response-v1.3.valid.json")
+    )
+
+
 def test_create_request_v11_binds_source_without_weakening_v10_or_memory() -> None:
     contract = validator(load("contracts/v1/analyses/create-request.schema.json"))
     trace = {**_trace_create_request("1.1"), "source_binding": _source_binding()}
