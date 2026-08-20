@@ -188,6 +188,12 @@ def test_report_visibility_and_terminal_state_close_together(tmp_path: Path) -> 
     analysis.report = {"schema_version": "1.2"}
     analysis.state = "completed"
     analysis.completed_at = NOW
+    analysis.runtime_status = {
+        **dict(analysis.runtime_status or {}),
+        "current_stage": "report",
+        "stage_state": "completed",
+        "available_actions": [],
+    }
     public = runtime.response(analysis)
     persisted = runtime._state_document(analysis)
 

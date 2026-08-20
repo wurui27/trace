@@ -85,6 +85,12 @@ from perfpilot_api.local_analysis_health import (
     HealthAggregator,
     supervisor_capability,
 )
+from perfpilot_api.local_analysis_projection import (
+    LocalAnalysisView,
+    from_persisted_document,
+    to_persisted_document,
+    to_public_document,
+)
 from perfpilot_api.local_cancellation import CancellationTarget, cancel_targets
 from perfpilot_api.local_task_supervisor import (
     REPORT_POLICY,
@@ -2909,11 +2915,15 @@ class _LocalRuntime:
         if self.upload_authorizations.get(digest) == key:
             del self.upload_authorizations[digest]
 
-    def _state_document(self, analysis: _LocalAnalysis) -> dict[str, object]:
-        document: dict[str, object] = {
-            "schema_version": "1.0",
-            "team_id": str(analysis.team_id),
-            "analysis_id": str(analysis.analysis_id),
+    def _analysis_view(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        public_document: Mapping[str, object] | None = None,
+    ) -> LocalAnalysisView:
+        if analysis.response_schema_version is None:
+            raise RuntimeError("local analysis response schema is unavailable")
+        payload: dict[str, object] = {
             "analysis_mode": analysis.analysis_mode,
             "device_id": str(analysis.device_id) if analysis.device_id is not None else None,
             "device_agent_id": (
@@ -2936,20 +2946,6 @@ class _LocalRuntime:
             "remote_publication": analysis.remote_publication,
             "profile": analysis.profile,
             "question": analysis.question,
-            "created_at": analysis.created_at.isoformat(),
-            "started_at": (
-                analysis.started_at.isoformat() if analysis.started_at is not None else None
-            ),
-            "completed_at": (
-                analysis.completed_at.isoformat()
-                if analysis.completed_at is not None
-                else None
-            ),
-            "state": analysis.state,
-            "version": analysis.version,
-            "generation": analysis.generation,
-            "response_schema_version": analysis.response_schema_version,
-            "runtime_status": dict(analysis.runtime_status or {}),
             "inputs": [
                 {
                     "descriptor": item.descriptor.model_dump(mode="json"),
@@ -2960,11 +2956,6 @@ class _LocalRuntime:
                 for item in analysis.inputs.values()
             ],
             "failure": analysis.failure,
-            "cancel_requested_at": (
-                analysis.cancel_requested_at.isoformat()
-                if analysis.cancel_requested_at is not None
-                else None
-            ),
             "stages": dict(analysis.stages),
             "source_run": (
                 {
@@ -2991,20 +2982,38 @@ class _LocalRuntime:
                 }
                 for item in analysis.ai_rounds
             ],
-            "report_available": analysis.report is not None,
         }
         if (analysis.evidence_format_version is None) != (
             analysis.evidence_manifest is None
         ):
             raise RuntimeError("invalid local evidence state")
         if analysis.evidence_format_version is not None:
-            document["evidence_format_version"] = analysis.evidence_format_version
-            document["evidence_manifest"] = dict(analysis.evidence_manifest or {})
+            payload["evidence_format_version"] = analysis.evidence_format_version
+            payload["evidence_manifest"] = dict(analysis.evidence_manifest or {})
         if analysis.smartperfetto_original is not None:
-            document["smartperfetto_original"] = (
+            payload["smartperfetto_original"] = (
                 analysis.smartperfetto_original.private_document()
             )
-        return document
+        if public_document is not None:
+            payload["public_document"] = dict(public_document)
+        return LocalAnalysisView(
+            analysis_id=analysis.analysis_id,
+            team_id=analysis.team_id,
+            schema_version=analysis.response_schema_version,
+            state=analysis.state,
+            version=analysis.version,
+            generation=analysis.generation,
+            created_at=analysis.created_at,
+            started_at=analysis.started_at,
+            completed_at=analysis.completed_at,
+            cancel_requested_at=analysis.cancel_requested_at,
+            report_available=analysis.report is not None,
+            runtime_status=dict(analysis.runtime_status or {}),
+            payload=payload,
+        )
+
+    def _state_document(self, analysis: _LocalAnalysis) -> dict[str, object]:
+        return to_persisted_document(self._analysis_view(analysis))
 
     async def _persist(self, analysis: _LocalAnalysis) -> None:
         document = self._state_document(analysis)
@@ -3516,6 +3525,7 @@ class _LocalRuntime:
 
     def _restore_analysis(self, document: Mapping[str, object]) -> _LocalAnalysis:
         try:
+            from_persisted_document(document)
             _validate_persisted_state_shape(document)
             return self._restore_analysis_validated(document)
         except Exception:
@@ -5961,6 +5971,12 @@ class _LocalRuntime:
         await self._persist(analysis)
 
     def response(self, analysis: _LocalAnalysis) -> dict[str, object]:
+        document = self._response_document(analysis)
+        return to_public_document(
+            self._analysis_view(analysis, public_document=document)
+        )
+
+    def _response_document(self, analysis: _LocalAnalysis) -> dict[str, object]:
         response_schema_version = analysis.response_schema_version
         if response_schema_version is None:
             raise RuntimeError("local analysis response schema is unavailable")
