@@ -91,6 +91,11 @@ from perfpilot_api.local_analysis_projection import (
     to_persisted_document,
     to_public_document,
 )
+from perfpilot_api.local_analysis_recovery import (
+    RecoveryAction,
+    RecoverySnapshot,
+    plan_recovery,
+)
 from perfpilot_api.local_cancellation import CancellationTarget, cancel_targets
 from perfpilot_api.local_task_supervisor import (
     REPORT_POLICY,
@@ -2618,6 +2623,33 @@ class _LocalRuntime:
         key = (analysis.team_id, analysis.analysis_id)
         return self.terminal_commit_locks.setdefault(key, asyncio.Lock())
 
+    @staticmethod
+    def _recovery_snapshot(
+        analysis: _LocalAnalysis,
+        *,
+        remote_manifest_present: bool = False,
+        identity_valid: bool = True,
+        artifacts_valid: bool = True,
+    ) -> RecoverySnapshot:
+        return RecoverySnapshot(
+            state=analysis.state,
+            canceled=analysis.cancel_requested_at is not None,
+            smartperfetto_state=str(
+                analysis.stages.get("smartperfetto", "pending")
+            ),
+            evidence_manifest_present=analysis.evidence_manifest is not None,
+            remote_manifest_present=remote_manifest_present,
+            report_present=analysis.report is not None,
+            source_state=str(
+                analysis.source_code_analysis.get(
+                    "context_state", "not_requested"
+                )
+            ),
+            remote_publication=analysis.remote_publication,
+            identity_valid=identity_valid,
+            artifacts_valid=artifacts_valid,
+        )
+
     def _load_supervised_tasks(self) -> tuple[SupervisedTask, ...]:
         tasks: list[SupervisedTask] = []
         for analysis in self.analyses.values():
@@ -3816,10 +3848,9 @@ class _LocalRuntime:
                 )
                 self._register_upload(upload)
             self.analyses[(team_id, analysis_id)] = analysis
-            restore_canceled = (
-                analysis.cancel_requested_at is not None
-                and analysis.state in _ACTIVE_ANALYSIS_STATES
-            )
+            recovery_actions = plan_recovery(self._recovery_snapshot(analysis))
+            restore_canceled = RecoveryAction.CLOSE_CANCELED in recovery_actions
+            close_completed = RecoveryAction.CLOSE_COMPLETED in recovery_actions
             if restore_canceled:
                 await self._transition(
                     analysis,
@@ -3831,17 +3862,25 @@ class _LocalRuntime:
                     if stage_state not in {"completed", "failed", "not_requested"}:
                         analysis.stages[stage_name] = "canceled"
                 analysis.version += 1
-            resume_from_prepared = (
-                not restore_canceled
-                and analysis.state in _ACTIVE_ANALYSIS_STATES
-                and analysis.stages.get("smartperfetto") == "completed"
-                and analysis.evidence_manifest is not None
-                and analysis.report is None
-                and (
-                    analysis.source_binding is None
-                    or analysis.source_code_analysis.get("context_state")
-                    in {"available", "unavailable"}
+            elif close_completed:
+                report_state = (
+                    analysis.report.get("state")
+                    if isinstance(analysis.report, Mapping)
+                    else None
                 )
+                await self._transition(
+                    analysis,
+                    target=(
+                        "partially_completed"
+                        if report_state == "partially_completed"
+                        else "completed"
+                    ),
+                    now=analysis.completed_at or datetime.now(UTC),
+                    result_generation=analysis.generation,
+                )
+                analysis.version += 1
+            resume_from_prepared = (
+                RecoveryAction.RESUME_SYNTHESIS in recovery_actions
                 and analysis.task is None
             )
             if resume_from_prepared:
@@ -3869,6 +3908,7 @@ class _LocalRuntime:
                 migrate_created_at
                 or migrate_runtime_contract
                 or restore_canceled
+                or close_completed
                 or source_degraded
             ):
                 try:
@@ -3883,7 +3923,7 @@ class _LocalRuntime:
             if resume_gate is not None:
                 resume_gate.set()
             if (
-                analysis.remote_publication in {"publishing", "published"}
+                RecoveryAction.RECONCILE_PUBLICATION in recovery_actions
                 and analysis.cancel_requested_at is None
                 and analysis.state not in _TERMINAL_ANALYSIS_STATES
                 and analysis.stages.get("smartperfetto") != "completed"
@@ -3918,6 +3958,14 @@ class _LocalRuntime:
                     "agent-capture-manifest.json",
                 )
                 if manifest_document is not None:
+                    manifest_actions = plan_recovery(
+                        self._recovery_snapshot(
+                            analysis,
+                            remote_manifest_present=True,
+                        )
+                    )
+                    if RecoveryAction.RESUME_REMOTE_ANALYSIS not in manifest_actions:
+                        continue
                     try:
                         access, manifest = self._restore_remote_capture(
                             analysis, manifest_document
