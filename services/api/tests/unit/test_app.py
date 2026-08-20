@@ -23,6 +23,18 @@ def test_health_returns_request_id() -> None:
     assert response.headers["x-request-id"] == "req-health"
 
 
+def test_readiness_returns_only_safe_capability_summary() -> None:
+    with TestClient(create_app(testing=True)) as client:
+        response = client.get("/v1/readiness")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": "1.0",
+        "state": "healthy",
+        "capabilities": [],
+    }
+
+
 def test_production_app_rejects_development_settings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

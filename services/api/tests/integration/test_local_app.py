@@ -189,6 +189,76 @@ class _FakeSmartPerfettoGateway:
         return None
 
 
+def test_local_health_readiness_and_team_health_are_safe_and_authorized(
+    tmp_path: Path,
+) -> None:
+    control = LocalControlStore(tmp_path / "control")
+    first = control.ensure_user("user01", "initial user password", False).principal
+    second = control.ensure_user("user02", "initial user password", False).principal
+    for principal in (first, second):
+        control.change_password(
+            principal.user_id,
+            "initial user password",
+            "established user password",
+        )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+        control_store=control,
+        source_code_analysis_enabled=True,
+    )
+
+    with _RawTestClient(app) as client:
+        assert client.get("/v1/health").json() == {"status": "ok"}
+        readiness = client.get("/v1/readiness")
+        unauthorized = client.get(f"/v1/teams/{first.team_id}/health")
+
+        assert readiness.status_code == 200
+        assert set(readiness.json()) == {
+            "schema_version",
+            "state",
+            "capabilities",
+        }
+        assert "token" not in readiness.text.casefold()
+        assert str(tmp_path) not in readiness.text
+        assert unauthorized.status_code == 401
+
+        app.state.local_runtime.capability_overrides["smartperfetto"] = "unavailable"
+        assert client.get("/v1/readiness").json()["state"] == "degraded"
+        app.state.local_runtime.capability_overrides["storage"] = "unavailable"
+        assert client.get("/v1/readiness").json()["state"] == "unavailable"
+        app.state.local_runtime.capability_overrides.clear()
+
+        first_headers = _authenticated_client(
+            client,
+            "user01",
+            "established user password",
+        )
+        own = client.get(
+            f"/v1/teams/{first.team_id}/health",
+            headers=first_headers,
+        )
+        assert own.status_code == 200
+        assert {item["name"] for item in own.json()["capabilities"]} >= {
+            "agent",
+            "device",
+            "source",
+        }
+
+        client.cookies.clear()
+        second_headers = _authenticated_client(
+            client,
+            "user02",
+            "established user password",
+        )
+        hidden = client.get(
+            f"/v1/teams/{first.team_id}/health",
+            headers=second_headers,
+        )
+        assert hidden.status_code == 404
+
+
 class _TransientCompletedReportGateway(_FakeSmartPerfettoGateway):
     def __init__(self, result: EngineResult) -> None:
         super().__init__(result)

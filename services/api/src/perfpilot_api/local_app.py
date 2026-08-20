@@ -79,6 +79,12 @@ from perfpilot_api.local_analysis_lifecycle import (
     AnalysisState,
     LifecycleSnapshot,
 )
+from perfpilot_api.local_analysis_health import (
+    AnalysisHealth,
+    CapabilityHealth,
+    HealthAggregator,
+    supervisor_capability,
+)
 from perfpilot_api.local_cancellation import CancellationTarget, cancel_targets
 from perfpilot_api.local_task_supervisor import (
     REPORT_POLICY,
@@ -2583,6 +2589,14 @@ class _LocalRuntime:
         self.tasks: set[asyncio.Task[None]] = set()
         self.supervisor_tasks: dict[asyncio.AbstractEventLoop, asyncio.Task[None]] = {}
         self.supervisor_last_tick_at: datetime | None = None
+        self.health_aggregator = HealthAggregator()
+        self.capability_overrides: dict[
+            str, Literal["healthy", "degraded", "unavailable"]
+        ] = {}
+        self.smartperfetto_health_state: Literal[
+            "healthy", "degraded", "unavailable"
+        ] = "healthy"
+        self.smartperfetto_last_checked_at = datetime.now(UTC)
         self.activity_supervisor = DurableTaskSupervisor(
             load_active=self._load_supervised_tasks,
             observe_upstream=self._observe_supervised_upstream,
@@ -2651,7 +2665,14 @@ class _LocalRuntime:
             run = analysis.source_run
             if run is None or run.run_id != task.upstream_run_id:
                 return None
-            current = await self.gateway.status(run)
+            try:
+                current = await self.gateway.status(run)
+            except Exception:
+                self.smartperfetto_health_state = "unavailable"
+                self.smartperfetto_last_checked_at = datetime.now(UTC)
+                raise
+            self.smartperfetto_health_state = "healthy"
+            self.smartperfetto_last_checked_at = datetime.now(UTC)
             return datetime.now(UTC) if current == "completed" else None
         if task.stage == "source_code":
             status = await self.source_tasks.context_status(
@@ -2723,6 +2744,77 @@ class _LocalRuntime:
         self.supervisor_last_tick_at = current
         await self.activity_supervisor.tick(current)
         await self._reconcile_remote_publications_once()
+
+    def analysis_health(self, now: datetime | None = None) -> AnalysisHealth:
+        current = now or datetime.now(UTC)
+        try:
+            self.store._verify_trusted_root()
+            storage_available = os.access(self.data_root, os.W_OK | os.X_OK)
+        except (LocalAnalysisStoreError, OSError):
+            storage_available = False
+        storage_state: Literal["healthy", "unavailable"] = (
+            "healthy" if storage_available else "unavailable"
+        )
+        smartperfetto_state = self.capability_overrides.get(
+            "smartperfetto", self.smartperfetto_health_state
+        )
+        ai_state = self.capability_overrides.get(
+            "ai", "healthy" if self.synthesizer is not None else "unavailable"
+        )
+        effective_storage_state = self.capability_overrides.get(
+            "storage", storage_state
+        )
+        supervisor = supervisor_capability(
+            last_tick_at=self.supervisor_last_tick_at,
+            now=current,
+            stale_after_seconds=max(30.0, self.poll_interval_seconds * 3),
+        )
+        supervisor_state = self.capability_overrides.get(
+            "supervisor", supervisor.state
+        )
+        capabilities = (
+            CapabilityHealth(
+                name="smartperfetto",
+                state=smartperfetto_state,
+                message=(
+                    "SmartPerfetto 可用"
+                    if smartperfetto_state == "healthy"
+                    else "SmartPerfetto 暂不可用"
+                ),
+                last_checked_at=self.smartperfetto_last_checked_at,
+            ),
+            CapabilityHealth(
+                name="ai",
+                state=ai_state,
+                message=(
+                    "中文总结服务可用"
+                    if ai_state == "healthy"
+                    else "中文总结服务未配置"
+                ),
+                last_checked_at=current,
+            ),
+            CapabilityHealth(
+                name="storage",
+                state=effective_storage_state,
+                message=(
+                    "本地存储可用"
+                    if effective_storage_state == "healthy"
+                    else "本地存储不可写"
+                ),
+                last_checked_at=current,
+            ),
+            CapabilityHealth(
+                name="supervisor",
+                state=supervisor_state,
+                message=(
+                    "任务监督器正常"
+                    if supervisor_state == "healthy"
+                    else "任务监督器无活动"
+                ),
+                last_checked_at=current,
+            ),
+        )
+        return self.health_aggregator.readiness(capabilities)
 
     async def _supervisor_loop(self) -> None:
         interval = max(0.05, min(self.poll_interval_seconds or 0.05, 5.0))
@@ -3861,6 +3953,13 @@ class _LocalRuntime:
         for analysis, access, manifest in pending_remote_analyses:
             self._schedule_remote_analysis(analysis, access, manifest)
 
+        try:
+            await self.supervise_activity_once()
+        except Exception as error:
+            _LOGGER.warning(
+                "Initial local task supervisor tick failed type=%s",
+                type(error).__name__,
+            )
         loop = asyncio.get_running_loop()
         if loop not in self.supervisor_tasks:
             self.supervisor_tasks[loop] = asyncio.create_task(self._supervisor_loop())
@@ -5301,7 +5400,14 @@ class _LocalRuntime:
             async with self.lock:
                 if analysis.cancel_requested_at is not None:
                     raise asyncio.CancelledError
-            current = await self.gateway.status(run)
+            try:
+                current = await self.gateway.status(run)
+            except Exception:
+                self.smartperfetto_health_state = "unavailable"
+                self.smartperfetto_last_checked_at = datetime.now(UTC)
+                raise
+            self.smartperfetto_health_state = "healthy"
+            self.smartperfetto_last_checked_at = datetime.now(UTC)
             if current == "completed":
                 try:
                     return await self.gateway.fetch_result(run)
@@ -6569,8 +6675,53 @@ def create_local_app(
         return token
 
     @app.get("/v1/health")
-    async def health() -> dict[str, object]:
-        return {"schema_version": "1.0", "status": "ready", "runtime": "local"}
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/v1/readiness")
+    async def readiness() -> dict[str, object]:
+        return runtime.analysis_health().document()
+
+    @app.get("/v1/teams/{team_id}/health")
+    async def team_health(request: Request, team_id: UUID) -> dict[str, object]:
+        authorize_team(request, team_id)
+        now = datetime.now(UTC)
+        agents = await resolved_agent_service.list_agents(team_id=team_id)
+        online_agents = tuple(agent for agent in agents if agent.state == "online")
+        devices = await resolved_device_directory.list_devices(team_id=team_id)
+        ready_devices = tuple(
+            device for device in devices if device.state in {"ready", "busy"}
+        )
+        try:
+            workspaces = await resolved_source_workspace_service.list_for_team(
+                team_id=team_id
+            )
+        except SourceBindingInvalid:
+            workspaces = ()
+        team_capabilities = (
+            CapabilityHealth(
+                name="agent",
+                state="healthy" if online_agents else "unavailable",
+                message="Agent 在线" if online_agents else "没有在线 Agent",
+                last_checked_at=now,
+            ),
+            CapabilityHealth(
+                name="device",
+                state="healthy" if ready_devices else "unavailable",
+                message="设备可用" if ready_devices else "没有可用设备",
+                last_checked_at=now,
+            ),
+            CapabilityHealth(
+                name="source",
+                state="healthy" if workspaces else "unavailable",
+                message="源码工作区可用" if workspaces else "没有可读源码工作区",
+                last_checked_at=now,
+            ),
+        )
+        global_health = runtime.analysis_health(now)
+        return runtime.health_aggregator.readiness(
+            (*global_health.capabilities, *team_capabilities)
+        ).document()
 
     @app.get("/local/v1/agent-inputs/{grant}")
     async def get_local_agent_input(grant: str):
