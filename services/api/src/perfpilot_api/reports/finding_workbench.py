@@ -1,0 +1,543 @@
+from __future__ import annotations
+
+import hashlib
+from collections.abc import Mapping
+from uuid import UUID, uuid5
+
+
+_FINDING_NAMESPACE = UUID("4d8de355-1b14-4e48-9156-44f51f7ad1d3")
+_IMPACT_POINTS = {
+    "critical": 40,
+    "warning": 28,
+    "healthy": 8,
+    "informational": 4,
+}
+_EVIDENCE_POINTS = {"E0": 0, "E1": 6, "E2": 12, "E3": 16, "E4": 20}
+_ATTRIBUTION_POINTS = {"low": 4, "medium": 12, "high": 20}
+_CONFIDENCE = {"none": "low", "low": "low", "medium": "medium", "high": "high"}
+_SOURCE_STATES = {
+    "strong": "matched",
+    "weak": "mismatch",
+    "none": "mismatch",
+}
+
+
+def _invalid() -> ValueError:
+    return ValueError("finding workbench input is invalid")
+
+
+def _canonical_key(parts: tuple[str, ...]) -> str:
+    normalized = "\u001f".join(part.strip().casefold() for part in parts)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+def stable_finding_id(
+    *,
+    scenario_type: str,
+    mechanism: str,
+    root_cause_domain: str,
+    responsible_component: str,
+) -> str:
+    key = _canonical_key(
+        (scenario_type, mechanism, root_cause_domain, responsible_component)
+    )
+    return str(uuid5(_FINDING_NAMESPACE, key))
+
+
+def priority_score(
+    *,
+    impact_points: int,
+    evidence_grade: str,
+    attribution: str,
+    critical_path_points: int,
+    reproducibility_points: int,
+) -> int:
+    if (
+        impact_points not in _IMPACT_POINTS.values()
+        or evidence_grade not in _EVIDENCE_POINTS
+        or attribution not in _ATTRIBUTION_POINTS
+        or not 0 <= critical_path_points <= 20
+        or not 0 <= reproducibility_points <= 15
+    ):
+        raise _invalid()
+    return min(
+        100,
+        impact_points
+        + _EVIDENCE_POINTS[evidence_grade]
+        + _ATTRIBUTION_POINTS[attribution]
+        + critical_path_points
+        + reproducibility_points,
+    )
+
+
+def build_capabilities(
+    *,
+    core_document: Mapping[str, object],
+    source_context: Mapping[str, object] | None,
+) -> dict[str, str]:
+    if not isinstance(core_document.get("scenario_reports"), list):
+        raise _invalid()
+    source = "not_requested"
+    if source_context is not None:
+        summary = source_context.get("match_summary")
+        if not isinstance(summary, str) or summary not in _SOURCE_STATES:
+            raise _invalid()
+        source = _SOURCE_STATES[summary]
+    return {
+        "trace": "available"
+        if core_document.get("core_state") in {"complete", "partial"}
+        else "unavailable",
+        "smartperfetto": "available",
+        "source": source,
+        "ai": "pending",
+    }
+
+
+def build_report_quality(
+    *,
+    core_document: Mapping[str, object],
+    source_context: Mapping[str, object] | None,
+    synthesis_state: str,
+    patch_validation_state: str,
+) -> dict[str, object]:
+    scenarios = core_document.get("scenario_reports")
+    if not isinstance(scenarios, list):
+        raise _invalid()
+
+    required_reasons: list[str] = []
+    optional_reasons: list[str] = []
+    trace_unusable = core_document.get("core_state") not in {"complete", "partial"}
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping):
+            raise _invalid()
+        health = scenario.get("trace_health")
+        capabilities = scenario.get("trace_capabilities")
+        if not isinstance(health, Mapping) or not isinstance(capabilities, list):
+            raise _invalid()
+        if health.get("parse_status") != "parsed":
+            trace_unusable = True
+        for capability in capabilities:
+            if not isinstance(capability, Mapping):
+                raise _invalid()
+            name = capability.get("name")
+            required = capability.get("required")
+            status = capability.get("status")
+            if not isinstance(name, str) or not isinstance(required, bool):
+                raise _invalid()
+            if status == "available":
+                continue
+            reason = f"{'required' if required else 'optional'}_capability_{name}_{status}"
+            (required_reasons if required else optional_reasons).append(reason)
+
+    trace_state = "unusable" if trace_unusable else "complete"
+    if trace_state != "unusable" and (
+        core_document.get("core_state") == "partial" or required_reasons
+    ):
+        trace_state = "partial"
+
+    source_state = "not_requested"
+    if source_context is not None:
+        summary = source_context.get("match_summary")
+        if summary == "strong":
+            source_state = "available_strong"
+        elif summary in {"weak", "none"}:
+            source_state = "available_weak"
+        else:
+            raise _invalid()
+
+    return {
+        "trace_core_state": trace_state,
+        "report_validation_state": "passed",
+        "synthesis_state": synthesis_state,
+        "source_correlation_state": source_state,
+        "patch_validation_state": patch_validation_state,
+        "reason_codes": sorted(set(required_reasons))
+        + sorted(set(optional_reasons)),
+    }
+
+
+def build_finding_workbench(
+    *,
+    core_document: Mapping[str, object],
+    source_context: Mapping[str, object] | None,
+    package_name: str,
+    duration_seconds: int,
+    environment_fingerprint: str,
+) -> dict[str, object]:
+    scenarios = core_document.get("scenario_reports")
+    if (
+        not isinstance(scenarios, list)
+        or not package_name
+        or not 1 <= duration_seconds <= 3600
+        or not environment_fingerprint.startswith("sha256:")
+        or len(environment_fingerprint) != 71
+    ):
+        raise _invalid()
+
+    strong_fragments = _strong_fragments(source_context)
+    findings = _merge_findings(scenarios, strong_fragments)
+    findings.sort(key=lambda item: (-int(item["priority_score"]), str(item["finding_id"])))
+    primary = [
+        str(item["finding_id"])
+        for item in findings
+        if item["status"] == "confirmed" and item["priority"] in {"p0", "p1"}
+    ][:3]
+    return {
+        "critical_path": _critical_path(scenarios),
+        "metrics": _metric_views(scenarios),
+        "evidence": _evidence_views(scenarios),
+        "findings": findings,
+        "primary_finding_ids": primary,
+        "retest_plans": _retest_plans(
+            findings,
+            package_name=package_name,
+            duration_seconds=duration_seconds,
+            environment_fingerprint=environment_fingerprint,
+        ),
+    }
+
+
+def _strong_fragments(
+    source_context: Mapping[str, object] | None,
+) -> list[Mapping[str, object]]:
+    if source_context is None:
+        return []
+    fragments = source_context.get("fragments")
+    if not isinstance(fragments, list):
+        raise _invalid()
+    if source_context.get("match_summary") != "strong":
+        return []
+    result: list[Mapping[str, object]] = []
+    for fragment in fragments:
+        if not isinstance(fragment, Mapping) or fragment.get("match_grade") != "strong":
+            raise _invalid()
+        result.append(fragment)
+    return result
+
+
+def _merge_findings(
+    scenarios: list[object],
+    strong_fragments: list[Mapping[str, object]],
+) -> list[dict[str, object]]:
+    merged: dict[str, dict[str, object]] = {}
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping):
+            raise _invalid()
+        scenario_type = scenario.get("scenario_type")
+        evidence = scenario.get("evidence")
+        raw_findings = scenario.get("findings")
+        metrics = scenario.get("metrics")
+        if (
+            not isinstance(scenario_type, str)
+            or not isinstance(evidence, list)
+            or not isinstance(raw_findings, list)
+            or not isinstance(metrics, list)
+        ):
+            raise _invalid()
+        evidence_by_id = {
+            item["evidence_id"]: item
+            for item in evidence
+            if isinstance(item, Mapping) and isinstance(item.get("evidence_id"), str)
+        }
+        for raw in raw_findings:
+            if not isinstance(raw, Mapping):
+                raise _invalid()
+            original_id = raw.get("finding_id")
+            rule_id = raw.get("rule_id")
+            kind = raw.get("kind")
+            if not all(isinstance(value, str) for value in (original_id, rule_id, kind)):
+                raise _invalid()
+            component = str(rule_id).rsplit(".", 1)[0]
+            finding_id = stable_finding_id(
+                scenario_type=scenario_type,
+                mechanism=str(rule_id),
+                root_cause_domain=str(kind),
+                responsible_component=component,
+            )
+            evidence_ids = _string_ids(raw.get("evidence_ids"))
+            grade = _evidence_grade(raw, evidence_ids, evidence_by_id)
+            attribution = _CONFIDENCE.get(str(raw.get("confidence")))
+            severity = str(raw.get("severity"))
+            if attribution is None or severity not in _IMPACT_POINTS:
+                raise _invalid()
+            located = any(_has_interval(evidence_by_id.get(value)) for value in evidence_ids)
+            score = priority_score(
+                impact_points=_IMPACT_POINTS[severity],
+                evidence_grade=grade,
+                attribution=attribution,
+                critical_path_points=20 if located else 0,
+                reproducibility_points=4,
+            )
+            source_refs = sorted(
+                str(fragment["source_ref_id"])
+                for fragment in strong_fragments
+                if isinstance(fragment.get("source_ref_id"), str)
+                and original_id in fragment.get("finding_ids", [])
+                and set(evidence_ids).intersection(fragment.get("evidence_ids", []))
+            )
+            metric_ids = sorted(
+                str(metric["metric_id"])
+                for metric in metrics
+                if isinstance(metric, Mapping) and isinstance(metric.get("metric_id"), str)
+            )
+            confirmed = raw.get("status") == "confirmed" and grade in {"E2", "E3", "E4"}
+            candidate: dict[str, object] = {
+                "finding_id": finding_id,
+                "scenario_type": scenario_type,
+                "title": str(raw.get("title")),
+                "problem": str(raw.get("summary")),
+                "impact": _impact_sentence(severity),
+                "mechanism": str(rule_id),
+                "root_cause": (
+                    str(raw.get("title"))
+                    if kind == "root_cause"
+                    else "当前只能确认性能症状，尚未确认源码根因。"
+                ),
+                "critical_path_contribution": 1.0 if located else 0.0,
+                "priority": _priority(score),
+                "priority_score": score,
+                "evidence_ids": evidence_ids,
+                "metric_ids": metric_ids,
+                "source_ref_ids": source_refs,
+                "status": "confirmed" if confirmed else "hypothesis",
+                "confidence": {
+                    "data_completeness": _scenario_completeness(scenario),
+                    "evidence_grade": grade,
+                    "attribution": attribution,
+                    "statistical": "single_sample",
+                },
+                "confirmed_items": [str(raw.get("summary"))] if confirmed else [],
+                "unconfirmed_items": ["单次样本尚未验证波动范围"],
+                "retest_plan_id": str(uuid5(_FINDING_NAMESPACE, f"retest:{finding_id}")),
+            }
+            current = merged.get(finding_id)
+            if current is None:
+                merged[finding_id] = candidate
+                continue
+            current["evidence_ids"] = sorted(
+                set(_string_ids(current["evidence_ids"])) | set(evidence_ids)
+            )
+            current["metric_ids"] = sorted(
+                set(_string_ids(current["metric_ids"])) | set(metric_ids)
+            )
+            current["source_ref_ids"] = sorted(
+                set(_string_ids(current["source_ref_ids"])) | set(source_refs)
+            )
+            current["priority_score"] = max(int(current["priority_score"]), score)
+            current["priority"] = _priority(int(current["priority_score"]))
+            current["confidence"]["evidence_grade"] = _merged_evidence_grade(  # type: ignore[index]
+                _string_ids(current["evidence_ids"]), evidence_by_id
+            )
+    return list(merged.values())
+
+
+def _evidence_grade(
+    finding: Mapping[str, object],
+    evidence_ids: list[str],
+    evidence_by_id: Mapping[str, Mapping[str, object]],
+) -> str:
+    if not evidence_ids:
+        return "E0"
+    if len(evidence_ids) >= 2 and all(
+        _has_interval(evidence_by_id.get(evidence_id)) for evidence_id in evidence_ids
+    ):
+        return "E3"
+    evidence = evidence_by_id.get(evidence_ids[0])
+    if _has_direct_locator(evidence):
+        return "E4"
+    if finding.get("status") == "confirmed":
+        return "E2"
+    return "E1"
+
+
+def _merged_evidence_grade(
+    evidence_ids: list[str],
+    evidence_by_id: Mapping[str, Mapping[str, object]],
+) -> str:
+    if len(evidence_ids) >= 2 and all(
+        _has_interval(evidence_by_id.get(evidence_id)) for evidence_id in evidence_ids
+    ):
+        return "E3"
+    return "E2"
+
+
+def _has_interval(evidence: Mapping[str, object] | None) -> bool:
+    return bool(
+        evidence
+        and isinstance(evidence.get("interval_start_ns"), int)
+        and isinstance(evidence.get("interval_end_ns"), int)
+        and int(evidence["interval_end_ns"]) >= int(evidence["interval_start_ns"])
+    )
+
+
+def _has_direct_locator(evidence: Mapping[str, object] | None) -> bool:
+    if not _has_interval(evidence) or evidence is None:
+        return False
+    fields = evidence.get("fields")
+    return bool(
+        isinstance(evidence.get("query_id"), str)
+        and isinstance(fields, Mapping)
+        and all(isinstance(fields.get(key), str) for key in ("process", "thread", "track", "slice"))
+    )
+
+
+def _scenario_completeness(scenario: Mapping[str, object]) -> str:
+    capabilities = scenario.get("trace_capabilities")
+    if not isinstance(capabilities, list):
+        raise _invalid()
+    for capability in capabilities:
+        if (
+            not isinstance(capability, Mapping)
+            or not isinstance(capability.get("required"), bool)
+        ):
+            raise _invalid()
+        if capability["required"] and capability.get("status") != "available":
+            return "limited"
+    return "complete"
+
+
+def _metric_views(scenarios: list[object]) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping) or not isinstance(scenario.get("metrics"), list):
+            raise _invalid()
+        evidence_ids = sorted(
+            str(item["evidence_id"])
+            for item in scenario.get("evidence", [])
+            if isinstance(item, Mapping) and isinstance(item.get("evidence_id"), str)
+        )
+        for metric in scenario["metrics"]:
+            if not isinstance(metric, Mapping) or not isinstance(metric.get("metric_id"), str):
+                raise _invalid()
+            result.append(
+                {
+                    "metric_id": metric["metric_id"],
+                    "name": str(metric.get("name")),
+                    "value": metric.get("numeric_value")
+                    if metric.get("status") == "available"
+                    else None,
+                    "unit": metric.get("unit"),
+                    "aggregation": "single_sample",
+                    "scenario_type": scenario.get("scenario_type"),
+                    "source": "smartperfetto",
+                    "evidence_ids": evidence_ids,
+                    "quality": "available"
+                    if metric.get("status") == "available"
+                    else "unavailable",
+                }
+            )
+    return sorted(result, key=lambda item: str(item["metric_id"]))
+
+
+def _locator(evidence: Mapping[str, object]) -> dict[str, object]:
+    start_ns = evidence.get("interval_start_ns")
+    end_ns = evidence.get("interval_end_ns")
+    fields = evidence.get("fields")
+    if not isinstance(start_ns, int) or not isinstance(end_ns, int) or end_ns < start_ns:
+        raise _invalid()
+    if not isinstance(fields, Mapping):
+        raise _invalid()
+    return {
+        "start_ns": start_ns,
+        "end_ns": end_ns,
+        "process": fields.get("process"),
+        "thread": fields.get("thread"),
+        "track": fields.get("track"),
+        "slice": fields.get("slice"),
+        "query_id": evidence.get("query_id"),
+    }
+
+
+def _evidence_views(scenarios: list[object]) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping) or not isinstance(scenario.get("evidence"), list):
+            raise _invalid()
+        metric_ids = sorted(
+            str(item["metric_id"])
+            for item in scenario.get("metrics", [])
+            if isinstance(item, Mapping) and isinstance(item.get("metric_id"), str)
+        )
+        for evidence in scenario["evidence"]:
+            if not isinstance(evidence, Mapping) or not isinstance(evidence.get("evidence_id"), str):
+                raise _invalid()
+            if not _has_interval(evidence):
+                continue
+            result.append(
+                {
+                    "evidence_id": evidence["evidence_id"],
+                    "kind": "trace_interval",
+                    "scenario_type": scenario.get("scenario_type"),
+                    "metric_ids": metric_ids,
+                    "summary": f"Trace 证据来自 {evidence.get('source')}。",
+                    "source": str(evidence.get("source")),
+                    "locator": _locator(evidence),
+                }
+            )
+    return sorted(result, key=lambda item: str(item["evidence_id"]))
+
+
+def _critical_path(scenarios: list[object]) -> list[dict[str, object]]:
+    result: list[dict[str, object]] = []
+    for evidence in _evidence_views(scenarios):
+        locator = evidence["locator"]
+        evidence_id = str(evidence["evidence_id"])
+        result.append(
+            {
+                "segment_id": str(uuid5(_FINDING_NAMESPACE, f"segment:{evidence_id}")),
+                "label": str(locator.get("slice") or evidence["source"]),
+                "start_ns": locator["start_ns"],
+                "end_ns": locator["end_ns"],
+                "duration_ns": int(locator["end_ns"]) - int(locator["start_ns"]),
+                "evidence_ids": [evidence_id],
+            }
+        )
+    return sorted(result, key=lambda item: (int(item["start_ns"]), str(item["segment_id"])))
+
+
+def _retest_plans(
+    findings: list[dict[str, object]],
+    *,
+    package_name: str,
+    duration_seconds: int,
+    environment_fingerprint: str,
+) -> list[dict[str, object]]:
+    return [
+        {
+            "retest_plan_id": finding["retest_plan_id"],
+            "finding_id": finding["finding_id"],
+            "scenario_type": finding["scenario_type"],
+            "package_name": package_name,
+            "duration_seconds": duration_seconds,
+            "environment_fingerprint": environment_fingerprint,
+            "metric_ids": finding["metric_ids"],
+            "pass_criteria": ["使用相同环境复测，并确认关联指标优于当前基线。"],
+            "notes": "使用相同设备、构建、场景和采集时长复测。",
+        }
+        for finding in findings
+    ]
+
+
+def _string_ids(value: object) -> list[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise _invalid()
+    return sorted(set(value))
+
+
+def _priority(score: int) -> str:
+    if score >= 80:
+        return "p0"
+    if score >= 60:
+        return "p1"
+    if score >= 40:
+        return "p2"
+    return "p3"
+
+
+def _impact_sentence(severity: str) -> str:
+    return {
+        "critical": "该问题直接影响场景关键性能目标。",
+        "warning": "该问题增加场景关键路径耗时。",
+        "healthy": "该项当前未超过既有性能边界。",
+        "informational": "该项用于补充解释当前性能环境。",
+    }[severity]
