@@ -8,6 +8,7 @@ import { projectDashboardReport } from "../lib/dashboard-report";
 import {
   createPerfPilotClient,
   PerfPilotApiError,
+  type AnalysisHealthResponse,
   type AnalysisResponse,
   type AnalysisState,
   type PerfPilotClient,
@@ -15,6 +16,7 @@ import {
 } from "../lib/perfpilot-api";
 import { ActiveAnalysisTaskCard } from "./active-analysis-task-card";
 import { NewAnalysisDialog } from "./new-analysis-dialog";
+import { SystemHealthBanner } from "./system-health-banner";
 import {
   createLatestReportLoader,
   LatestAnalysisReportEntry,
@@ -93,6 +95,7 @@ export function Dashboard({
   const client = providedClient ?? session?.client ?? defaultClient;
   const [teamId, setTeamId] = useState<string | null>(null);
   const [currentAnalysis, setCurrentAnalysis] = useState<AnalysisResponse | null>(null);
+  const [health, setHealth] = useState<AnalysisHealthResponse | null>(null);
   const [stale, setStale] = useState(false);
   const [canceling, setCanceling] = useState(false);
   const [cancelError, setCancelError] = useState<string | null>(null);
@@ -122,10 +125,16 @@ export function Dashboard({
       const me = await client.me(controller.signal);
       const resolvedTeamId = me.memberships[0]?.team.id;
       if (!resolvedTeamId) return;
-      const active = await client.activeAnalyses(resolvedTeamId, 1, controller.signal);
+      const [active, readiness] = await Promise.all([
+        client.activeAnalyses(resolvedTeamId, 1, controller.signal),
+        client.readiness
+          ? client.readiness(controller.signal).catch(() => null)
+          : Promise.resolve(null),
+      ]);
       if (controller.signal.aborted) return;
       setTeamId(resolvedTeamId);
       setCurrentAnalysis(active.analyses[0] ?? null);
+      setHealth(readiness);
       setStale(false);
     })().catch(() => {
       if (!controller.signal.aborted) setStale(true);
@@ -236,10 +245,12 @@ export function Dashboard({
           </p>
         </div>
         <NewAnalysisDialog
-          disabled={activeAnalysisId !== null}
+          disabled={activeAnalysisId !== null || health?.state === "unavailable"}
           onSubmitted={handleSubmitted}
         />
       </header>
+
+      <SystemHealthBanner health={health} />
 
       {currentAnalysis ? (
         <ActiveAnalysisTaskCard

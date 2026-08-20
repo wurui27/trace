@@ -99,20 +99,9 @@ const inputStateLabels = {
   finalized: "已校验",
 } as const;
 
-const activeStates = new Set<AnalysisState>([
-  "creating",
-  "created",
-  "uploading",
-  "queued",
-  "scheduled",
-  "running",
-  "analyzing",
-]);
-
 function analysisStillChanging(analysis: AnalysisResponse): boolean {
-  return (
-    activeStates.has(analysis.state) ||
-    analysis.stages.some((stage) => stage.state === "pending" || stage.state === "running")
+  return !["completed", "partially_completed", "failed", "canceled", "deleted"].includes(
+    analysis.state,
   );
 }
 
@@ -343,6 +332,16 @@ const stageCopy: Record<
   report: { label: "报告完成", description: "归档可追溯的指标、证据与结论。" },
 };
 
+const runtimeStageCopy = {
+  input_validation: "正在校验分析输入",
+  device_claim: "正在等待设备",
+  device_capture: "正在采集真机 Trace",
+  smartperfetto: "SmartPerfetto 正在分析",
+  source_code: "正在读取并匹配源码",
+  perfpilot_ai: "正在生成中文分析结论",
+  report: "正在生成分析报告",
+} as const;
+
 function stageClass(stage: AnalysisStage): string {
   if (stage.state === "completed") return "is-complete";
   if (stage.state === "running") return "is-current";
@@ -369,6 +368,16 @@ export function AnalysisProgressView({
 }: AnalysisProgressViewProps) {
   const copy = stateCopy[analysis.state];
   const deviceMode = analysis.analysis_mode === "device";
+  const runtimeStatus = analysis.schema_version === "1.3" ? analysis.runtime_status : undefined;
+  const terminal = ["completed", "partially_completed", "failed", "canceled", "deleted"].includes(
+    analysis.state,
+  );
+  const title = runtimeStatus && !terminal
+    ? runtimeStageCopy[runtimeStatus.current_stage]
+    : copy.title;
+  const description = runtimeStatus && !terminal
+    ? "当前进度由服务端任务状态实时确认。"
+    : copy.description;
 
   return (
     <div className="analysis-detail-stack">
@@ -376,8 +385,8 @@ export function AnalysisProgressView({
       <header className="analysis-progress-header">
         <div>
           <p className="page-eyebrow">{deviceMode ? "DEVICE ANALYSIS" : "TRACE ANALYSIS"}</p>
-          <h1 className={`analysis-state-title is-${copy.tone}`}>{copy.title}</h1>
-          <p>{copy.description}</p>
+          <h1 className={`analysis-state-title is-${copy.tone}`}>{title}</h1>
+          <p>{description}</p>
         </div>
         <span className={`analysis-state-badge is-${copy.tone}`}>{analysis.state}</span>
       </header>
@@ -407,8 +416,26 @@ export function AnalysisProgressView({
 
       <section className="analysis-stage-section" aria-labelledby="analysis-stage-title">
         <h2 id="analysis-stage-title">处理进度</h2>
-        <ol className="analysis-stage-list">
-          {deviceMode
+        {runtimeStatus ? (
+          <div className={`analysis-runtime-status is-${runtimeStatus.stage_state}`}>
+            <strong>{runtimeStageCopy[runtimeStatus.current_stage]}</strong>
+            <p>{runtimeStatus.progress_summary}</p>
+            {runtimeStatus.stage_state === "slow" ? (
+              <p className="analysis-runtime-warning is-warning">
+                处理时间较长，任务仍在继续
+              </p>
+            ) : runtimeStatus.stage_state === "waiting_for_upstream" ? (
+              <p className="analysis-runtime-warning is-warning">
+                上游仍在处理，暂未收到新的进度
+              </p>
+            ) : null}
+            <time dateTime={runtimeStatus.updated_at}>
+              最近更新：{runtimeStatus.updated_at}
+            </time>
+          </div>
+        ) : (
+          <ol className="analysis-stage-list">
+            {deviceMode
             ? analysis.scenarios?.map((scenario) => {
                 const content = scenarioCopy[scenario.scenario_type];
                 const className =
@@ -443,7 +470,8 @@ export function AnalysisProgressView({
                   </li>
                 );
               })}
-        </ol>
+          </ol>
+        )}
       </section>
 
       <section className="analysis-input-section" aria-labelledby="analysis-input-title">

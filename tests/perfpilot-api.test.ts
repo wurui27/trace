@@ -45,6 +45,38 @@ function analysis(state: AnalysisResponse["state"]): AnalysisResponse {
   };
 }
 
+function analysisV13(state: AnalysisResponse["state"] = "analyzing"): Record<string, unknown> {
+  return {
+    ...analysis(state),
+    schema_version: "1.3",
+    source_code_analysis: {
+      requested: false,
+      provider_kind: null,
+      agent_id: null,
+      workspace_id: null,
+      snapshot_policy: null,
+      validation_profile_id: null,
+      context_state: "not_requested",
+      match_summary: "none",
+      verification_state: "not_requested",
+      failure_code: null,
+    },
+    runtime_status: {
+      current_stage: "source_code",
+      stage_state: "slow",
+      started_at: "2026-08-20T08:00:00+00:00",
+      updated_at: "2026-08-20T08:03:00+00:00",
+      last_progress_at: "2026-08-20T08:00:00+00:00",
+      attempt: 1,
+      max_attempts: 2,
+      generation: 1,
+      waiting_for: "source_agent",
+      progress_summary: "已读取 1247 个文件，正在匹配源码",
+      available_actions: ["cancel"],
+    },
+  };
+}
+
 function reportPayload(): Record<string, unknown> {
   return {
     schema_version: "1.1",
@@ -446,10 +478,10 @@ describe("PerfPilot browser API", () => {
     });
   });
 
-  it("creates a no-source remote device 1.2 script capture without uploading an APK", async () => {
+  it("creates a no-source remote device 1.3 script capture without uploading an APK", async () => {
     const calls: Array<{ url: string; init: RequestInit }> = [];
     const deviceAnalysis = {
-      schema_version: "1.2",
+      schema_version: "1.3",
       analysis_id: ANALYSIS_ID,
       team_id: TEAM_ID,
       analysis_mode: "device",
@@ -509,6 +541,12 @@ describe("PerfPilot browser API", () => {
         verification_state: "not_requested",
         failure_code: null,
       },
+      runtime_status: {
+        ...(analysisV13().runtime_status as Record<string, unknown>),
+        current_stage: "device_claim",
+        stage_state: "waiting",
+        waiting_for: "agent",
+      },
     };
     const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
       const url = String(input);
@@ -544,7 +582,7 @@ describe("PerfPilot browser API", () => {
     expect(result.analysis).toMatchObject({ analysis_mode: "device", state: "queued" });
     const create = calls.find((call) => call.url.endsWith("/analyses"));
     expect(JSON.parse(String(create?.init.body))).toEqual({
-      schema_version: "1.2",
+      schema_version: "1.3",
       analysis_mode: "device",
       device_id: DEVICE_ID,
       test_type: "cold_start",
@@ -676,7 +714,7 @@ describe("PerfPilot browser API", () => {
     };
     const sourceAwareAnalysis = (state: AnalysisResponse["state"]): AnalysisResponse => ({
       ...analysis(state),
-      schema_version: "1.1",
+      schema_version: "1.3",
       source_code_analysis: {
         requested: true,
         ...sourceBinding,
@@ -685,6 +723,7 @@ describe("PerfPilot browser API", () => {
         verification_state: "not_requested",
         failure_code: null,
       },
+      runtime_status: analysisV13(state).runtime_status,
     });
     const fetcher = vi.fn(async (input: RequestInfo | URL, init: RequestInit = {}) => {
       const url = String(input);
@@ -792,7 +831,7 @@ describe("PerfPilot browser API", () => {
       "trace-analysis-fixed",
     );
     expect(JSON.parse(String(create?.init.body))).toMatchObject({
-      schema_version: "1.1",
+      schema_version: "1.3",
       analysis_mode: "trace_upload",
       test_type: "scroll",
       package_name: "com.rivotek.mediacenter",
@@ -942,6 +981,65 @@ describe("PerfPilot browser API", () => {
     await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
       code: "invalid_api_response",
     });
+  });
+
+  it("strictly validates authoritative 1.3 runtime status", async () => {
+    const valid = analysisV13();
+    const runtime = valid.runtime_status as Record<string, unknown>;
+    const variants = [
+      valid,
+      { ...valid, runtime_status: undefined },
+      { ...valid, runtime_status: { ...runtime, current_stage: "private_stage" } },
+      { ...valid, runtime_status: { ...runtime, available_actions: ["delete"] } },
+      { ...valid, runtime_status: { ...runtime, attempt: -1 } },
+      { ...valid, runtime_status: { ...runtime, generation: -1 } },
+      { ...valid, runtime_status: { ...runtime, progress_summary: "x".repeat(241) } },
+      { ...valid, schema_version: "1.2" },
+    ];
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockImplementation(async () => Response.json(variants.shift()));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      schema_version: "1.3",
+      runtime_status: { current_stage: "source_code", stage_state: "slow" },
+    });
+    for (let index = 0; index < 7; index += 1) {
+      await expect(client.analysis(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+        code: "invalid_api_response",
+      });
+    }
+  });
+
+  it("validates safe readiness responses and rejects private diagnostics", async () => {
+    const valid = {
+      schema_version: "1.0",
+      state: "degraded",
+      capabilities: [
+        {
+          name: "smartperfetto",
+          state: "unavailable",
+          message: "SmartPerfetto 暂不可用",
+          last_checked_at: "2026-08-20T08:00:00+00:00",
+        },
+      ],
+    };
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(Response.json(valid))
+      .mockResolvedValueOnce(Response.json({ ...valid, token: "private" }))
+      .mockResolvedValueOnce(
+        Response.json({
+          ...valid,
+          capabilities: [{ ...valid.capabilities[0], name: "internal_database" }],
+        }),
+      );
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.readiness?.()).resolves.toEqual(valid);
+    await expect(client.readiness?.()).rejects.toMatchObject({ code: "invalid_api_response" });
+    await expect(client.readiness?.()).rejects.toMatchObject({ code: "invalid_api_response" });
   });
 
   it("accepts not_requested only for device 1.1 memory_cycle", async () => {

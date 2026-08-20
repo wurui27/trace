@@ -54,6 +54,40 @@ function analysis(
   };
 }
 
+function authoritativeAnalysis(
+  stageState: "running" | "slow" | "waiting_for_upstream" = "slow",
+): AnalysisResponse {
+  return {
+    ...analysis("analyzing"),
+    schema_version: "1.3",
+    source_code_analysis: {
+      requested: false,
+      provider_kind: null,
+      agent_id: null,
+      workspace_id: null,
+      snapshot_policy: null,
+      validation_profile_id: null,
+      context_state: "not_requested",
+      match_summary: "none",
+      verification_state: "not_requested",
+      failure_code: null,
+    },
+    runtime_status: {
+      current_stage: "source_code",
+      stage_state: stageState,
+      started_at: "2026-08-20T08:00:00+00:00",
+      updated_at: "2026-08-20T08:03:00+00:00",
+      last_progress_at: "2026-08-20T08:00:00+00:00",
+      attempt: 1,
+      max_attempts: 2,
+      generation: 1,
+      waiting_for: "source_agent",
+      progress_summary: "已读取 1247 个文件，找到 18 个相关源码片段",
+      available_actions: [],
+    },
+  } as AnalysisResponse;
+}
+
 function stageList(state: AnalysisState): readonly AnalysisStage[] {
   const finished = ["completed", "partially_completed", "failed", "canceled"].includes(state);
   return [
@@ -175,24 +209,33 @@ describe("AnalysisProgress", () => {
     expect(screen.getByText("报告完成").closest("li")).not.toHaveClass("is-complete");
   });
 
-  it("polls until all server stages settle and retains the prior report during rerun", async () => {
+  it("renders authoritative source activity as a warning without inventing failure", () => {
+    render(<AnalysisProgressView analysis={authoritativeAnalysis()} />);
+
+    expect(screen.getByRole("heading", { name: "正在读取并匹配源码" })).toBeInTheDocument();
+    expect(screen.getByText("已读取 1247 个文件，找到 18 个相关源码片段")).toBeInTheDocument();
+    expect(screen.getByText(/最近更新.*2026-08-20T08:03:00/)).toBeInTheDocument();
+    expect(screen.getByText("处理时间较长，任务仍在继续")).toHaveClass("is-warning");
+    expect(screen.queryByText("分析未能完成")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "取消分析" })).not.toBeInTheDocument();
+  });
+
+  it("stops polling immediately when the authoritative parent state is terminal", async () => {
     const running = analysis("completed", "analysis-live-1", [
       { stage: "input_validation", state: "completed", failure: null },
       { stage: "smartperfetto", state: "completed", failure: null },
       { stage: "perfpilot_ai", state: "running", failure: null },
       { stage: "report", state: "pending", failure: null },
     ]);
-    const complete = analysis("completed");
     const oldReport = failedReport();
-    const newReport = { ...failedReport(), report_version: 2 };
     const client = {
       csrf: vi.fn(async () => "csrf"),
       me: vi.fn(async () => ({
         schema_version: "1.0" as const,
         memberships: [{ team: { id: "team-1", name: "Ray" }, role: "owner" }],
       })),
-      analysis: vi.fn().mockResolvedValueOnce(running).mockResolvedValueOnce(complete),
-      report: vi.fn().mockResolvedValueOnce(oldReport).mockResolvedValueOnce(newReport),
+      analysis: vi.fn().mockResolvedValueOnce(running),
+      report: vi.fn().mockResolvedValueOnce(oldReport),
     } as unknown as PerfPilotClient;
     const updates: Array<{ report: AnalysisReport | null; analysis: AnalysisResponse }> = [];
 
@@ -202,9 +245,9 @@ describe("AnalysisProgress", () => {
       (snapshot) => updates.push(snapshot),
     );
 
-    expect(client.analysis).toHaveBeenCalledTimes(2);
-    expect(client.report).toHaveBeenCalledTimes(2);
-    expect(updates.map((item) => item.report?.report_version)).toEqual([1, 2]);
+    expect(client.analysis).toHaveBeenCalledTimes(1);
+    expect(client.report).toHaveBeenCalledTimes(1);
+    expect(updates.map((item) => item.report?.report_version)).toEqual([1]);
   });
 
   it("does not substitute fixture findings when the real report cannot load", async () => {

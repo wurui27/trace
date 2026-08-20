@@ -439,7 +439,7 @@ export interface TraceFileSelection {
 }
 
 export interface AnalysisResponse {
-  readonly schema_version: "1.0" | "1.1" | "1.2";
+  readonly schema_version: "1.0" | "1.1" | "1.2" | "1.3";
   readonly analysis_id: string;
   readonly team_id: string;
   readonly analysis_mode: AnalysisMode;
@@ -478,6 +478,66 @@ export interface AnalysisResponse {
   readonly started_at?: string | null;
   readonly completed_at?: string | null;
   readonly capture_configuration?: DeviceCaptureConfiguration;
+  readonly runtime_status?: AnalysisRuntimeStatus;
+}
+
+export interface AnalysisRuntimeStatus {
+  readonly current_stage:
+    | "input_validation"
+    | "device_claim"
+    | "device_capture"
+    | "smartperfetto"
+    | "source_code"
+    | "perfpilot_ai"
+    | "report";
+  readonly stage_state:
+    | "pending"
+    | "running"
+    | "waiting"
+    | "slow"
+    | "waiting_for_upstream"
+    | "completed"
+    | "failed"
+    | "canceled"
+    | "cancel_requested"
+    | "not_requested";
+  readonly started_at: string;
+  readonly updated_at: string;
+  readonly last_progress_at: string;
+  readonly attempt: number;
+  readonly max_attempts: number;
+  readonly generation: number;
+  readonly waiting_for:
+    | "agent"
+    | "device"
+    | "smartperfetto"
+    | "source_agent"
+    | "ai_provider"
+    | "storage"
+    | "report_publish"
+    | null;
+  readonly progress_summary: string;
+  readonly available_actions: readonly ("cancel" | "retry")[];
+}
+
+export interface AnalysisCapabilityHealth {
+  readonly name:
+    | "smartperfetto"
+    | "ai"
+    | "agent"
+    | "device"
+    | "source"
+    | "storage"
+    | "supervisor";
+  readonly state: "healthy" | "degraded" | "unavailable";
+  readonly message: string;
+  readonly last_checked_at: string;
+}
+
+export interface AnalysisHealthResponse {
+  readonly schema_version: "1.0";
+  readonly state: "healthy" | "degraded" | "unavailable";
+  readonly capabilities: readonly AnalysisCapabilityHealth[];
 }
 
 export type DeviceTestType = "cold_start" | "hot_start" | "scroll";
@@ -702,6 +762,7 @@ export class PerfPilotApiError extends Error {
 }
 
 export interface PerfPilotClient {
+  readiness?(signal?: AbortSignal): Promise<AnalysisHealthResponse>;
   readonly fetcher: typeof globalThis.fetch;
   subscribeAuthFailures?(listener: () => void): () => void;
   device(signal?: AbortSignal): Promise<LocalDeviceStatusResponse>;
@@ -2370,10 +2431,125 @@ function validActiveLease(value: unknown): value is ActiveAnalysisLease {
   );
 }
 
+function validAnalysisRuntimeStatus(value: unknown): value is AnalysisRuntimeStatus {
+  const stages = [
+    "input_validation",
+    "device_claim",
+    "device_capture",
+    "smartperfetto",
+    "source_code",
+    "perfpilot_ai",
+    "report",
+  ];
+  const states = [
+    "pending",
+    "running",
+    "waiting",
+    "slow",
+    "waiting_for_upstream",
+    "completed",
+    "failed",
+    "canceled",
+    "cancel_requested",
+    "not_requested",
+  ];
+  const waitingFor = [
+    "agent",
+    "device",
+    "smartperfetto",
+    "source_agent",
+    "ai_provider",
+    "storage",
+    "report_publish",
+  ];
+  if (
+    !object(value) ||
+    !exactKeys(value, [
+      "current_stage",
+      "stage_state",
+      "started_at",
+      "updated_at",
+      "last_progress_at",
+      "attempt",
+      "max_attempts",
+      "generation",
+      "waiting_for",
+      "progress_summary",
+      "available_actions",
+    ]) ||
+    !stages.includes(String(value.current_stage)) ||
+    !states.includes(String(value.stage_state)) ||
+    !validDateTime(value.started_at) ||
+    !validDateTime(value.updated_at) ||
+    !validDateTime(value.last_progress_at) ||
+    !Number.isSafeInteger(value.attempt) ||
+    Number(value.attempt) < 1 ||
+    !Number.isSafeInteger(value.max_attempts) ||
+    Number(value.max_attempts) < 1 ||
+    Number(value.attempt) > Number(value.max_attempts) ||
+    !Number.isSafeInteger(value.generation) ||
+    Number(value.generation) < 1 ||
+    (value.waiting_for !== null && !waitingFor.includes(String(value.waiting_for))) ||
+    typeof value.progress_summary !== "string" ||
+    value.progress_summary.length > 240 ||
+    !Array.isArray(value.available_actions) ||
+    value.available_actions.length > 2 ||
+    new Set(value.available_actions).size !== value.available_actions.length ||
+    !value.available_actions.every((item) => ["cancel", "retry"].includes(String(item)))
+  ) {
+    return false;
+  }
+  return true;
+}
+
+function safeHealthMessage(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length > 0 &&
+    value.length <= 120 &&
+    !/(?:https?:\/\/|[A-Za-z]:[\\/]|\/(?:Users|home|var|tmp)\/|token|secret)/i.test(value)
+  );
+}
+
+function analysisHealthResponse(value: unknown): AnalysisHealthResponse {
+  const names = [
+    "smartperfetto",
+    "ai",
+    "agent",
+    "device",
+    "source",
+    "storage",
+    "supervisor",
+  ];
+  if (
+    !object(value) ||
+    !exactKeys(value, ["schema_version", "state", "capabilities"]) ||
+    value.schema_version !== "1.0" ||
+    !["healthy", "degraded", "unavailable"].includes(String(value.state)) ||
+    !Array.isArray(value.capabilities) ||
+    value.capabilities.length > names.length ||
+    !value.capabilities.every(
+      (item) =>
+        object(item) &&
+        exactKeys(item, ["name", "state", "message", "last_checked_at"]) &&
+        names.includes(String(item.name)) &&
+        ["healthy", "degraded", "unavailable"].includes(String(item.state)) &&
+        safeHealthMessage(item.message) &&
+        validDateTime(item.last_checked_at),
+    ) ||
+    new Set(value.capabilities.map((item) => (object(item) ? item.name : null))).size !==
+      value.capabilities.length
+  ) {
+    throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+  }
+  return value as unknown as AnalysisHealthResponse;
+}
+
 function analysisResponse(value: unknown): AnalysisResponse {
   const hasAiRounds = object(value) && "ai_rounds" in value;
   const hasSource = object(value) && "source_analysis" in value;
   const hasSourceCode = object(value) && "source_code_analysis" in value;
+  const hasRuntimeStatus = object(value) && "runtime_status" in value;
   const createdAt = object(value) ? value.created_at : undefined;
   const cancelRequestedAt = object(value) ? value.cancel_requested_at : undefined;
   const commonKeys = [
@@ -2388,6 +2564,7 @@ function analysisResponse(value: unknown): AnalysisResponse {
     "report_available",
     "failure",
     "source_code_analysis",
+    "runtime_status",
   ] as const;
   const modeKeys = object(value)
     ? value.analysis_mode === "trace_upload"
@@ -2408,7 +2585,8 @@ function analysisResponse(value: unknown): AnalysisResponse {
           "source_analysis",
         ]
       : value.analysis_mode === "device"
-        ? value.schema_version === "1.2"
+        ? value.schema_version === "1.2" ||
+          (value.schema_version === "1.3" && "capture_configuration" in value)
           ? [
               "device_id",
               "application_version_id",
@@ -2436,7 +2614,7 @@ function analysisResponse(value: unknown): AnalysisResponse {
   if (
     !object(value) ||
     !exactKeys(value, [...commonKeys, ...modeKeys]) ||
-    !["1.0", "1.1", "1.2"].includes(String(value.schema_version)) ||
+    !["1.0", "1.1", "1.2", "1.3"].includes(String(value.schema_version)) ||
     !["device", "trace_upload", "memory_upload"].includes(String(value.analysis_mode)) ||
     typeof value.analysis_id !== "string" ||
     typeof value.team_id !== "string" ||
@@ -2453,8 +2631,10 @@ function analysisResponse(value: unknown): AnalysisResponse {
         cancelRequestedAt.length > 64 ||
         Number.isNaN(Date.parse(cancelRequestedAt)))) ||
     (value.failure !== null && !validFailure(value.failure)) ||
-    (["1.1", "1.2"].includes(String(value.schema_version))) !== hasSourceCode ||
-    (hasSourceCode && !validSourceCodeAnalysis(value.source_code_analysis))
+    (["1.1", "1.2", "1.3"].includes(String(value.schema_version))) !== hasSourceCode ||
+    (hasSourceCode && !validSourceCodeAnalysis(value.source_code_analysis)) ||
+    (value.schema_version === "1.3") !== hasRuntimeStatus ||
+    (hasRuntimeStatus && !validAnalysisRuntimeStatus(value.runtime_status))
   ) {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
@@ -2489,7 +2669,10 @@ function analysisResponse(value: unknown): AnalysisResponse {
     throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
   }
   if (value.analysis_mode === "device") {
-    if (value.schema_version === "1.2") {
+    if (
+      value.schema_version === "1.2" ||
+      (value.schema_version === "1.3" && "capture_configuration" in value)
+    ) {
       if (
         typeof value.device_id !== "string" ||
         value.application_version_id !== null ||
@@ -2743,6 +2926,11 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
       authFailureListeners.add(listener);
       return () => authFailureListeners.delete(listener);
     },
+    async readiness(signal) {
+      return analysisHealthResponse(
+        await requestJson("/api/v1/readiness", {}, signal),
+      );
+    },
     async device(signal) {
       return localDeviceResponse(await requestJson("/api/v1/device", {}, signal));
     },
@@ -2890,7 +3078,7 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         {
           method: "POST",
           body: JSON.stringify({
-            schema_version: sourceBinding ? "1.1" : "1.0",
+            schema_version: "1.3",
             analysis_mode: "trace_upload",
             test_type: testType,
             package_name: packageName,
@@ -2926,7 +3114,7 @@ export function createPerfPilotClient(options: ClientOptions = {}): PerfPilotCli
         {
           method: "POST",
           body: JSON.stringify({
-            schema_version: "1.2",
+            schema_version: "1.3",
             analysis_mode: "device",
             device_id: deviceId,
             test_type: configuration.test_type,

@@ -2896,6 +2896,83 @@ fieldset.new-analysis-field {
   font-size: 11px;
 }
 
+.analysis-runtime-status {
+  display: grid;
+  gap: 8px;
+  margin-top: 17px;
+  padding: 16px;
+  border: 1px solid #c9daf8;
+  border-radius: var(--radius-sm);
+  background: #f6f9ff;
+  color: #18345f;
+}
+
+.analysis-runtime-status p,
+.analysis-runtime-status time {
+  margin: 0;
+}
+
+.analysis-runtime-status time {
+  color: #5d7192;
+  font-size: 11px;
+}
+
+.analysis-runtime-warning.is-warning {
+  color: #8a5b00;
+  font-weight: 600;
+}
+
+.system-health-banner {
+  margin-bottom: 18px;
+  padding: 14px 16px;
+  border: 1px solid #d8b45b;
+  border-radius: var(--radius-sm);
+  background: #fffaf0;
+  color: #664710;
+}
+
+.system-health-banner.is-unavailable {
+  border-color: #e3a3aa;
+  background: #fff5f6;
+  color: #7c2430;
+}
+
+.system-health-summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.system-health-summary p {
+  margin: 4px 0 0;
+}
+
+.system-health-summary button {
+  flex: none;
+  border: 1px solid #9cb8e6;
+  border-radius: 8px;
+  padding: 7px 10px;
+  background: #fff;
+  color: #1c5aa6;
+  cursor: pointer;
+}
+
+.system-health-banner details {
+  margin-top: 10px;
+}
+
+.system-health-banner ul {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 0;
+  padding-left: 20px;
+}
+
+.system-health-banner li strong {
+  margin-right: 8px;
+}
+
 .analysis-section-heading {
   display: flex;
   align-items: center;

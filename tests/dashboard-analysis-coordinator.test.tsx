@@ -157,6 +157,34 @@ function clientWithActive(
 }
 
 describe("Dashboard analysis coordinator", () => {
+  it("shows degraded health without disabling available analysis entry", async () => {
+    const client = clientWithActive({
+      readiness: vi.fn().mockResolvedValue({
+        schema_version: "1.0",
+        state: "degraded",
+        capabilities: [
+          {
+            name: "agent",
+            state: "unavailable",
+            message: "没有在线 Agent",
+            last_checked_at: "2026-08-20T08:00:00+00:00",
+          },
+        ],
+      }),
+      activeAnalyses: vi.fn().mockResolvedValue({ schema_version: "1.0", analyses: [] }),
+    });
+    render(
+      <TestDashboard
+        client={client}
+        pollDelay={() => new Promise<void>(() => undefined)}
+        latestReportLoader={vi.fn().mockResolvedValue(null)}
+      />,
+    );
+
+    expect(await screen.findByText("部分分析能力暂不可用")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "新建分析" })).toBeEnabled();
+  });
+
   it("fills the dashboard result slots from the latest real report", async () => {
     const client = clientWithActive({
       activeAnalyses: vi.fn().mockResolvedValue({
