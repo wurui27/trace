@@ -6,6 +6,7 @@ import Link from "next/link";
 
 import { AnalysisReportView } from "./analysis-report";
 import {
+  analysisIsTerminal,
   createPerfPilotClient,
   createRandomUuid,
   PerfPilotApiError,
@@ -100,9 +101,7 @@ const inputStateLabels = {
 } as const;
 
 function analysisStillChanging(analysis: AnalysisResponse): boolean {
-  return !["completed", "partially_completed", "failed", "canceled", "deleted"].includes(
-    analysis.state,
-  );
+  return !analysisIsTerminal(analysis);
 }
 
 const scenarioCopy = {
@@ -369,9 +368,7 @@ export function AnalysisProgressView({
   const copy = stateCopy[analysis.state];
   const deviceMode = analysis.analysis_mode === "device";
   const runtimeStatus = analysis.schema_version === "1.3" ? analysis.runtime_status : undefined;
-  const terminal = ["completed", "partially_completed", "failed", "canceled", "deleted"].includes(
-    analysis.state,
-  );
+  const terminal = analysisIsTerminal(analysis);
   const title = runtimeStatus && !terminal
     ? runtimeStageCopy[runtimeStatus.current_stage]
     : copy.title;

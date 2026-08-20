@@ -5,6 +5,12 @@ import {
   PerfPilotApiError,
   type AnalysisResponse,
 } from "../app/lib/perfpilot-api";
+import {
+  analysisIsTerminal,
+  parseAnalysisListResponse,
+  parseAnalysisResponse,
+  type AnalysisRuntimeStatus,
+} from "../app/lib/perfpilot-analysis-api";
 
 const TEAM_ID = "81000000-0000-4000-8000-000000000001";
 const ANALYSIS_ID = "82000000-0000-4000-8000-000000000001";
@@ -86,6 +92,22 @@ async function parse(payload: Record<string, unknown>): Promise<AnalysisResponse
 }
 
 describe("analysis contract characterization", () => {
+  it("exposes an HTTP-independent analysis parser surface", () => {
+    const payload = traceResponse("1.3");
+    const parsed = parseAnalysisResponse(payload);
+    const runtime: AnalysisRuntimeStatus | undefined = parsed.runtime_status;
+
+    expect(parsed.analysis_id).toBe(ANALYSIS_ID);
+    expect(runtime?.current_stage).toBe("source_code");
+    expect(analysisIsTerminal(parsed)).toBe(false);
+    expect(
+      parseAnalysisListResponse(
+        { schema_version: "1.0", analyses: [payload] },
+        { teamId: TEAM_ID, limit: 1, filter: "active" },
+      ).analyses,
+    ).toHaveLength(1);
+  });
+
   it.each(["1.0", "1.1", "1.3"] as const)("keeps schema %s readable", async (version) => {
     await expect(parse(traceResponse(version))).resolves.toMatchObject({
       schema_version: version,
