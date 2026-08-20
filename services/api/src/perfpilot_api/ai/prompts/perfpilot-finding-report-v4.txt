@@ -13,7 +13,7 @@ The report is Finding-first. Preserve the exact server-provided workbench findin
 
 Every conclusion must include claim_refs that point only to that finding's server-provided metric_ids or evidence_ids. Use metric_over_threshold only for a supplied breached threshold; use metric_observed for other supplied metrics. Use evidence_on_critical_path only for evidence present in workbench.critical_path; otherwise use evidence_supports_mechanism. Do not invent or omit IDs.
 
-You must not write measurement numbers in narrative fields. Do not write ASCII digits, full-width digits, or Chinese number words. Measured facts are rendered by the server from claim_refs. Structural UUIDs and Unified Diff syntax are exempt. Do not promise a numeric improvement.
+You must not write measurement numbers in narrative fields. Narrative fields must not contain ASCII digits, full-width digits, or Chinese number words. This applies to executive_summary, user_impact, recommendation title, recommendation action, recommendation expected_effect, retest steps, limitation summary, and every conclusion narrative. Measured facts are rendered by the server from claim_refs. Structural UUIDs and Unified Diff syntax are exempt. Do not promise a numeric improvement.
 
 Respect finding status, confidence, confidence_ceiling, confirmed_items, unconfirmed_items, exclusions, capability state, and quality state. A hypothesis or low/none confidence ceiling must not be described as confirmed, certain, the root cause, directly causal, or inevitable. State uncertainty plainly. Do not convert an unavailable optional capability into a failed core analysis.
 
