@@ -80,6 +80,13 @@ from perfpilot_api.local_analysis_lifecycle import (
     LifecycleSnapshot,
 )
 from perfpilot_api.local_cancellation import CancellationTarget, cancel_targets
+from perfpilot_api.local_task_supervisor import (
+    REPORT_POLICY,
+    ActivityState,
+    DurableTaskSupervisor,
+    SupervisedTask,
+    run_control_operation,
+)
 from perfpilot_api.local_agent_store import LocalAgentStore, LocalDeviceDirectoryRepository
 from perfpilot_api.local_agent_enrollment import (
     LocalAgentEnrollmentBroker,
@@ -2536,7 +2543,7 @@ class _LocalRuntime:
         poll_interval_seconds: float,
         source_tasks: SourceTaskService,
         source_artifacts: SourceArtifactService,
-        source_wait_seconds: float,
+        source_wait_seconds: float | None,
         device_directory: DeviceDirectory,
         agent_tasks: AgentTaskService,
         agent_artifacts: LocalAgentArtifactService,
@@ -2544,7 +2551,7 @@ class _LocalRuntime:
     ) -> None:
         if poll_interval_seconds < 0:
             raise ValueError("poll interval must not be negative")
-        if (
+        if source_wait_seconds is not None and (
             isinstance(source_wait_seconds, bool)
             or not isinstance(source_wait_seconds, (int, float))
             or not 0 <= source_wait_seconds <= 120
@@ -2574,6 +2581,14 @@ class _LocalRuntime:
         self.remote_publication_locks: dict[tuple[UUID, UUID], asyncio.Lock] = {}
         self.terminal_commit_locks: dict[tuple[UUID, UUID], asyncio.Lock] = {}
         self.tasks: set[asyncio.Task[None]] = set()
+        self.supervisor_tasks: dict[asyncio.AbstractEventLoop, asyncio.Task[None]] = {}
+        self.supervisor_last_tick_at: datetime | None = None
+        self.activity_supervisor = DurableTaskSupervisor(
+            load_active=self._load_supervised_tasks,
+            observe_upstream=self._observe_supervised_upstream,
+            save_activity=self._save_supervised_activity,
+            cancel_task=self._cancel_supervised_task,
+        )
 
     def _remote_publication_lock(self, analysis: _LocalAnalysis) -> asyncio.Lock:
         key = (analysis.team_id, analysis.analysis_id)
@@ -2582,6 +2597,202 @@ class _LocalRuntime:
     def _terminal_commit_lock(self, analysis: _LocalAnalysis) -> asyncio.Lock:
         key = (analysis.team_id, analysis.analysis_id)
         return self.terminal_commit_locks.setdefault(key, asyncio.Lock())
+
+    def _load_supervised_tasks(self) -> tuple[SupervisedTask, ...]:
+        tasks: list[SupervisedTask] = []
+        for analysis in self.analyses.values():
+            if analysis.state not in _ACTIVE_ANALYSIS_STATES:
+                continue
+            status = analysis.runtime_status or {}
+            stage = status.get("current_stage")
+            started_at = _parse_utc_datetime(status.get("started_at"))
+            last_progress_at = _parse_utc_datetime(status.get("last_progress_at"))
+            if not isinstance(stage, str) or started_at is None or last_progress_at is None:
+                continue
+            waiting_for = status.get("waiting_for")
+            upstream_run_id: str | None = None
+            if stage == "smartperfetto" and analysis.source_run is not None:
+                upstream_run_id = analysis.source_run.run_id
+            elif stage == "source_code" and analysis.source_binding is not None:
+                upstream_run_id = str(analysis.analysis_id)
+            elif stage == "perfpilot_ai":
+                upstream_run_id = f"generation-{analysis.generation}"
+            tasks.append(
+                SupervisedTask(
+                    key=f"{analysis.team_id}:{analysis.analysis_id}",
+                    stage=stage,
+                    started_at=started_at,
+                    last_progress_at=last_progress_at,
+                    waiting_for=(waiting_for if isinstance(waiting_for, str) else None),
+                    upstream_run_id=upstream_run_id,
+                    cancel_requested=analysis.cancel_requested_at is not None,
+                )
+            )
+        return tuple(tasks)
+
+    def _supervised_analysis(self, task: SupervisedTask) -> _LocalAnalysis | None:
+        team_text, separator, analysis_text = task.key.partition(":")
+        if separator != ":":
+            return None
+        try:
+            key = (UUID(team_text), UUID(analysis_text))
+        except ValueError:
+            return None
+        return self.analyses.get(key)
+
+    async def _observe_supervised_upstream(
+        self,
+        task: SupervisedTask,
+    ) -> datetime | None:
+        analysis = self._supervised_analysis(task)
+        if analysis is None or analysis.state not in _ACTIVE_ANALYSIS_STATES:
+            return None
+        if task.stage == "smartperfetto":
+            run = analysis.source_run
+            if run is None or run.run_id != task.upstream_run_id:
+                return None
+            current = await self.gateway.status(run)
+            return datetime.now(UTC) if current == "completed" else None
+        if task.stage == "source_code":
+            status = await self.source_tasks.context_status(
+                team_id=analysis.team_id,
+                analysis_id=analysis.analysis_id,
+            )
+            if status is not None and status.state == "completed":
+                return datetime.now(UTC)
+        return None
+
+    async def _save_supervised_activity(
+        self,
+        task: SupervisedTask,
+        state: ActivityState,
+    ) -> None:
+        analysis = self._supervised_analysis(task)
+        now = self.supervisor_last_tick_at or datetime.now(UTC)
+        if analysis is None:
+            return
+        async with self.lock:
+            status = analysis.runtime_status or {}
+            if (
+                analysis.state not in _ACTIVE_ANALYSIS_STATES
+                or status.get("current_stage") != task.stage
+                or analysis.generation != int(status.get("generation", 0))
+            ):
+                return
+            if state.deadline_exceeded:
+                await self._transition(analysis, target="failed", now=now)
+                analysis.failure = {
+                    "code": "analysis_stage_timeout",
+                    "message": "分析阶段等待超过配置截止时间",
+                    "retryable": True,
+                }
+                if task.stage in analysis.stages:
+                    analysis.stages[task.stage] = "failed"
+                if task.stage != "report":
+                    analysis.stages["report"] = "not_requested"
+            else:
+                next_status = validate_analysis_runtime_status(
+                    {
+                        **status,
+                        "stage_state": state.stage_state,
+                        "updated_at": now.isoformat(),
+                        "waiting_for": state.waiting_for,
+                        "progress_summary": state.progress_summary,
+                    }
+                )
+                if all(
+                    status.get(key) == next_status.get(key)
+                    for key in (
+                        "stage_state",
+                        "waiting_for",
+                        "progress_summary",
+                    )
+                ):
+                    return
+                analysis.runtime_status = next_status
+            analysis.version += 1
+        await self._persist(analysis)
+
+    async def _cancel_supervised_task(self, task: SupervisedTask) -> None:
+        analysis = self._supervised_analysis(task)
+        if analysis is not None and analysis.state in _ACTIVE_ANALYSIS_STATES:
+            await self.cancel(analysis)
+
+    async def supervise_activity_once(self, now: datetime | None = None) -> None:
+        current = now or datetime.now(UTC)
+        self.supervisor_last_tick_at = current
+        await self.activity_supervisor.tick(current)
+        await self._reconcile_remote_publications_once()
+
+    async def _supervisor_loop(self) -> None:
+        interval = max(0.05, min(self.poll_interval_seconds or 0.05, 5.0))
+        while True:
+            try:
+                await self.supervise_activity_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _LOGGER.warning(
+                    "Local task supervisor tick failed type=%s",
+                    type(error).__name__,
+                )
+            await asyncio.sleep(interval)
+
+    async def _reconcile_remote_publications_once(self) -> None:
+        pending: list[tuple[_LocalAnalysis, _LocalUpload]] = []
+        async with self.lock:
+            for analysis in self.analyses.values():
+                if (
+                    analysis.remote_publication not in {"publishing", "published"}
+                    or analysis.cancel_requested_at is not None
+                    or analysis.state in _TERMINAL_ANALYSIS_STATES
+                    or analysis.state == "analyzing"
+                    or analysis.stages.get("smartperfetto") == "completed"
+                ):
+                    continue
+                target = analysis.inputs.get("apk")
+                if target is None or target.upload_id is None:
+                    continue
+                upload = self.uploads.get(
+                    (analysis.team_id, analysis.analysis_id, target.upload_id)
+                )
+                if upload is not None and upload.bytes_ready:
+                    pending.append((analysis, upload))
+        for analysis, upload in pending:
+            async def publish(_idempotency_key: str) -> None:
+                async with self._remote_publication_lock(analysis):
+                    await self._publish_remote_device(analysis, upload)
+
+            try:
+                await run_control_operation(
+                    publish,
+                    idempotency_key=f"{analysis.team_id}:{analysis.analysis_id}:publish",
+                    policy=REPORT_POLICY,
+                    retryable=(AgentTaskError, LocalAnalysisStoreError, RuntimeError),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                _LOGGER.warning(
+                    "Remote capture publication recovery deferred type=%s",
+                    type(error).__name__,
+                )
+                async with self.lock:
+                    status = analysis.runtime_status or {}
+                    analysis.runtime_status = validate_analysis_runtime_status(
+                        {
+                            **status,
+                            "updated_at": datetime.now(UTC).isoformat(),
+                            "attempt": min(
+                                int(status.get("attempt", 1)) + 1,
+                                int(status.get("max_attempts", 2)),
+                            ),
+                            "waiting_for": "report_publish",
+                            "progress_summary": "发布暂未完成，将继续恢复同一任务",
+                        }
+                    )
+                    analysis.version += 1
+                await self._persist(analysis)
 
     @staticmethod
     def _upload_key(upload: _LocalUpload) -> tuple[UUID, UUID, str]:
@@ -2922,6 +3133,14 @@ class _LocalRuntime:
                 return
             analysis.state = "scheduled"
             analysis.started_at = analysis.started_at or datetime.now(UTC)
+            _record_progress(
+                analysis,
+                stage="device_capture",
+                state="running",
+                summary="Agent 已领取任务，正在采集真机 Trace",
+                waiting_for="agent",
+                now=datetime.now(UTC),
+            )
             analysis.version += 1
         await self._persist(analysis)
 
@@ -2961,6 +3180,14 @@ class _LocalRuntime:
                 if analysis.generation != generation:
                     raise _StaleLocalGeneration
                 analysis.stages["smartperfetto"] = "running"
+                _record_progress(
+                    analysis,
+                    stage="smartperfetto",
+                    state="running",
+                    summary="正在分析真机 Trace",
+                    waiting_for="smartperfetto",
+                    now=datetime.now(UTC),
+                )
                 analysis.version += 1
             await self._persist(analysis)
             results: dict[str, EngineResult] = {}
@@ -3624,11 +3851,6 @@ class _LocalRuntime:
                     "Remote capture publication recovery deferred type=%s",
                     type(error).__name__,
                 )
-                task = asyncio.create_task(
-                    self._retry_remote_publication(analysis, upload)
-                )
-                self.tasks.add(task)
-                task.add_done_callback(self.tasks.discard)
         for analysis in pending_script_publications:
             await self.agent_tasks.enqueue(self._script_device_definition(analysis))
             if analysis.remote_publication != "published" or analysis.state != "queued":
@@ -3638,6 +3860,10 @@ class _LocalRuntime:
                 await self._persist(analysis)
         for analysis, access, manifest in pending_remote_analyses:
             self._schedule_remote_analysis(analysis, access, manifest)
+
+        loop = asyncio.get_running_loop()
+        if loop not in self.supervisor_tasks:
+            self.supervisor_tasks[loop] = asyncio.create_task(self._supervisor_loop())
 
     def _restore_remote_capture(
         self,
@@ -3685,34 +3911,12 @@ class _LocalRuntime:
         )
         return access, manifest
 
-    async def _retry_remote_publication(
-        self,
-        analysis: _LocalAnalysis,
-        upload: _LocalUpload,
-    ) -> None:
-        delay = 0.1
-        while True:
-            await asyncio.sleep(delay)
-            async with self.lock:
-                if (
-                    analysis.cancel_requested_at is not None
-                    or analysis.state in _TERMINAL_ANALYSIS_STATES
-                ):
-                    return
-            try:
-                async with self._remote_publication_lock(analysis):
-                    await self._publish_remote_device(analysis, upload)
-                return
-            except asyncio.CancelledError:
-                raise
-            except Exception as error:
-                _LOGGER.warning(
-                    "Remote capture publication recovery retry type=%s",
-                    type(error).__name__,
-                )
-                delay = min(delay * 2, 5.0)
-
     async def close(self) -> None:
+        loop = asyncio.get_running_loop()
+        supervisor_task = self.supervisor_tasks.pop(loop, None)
+        if supervisor_task is not None:
+            supervisor_task.cancel()
+            await asyncio.gather(supervisor_task, return_exceptions=True)
         tasks = tuple(self.tasks)
         for task in tasks:
             task.cancel()
@@ -4496,6 +4700,7 @@ class _LocalRuntime:
             previous_state = analysis.state
             previous_started_at = analysis.started_at
             previous_stages = dict(analysis.stages)
+            previous_runtime_status = dict(analysis.runtime_status or {})
             target.finalized = True
             target.artifact_id = target.artifact_id or str(uuid4())
             analysis.version += 1
@@ -4505,6 +4710,14 @@ class _LocalRuntime:
                 analysis.stages["smartperfetto"] = "running"
                 analysis.state = "analyzing"
                 analysis.started_at = analysis.started_at or datetime.now(UTC)
+                _record_progress(
+                    analysis,
+                    stage="smartperfetto",
+                    state="running",
+                    summary="正在分析 Trace",
+                    waiting_for="smartperfetto",
+                    now=datetime.now(UTC),
+                )
                 start_gate = asyncio.Event()
 
                 async def execute_reserved() -> None:
@@ -4536,6 +4749,7 @@ class _LocalRuntime:
                 analysis.state = previous_state
                 analysis.started_at = previous_started_at
                 analysis.stages = previous_stages
+                analysis.runtime_status = previous_runtime_status
             raise
         if start_gate is not None:
             start_gate.set()
@@ -4831,8 +5045,17 @@ class _LocalRuntime:
             else:
                 previous_state = analysis.state
                 previous_version = analysis.version
+                previous_runtime_status = dict(analysis.runtime_status or {})
                 analysis.remote_publication = "published"
                 analysis.state = "queued"
+                _record_progress(
+                    analysis,
+                    stage="device_claim",
+                    state="waiting",
+                    summary="正在等待 Agent 领取设备采集任务",
+                    waiting_for="agent",
+                    now=datetime.now(UTC),
+                )
                 analysis.version += 1
         if canceled:
             await self._cancel_remote_publication(
@@ -4849,6 +5072,7 @@ class _LocalRuntime:
             async with self.lock:
                 analysis.remote_publication = "publishing"
                 analysis.state = previous_state
+                analysis.runtime_status = previous_runtime_status
                 analysis.version = previous_version
             raise
         await self._reject_canceled_remote_publication(
@@ -5108,6 +5332,22 @@ class _LocalRuntime:
                 raise _StaleLocalGeneration
             analysis.stages["smartperfetto"] = "completed"
             analysis.stages["perfpilot_ai"] = "running"
+            _record_progress(
+                analysis,
+                stage=("source_code" if analysis.source_binding is not None else "perfpilot_ai"),
+                state="running",
+                summary=(
+                    "正在读取并匹配源码"
+                    if analysis.source_binding is not None
+                    else "正在生成中文分析结论"
+                ),
+                waiting_for=(
+                    "source_agent"
+                    if analysis.source_binding is not None
+                    else "ai_provider"
+                ),
+                now=datetime.now(UTC),
+            )
             analysis.version += 1
         await self._persist(analysis)
 
@@ -5125,6 +5365,20 @@ class _LocalRuntime:
                 generation=generation,
             )
             source_context = await self._await_source_context(analysis, result)
+            if analysis.source_binding is not None:
+                async with self.lock:
+                    if analysis.generation != generation:
+                        raise _StaleLocalGeneration
+                    _record_progress(
+                        analysis,
+                        stage="perfpilot_ai",
+                        state="running",
+                        summary="正在生成中文分析结论",
+                        waiting_for="ai_provider",
+                        now=datetime.now(UTC),
+                    )
+                    analysis.version += 1
+                await self._persist(analysis)
             prepared = _prepare_local_report(
                 analysis,
                 result,
@@ -5176,6 +5430,19 @@ class _LocalRuntime:
         binding = analysis.source_binding
         if binding is None:
             return None
+        async with self.lock:
+            if analysis.cancel_requested_at is not None:
+                raise asyncio.CancelledError
+            _record_progress(
+                analysis,
+                stage="source_code",
+                state="running",
+                summary="正在读取并匹配源码",
+                waiting_for="source_agent",
+                now=datetime.now(UTC),
+            )
+            analysis.version += 1
+        await self._persist(analysis)
         try:
             authority = derive_source_authority(core_document)
             await self.source_tasks.create_context_task(
@@ -5189,8 +5456,12 @@ class _LocalRuntime:
         except (SourceTaskError, ValueError):
             await self._degrade_source(analysis, "source_agent_unavailable")
             return None
-        deadline = asyncio.get_running_loop().time() + self.source_wait_seconds
-        while asyncio.get_running_loop().time() < deadline:
+        deadline = (
+            None
+            if self.source_wait_seconds is None
+            else asyncio.get_running_loop().time() + self.source_wait_seconds
+        )
+        while deadline is None or asyncio.get_running_loop().time() < deadline:
             async with self.lock:
                 if analysis.cancel_requested_at is not None:
                     raise asyncio.CancelledError
@@ -5292,6 +5563,16 @@ class _LocalRuntime:
             analysis.source_rounds, analysis.source_verification = _source_metadata(
                 prepared.source_report
             )
+            _record_progress(
+                analysis,
+                stage="perfpilot_ai",
+                state="running",
+                summary="正在生成中文分析结论",
+                waiting_for="ai_provider",
+                now=datetime.now(UTC),
+            )
+            analysis.version += 1
+        await self._persist(analysis)
         await asyncio.to_thread(
             self.store.save_document,
             analysis.team_id,
@@ -5427,6 +5708,16 @@ class _LocalRuntime:
         async with self.lock:
             if analysis.generation != generation:
                 raise _StaleLocalGeneration
+            _record_progress(
+                analysis,
+                stage="report",
+                state="running",
+                summary="正在生成分析报告",
+                waiting_for="report_publish",
+                now=datetime.now(UTC),
+            )
+            analysis.version += 1
+        await self._persist(analysis)
         report = _compose_local_report(
             analysis,
             prepared,
@@ -5963,7 +6254,7 @@ def create_local_app(
     public_origin: str | None = None,
     poll_interval_seconds: float = 2.0,
     source_code_analysis_enabled: bool | None = None,
-    source_wait_seconds: float = 120.0,
+    source_wait_seconds: float | None = None,
     auto_agent_enrollment: bool | None = None,
 ) -> FastAPI:
     resolved_source_code_analysis_enabled = (

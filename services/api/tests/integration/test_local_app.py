@@ -52,6 +52,7 @@ from perfpilot_api.local_analysis_store import (
     LocalAnalysisStore,
     LocalAnalysisStoreDurabilityError,
     LocalAnalysisStoreError,
+    validate_analysis_runtime_status,
 )
 from perfpilot_api.local_agent_artifacts import LocalAgentArtifactService
 from perfpilot_api.local_control_store import LocalControlStore
@@ -3357,6 +3358,100 @@ def test_local_analysis_v13_persists_authoritative_runtime_status(
     assert restored.status_code == 200
     assert restored.json()["schema_version"] == "1.3"
     assert restored.json()["runtime_status"] == payload["runtime_status"]
+
+
+def test_local_supervisor_marks_idle_upstream_without_failing_analysis(
+    tmp_path: Path,
+) -> None:
+    gateway = _BlockingSmartPerfettoGateway(_smartperfetto_result())
+    app = create_local_app(
+        gateway=gateway,
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=60,
+    )
+    trace = b"supervised-trace"
+    checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
+    now = datetime(2026, 8, 20, 12, tzinfo=UTC)
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        created = client.post(
+            f"/v1/teams/{team_id}/analyses",
+            headers=headers,
+            json={
+                "schema_version": "1.3",
+                "analysis_mode": "trace_upload",
+                "test_type": "cold_start",
+                "package_name": "com.rivotek.mediacenter",
+                "question": None,
+                "inputs": [
+                    {
+                        "kind": "trace",
+                        "mime": "application/octet-stream",
+                        "size": len(trace),
+                        "sha256_b64": checksum,
+                    }
+                ],
+            },
+        ).json()
+        analysis_id = UUID(created["analysis_id"])
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=str(analysis_id),
+            headers=headers,
+            checksum=checksum,
+            trace=trace,
+        )
+        runtime = app.state.local_runtime
+        assert client.portal is not None
+        client.portal.call(asyncio.sleep, 0.01)
+
+        async def make_idle() -> None:
+            analysis = runtime.analyses[(UUID(team_id), analysis_id)]
+            async with runtime.lock:
+                analysis.runtime_status = validate_analysis_runtime_status(
+                    {
+                        **(analysis.runtime_status or {}),
+                        "current_stage": "smartperfetto",
+                        "stage_state": "running",
+                        "started_at": (now - timedelta(hours=1)).isoformat(),
+                        "updated_at": (now - timedelta(minutes=10)).isoformat(),
+                        "last_progress_at": (now - timedelta(minutes=10)).isoformat(),
+                        "waiting_for": "smartperfetto",
+                        "progress_summary": "正在分析 Trace",
+                    }
+                )
+            await runtime._persist(analysis)
+
+        client.portal.call(make_idle)
+        client.portal.call(runtime.supervise_activity_once, now)
+        idle = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}").json()
+
+        assert idle["state"] == "analyzing"
+        assert idle["runtime_status"]["stage_state"] == "waiting_for_upstream"
+        assert idle["runtime_status"]["waiting_for"] == "smartperfetto"
+
+        async def record_heartbeat() -> None:
+            analysis = runtime.analyses[(UUID(team_id), analysis_id)]
+            async with runtime.lock:
+                analysis.runtime_status = validate_analysis_runtime_status(
+                    {
+                        **(analysis.runtime_status or {}),
+                        "updated_at": now.isoformat(),
+                        "last_progress_at": now.isoformat(),
+                    }
+                )
+
+        client.portal.call(record_heartbeat)
+        client.portal.call(runtime.supervise_activity_once, now)
+        active = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}").json()
+
+        assert active["state"] == "analyzing"
+        assert active["runtime_status"]["stage_state"] == "running"
+        assert active["runtime_status"]["waiting_for"] is None
 
 
 def test_successful_trace_submission_removes_only_current_team_previous_analysis(
