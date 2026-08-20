@@ -12,6 +12,7 @@ import {
   type ReportMetric,
 } from "../lib/perfpilot-api";
 import { ConciseReportSummary } from "./concise-report-summary";
+import { FindingWorkbench, type TraceEvidenceTarget } from "./finding-workbench";
 import { SourceFixesPanel } from "./source-fixes-panel";
 import { SmartPerfettoOriginalReport } from "./smartperfetto-original-report";
 
@@ -23,6 +24,10 @@ interface AnalysisReportViewProps {
   readonly retrying: boolean;
   readonly teamId?: string;
   readonly client?: PerfPilotClient;
+  readonly openEvidence?: (target: TraceEvidenceTarget) => void;
+  readonly onOriginalReady?: (ready: boolean) => void;
+  readonly preloadOriginal?: boolean;
+  readonly originalPrintFallback?: boolean;
 }
 
 interface LegacyAnalysisReportViewProps extends Omit<AnalysisReportViewProps, "report"> {
@@ -159,6 +164,19 @@ function memoryMetricRank(metric: ReportMetric): number {
 }
 
 export function AnalysisReportView(props: AnalysisReportViewProps) {
+  if (props.report.schema_version === "1.3") {
+    return (
+      <FindingWorkbench
+        client={props.client ?? defaultClient}
+        openEvidence={props.openEvidence}
+        onOriginalReady={props.onOriginalReady}
+        preloadOriginal={props.preloadOriginal}
+        originalPrintFallback={props.originalPrintFallback}
+        report={props.report}
+        teamId={props.teamId}
+      />
+    );
+  }
   if (props.report.schema_version === "1.2") {
     return <SourceAwareAnalysisReportView report={props.report} teamId={props.teamId} client={props.client ?? defaultClient} />;
   }

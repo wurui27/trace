@@ -309,13 +309,23 @@ def _validate_synthesis_against_workbench(
     metric_ids = _unique_ids(workbench.get("metrics"), "metric_id")
     evidence_ids = _unique_ids(workbench.get("evidence"), "evidence_id")
     primary = workbench.get("primary_finding_ids")
+    findings = workbench.get("findings")
     conclusions = output.get("conclusions")
-    if not isinstance(primary, list) or not isinstance(conclusions, list):
+    top_findings = output.get("top_findings")
+    if not all(isinstance(value, list) for value in (primary, findings, conclusions, top_findings)):
         raise SourceAwareSemanticError
+    assert isinstance(findings, list)
+    assert isinstance(top_findings, list)
     conclusion_ids = [
         item.get("finding_id") for item in conclusions if isinstance(item, dict)
     ]
-    if conclusion_ids != primary:
+    expected_finding_ids = [
+        item.get("finding_id") for item in findings if isinstance(item, dict)
+    ]
+    top_finding_ids = [
+        item.get("finding_id") for item in top_findings if isinstance(item, dict)
+    ]
+    if conclusion_ids != expected_finding_ids or top_finding_ids != primary:
         raise SourceAwareSemanticError
     if not _string_set(output.get("key_metric_ids")).issubset(metric_ids):
         raise SourceAwareSemanticError

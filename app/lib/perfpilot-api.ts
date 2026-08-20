@@ -159,7 +159,7 @@ export interface ReportEvidence {
 export interface ReportScenario {
   readonly scenario_job_id: string;
   readonly scenario_type: "cold_start" | "startup" | "scroll" | "memory_cycle";
-  readonly result_state: "completed" | "failed" | "canceled";
+  readonly result_state: "completed" | "partially_completed" | "failed" | "canceled";
   readonly device_group_id: string | null;
   readonly device_group_reason: string | null;
   readonly bundle: {
@@ -236,6 +236,162 @@ export interface ConciseSynthesisOutput {
   readonly source_fixes: readonly Omit<SourceFix, "verification">[];
   readonly retest_plan: SynthesisOutput["retest_plan"];
   readonly limitations: SynthesisOutput["limitations"];
+}
+
+export interface FindingClaimReference {
+  readonly claim_type:
+    | "metric_over_threshold"
+    | "metric_observed"
+    | "evidence_on_critical_path"
+    | "evidence_supports_mechanism";
+  readonly metric_id: string | null;
+  readonly evidence_id: string | null;
+}
+
+export interface FindingSynthesisOutput
+  extends Omit<ConciseSynthesisOutput, "schema_version" | "conclusions"> {
+  readonly schema_version: "2.1";
+  readonly conclusions: ReadonlyArray<{
+    readonly finding_id: string;
+    readonly evidence_ids: readonly string[];
+    readonly source_ref_ids: readonly string[];
+    readonly claim_refs: readonly FindingClaimReference[];
+    readonly problem: string;
+    readonly cause: string;
+    readonly source_root_cause: string;
+    readonly recommendation: string;
+  }>;
+}
+
+export interface FindingConfidence {
+  readonly data_completeness: "complete" | "limited" | "insufficient";
+  readonly evidence_grade: "E0" | "E1" | "E2" | "E3" | "E4";
+  readonly attribution: "low" | "medium" | "high";
+  readonly statistical: "single_sample" | "limited_samples" | "supported";
+}
+
+export interface FindingWorkbenchMetric {
+  readonly metric_id: string;
+  readonly name: string;
+  readonly value: number | string | null;
+  readonly unit: string | null;
+  readonly aggregation: "single_sample" | "min" | "max" | "mean" | "median" | "p95";
+  readonly scenario_type: "startup" | "scroll" | "memory_cycle" | "other";
+  readonly source: string;
+  readonly evidence_ids: readonly string[];
+  readonly quality: "available" | "unavailable" | "not_collected";
+}
+
+export interface TraceEvidenceLocator {
+  readonly start_ns: number;
+  readonly end_ns: number;
+  readonly process: string | null;
+  readonly thread: string | null;
+  readonly track: string | null;
+  readonly slice: string | null;
+  readonly query_id: string | null;
+}
+
+export interface FindingWorkbenchEvidence {
+  readonly evidence_id: string;
+  readonly kind: "trace_interval" | "metric" | "source" | "exclusion";
+  readonly scenario_type: "startup" | "scroll" | "memory_cycle" | "other";
+  readonly metric_ids: readonly string[];
+  readonly summary: string;
+  readonly source: string;
+  readonly locator: TraceEvidenceLocator | null;
+}
+
+export interface FindingWorkbenchFinding {
+  readonly finding_id: string;
+  readonly scenario_type: "startup" | "scroll" | "memory_cycle" | "other";
+  readonly title: string;
+  readonly problem: string;
+  readonly impact: string;
+  readonly mechanism: string;
+  readonly root_cause: string;
+  readonly critical_path_contribution: number;
+  readonly priority: "p0" | "p1" | "p2" | "p3";
+  readonly priority_score: number;
+  readonly evidence_ids: readonly string[];
+  readonly metric_ids: readonly string[];
+  readonly source_ref_ids: readonly string[];
+  readonly status: "confirmed" | "hypothesis" | "resolved" | "improved" | "unchanged" | "regressed" | "new";
+  readonly confidence: FindingConfidence;
+  readonly confidence_ceiling: "high" | "medium" | "low" | "none";
+  readonly confirmed_items: readonly string[];
+  readonly unconfirmed_items: readonly string[];
+  readonly exclusions: ReadonlyArray<{
+    readonly code: string;
+    readonly status: "excluded" | "not_excluded" | "unknown";
+    readonly evidence_ids: readonly string[];
+  }>;
+  readonly engine_recommendation: string | null;
+  readonly engine_retest: string;
+  readonly retest_plan_id: string;
+}
+
+export interface FindingRetestPlan {
+  readonly retest_plan_id: string;
+  readonly finding_id: string;
+  readonly scenario_type: "startup" | "scroll" | "memory_cycle" | "other";
+  readonly package_name: string;
+  readonly duration_seconds: number;
+  readonly environment_fingerprint: string;
+  readonly metric_ids: readonly string[];
+  readonly pass_criteria: readonly string[];
+  readonly notes: string;
+}
+
+export interface FindingWorkbenchDocument {
+  readonly critical_path: ReadonlyArray<{
+    readonly segment_id: string;
+    readonly label: string;
+    readonly start_ns: number;
+    readonly end_ns: number;
+    readonly duration_ns: number;
+    readonly evidence_ids: readonly string[];
+  }>;
+  readonly metrics: readonly FindingWorkbenchMetric[];
+  readonly evidence: readonly FindingWorkbenchEvidence[];
+  readonly findings: readonly FindingWorkbenchFinding[];
+  readonly primary_finding_ids: readonly string[];
+  readonly retest_plans: readonly FindingRetestPlan[];
+}
+
+export interface ReportCapabilities {
+  readonly trace: "available" | "unavailable";
+  readonly smartperfetto: "available" | "failed";
+  readonly source: "matched" | "mismatch" | "unavailable" | "not_requested";
+  readonly ai: "available" | "deterministic_fallback";
+}
+
+export interface FindingReportQuality {
+  readonly trace_core_state: "complete" | "partial" | "unusable";
+  readonly report_validation_state: "passed" | "warning" | "failed";
+  readonly synthesis_state: "not_requested" | "queued" | "running" | "completed" | "failed";
+  readonly source_correlation_state:
+    | "not_requested"
+    | "waiting"
+    | "available_strong"
+    | "available_weak"
+    | "unavailable"
+    | "failed";
+  readonly patch_validation_state: "not_requested" | "pending" | "verified" | "failed" | "unavailable";
+  readonly reason_codes: readonly string[];
+  readonly scenarios: ReadonlyArray<{
+    readonly scenario_type: "startup" | "scroll" | "memory_cycle" | "other";
+    readonly parse_status: "parsed" | "failed" | "not_applicable";
+    readonly measurement_window_coverage: "complete" | "partial" | "missing";
+    readonly data_loss_present: boolean;
+    readonly data_loss_categories: readonly string[];
+    readonly capabilities: ReadonlyArray<{
+      readonly name: string;
+      readonly required: boolean;
+      readonly status: "available" | "unavailable" | "insufficient_data";
+      readonly reason_code: string | null;
+    }>;
+  }>;
 }
 
 export interface SourceReference {
@@ -381,7 +537,35 @@ export interface SourceAwareAnalysisReport extends AnalysisReportBase {
       };
 }
 
-export type AnalysisReport = LegacyAnalysisReport | SourceAwareAnalysisReport;
+export interface FindingWorkbenchReport extends AnalysisReportBase {
+  readonly schema_version: "1.3";
+  readonly state: "completed" | "partially_completed";
+  readonly synthesis:
+    | {
+        readonly state: "completed";
+        readonly output: FindingSynthesisOutput;
+        readonly synthesis_artifact_id: string;
+        readonly failure_code: null;
+        readonly provenance: SynthesisProvenance;
+      }
+    | {
+        readonly state: "failed";
+        readonly output: null;
+        readonly synthesis_artifact_id: null;
+        readonly failure_code: string;
+        readonly provenance: null;
+      };
+  readonly source_code?: SourceCodeReport;
+  readonly smartperfetto_original?: SmartPerfettoOriginalMetadata;
+  readonly capabilities: ReportCapabilities;
+  readonly quality: FindingReportQuality;
+  readonly workbench: FindingWorkbenchDocument;
+}
+
+export type AnalysisReport =
+  | LegacyAnalysisReport
+  | SourceAwareAnalysisReport
+  | FindingWorkbenchReport;
 
 export interface SmartPerfettoOriginalMetadata {
   readonly available: true;
@@ -1456,6 +1640,66 @@ function validConciseSynthesisOutput(value: unknown): value is ConciseSynthesisO
   );
 }
 
+function uuidArray(value: unknown, maximum: number, minimum = 0): value is string[] {
+  return (
+    stringArray(value, maximum, minimum) &&
+    new Set(value).size === value.length &&
+    value.every((item) => CANONICAL_UUID.test(item))
+  );
+}
+
+function validFindingSynthesisOutput(value: unknown): value is FindingSynthesisOutput {
+  return (
+    object(value) &&
+    exactKeys(value, [
+      "schema_version", "verdict", "executive_summary", "key_metric_ids",
+      "conclusions", "top_findings", "recommendations", "source_fixes",
+      "retest_plan", "limitations",
+    ]) &&
+    value.schema_version === "2.1" &&
+    typeof value.verdict === "string" &&
+    typeof value.executive_summary === "string" &&
+    uuidArray(value.key_metric_ids, 3) &&
+    Array.isArray(value.conclusions) &&
+    value.conclusions.length <= 128 &&
+    value.conclusions.every((conclusion) =>
+      object(conclusion) &&
+      exactKeys(conclusion, [
+        "finding_id", "evidence_ids", "source_ref_ids", "claim_refs", "problem",
+        "cause", "source_root_cause", "recommendation",
+      ]) &&
+      CANONICAL_UUID.test(String(conclusion.finding_id)) &&
+      uuidArray(conclusion.evidence_ids, 20, 1) &&
+      uuidArray(conclusion.source_ref_ids, 20) &&
+      Array.isArray(conclusion.claim_refs) &&
+      conclusion.claim_refs.length >= 1 &&
+      conclusion.claim_refs.length <= 20 &&
+      conclusion.claim_refs.every((claim) =>
+        object(claim) &&
+        exactKeys(claim, ["claim_type", "metric_id", "evidence_id"]) &&
+        [
+          "metric_over_threshold", "metric_observed", "evidence_on_critical_path",
+          "evidence_supports_mechanism",
+        ].includes(String(claim.claim_type)) &&
+        (claim.metric_id === null || CANONICAL_UUID.test(String(claim.metric_id))) &&
+        (claim.evidence_id === null || CANONICAL_UUID.test(String(claim.evidence_id))) &&
+        ((claim.metric_id === null) !== (claim.evidence_id === null))
+      ) &&
+      [
+        conclusion.problem,
+        conclusion.cause,
+        conclusion.source_root_cause,
+        conclusion.recommendation,
+      ].every((text) => typeof text === "string" && text.length >= 1 && text.length <= 2000)
+    ) &&
+    Array.isArray(value.source_fixes) &&
+    value.source_fixes.length <= 36 &&
+    value.source_fixes.every((fix) => validSourceFix(fix, false)) &&
+    uniqueSourceFixBindings(value.source_fixes) &&
+    validSynthesisItems(value)
+  );
+}
+
 function uniqueSourceFixBindings(fixes: readonly unknown[]): boolean {
   const bindings = new Set<string>();
   for (const fix of fixes) {
@@ -1586,7 +1830,294 @@ function validOriginalMetadata(value: unknown): value is SmartPerfettoOriginalMe
     /^[0-9a-f]{64}$/.test(value.sha256);
 }
 
+const WORKBENCH_SCENARIOS = ["startup", "scroll", "memory_cycle", "other"] as const;
+
+function validFindingScenario(value: unknown): value is ReportScenario {
+  if (
+    !object(value) ||
+    !exactKeys(value, [
+      "scenario_job_id", "scenario_type", "result_state", "device_group_id",
+      "device_group_reason", "bundle", "failure",
+    ]) ||
+    !CANONICAL_UUID.test(String(value.scenario_job_id)) ||
+    !["startup", "scroll", "memory_cycle"].includes(String(value.scenario_type)) ||
+    !["completed", "partially_completed", "failed", "canceled"].includes(String(value.result_state)) ||
+    (value.device_group_id !== null && !CANONICAL_UUID.test(String(value.device_group_id))) ||
+    (value.device_group_reason !== null && ![
+      "not_applicable", "not_provided", "device_unavailable", "canceled_before_assignment",
+    ].includes(String(value.device_group_reason))) ||
+    (value.device_group_id === null) === (value.device_group_reason === null) ||
+    (value.bundle !== null && !validReportBundle(value.bundle)) ||
+    (value.failure !== null && !validFailure(value.failure))
+  ) return false;
+  if (["completed", "partially_completed"].includes(String(value.result_state))) {
+    return value.bundle !== null && value.failure === null;
+  }
+  return value.bundle !== null || value.failure !== null;
+}
+
+function validFindingCapabilities(value: unknown): value is ReportCapabilities {
+  return object(value) &&
+    exactKeys(value, ["trace", "smartperfetto", "source", "ai"]) &&
+    ["available", "unavailable"].includes(String(value.trace)) &&
+    ["available", "failed"].includes(String(value.smartperfetto)) &&
+    ["matched", "mismatch", "unavailable", "not_requested"].includes(String(value.source)) &&
+    ["available", "deterministic_fallback"].includes(String(value.ai));
+}
+
+function validFindingQuality(value: unknown): value is FindingReportQuality {
+  return object(value) &&
+    exactKeys(value, [
+      "trace_core_state", "report_validation_state", "synthesis_state",
+      "source_correlation_state", "patch_validation_state", "reason_codes", "scenarios",
+    ]) &&
+    ["complete", "partial", "unusable"].includes(String(value.trace_core_state)) &&
+    ["passed", "warning", "failed"].includes(String(value.report_validation_state)) &&
+    ["not_requested", "queued", "running", "completed", "failed"].includes(String(value.synthesis_state)) &&
+    ["not_requested", "waiting", "available_strong", "available_weak", "unavailable", "failed"].includes(String(value.source_correlation_state)) &&
+    ["not_requested", "pending", "verified", "failed", "unavailable"].includes(String(value.patch_validation_state)) &&
+    stringArray(value.reason_codes, 64) &&
+    new Set(value.reason_codes).size === value.reason_codes.length &&
+    Array.isArray(value.scenarios) &&
+    value.scenarios.length <= 8 &&
+    value.scenarios.every((scenario) =>
+      object(scenario) &&
+      exactKeys(scenario, [
+        "scenario_type", "parse_status", "measurement_window_coverage",
+        "data_loss_present", "data_loss_categories", "capabilities",
+      ]) &&
+      WORKBENCH_SCENARIOS.includes(scenario.scenario_type as typeof WORKBENCH_SCENARIOS[number]) &&
+      ["parsed", "failed", "not_applicable"].includes(String(scenario.parse_status)) &&
+      ["complete", "partial", "missing"].includes(String(scenario.measurement_window_coverage)) &&
+      typeof scenario.data_loss_present === "boolean" &&
+      stringArray(scenario.data_loss_categories, 16) &&
+      new Set(scenario.data_loss_categories).size === scenario.data_loss_categories.length &&
+      Array.isArray(scenario.capabilities) &&
+      scenario.capabilities.length <= 64 &&
+      scenario.capabilities.every((capability) =>
+        object(capability) &&
+        exactKeys(capability, ["name", "required", "status", "reason_code"]) &&
+        typeof capability.name === "string" &&
+        typeof capability.required === "boolean" &&
+        ["available", "unavailable", "insufficient_data"].includes(String(capability.status)) &&
+        (capability.reason_code === null || typeof capability.reason_code === "string")
+      )
+    );
+}
+
+function validTraceLocator(value: unknown): value is TraceEvidenceLocator {
+  return object(value) &&
+    exactKeys(value, ["start_ns", "end_ns", "process", "thread", "track", "slice", "query_id"]) &&
+    Number.isSafeInteger(value.start_ns) && Number(value.start_ns) >= 0 &&
+    Number.isSafeInteger(value.end_ns) && Number(value.end_ns) >= Number(value.start_ns) &&
+    [value.process, value.thread, value.track, value.slice, value.query_id].every(
+      (item) => item === null || typeof item === "string",
+    );
+}
+
+function validFindingWorkbench(value: unknown, sourceCapability: ReportCapabilities["source"]): value is FindingWorkbenchDocument {
+  if (!object(value) || !exactKeys(value, [
+    "critical_path", "metrics", "evidence", "findings", "primary_finding_ids", "retest_plans",
+  ])) return false;
+  if (
+    !Array.isArray(value.metrics) || value.metrics.length > 256 ||
+    !Array.isArray(value.evidence) || value.evidence.length > 512 ||
+    !Array.isArray(value.findings) || value.findings.length > 128 ||
+    !Array.isArray(value.retest_plans) || value.retest_plans.length > 128 ||
+    !Array.isArray(value.critical_path) || value.critical_path.length > 64 ||
+    !uuidArray(value.primary_finding_ids, 3)
+  ) return false;
+  const metricsValid = value.metrics.every((metric) =>
+    object(metric) && exactKeys(metric, [
+      "metric_id", "name", "value", "unit", "aggregation", "scenario_type", "source",
+      "evidence_ids", "quality",
+    ]) && CANONICAL_UUID.test(String(metric.metric_id)) && typeof metric.name === "string" &&
+    (metric.value === null || typeof metric.value === "number" || typeof metric.value === "string") &&
+    (metric.unit === null || typeof metric.unit === "string") &&
+    ["single_sample", "min", "max", "mean", "median", "p95"].includes(String(metric.aggregation)) &&
+    WORKBENCH_SCENARIOS.includes(metric.scenario_type as typeof WORKBENCH_SCENARIOS[number]) &&
+    typeof metric.source === "string" && uuidArray(metric.evidence_ids, 20) &&
+    ["available", "unavailable", "not_collected"].includes(String(metric.quality))
+  );
+  const evidenceValid = value.evidence.every((evidence) =>
+    object(evidence) && exactKeys(evidence, [
+      "evidence_id", "kind", "scenario_type", "metric_ids", "summary", "source", "locator",
+    ]) && CANONICAL_UUID.test(String(evidence.evidence_id)) &&
+    ["trace_interval", "metric", "source", "exclusion"].includes(String(evidence.kind)) &&
+    WORKBENCH_SCENARIOS.includes(evidence.scenario_type as typeof WORKBENCH_SCENARIOS[number]) &&
+    uuidArray(evidence.metric_ids, 20) && typeof evidence.summary === "string" &&
+    typeof evidence.source === "string" && (evidence.locator === null || validTraceLocator(evidence.locator))
+  );
+  const findingsValid = value.findings.every((finding) =>
+    object(finding) && exactKeys(finding, [
+      "finding_id", "scenario_type", "title", "problem", "impact", "mechanism",
+      "root_cause", "critical_path_contribution", "priority", "priority_score",
+      "evidence_ids", "metric_ids", "source_ref_ids", "status", "confidence",
+      "confidence_ceiling", "confirmed_items", "unconfirmed_items", "exclusions",
+      "engine_recommendation", "engine_retest", "retest_plan_id",
+    ]) && CANONICAL_UUID.test(String(finding.finding_id)) &&
+    WORKBENCH_SCENARIOS.includes(finding.scenario_type as typeof WORKBENCH_SCENARIOS[number]) &&
+    [finding.title, finding.problem, finding.impact, finding.mechanism, finding.root_cause, finding.engine_retest].every(
+      (item) => typeof item === "string" && item.length >= 1,
+    ) && (finding.engine_recommendation === null || typeof finding.engine_recommendation === "string") &&
+    typeof finding.critical_path_contribution === "number" && finding.critical_path_contribution >= 0 && finding.critical_path_contribution <= 1 &&
+    ["p0", "p1", "p2", "p3"].includes(String(finding.priority)) &&
+    Number.isSafeInteger(finding.priority_score) && Number(finding.priority_score) >= 0 && Number(finding.priority_score) <= 100 &&
+    uuidArray(finding.evidence_ids, 20, 1) && uuidArray(finding.metric_ids, 20) && uuidArray(finding.source_ref_ids, 20) &&
+    (sourceCapability === "matched" || finding.source_ref_ids.length === 0) &&
+    ["confirmed", "hypothesis", "resolved", "improved", "unchanged", "regressed", "new"].includes(String(finding.status)) &&
+    object(finding.confidence) && exactKeys(finding.confidence, ["data_completeness", "evidence_grade", "attribution", "statistical"]) &&
+    ["complete", "limited", "insufficient"].includes(String(finding.confidence.data_completeness)) &&
+    ["E0", "E1", "E2", "E3", "E4"].includes(String(finding.confidence.evidence_grade)) &&
+    ["low", "medium", "high"].includes(String(finding.confidence.attribution)) &&
+    ["single_sample", "limited_samples", "supported"].includes(String(finding.confidence.statistical)) &&
+    ["high", "medium", "low", "none"].includes(String(finding.confidence_ceiling)) &&
+    stringArray(finding.confirmed_items, 20) && new Set(finding.confirmed_items).size === finding.confirmed_items.length &&
+    stringArray(finding.unconfirmed_items, 20) && new Set(finding.unconfirmed_items).size === finding.unconfirmed_items.length &&
+    Array.isArray(finding.exclusions) && finding.exclusions.length <= 20 && finding.exclusions.every((exclusion) =>
+      object(exclusion) && exactKeys(exclusion, ["code", "status", "evidence_ids"]) &&
+      typeof exclusion.code === "string" && ["excluded", "not_excluded", "unknown"].includes(String(exclusion.status)) &&
+      uuidArray(exclusion.evidence_ids, 20)
+    ) && CANONICAL_UUID.test(String(finding.retest_plan_id))
+  );
+  const retestsValid = value.retest_plans.every((plan) =>
+    object(plan) && exactKeys(plan, [
+      "retest_plan_id", "finding_id", "scenario_type", "package_name", "duration_seconds",
+      "environment_fingerprint", "metric_ids", "pass_criteria", "notes",
+    ]) && CANONICAL_UUID.test(String(plan.retest_plan_id)) && CANONICAL_UUID.test(String(plan.finding_id)) &&
+    WORKBENCH_SCENARIOS.includes(plan.scenario_type as typeof WORKBENCH_SCENARIOS[number]) &&
+    typeof plan.package_name === "string" && Number.isSafeInteger(plan.duration_seconds) &&
+    Number(plan.duration_seconds) >= 1 && Number(plan.duration_seconds) <= 3600 &&
+    /^sha256:[a-f0-9]{64}$/.test(String(plan.environment_fingerprint)) && uuidArray(plan.metric_ids, 20, 1) &&
+    stringArray(plan.pass_criteria, 20, 1) && new Set(plan.pass_criteria).size === plan.pass_criteria.length &&
+    typeof plan.notes === "string"
+  );
+  const criticalPathValid = value.critical_path.every((segment) =>
+    object(segment) && exactKeys(segment, ["segment_id", "label", "start_ns", "end_ns", "duration_ns", "evidence_ids"]) &&
+    CANONICAL_UUID.test(String(segment.segment_id)) && typeof segment.label === "string" &&
+    Number.isSafeInteger(segment.start_ns) && Number(segment.start_ns) >= 0 &&
+    Number.isSafeInteger(segment.end_ns) && Number(segment.end_ns) >= Number(segment.start_ns) &&
+    Number.isSafeInteger(segment.duration_ns) && Number(segment.duration_ns) === Number(segment.end_ns) - Number(segment.start_ns) &&
+    uuidArray(segment.evidence_ids, 20, 1)
+  );
+  if (!metricsValid || !evidenceValid || !findingsValid || !retestsValid || !criticalPathValid) return false;
+
+  const workbench = value as unknown as FindingWorkbenchDocument;
+  const metricIds = new Set(workbench.metrics.map((item) => item.metric_id));
+  const evidenceIds = new Set(workbench.evidence.map((item) => item.evidence_id));
+  const findingIds = new Set(workbench.findings.map((item) => item.finding_id));
+  const retestById = new Map(workbench.retest_plans.map((item) => [item.retest_plan_id, item]));
+  if (metricIds.size !== workbench.metrics.length || evidenceIds.size !== workbench.evidence.length || findingIds.size !== workbench.findings.length || retestById.size !== workbench.retest_plans.length) return false;
+  if (workbench.metrics.some((item) => item.evidence_ids.some((id) => !evidenceIds.has(id))) ||
+      workbench.evidence.some((item) => item.metric_ids.some((id) => !metricIds.has(id))) ||
+      workbench.critical_path.some((item) => item.evidence_ids.some((id) => !evidenceIds.has(id)))) return false;
+  const sorted = [...workbench.findings].sort((left, right) => right.priority_score - left.priority_score || left.finding_id.localeCompare(right.finding_id));
+  if (sorted.some((item, index) => item.finding_id !== workbench.findings[index]?.finding_id)) return false;
+  const eligiblePrimary = workbench.findings
+    .filter((item) => item.status === "confirmed" && ["p0", "p1"].includes(item.priority))
+    .slice(0, 3)
+    .map((item) => item.finding_id);
+  if (eligiblePrimary.join("\0") !== workbench.primary_finding_ids.join("\0")) return false;
+  return workbench.findings.every((finding) => {
+    const plan = retestById.get(finding.retest_plan_id);
+    return finding.evidence_ids.every((id) => evidenceIds.has(id)) &&
+      finding.metric_ids.every((id) => metricIds.has(id)) &&
+      plan?.finding_id === finding.finding_id &&
+      plan.metric_ids.every((id) => metricIds.has(id));
+  });
+}
+
+function validFindingReportSemantics(value: Record<string, unknown>): boolean {
+  if (!validFindingCapabilities(value.capabilities) || !validFindingQuality(value.quality) ||
+      !validFindingWorkbench(value.workbench, value.capabilities.source)) return false;
+  const workbench = value.workbench;
+  const quality = value.quality;
+  const expectedSourceState = {
+    matched: "available_strong", mismatch: "available_weak", unavailable: "unavailable",
+    not_requested: "not_requested",
+  }[value.capabilities.source];
+  if (quality.source_correlation_state !== expectedSourceState || quality.synthesis_state !== "completed") return false;
+  if ((value.state === "completed") !== (quality.trace_core_state === "complete")) return false;
+  if (value.state === "completed" && quality.report_validation_state !== "passed") return false;
+  if (!object(value.synthesis) || !exactKeys(value.synthesis, [
+    "state", "output", "synthesis_artifact_id", "failure_code", "provenance",
+  ])) return false;
+  const synthesis = value.synthesis;
+  if (synthesis.state !== "completed" || !validFindingSynthesisOutput(synthesis.output) ||
+      !CANONICAL_UUID.test(String(synthesis.synthesis_artifact_id)) || synthesis.failure_code !== null ||
+      !validSynthesisProvenance(synthesis.provenance)) return false;
+  const output = synthesis.output;
+  const source = value.source_code;
+  if (value.capabilities.source === "matched") {
+    if (
+      !validSourceCodeReport(source) ||
+      !source.requested ||
+      source.context_state !== "available" ||
+      source.match_summary !== "strong"
+    ) return false;
+    const sourceRefIds = new Set(source.source_refs.map((item) => item.source_ref_id));
+    if (
+      sourceRefIds.size === 0 ||
+      workbench.findings.some((finding) =>
+        finding.source_ref_ids.some((id) => !sourceRefIds.has(id))) ||
+      output.source_fixes.some((fix) =>
+        fix.source_ref_ids.some((id) => !sourceRefIds.has(id)))
+    ) return false;
+  } else {
+    if (
+      workbench.findings.some((finding) => finding.source_ref_ids.length > 0) ||
+      output.source_fixes.length > 0
+    ) return false;
+    if (value.capabilities.source === "mismatch") {
+      if (!validSourceCodeReport(source) || !source.requested ||
+          source.context_state !== "available" || source.match_summary !== "weak") return false;
+    } else if (value.capabilities.source === "unavailable") {
+      if (source !== undefined && (!validSourceCodeReport(source) || !source.requested ||
+          source.context_state === "available" || source.match_summary !== "none")) return false;
+    } else if (source !== undefined && (!validSourceCodeReport(source) || source.requested ||
+        source.context_state !== "not_requested" || source.match_summary !== "none")) return false;
+  }
+  const findingById = new Map(workbench.findings.map((item) => [item.finding_id, item]));
+  if (output.conclusions.map((item) => item.finding_id).join("\0") !== workbench.findings.map((item) => item.finding_id).join("\0")) return false;
+  if (output.top_findings.map((item) => item.finding_id).join("\0") !== workbench.primary_finding_ids.join("\0")) return false;
+  const metricIds = new Set(workbench.metrics.map((item) => item.metric_id));
+  const evidenceIds = new Set(workbench.evidence.map((item) => item.evidence_id));
+  if (output.key_metric_ids.some((id) => !metricIds.has(id))) return false;
+  for (const conclusion of output.conclusions) {
+    const finding = findingById.get(conclusion.finding_id);
+    if (!finding || conclusion.evidence_ids.join("\0") !== finding.evidence_ids.join("\0") ||
+        conclusion.source_ref_ids.join("\0") !== finding.source_ref_ids.join("\0")) return false;
+    for (const claim of conclusion.claim_refs) {
+      if (claim.metric_id !== null && (!metricIds.has(claim.metric_id) || !finding.metric_ids.includes(claim.metric_id))) return false;
+      if (claim.evidence_id !== null && (!evidenceIds.has(claim.evidence_id) || !finding.evidence_ids.includes(claim.evidence_id))) return false;
+    }
+  }
+  return true;
+}
+
 function analysisReportResponse(value: unknown): AnalysisReport {
+  if (object(value) && value.schema_version === "1.3") {
+    const validTopLevel =
+      !containsPrivateTransportData(value, true) &&
+      exactKeys(value, [
+        "schema_version", "analysis_id", "analysis_mode", "state", "report_version",
+        "generated_at", "scenario_reports", "synthesis", "source_code",
+        "smartperfetto_original", "capabilities", "quality", "workbench",
+      ]) &&
+      CANONICAL_UUID.test(String(value.analysis_id)) &&
+      ["device", "trace_upload"].includes(String(value.analysis_mode)) &&
+      ["completed", "partially_completed"].includes(String(value.state)) &&
+      Number.isSafeInteger(value.report_version) && Number(value.report_version) >= 1 &&
+      typeof value.generated_at === "string" && !Number.isNaN(Date.parse(value.generated_at)) &&
+      Array.isArray(value.scenario_reports) && value.scenario_reports.length >= 1 &&
+      value.scenario_reports.length <= 3 && value.scenario_reports.every(validFindingScenario) &&
+      (value.source_code === undefined || validSourceCodeReport(value.source_code)) &&
+      (value.smartperfetto_original === undefined || validOriginalMetadata(value.smartperfetto_original));
+    if (!validTopLevel || !validFindingReportSemantics(value)) {
+      throw new PerfPilotApiError("invalid_api_response", "服务返回内容无效", false, null);
+    }
+    return value as unknown as FindingWorkbenchReport;
+  }
   const sourceAware = object(value) && value.schema_version === "1.2";
   if (
     !object(value) ||

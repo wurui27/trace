@@ -3,6 +3,7 @@
 import { ArrowLeft, CheckCircle2, Download } from "lucide-react";
 import Link from "next/link";
 import { useEffect, useRef, useState } from "react";
+import { flushSync } from "react-dom";
 
 import { completedAiProcessCopy } from "../lib/analysis-ai-status";
 import { createRandomUuid } from "../lib/perfpilot-api";
@@ -48,7 +49,12 @@ export function FullAnalysisReport({
   const [snapshot, setSnapshot] = useState<ReportSnapshot | null>(null);
   const [retrying, setRetrying] = useState(false);
   const [printSupported, setPrintSupported] = useState<boolean | null>(null);
+  const [preparingPrint, setPreparingPrint] = useState(false);
+  const [preloadOriginal, setPreloadOriginal] = useState(false);
+  const [originalPrintFallback, setOriginalPrintFallback] = useState(false);
   const retryController = useRef<AbortController | null>(null);
+  const originalReady = useRef(false);
+  const originalWaiter = useRef<((ready: boolean) => void) | null>(null);
   const requestKey = `${analysisId}:${attempt}`;
 
   useEffect(() => {
@@ -68,6 +74,8 @@ export function FullAnalysisReport({
   useEffect(
     () => () => {
       retryController.current?.abort();
+      originalWaiter.current?.(false);
+      originalWaiter.current = null;
     },
     [analysisId],
   );
@@ -138,6 +146,7 @@ export function FullAnalysisReport({
   );
   const hasMemoryScenario = memoryScenario !== undefined;
   const memoryComplete = memoryScenario?.result_state === "completed";
+  const findingWorkbenchComplete = report.schema_version === "1.3";
   const smartPerfettoSummary =
     sourceRounds === null || sourceRounds === undefined
       ? "SmartPerfetto 已完成"
@@ -157,8 +166,42 @@ export function FullAnalysisReport({
     }
   };
 
-  const printReport = (): void => {
-    printer(analysisId);
+  const handleOriginalReady = (ready: boolean): void => {
+    originalReady.current = ready;
+    originalWaiter.current?.(ready);
+    originalWaiter.current = null;
+  };
+
+  const printReport = async (): Promise<void> => {
+    if (preparingPrint) return;
+    setPreparingPrint(true);
+    try {
+      if (report.schema_version === "1.3" && report.smartperfetto_original) {
+        originalReady.current = false;
+        flushSync(() => {
+          setOriginalPrintFallback(false);
+          setPreloadOriginal(true);
+        });
+        const ready = await new Promise<boolean>((resolve) => {
+          if (originalReady.current) {
+            resolve(true);
+            return;
+          }
+          const timeout = window.setTimeout(() => {
+            originalWaiter.current = null;
+            resolve(false);
+          }, 3000);
+          originalWaiter.current = (value) => {
+            window.clearTimeout(timeout);
+            resolve(value);
+          };
+        });
+        if (!ready) flushSync(() => setOriginalPrintFallback(true));
+      }
+      printer(analysisId);
+    } finally {
+      setPreparingPrint(false);
+    }
   };
 
   return (
@@ -182,8 +225,8 @@ export function FullAnalysisReport({
           <button
             aria-describedby={printSupported === false ? "report-print-unavailable" : undefined}
             className="final-report-download"
-            disabled={printSupported !== true}
-            onClick={printReport}
+            disabled={printSupported !== true || preparingPrint}
+            onClick={() => void printReport()}
             type="button"
           >
             <Download aria-hidden="true" />
@@ -207,9 +250,13 @@ export function FullAnalysisReport({
             <p className="section-label">ANDROID PERFORMANCE REPORT</p>
             <div className="final-report-title-row">
               <h1 id="final-report-title">最终性能报告</h1>
-              <span className={`is-${report.state}`}>
+              <span className={findingWorkbenchComplete ? "is-completed" : `is-${report.state}`}>
                 <CheckCircle2 aria-hidden="true" />
-                {report.state === "completed" ? "结论完整" : "部分结论"}
+                {findingWorkbenchComplete
+                  ? "分析完成"
+                  : report.state === "completed"
+                    ? "结论完整"
+                    : "部分结论"}
               </span>
             </div>
             <p>
@@ -281,7 +328,10 @@ export function FullAnalysisReport({
           report={report}
           teamId={analysis.team_id}
           client={client}
+          onOriginalReady={handleOriginalReady}
           onRetrySynthesis={retrySynthesis}
+          originalPrintFallback={originalPrintFallback}
+          preloadOriginal={preloadOriginal}
           retrying={retrying}
         />
       </main>

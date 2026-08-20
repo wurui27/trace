@@ -4077,6 +4077,562 @@ fieldset.new-analysis-field {
   margin-top: 14px;
 }
 
+.finding-workbench {
+  min-height: 720px;
+  display: grid;
+  grid-template-columns: 224px minmax(0, 1fr);
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.finding-workbench-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 18px 12px;
+  border-right: 1px solid #dbe6f3;
+  background: #f7faff;
+}
+
+.finding-workbench-nav-title {
+  display: grid;
+  gap: 2px;
+  padding: 3px 10px 17px;
+  margin-bottom: 6px;
+  border-bottom: 1px solid var(--border);
+}
+
+.finding-workbench-nav-title strong {
+  font-size: 14px;
+}
+
+.finding-workbench-nav-title span,
+.finding-section-heading > span {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.finding-workbench-nav > button {
+  min-height: 42px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 10px;
+  border: 0;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 12px;
+  font-weight: 700;
+  text-align: left;
+  cursor: pointer;
+}
+
+.finding-workbench-nav > button > span {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #adbbca;
+}
+
+.finding-workbench-nav > button[aria-selected="true"] {
+  background: #eaf2ff;
+  color: var(--primary-dark);
+}
+
+.finding-workbench-nav > button[aria-selected="true"] > span {
+  background: var(--primary);
+}
+
+.finding-workbench-content,
+.finding-workbench-content > [role="tabpanel"] {
+  min-width: 0;
+}
+
+.finding-workbench-content > [role="tabpanel"] {
+  padding: 28px 30px 36px;
+}
+
+.finding-overview,
+.finding-list-region,
+.finding-evidence-panel,
+.finding-source-panel,
+.finding-retest-panel {
+  display: grid;
+  gap: 24px;
+}
+
+.finding-overview-hero,
+.finding-section-heading,
+.finding-detail-heading,
+.finding-source-fixes header,
+.finding-retest-list header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 20px;
+}
+
+.finding-overview-hero h2,
+.finding-section-heading h2,
+.finding-section-heading h3 {
+  margin: 5px 0 0;
+  letter-spacing: -0.025em;
+}
+
+.finding-overview-hero > div > p:last-child {
+  max-width: 760px;
+  margin: 12px 0 0;
+  color: var(--text-secondary);
+  font-size: 15px;
+}
+
+.finding-status {
+  min-height: 30px;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 780;
+}
+
+.finding-status.is-completed {
+  background: var(--success-soft);
+  color: var(--success);
+}
+
+.finding-capabilities,
+.finding-confidence,
+.finding-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin: 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--border);
+  gap: 1px;
+}
+
+.finding-capabilities > div,
+.finding-confidence > div,
+.finding-metric-grid > div {
+  min-width: 0;
+  padding: 13px 14px;
+  background: var(--surface);
+}
+
+.finding-capabilities dt,
+.finding-confidence dt,
+.finding-metric-grid dt,
+.finding-evidence-list dt,
+.finding-retest-list dt {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.finding-capabilities dd,
+.finding-confidence dd,
+.finding-metric-grid dd,
+.finding-evidence-list dd,
+.finding-retest-list dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-size: 12px;
+  font-weight: 720;
+}
+
+.finding-critical-path {
+  padding: 18px;
+  border: 1px solid #cbdcf7;
+  border-radius: var(--radius-md);
+  background: #f8fbff;
+}
+
+.finding-critical-path ol,
+.finding-list-items,
+.finding-evidence-list,
+.finding-source-fixes,
+.finding-manual-actions,
+.finding-retest-list {
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.finding-critical-path li {
+  min-height: 48px;
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.finding-critical-path li:last-child {
+  border-bottom: 0;
+}
+
+.finding-critical-path li > span {
+  width: 8px;
+  height: 100%;
+  min-height: 30px;
+  border-radius: 3px;
+  background: var(--primary);
+}
+
+.finding-critical-path li div {
+  display: grid;
+}
+
+.finding-critical-path small,
+.finding-list-items small,
+.finding-source-fixes small,
+.finding-metric-grid small {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.finding-critical-path b {
+  color: var(--primary-dark);
+  font: 750 13px var(--font-geist-mono), monospace;
+}
+
+.finding-overview-primary {
+  display: grid;
+  gap: 12px;
+}
+
+.finding-detail {
+  padding: 19px 20px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background: var(--surface);
+}
+
+.finding-detail-heading > div {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.finding-detail-heading h3 {
+  flex: 1;
+  margin: 0;
+  font-size: 15px;
+}
+
+.finding-detail-heading > p {
+  max-width: 320px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 11px;
+  text-align: right;
+}
+
+.finding-priority {
+  min-width: 30px;
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 5px;
+  background: var(--primary-soft);
+  color: var(--primary-dark);
+  font: 800 10px var(--font-geist-mono), monospace;
+}
+
+.finding-priority.is-p0 {
+  background: var(--danger-soft);
+  color: var(--danger);
+}
+
+.finding-priority.is-p1 {
+  background: var(--warning-soft);
+  color: var(--warning);
+}
+
+.finding-diagnostic-chain {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 17px 0 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--border);
+}
+
+.finding-diagnostic-chain > div {
+  min-width: 0;
+  padding: 15px;
+  background: #fbfcff;
+}
+
+.finding-diagnostic-chain dt {
+  color: var(--primary-dark);
+  font-size: 11px;
+  font-weight: 780;
+}
+
+.finding-diagnostic-chain dd {
+  margin: 7px 0 0;
+  color: var(--text-secondary);
+  line-height: 1.65;
+  white-space: pre-wrap;
+}
+
+.finding-confidence {
+  margin-top: 12px;
+}
+
+.finding-boundary,
+.finding-additional {
+  margin-top: 12px;
+}
+
+.finding-boundary summary,
+.finding-additional > summary {
+  color: var(--primary-dark);
+  font-size: 11px;
+  font-weight: 730;
+  cursor: pointer;
+}
+
+.finding-additional > div {
+  margin-top: 12px;
+}
+
+.finding-filters {
+  display: flex;
+  gap: 12px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: #fbfcff;
+}
+
+.finding-filters label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-muted);
+  font-size: 11px;
+}
+
+.finding-filters select {
+  min-height: 34px;
+  padding: 0 28px 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+.finding-list-layout {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.38fr) minmax(0, 1fr);
+  gap: 18px;
+}
+
+.finding-list-items {
+  display: grid;
+  align-content: start;
+  gap: 6px;
+}
+
+.finding-list-items button {
+  width: 100%;
+  min-height: 58px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 3px 10px;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  text-align: left;
+  cursor: pointer;
+}
+
+.finding-list-items button[aria-current="true"] {
+  border-color: #a9c4f7;
+  background: var(--primary-soft);
+}
+
+.finding-list-items strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.finding-list-items small {
+  grid-column: 2;
+}
+
+.finding-metric-grid {
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+}
+
+.finding-metric-grid dd {
+  font: 760 17px var(--font-geist-mono), monospace;
+}
+
+.finding-evidence-list,
+.finding-source-fixes,
+.finding-retest-list {
+  display: grid;
+  gap: 10px;
+}
+
+.finding-evidence-list > li,
+.finding-source-fixes > li,
+.finding-retest-list > li,
+.finding-manual-actions > li {
+  padding: 16px 17px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+}
+
+.finding-evidence-list > li {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.finding-evidence-list p,
+.finding-source-panel p,
+.finding-retest-list p {
+  color: var(--text-secondary);
+}
+
+.finding-evidence-list dl,
+.finding-retest-list dl {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 18px;
+  margin: 10px 0 0;
+}
+
+.finding-evidence-list button {
+  align-self: center;
+  padding: 0 13px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-sm);
+  background: var(--surface);
+  color: var(--primary-dark);
+  font-size: 11px;
+  font-weight: 740;
+  cursor: pointer;
+}
+
+.finding-evidence-unlocated {
+  color: var(--warning) !important;
+  font-size: 11px;
+}
+
+.finding-reference-notice {
+  margin: 0;
+  padding: 10px 13px;
+  border-left: 3px solid var(--primary);
+  background: var(--primary-soft);
+  font-weight: 730;
+}
+
+.finding-source-fixes header > div,
+.finding-retest-list header > div {
+  display: grid;
+}
+
+.finding-source-fixes pre {
+  max-height: 420px;
+  margin: 12px 0;
+  padding: 14px;
+  overflow: auto;
+  border: 1px solid #d7e2ef;
+  border-radius: var(--radius-sm);
+  background: #0f1c2a;
+  color: #dce9f7;
+  font: 11px/1.65 var(--font-geist-mono), monospace;
+}
+
+.finding-retest-list header code {
+  color: var(--primary-dark);
+}
+
+.finding-retest-list code {
+  overflow-wrap: anywhere;
+  font-size: 10px;
+}
+
+.finding-empty {
+  padding: 24px;
+  border: 1px dashed var(--border-strong);
+  border-radius: var(--radius-sm);
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.trace-evidence-locator {
+  width: min(920px, calc(100vw - 48px));
+  margin: 48px auto;
+  padding: 30px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.trace-evidence-locator h1 {
+  margin: 6px 0 0;
+  font-size: 24px;
+}
+
+.trace-evidence-locator > p:not(.section-label) {
+  color: var(--text-secondary);
+}
+
+.trace-evidence-locator dl {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1px;
+  margin: 20px 0;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  background: var(--border);
+}
+
+.trace-evidence-locator dl > div {
+  padding: 13px;
+  background: var(--surface);
+}
+
+.trace-evidence-locator dt {
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.trace-evidence-locator dd {
+  margin: 4px 0 0;
+  overflow-wrap: anywhere;
+  font-family: var(--font-geist-mono), monospace;
+}
+
+.trace-evidence-locator button {
+  padding: 0 14px;
+  border: 1px solid var(--primary);
+  border-radius: var(--radius-sm);
+  background: var(--primary);
+  color: var(--surface);
+  font-weight: 740;
+  cursor: pointer;
+}
+
 .smartperfetto-original-actions {
   display: flex;
   align-items: center;
@@ -4173,6 +4729,44 @@ fieldset.new-analysis-field {
 
   [data-report-printing="true"] [data-report-layer="original"] {
     display: none !important;
+  }
+
+  [data-report-printing="true"] .finding-workbench {
+    display: block;
+    border: 0;
+    box-shadow: none;
+  }
+
+  [data-report-printing="true"] .finding-workbench-nav {
+    display: none !important;
+  }
+
+  [data-report-printing="true"] .finding-workbench-content > [data-report-layer] {
+    display: block !important;
+    padding: 20px 0;
+    border-bottom: 1px solid var(--border-strong);
+  }
+
+  [data-report-printing="true"] .finding-workbench [data-report-layer="original"] {
+    display: block !important;
+  }
+
+  [data-report-printing="true"] .finding-additional > :not(summary),
+  [data-report-printing="true"] .finding-boundary > :not(summary) {
+    display: block !important;
+  }
+
+  [data-report-printing="true"] .finding-additional > summary,
+  [data-report-printing="true"] .finding-boundary > summary {
+    display: none;
+  }
+
+  .finding-detail,
+  .finding-evidence-list > li,
+  .finding-source-fixes > li,
+  .finding-retest-list > li {
+    break-inside: avoid;
+    page-break-inside: avoid;
   }
 }
 

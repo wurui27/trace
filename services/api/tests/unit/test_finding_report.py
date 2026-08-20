@@ -90,3 +90,43 @@ def test_composer_marks_deterministic_fallback_without_partial_state() -> None:
 
     assert result["state"] == "completed"
     assert result["capabilities"]["ai"] == "deterministic_fallback"
+
+
+def test_composer_preserves_non_primary_finding_conclusions() -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+    from perfpilot_api.reports.contracts import canonical_json_bytes
+    from perfpilot_api.reports.finding_report import compose_finding_report
+    from perfpilot_api.reports.projection import AIProjection
+
+    projection = _load("analysis-projection-v2.1.valid.json")
+    workbench = projection["workbench"]
+    finding = deepcopy(workbench["findings"][0])
+    finding["finding_id"] = "85000000-0000-4000-8000-000000000002"
+    finding["title"] = "次要启动问题"
+    finding["priority"] = "p2"
+    finding["priority_score"] = 50
+    finding["retest_plan_id"] = "89000000-0000-4000-8000-000000000002"
+    workbench["findings"].append(finding)
+    retest = deepcopy(workbench["retest_plans"][0])
+    retest["retest_plan_id"] = finding["retest_plan_id"]
+    retest["finding_id"] = finding["finding_id"]
+    workbench["retest_plans"].append(retest)
+    payload = canonical_json_bytes(projection)
+    synthesis = build_deterministic_finding_synthesis(
+        AIProjection(canonical_bytes=payload, sha256_b64="Y2hlY2tzdW0=")
+    )
+
+    result = compose_finding_report(
+        base_report=_base_report(),
+        projection=projection,
+        synthesis=synthesis.document,
+        report_version=3,
+        ai_mode="deterministic_fallback",
+    )
+
+    assert [item["finding_id"] for item in result["synthesis"]["output"]["conclusions"]] == [
+        item["finding_id"] for item in result["workbench"]["findings"]
+    ]
+    assert result["workbench"]["primary_finding_ids"] == [
+        "85000000-0000-4000-8000-000000000001"
+    ]

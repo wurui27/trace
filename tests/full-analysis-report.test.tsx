@@ -1,9 +1,10 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import analysisReportV13Example from "../contracts/v1/examples/analysis-report-v1.3.valid.json";
 import { FullAnalysisReport } from "../app/components/full-analysis-report";
 import type {
   AnalysisReport,
@@ -101,6 +102,56 @@ const report: AnalysisReport = {
 };
 
 describe("FullAnalysisReport", () => {
+  it("preloads the original HTML and prints every Finding workbench region", async () => {
+    const findingReport = structuredClone(analysisReportV13Example) as Record<string, unknown>;
+    findingReport.smartperfetto_original = {
+      available: true,
+      artifact_id: "92000000-0000-4000-8000-000000000001",
+      version: 2,
+      mime: "text/html",
+      size: 128,
+      sha256: "a".repeat(64),
+    };
+    const loader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({
+        teamId: "team-1",
+        analysis,
+        report: findingReport as unknown as AnalysisReport,
+        reportLoadFailed: false,
+      });
+    });
+    const client = {
+      smartPerfettoOriginalUrl: vi.fn(() => "/original.html"),
+      smartPerfettoOriginalDownloadUrl: vi.fn(() => "/original.html?download=true"),
+    } as unknown as PerfPilotClient;
+    const printer = vi.fn(() => {
+      for (const layer of ["overview", "findings", "evidence", "source", "original", "retest"]) {
+        expect(document.querySelector(`[data-report-layer="${layer}"]`)).not.toBeNull();
+      }
+      expect(screen.getByTitle("SmartPerfetto 原始 HTML 报告")).toBeInTheDocument();
+      return true;
+    });
+
+    const { container } = render(
+      <FullAnalysisReport
+        analysisId="analysis-live-1"
+        client={client}
+        loader={loader}
+        printer={printer}
+      />,
+    );
+    await screen.findAllByText("分析完成");
+    expect(container.querySelector(".final-report-title-row .is-completed")).toHaveTextContent("分析完成");
+    const button = await screen.findByRole("button", { name: "下载 PDF" });
+    const clicked = userEvent.setup().click(button);
+    const frame = await screen.findByTitle("SmartPerfetto 原始 HTML 报告");
+    fireEvent.load(frame);
+    await clicked;
+
+    expect(client.smartPerfettoOriginalUrl).toHaveBeenCalledOnce();
+    expect(printer).toHaveBeenCalledOnce();
+  });
+
   it("prints only the PerfPilot report without loading or rewriting the original HTML", async () => {
     const sourceAwareReport = {
       ...report,

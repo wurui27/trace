@@ -1,5 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 
+import analysisReportV13Example from "../contracts/v1/examples/analysis-report-v1.3.valid.json";
+
 import {
   createRandomUuid,
   createPerfPilotClient,
@@ -143,6 +145,10 @@ function reportPayload(): Record<string, unknown> {
       },
     },
   };
+}
+
+function findingWorkbenchReportPayload(): Record<string, unknown> {
+  return structuredClone(analysisReportV13Example) as Record<string, unknown>;
 }
 
 function sourceAwareReportPayload(): Record<string, unknown> {
@@ -1441,6 +1447,62 @@ describe("PerfPilot browser API", () => {
     await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
       code: "invalid_api_response",
     });
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
+  it("accepts a closed AnalysisReport 1.3 finding workbench", async () => {
+    const fetcher = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(Response.json(findingWorkbenchReportPayload()));
+    const client = createPerfPilotClient({ fetcher });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      schema_version: "1.3",
+      capabilities: { source: "not_requested" },
+      synthesis: { state: "completed", output: { schema_version: "2.1" } },
+      workbench: {
+        primary_finding_ids: ["85000000-0000-4000-8000-000000000001"],
+      },
+    });
+  });
+
+  it.each(["private_path", "repo_url", "remote", "argv"])(
+    "rejects private top-level field %s in AnalysisReport 1.3",
+    async (field) => {
+      const response = { ...findingWorkbenchReportPayload(), [field]: "private-marker" };
+      const client = createPerfPilotClient({
+        fetcher: vi.fn<typeof fetch>().mockResolvedValue(Response.json(response)),
+      });
+
+      await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+        code: "invalid_api_response",
+      });
+    },
+  );
+
+  it("rejects semantically open AnalysisReport 1.3 workbench references", async () => {
+    const response = findingWorkbenchReportPayload();
+    const workbench = response.workbench as Record<string, unknown>;
+    workbench.primary_finding_ids = ["85000000-0000-4000-8000-000000000099"];
+    const client = createPerfPilotClient({
+      fetcher: vi.fn<typeof fetch>().mockResolvedValue(Response.json(response)),
+    });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
+      code: "invalid_api_response",
+    });
+  });
+
+  it("rejects a claimed strong source match without a validated public source document", async () => {
+    const response = findingWorkbenchReportPayload();
+    (response.capabilities as Record<string, unknown>).source = "matched";
+    (response.quality as Record<string, unknown>).source_correlation_state = "available_strong";
+    const client = createPerfPilotClient({
+      fetcher: vi.fn<typeof fetch>().mockResolvedValue(Response.json(response)),
+    });
+
     await expect(client.report(TEAM_ID, ANALYSIS_ID)).rejects.toMatchObject({
       code: "invalid_api_response",
     });

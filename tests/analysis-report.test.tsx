@@ -4,6 +4,7 @@ import { cleanup, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import analysisReportV13Example from "../contracts/v1/examples/analysis-report-v1.3.valid.json";
 import { AnalysisReportView } from "../app/components/analysis-report";
 import type { AnalysisReport, ReportFinding } from "../app/lib/perfpilot-api";
 
@@ -346,7 +347,212 @@ function sourceActionReport(): AnalysisReport {
   };
 }
 
+function findingWorkbenchReport(): Extract<AnalysisReport, { readonly schema_version: "1.3" }> {
+  return structuredClone(analysisReportV13Example) as unknown as Extract<
+    AnalysisReport,
+    { readonly schema_version: "1.3" }
+  >;
+}
+
+function findingWorkbenchReportWithSixFindings(): Extract<AnalysisReport, { readonly schema_version: "1.3" }> {
+  const base = structuredClone(analysisReportV13Example);
+  const template = base.workbench.findings[0];
+  const conclusion = base.synthesis.output.conclusions[0];
+  const retest = base.workbench.retest_plans[0];
+  base.workbench.findings = Array.from({ length: 6 }, (_, index) => ({
+    ...structuredClone(template),
+    finding_id: FINDING_IDS[index],
+    title: `问题 ${index + 1}`,
+    priority: index < 2 ? "p0" : index === 2 ? "p1" : "p2",
+    priority_score: 96 - index,
+    retest_plan_id: `89000000-0000-4000-8000-${String(index + 1).padStart(12, "0")}`,
+  }));
+  base.workbench.primary_finding_ids = FINDING_IDS.slice(0, 3);
+  base.workbench.retest_plans = base.workbench.findings.map((finding: Record<string, unknown>) => ({
+    ...structuredClone(retest),
+    retest_plan_id: finding.retest_plan_id,
+    finding_id: finding.finding_id,
+  }));
+  base.synthesis.output.conclusions = base.workbench.findings.map((finding: Record<string, unknown>, index: number) => ({
+    ...structuredClone(conclusion),
+    finding_id: finding.finding_id,
+    problem: `问题点 ${index + 1}`,
+    cause: `问题原因 ${index + 1}`,
+    source_root_cause: `源码判断 ${index + 1}`,
+    recommendation: `修改建议 ${index + 1}`,
+  }));
+  base.synthesis.output.top_findings = base.synthesis.output.top_findings.concat(
+    FINDING_IDS.slice(1, 3).map((findingId, index) => ({
+      ...base.synthesis.output.top_findings[0],
+      finding_id: findingId,
+      user_impact: `主要影响 ${index + 2}`,
+    })),
+  );
+  return base as unknown as Extract<AnalysisReport, { readonly schema_version: "1.3" }>;
+}
+
 describe("AnalysisReportView", () => {
+  it("dispatches AnalysisReport 1.3 to the six-region Finding workbench", () => {
+    render(
+      <AnalysisReportView
+        report={findingWorkbenchReport()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    expect(screen.getByRole("tablist", { name: "Finding 工作台" })).toBeVisible();
+    for (const label of [
+      "概览",
+      "问题清单",
+      "证据与指标",
+      "源码与优化",
+      "SmartPerfetto 原始报告",
+      "复测计划",
+    ]) {
+      expect(screen.getByRole("tab", { name: label })).toBeVisible();
+    }
+    expect(screen.getByText("分析完成")).toHaveClass("is-completed");
+    expect(screen.queryByRole("tab", { name: "技术附录" })).not.toBeInTheDocument();
+  });
+
+  it("renders the server-owned critical path and four-part Finding diagnosis", () => {
+    render(
+      <AnalysisReportView
+        report={findingWorkbenchReport()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    expect(screen.getByText("Application 初始化")).toBeVisible();
+    expect(screen.getByText("190 ms")).toBeVisible();
+    const overview = screen.getByRole("tabpanel");
+    for (const label of [
+      "1. 问题点",
+      "2. 为什么会有这个问题",
+      "3. 结合源码判断的根因是什么",
+      "4. 修改建议",
+    ]) {
+      expect(within(overview).getByText(label)).toBeVisible();
+    }
+  });
+
+  it("opens only a validated Trace evidence identifier", async () => {
+    const user = userEvent.setup();
+    const openEvidence = vi.fn();
+    render(
+      <AnalysisReportView
+        report={findingWorkbenchReport()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+        openEvidence={openEvidence}
+      />,
+    );
+
+    await user.click(screen.getByRole("tab", { name: "证据与指标" }));
+    await user.click(screen.getByRole("button", { name: "在 Trace 中打开证据" }));
+    expect(openEvidence).toHaveBeenCalledWith({
+      analysisId: ANALYSIS_ID,
+      evidenceId: "86000000-0000-4000-8000-000000000001",
+    });
+  });
+
+  it("keeps AnalysisReport 1.2 on the existing report tabs", () => {
+    render(
+      <AnalysisReportView
+        report={sourceAwareReport()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    expect(screen.getByRole("tab", { name: "结论" })).toBeVisible();
+    expect(screen.queryByRole("tab", { name: "问题清单" })).not.toBeInTheDocument();
+  });
+
+  it("shows three primary findings and folds every additional finding", async () => {
+    const user = userEvent.setup();
+    render(
+      <AnalysisReportView
+        report={findingWorkbenchReportWithSixFindings()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    expect(screen.getAllByTestId("primary-finding")).toHaveLength(3);
+    const details = screen.getByText("展开其余 3 项").closest("details");
+    expect(details).not.toHaveAttribute("open");
+    expect(screen.getAllByTestId("additional-finding")).toHaveLength(3);
+    await user.click(screen.getByText("展开其余 3 项"));
+    expect(details).toHaveAttribute("open");
+  });
+
+  it("filters the stable server Finding order", async () => {
+    const user = userEvent.setup();
+    render(
+      <AnalysisReportView
+        report={findingWorkbenchReportWithSixFindings()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    await user.click(screen.getByRole("tab", { name: "问题清单" }));
+    await user.selectOptions(screen.getByLabelText("优先级"), "p0");
+    expect(screen.getAllByTestId("finding-list-item").map((node) => node.dataset.priority)).toEqual(["p0", "p0"]);
+  });
+
+  it("never renders source locations or Diff without a strong match", async () => {
+    const user = userEvent.setup();
+    const example = structuredClone(analysisReportV13Example);
+    const report = {
+      ...example,
+      capabilities: { ...example.capabilities, source: "mismatch" },
+      quality: { ...example.quality, source_correlation_state: "available_weak" },
+      source_code: {
+        requested: true,
+        match_summary: "weak",
+        source_refs: [{ relative_path: "private/Startup.kt", symbol: "demo.Startup.run" }],
+        fixes: [],
+      },
+    };
+    render(
+      <AnalysisReportView
+        report={report as AnalysisReport}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    await user.click(screen.getByRole("tab", { name: "源码与优化" }));
+    const sourcePanel = screen.getByRole("tabpanel");
+    expect(within(sourcePanel).getByRole("heading", { name: "源码不匹配" })).toBeVisible();
+    expect(within(sourcePanel).getByText("修改仅供参考")).toBeVisible();
+    expect(within(sourcePanel).queryByText(/private\/Startup\.kt/)).not.toBeInTheDocument();
+    expect(within(sourcePanel).queryByText(/demo\.Startup\.run/)).not.toBeInTheDocument();
+    expect(within(sourcePanel).queryByLabelText("建议代码 Diff")).not.toBeInTheDocument();
+  });
+
+  it("renders an explicit package, duration, metric and environment fingerprint for retest", async () => {
+    const user = userEvent.setup();
+    render(
+      <AnalysisReportView
+        report={findingWorkbenchReport()}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    await user.click(screen.getByRole("tab", { name: "复测计划" }));
+    const retestPanel = screen.getByRole("tabpanel");
+    expect(within(retestPanel).getByText("com.rivotek.mediacenter")).toBeVisible();
+    expect(within(retestPanel).getByText("15 秒")).toBeVisible();
+    expect(within(retestPanel).getByText("startup.time_to_initial_display_ms")).toBeVisible();
+    expect(within(retestPanel).getByText(/^sha256:/)).toBeVisible();
+  });
+
   it("shows three primary four-part conclusions and keeps every remaining conclusion collapsible", async () => {
     const user = userEvent.setup();
     render(
