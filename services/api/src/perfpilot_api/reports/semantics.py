@@ -210,14 +210,10 @@ def _validate_workbench_document(document: dict[str, object]) -> None:
         ):
             raise SourceAwareSemanticError
 
-    expected_order = sorted(
-        findings,
-        key=lambda item: (
-            -int(item.get("priority_score", -1)) if isinstance(item, dict) else 1,
-            str(item.get("finding_id")) if isinstance(item, dict) else "",
-        ),
-    )
-    if findings != expected_order:
+    if any(not isinstance(item, dict) for item in findings):
+        raise SourceAwareSemanticError
+    priority_scores = [int(item.get("priority_score", -1)) for item in findings]
+    if priority_scores != sorted(priority_scores, reverse=True):
         raise SourceAwareSemanticError
     eligible_primary: list[str] = []
     for item in findings:

@@ -37,7 +37,11 @@ export function RetestPlanPanel({ report }: { readonly report: FindingWorkbenchR
                 <div><dt>环境指纹</dt><dd><code>{plan.environment_fingerprint}</code></dd></div>
                 <div>
                   <dt>验证指标</dt>
-                  <dd>{plan.metric_ids.map((id) => metricById.get(id)?.name ?? id).join("、")}</dd>
+                  <dd>
+                    {plan.metric_ids.length > 0
+                      ? plan.metric_ids.map((id) => metricById.get(id)?.name ?? id).join("、")
+                      : "暂无直接量化指标"}
+                  </dd>
                 </div>
               </dl>
               <ul>

@@ -243,9 +243,7 @@ def _validate_payload_keys(payload: Mapping[str, object]) -> None:
 def to_persisted_document(value: LocalAnalysisView) -> dict[str, object]:
     _validate_payload_keys(value.payload)
     payload = {
-        key: item
-        for key, item in value.payload.items()
-        if key in _PAYLOAD_PERSISTED_KEYS
+        key: item for key, item in value.payload.items() if key in _PAYLOAD_PERSISTED_KEYS
     }
     document: dict[str, object] = {
         "schema_version": "1.0",

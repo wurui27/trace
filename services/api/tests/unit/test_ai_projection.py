@@ -103,6 +103,25 @@ def test_projection_v21_contains_server_owned_quality_and_workbench() -> None:
     assert document["workbench"]["evidence"][0]["locator"]["start_ns"] >= 0
 
 
+def test_projection_v21_keeps_unlinked_finding_and_retest_metrics_empty() -> None:
+    projection = build_ai_projection(
+        _core(),
+        analysis_profile="startup",
+        question=None,
+        source_context=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+
+    workbench = projection.document["workbench"]
+    assert workbench["findings"][0]["metric_ids"] == []
+    assert workbench["retest_plans"][0]["metric_ids"] == []
+
+
 def test_projection_v21_bounds_realistic_metric_and_evidence_links() -> None:
     document = _core().document
     scenario = document["scenario_reports"][0]
@@ -293,7 +312,6 @@ def test_projection_v21_recomputes_metric_links_after_evidence_truncation() -> N
     direct_metric["name"] = "startup.other_metric"
     direct_metric["sample_ids"] = [discarded_evidence_id]
     scenario["metrics"] = [direct_metric]
-    fallback_metric_ids: list[str] = []
     for index, name in enumerate(
         (
             "startup.get_startups.dur_ms",
@@ -307,7 +325,6 @@ def test_projection_v21_recomputes_metric_links_after_evidence_truncation() -> N
         metric["name"] = name
         metric["sample_ids"] = []
         scenario["metrics"].append(metric)
-        fallback_metric_ids.append(metric["metric_id"])
 
     projection = build_ai_projection(
         NormalizedTraceReport(
@@ -327,7 +344,7 @@ def test_projection_v21_recomputes_metric_links_after_evidence_truncation() -> N
     finding = projection.document["workbench"]["findings"][0]
     assert finding["evidence_ids"] == retained_evidence_ids
     assert direct_metric["metric_id"] not in finding["metric_ids"]
-    assert finding["metric_ids"] == fallback_metric_ids
+    assert finding["metric_ids"] == []
 
 
 def test_projection_v21_uses_one_bounded_bidirectional_edge_set() -> None:

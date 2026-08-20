@@ -554,6 +554,28 @@ describe("AnalysisReportView", () => {
     expect(within(retestPanel).getByText(/^sha256:/)).toBeVisible();
   });
 
+  it("explains metricless evidence retests instead of rendering an empty metric value", async () => {
+    const user = userEvent.setup();
+    const report = findingWorkbenchReport();
+    report.workbench.findings[0].metric_ids = [];
+    report.workbench.retest_plans[0].metric_ids = [];
+    report.workbench.retest_plans[0].pass_criteria = [
+      "在相同场景中确认该机制不再出现在关键路径，或补采到可直接量化的指标证据。",
+    ];
+    render(
+      <AnalysisReportView
+        report={report}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    await user.click(screen.getByRole("tab", { name: "复测计划" }));
+    const retestPanel = screen.getByRole("tabpanel");
+    expect(within(retestPanel).getByText("暂无直接量化指标")).toBeVisible();
+    expect(within(retestPanel).getByText(/补采到可直接量化的指标证据/)).toBeVisible();
+  });
+
   it("shows three primary four-part conclusions and keeps every remaining conclusion collapsible", async () => {
     const user = userEvent.setup();
     render(

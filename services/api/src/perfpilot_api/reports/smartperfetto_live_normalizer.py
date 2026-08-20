@@ -34,6 +34,37 @@ _METRIC_HINT = re.compile(
     r"jank|frame|time|value|score|rate)(?:_|$)"
 )
 _RECOMMENDATION = re.compile(r"\*{0,2}建议\*{0,2}[：:]\s*", re.IGNORECASE)
+_INTERNAL_DIAGNOSTIC_LABEL = re.compile(r"(?<![A-Za-z0-9_.-])SR[0-9]+(?![A-Za-z0-9_.-])", re.IGNORECASE)
+_UNCERTAIN_DIAGNOSTIC_MARKERS = (
+    "疑似",
+    "相关性",
+    "聚合口径",
+    "口径差异",
+    "尚未证明",
+    "候选",
+    "需复核",
+    "推测",
+    "或许",
+    "是否",
+    "不作为独立根因",
+)
+_LIMITATION_TITLE_MARKERS = (
+    "能力边界",
+    "数据限制",
+    "证据限制",
+    "采集限制",
+    "分析限制",
+)
+
+
+def _public_diagnostic_title(value: object, *, fallback: str) -> str:
+    title = _text(value, fallback=fallback, limit=255)
+    title = _INTERNAL_DIAGNOSTIC_LABEL.sub("", title)
+    title = re.sub(r"\s*[—–-]\s*[：:]\s*", "：", title)
+    title = re.sub(r"\s*[—–-]\s*(?=[（(])", "", title)
+    title = re.sub(r"\s*[—–-]\s*(?:[/／|]\s*)*$", "", title)
+    title = re.sub(r"\s{2,}", " ", title).strip(" —–-/／|")
+    return title or fallback
 
 
 def _fail() -> SmartPerfettoNormalizationError:
@@ -236,19 +267,79 @@ def _envelope_facts(
     artifact_id: UUID,
     scenario: str,
     envelopes: Sequence[object],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    dict[str, list[str]],
+    set[str],
+    set[str],
+]:
     evidence: list[dict[str, object]] = []
     metrics: list[dict[str, object]] = []
+    evidence_by_artifact: dict[str, list[str]] = {}
+    artifact_level_evidence_ids: set[str] = set()
+    empty_artifact_ids: set[str] = set()
     metric_names: set[str] = set()
+
+    def add_artifact_evidence(
+        *,
+        envelope_index: int,
+        source_name: str,
+        source_artifact_id: str,
+        row_count: int,
+    ) -> None:
+        evidence_id = _stable(
+            analysis_id,
+            "live-envelope-artifact",
+            f"{scenario}:{source_name}:{envelope_index}:{source_artifact_id}",
+        )
+        evidence.append(
+            {
+                "evidence_id": evidence_id,
+                "source": "smartperfetto.live_envelope_artifact",
+                "query_id": _slug(source_name, fallback="envelope"),
+                "interval_start_ns": None,
+                "interval_end_ns": None,
+                "artifact_id": str(artifact_id),
+                "fields": {
+                    "source_artifact_id": source_artifact_id,
+                    "row_count": row_count,
+                },
+            }
+        )
+        if row_count > 0:
+            evidence_by_artifact.setdefault(source_artifact_id.casefold(), []).append(
+                evidence_id
+            )
+            artifact_level_evidence_ids.add(evidence_id)
+        else:
+            empty_artifact_ids.add(source_artifact_id.casefold())
+
     for envelope_index, raw in enumerate(envelopes):
-        if len(evidence) >= 70 or not isinstance(raw, Mapping):
-            break
-        values = _rows(raw)
-        if values is None:
+        if not isinstance(raw, Mapping):
             continue
-        columns, row = values
         meta = raw.get("meta") if isinstance(raw.get("meta"), Mapping) else {}
         source_name = _text(meta.get("source"), fallback=f"envelope_{envelope_index}")
+        source_artifact_id = _text(meta.get("artifactId"), limit=128)
+        data = raw.get("data") if isinstance(raw.get("data"), Mapping) else {}
+        raw_rows = data.get("rows")
+        row_count = (
+            len(raw_rows)
+            if isinstance(raw_rows, Sequence)
+            and not isinstance(raw_rows, str | bytes | bytearray)
+            else None
+        )
+        values = _rows(raw)
+        if values is None:
+            if source_artifact_id and row_count is not None:
+                add_artifact_evidence(
+                    envelope_index=envelope_index,
+                    source_name=source_name,
+                    source_artifact_id=source_artifact_id,
+                    row_count=row_count,
+                )
+            continue
+        columns, row = values
         source_slug = _slug(source_name, fallback="envelope")
         evidence_id = _stable(
             analysis_id,
@@ -280,6 +371,20 @@ def _envelope_facts(
                 "fields": fields,
             }
         )
+        if source_artifact_id:
+            if row_count == 1:
+                evidence_by_artifact.setdefault(
+                    source_artifact_id.casefold(), []
+                ).append(evidence_id)
+            else:
+                add_artifact_evidence(
+                    envelope_index=envelope_index,
+                    source_name=source_name,
+                    source_artifact_id=source_artifact_id,
+                    row_count=row_count or 0,
+                )
+        if row_count != 1:
+            continue
         display_columns = _display_columns(raw)
         display = raw.get("display") if isinstance(raw.get("display"), Mapping) else {}
         title = _text(display.get("title"), fallback=source_name, limit=500)
@@ -307,7 +412,13 @@ def _envelope_facts(
                 }
             )
             added += 1
-    return evidence, metrics
+    return (
+        evidence,
+        metrics,
+        evidence_by_artifact,
+        artifact_level_evidence_ids,
+        empty_artifact_ids,
+    )
 
 
 def _confidence(value: object) -> str:
@@ -351,13 +462,188 @@ def _recommendation(diagnostic: Mapping[str, object], fallback: str | None) -> s
     return fallback[:2000] if fallback else None
 
 
+def _referenced_envelope_evidence_ids(
+    text: str,
+    evidence_by_artifact: Mapping[str, Sequence[str]],
+) -> list[str]:
+    referenced: list[str] = []
+    for artifact_id, evidence_ids in evidence_by_artifact.items():
+        if re.search(
+            rf"(?<![a-z0-9_.-]){re.escape(artifact_id)}(?![a-z0-9_.-])",
+            text,
+            re.IGNORECASE,
+        ) is None:
+            continue
+        for evidence_id in evidence_ids:
+            if evidence_id not in referenced:
+                referenced.append(evidence_id)
+    return referenced[:20]
+
+
+def _is_limitation_diagnostic(
+    diagnostic: Mapping[str, object],
+    *,
+    title: str,
+    description: str,
+) -> bool:
+    severity = str(diagnostic.get("severity", "")).casefold()
+    text = f"{title}\n{description}"
+    resolved = re.search(
+        r"(?:已排除|排除).{0,12}(?:边界|限制)"
+        r"|(?:边界|限制).{0,16}(?:(?:已经|现已|已).{0,6})?"
+        r"(?:解除|消除|排除|不存在)"
+        r"|(?:已经|现已|已)(?:证明)?不存在.{0,16}(?:边界|限制)",
+        text,
+    )
+    if resolved is not None:
+        return False
+    if severity in {"info", "informational"} and (
+        any(marker in title for marker in ("诊断说明", "采集说明", "采集状态"))
+        or any(
+            marker in description
+            for marker in ("仅用于说明", "仅供说明", "说明采集状态")
+        )
+    ):
+        return True
+    if any(
+        marker in title for marker in _LIMITATION_TITLE_MARKERS
+    ):
+        return True
+    capability = (
+        r"(?:thread-state|blocked_function|数据|指标|证据|字段|调用栈|轨迹|trace)"
+    )
+    return (
+        re.search(rf"{capability}.{{0,24}}未采集", text, re.IGNORECASE) is not None
+        or re.search(rf"未采集.{{0,24}}{capability}", text, re.IGNORECASE)
+        is not None
+    )
+
+
+def _is_uncertain_diagnostic(text: str) -> bool:
+    resolved_patterns = (
+        r"(?:已排除|排除).*(?:相关性|疑似|候选|可能)",
+        r"(?:聚合口径|口径差异).*(?:已校正|已核对|已验证|已确认)",
+        r"无需复核",
+        r"(?:不是|并非).*(?:候选|疑似|可能)",
+        r"不再(?:是)?(?:疑似|候选|可能)",
+        r"(?:相关性|聚合口径|口径差异|疑似|候选|需复核|可能)"
+        r".{0,40}(?:已经|现已|已).{0,20}(?:确认|证明|排除|复核|校正)",
+        r"不可能(?:是|由|导致|成为|影响)",
+        r"不提示",
+        r"(?:相关性并不存在|无相关性)",
+        r"提示[：:].*(?:已确认|根因)",
+    )
+    title, _, description = text.partition("\n")
+
+    def mechanisms(value: str) -> set[str]:
+        folded = value.casefold()
+        groups = {
+            "binder": ("binder", "同步 ipc"),
+            "jit": ("jit", "baseline profile"),
+            "native": ("native", "dlopen", ".so"),
+            "sdk": ("sdk",),
+            "frame": ("首帧", "doframe", "compose", "measure"),
+            "fork": ("fork", "调度延迟"),
+            "system": ("system_server", "surfaceflinger", "系统层", "系统侧"),
+        }
+        return {
+            name
+            for name, markers in groups.items()
+            if any(marker in folded for marker in markers)
+        }
+
+    title_mechanisms = mechanisms(title)
+    description_mechanisms = mechanisms(description)
+    confirmation_matches_title = (
+        not title_mechanisms
+        or not description_mechanisms
+        or bool(title_mechanisms & description_mechanisms)
+    )
+    if (
+        any(marker in title for marker in _UNCERTAIN_DIAGNOSTIC_MARKERS)
+        and re.search(
+            r"(?:(?:已经|现已|已).{0,12}(?:确认|证明|复核)|复核并确认|是根因)",
+            description,
+            re.IGNORECASE,
+        )
+        and not any(marker in description for marker in _UNCERTAIN_DIAGNOSTIC_MARKERS)
+        and confirmation_matches_title
+    ):
+        return False
+    for clause in re.split(
+        r"[，。；！？\n]|(?:但是|然而|不过|同时|但|而|且)|提示[：:]",
+        text,
+    ):
+        if not clause or any(re.search(pattern, clause) for pattern in resolved_patterns):
+            continue
+        if any(marker in clause for marker in _UNCERTAIN_DIAGNOSTIC_MARKERS):
+            return True
+        if re.search(
+            r"(?:证据|trace|数据|结果|现象)(?:仅)?提示", clause, re.IGNORECASE
+        ):
+            return True
+        if re.search(
+            r"提示(?!用户|操作|页面|界面|文案|信息|弹窗|音|框)",
+            clause,
+        ):
+            return True
+        if re.search(
+            r"(?:聚合|后台线程|并行|跨窗口).{0,16}口径"
+            r"|口径.{0,16}(?:聚合|后台线程|并行|跨窗口)",
+            clause,
+            re.IGNORECASE,
+        ):
+            return True
+        if re.search(r"可能(?:与|是|存在|影响|导致|造成|引发)", clause):
+            return True
+    return False
+
+
+def _safe_multirow_diagnostic_narrative(
+    *,
+    title: str,
+    description: str,
+    has_artifact_level_evidence: bool,
+) -> tuple[str, str]:
+    if not has_artifact_level_evidence:
+        return title, description
+    text = f"{title}\n{description}".casefold()
+    if "sdk" not in text or not any(
+        marker in text
+        for marker in ("application.oncreate", "bindapplication", "performcreate")
+    ):
+        return title, description
+    safe_title = "外部 SDK 在启动主线程同步初始化"
+    if (
+        "qqmusicsdkadapter.doinit" in text
+        and "xeaglebtadapter.start" in text
+    ):
+        return (
+            safe_title,
+            "Trace 显示 QQMusicSdkAdapter.doInit 与 XeagleBtAdapter.start "
+            "都占用启动主线程；相关调用的生命周期入口必须分别定位。",
+        )
+    return (
+        safe_title,
+        "Trace 汇总支持外部 SDK 在启动主线程同步执行；"
+        "具体调用的生命周期入口仍需分别核对。",
+    )
+
+
 def _diagnostic_facts(
     analysis_id: UUID,
     artifact_id: UUID,
     scenario: str,
     diagnostics: Sequence[object],
     actions: Sequence[object],
-) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
+    evidence_by_artifact: Mapping[str, Sequence[str]],
+    artifact_level_evidence_ids: set[str],
+    empty_artifact_ids: set[str],
+) -> tuple[
+    list[dict[str, object]],
+    list[dict[str, object]],
+    list[dict[str, object]],
+]:
     action_by_diagnostic = {
         str(item["sourceDiagnosticId"]): _text(item.get("label"))
         for item in actions
@@ -367,50 +653,100 @@ def _diagnostic_facts(
     }
     evidence: list[dict[str, object]] = []
     findings: list[dict[str, object]] = []
+    limitations: list[dict[str, object]] = []
     seen: set[str] = set()
     for index, raw in enumerate(diagnostics):
-        if len(findings) >= 80 or not isinstance(raw, Mapping):
+        if not isinstance(raw, Mapping):
             continue
         source_id = _text(raw.get("id"), fallback=f"diagnostic_{index}", limit=128)
         if source_id in seen:
             continue
         seen.add(source_id)
-        title = _text(raw.get("title"), fallback=f"性能发现 {index + 1}", limit=255)
+        title = _public_diagnostic_title(
+            raw.get("title"), fallback=f"性能发现 {index + 1}"
+        )
         description = _text(raw.get("description"), fallback=title)
         detail = ""
+        evidence_texts: list[str] = []
         raw_evidence = raw.get("evidence")
         if isinstance(raw_evidence, Sequence) and not isinstance(
             raw_evidence, str | bytes | bytearray
         ):
-            detail = next(
-                (
-                    _text(item.get("text"))
-                    for item in raw_evidence
-                    if isinstance(item, Mapping) and _text(item.get("text"))
-                ),
-                "",
+            evidence_texts = [
+                _text(item.get("text"))
+                for item in raw_evidence
+                if isinstance(item, Mapping) and _text(item.get("text"))
+            ]
+            detail = evidence_texts[0] if evidence_texts else ""
+        diagnostic_text = "\n".join((title, description, *evidence_texts))
+        evidence_ids = _referenced_envelope_evidence_ids(
+            diagnostic_text,
+            evidence_by_artifact,
+        )
+        references_empty_artifact = any(
+            re.search(
+                rf"(?<![a-z0-9_.-]){re.escape(source_artifact_id)}(?![a-z0-9_.-])",
+                diagnostic_text,
+                re.IGNORECASE,
             )
-        evidence_id = _stable(
-            analysis_id,
-            "live-diagnostic-evidence",
-            f"{scenario}:{source_id}",
+            is not None
+            for source_artifact_id in empty_artifact_ids
         )
-        evidence.append(
-            {
-                "evidence_id": evidence_id,
-                "source": "smartperfetto.diagnostic",
-                "query_id": _slug(source_id, fallback="diagnostic"),
-                "interval_start_ns": None,
-                "interval_end_ns": None,
-                "artifact_id": str(artifact_id),
-                "fields": {
-                    "title": title,
-                    "description": description,
-                    "detail": detail,
-                },
-            }
+        title, summary = _safe_multirow_diagnostic_narrative(
+            title=title,
+            description=description,
+            has_artifact_level_evidence=any(
+                evidence_id in artifact_level_evidence_ids for evidence_id in evidence_ids
+            ),
         )
+        is_limitation = _is_limitation_diagnostic(
+            raw,
+            title=title,
+            description=description,
+        )
+        if not evidence_ids:
+            evidence_id = _stable(
+                analysis_id,
+                "live-diagnostic-evidence",
+                f"{scenario}:{source_id}",
+            )
+            evidence.append(
+                {
+                    "evidence_id": evidence_id,
+                    "source": "smartperfetto.diagnostic",
+                    "query_id": _slug(source_id, fallback="diagnostic"),
+                    "interval_start_ns": None,
+                    "interval_end_ns": None,
+                    "artifact_id": str(artifact_id),
+                    "fields": {
+                        "title": title,
+                        "description": description,
+                        "detail": detail,
+                    },
+                }
+            )
+            evidence_ids = [evidence_id]
+        if is_limitation:
+            limitations.append(
+                {
+                    "limitation_id": _stable(
+                        analysis_id,
+                        "live-diagnostic-limitation",
+                        f"{scenario}:{source_id}",
+                    ),
+                    "code": _slug(
+                        f"smartperfetto.diagnostic.{source_id}",
+                        fallback="smartperfetto.diagnostic",
+                    ),
+                    "summary": summary,
+                    "evidence_ids": evidence_ids,
+                }
+            )
+            continue
         confidence = _confidence(raw.get("confidence"))
+        uncertain = _is_uncertain_diagnostic(diagnostic_text) or references_empty_artifact
+        if uncertain and confidence == "high":
+            confidence = "medium"
         findings.append(
             {
                 "finding_id": _stable(
@@ -419,20 +755,26 @@ def _diagnostic_facts(
                     f"{scenario}:{source_id}",
                 ),
                 "rule_id": _slug(f"smartperfetto.{source_id}", fallback="smartperfetto"),
-                "kind": "root_cause",
-                "status": "confirmed" if confidence in {"high", "medium"} else "suspected",
+                "kind": "symptom" if uncertain else "root_cause",
+                "status": (
+                    "suspected"
+                    if uncertain
+                    else "confirmed"
+                    if confidence in {"high", "medium"}
+                    else "suspected"
+                ),
                 "severity": _severity(raw.get("severity")),
                 "confidence": confidence,
                 "confidence_ceiling": confidence,
                 "title": title,
-                "summary": description,
-                "evidence_ids": [evidence_id],
+                "summary": summary,
+                "evidence_ids": evidence_ids,
                 "exclusions": [],
                 "recommendation": _recommendation(raw, action_by_diagnostic.get(source_id)),
                 "retest": "在相同设备、构建和操作场景下重新采集 Trace，并比较关键指标。",
             }
         )
-    return evidence, findings
+    return evidence, findings, limitations
 
 
 def _build_core(
@@ -462,21 +804,95 @@ def _build_core(
     if not envelopes:
         raise _fail()
     scenario = _scenario_type(envelopes)
-    envelope_evidence, metrics = _envelope_facts(
+    (
+        envelope_evidence,
+        metrics,
+        evidence_by_artifact,
+        artifact_level_evidence_ids,
+        empty_artifact_ids,
+    ) = _envelope_facts(
         source.analysis_id,
         source.artifact_id,
         scenario,
         envelopes,
     )
-    diagnostic_evidence, findings = _diagnostic_facts(
+    diagnostic_evidence, findings, diagnostic_limitations = _diagnostic_facts(
         source.analysis_id,
         source.artifact_id,
         scenario,
         diagnostics,
         actions,
+        evidence_by_artifact,
+        artifact_level_evidence_ids,
+        empty_artifact_ids,
     )
-    envelope_evidence = envelope_evidence[: max(0, 100 - len(diagnostic_evidence))]
-    retained_evidence_ids = {item["evidence_id"] for item in envelope_evidence}
+    envelope_evidence_by_id = {
+        item["evidence_id"]: item for item in envelope_evidence
+    }
+    diagnostic_evidence_by_id = {
+        item["evidence_id"]: item for item in diagnostic_evidence
+    }
+    available_evidence_ids = (
+        envelope_evidence_by_id.keys() | diagnostic_evidence_by_id.keys()
+    )
+    retained_evidence_ids: set[str] = set()
+
+    severity_rank = {"critical": 0, "warning": 1, "informational": 2}
+    confidence_rank = {"high": 0, "medium": 1, "low": 2, "none": 3}
+    ranked_findings = sorted(
+        enumerate(findings),
+        key=lambda pair: (
+            severity_rank.get(str(pair[1].get("severity")), 4),
+            confidence_rank.get(str(pair[1].get("confidence")), 4),
+            0 if pair[1].get("status") == "confirmed" else 1,
+            pair[0],
+        ),
+    )
+    retained_finding_indexes: set[int] = set()
+    for index, item in ranked_findings:
+        if len(retained_finding_indexes) >= 80:
+            break
+        evidence_ids = set(item["evidence_ids"])  # type: ignore[arg-type]
+        if not evidence_ids.issubset(available_evidence_ids):
+            continue
+        if len(retained_evidence_ids | evidence_ids) > 100:
+            continue
+        retained_evidence_ids.update(evidence_ids)
+        retained_finding_indexes.add(index)
+    findings = [
+        item for index, item in enumerate(findings) if index in retained_finding_indexes
+    ]
+
+    retained_limitation_indexes: set[int] = set()
+    for index, item in enumerate(diagnostic_limitations[:19]):
+        evidence_ids = set(item["evidence_ids"])  # type: ignore[arg-type]
+        if not evidence_ids.issubset(available_evidence_ids):
+            continue
+        if len(retained_evidence_ids | evidence_ids) > 100:
+            continue
+        retained_evidence_ids.update(evidence_ids)
+        retained_limitation_indexes.add(index)
+    diagnostic_limitations = [
+        item
+        for index, item in enumerate(diagnostic_limitations)
+        if index in retained_limitation_indexes
+    ]
+
+    for item in envelope_evidence:
+        if len(retained_evidence_ids) >= 100:
+            break
+        retained_evidence_ids.add(item["evidence_id"])
+
+    diagnostic_evidence = [
+        item
+        for item in diagnostic_evidence
+        if item["evidence_id"] in retained_evidence_ids
+    ]
+    envelope_evidence = [
+        item
+        for item in envelope_evidence
+        if item["evidence_id"] in retained_evidence_ids
+    ]
     metrics = [
         item
         for item in metrics
@@ -553,7 +969,8 @@ def _build_core(
                     "相关零值是协议占位，不能解释为已证明没有数据丢失。"
                 ),
                 "evidence_ids": [],
-            }
+            },
+            *diagnostic_limitations,
         ],
         "provenance": {
             "engine_id": "smartperfetto",

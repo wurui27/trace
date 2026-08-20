@@ -1468,6 +1468,75 @@ describe("PerfPilot browser API", () => {
     });
   });
 
+  it("accepts metricless folded findings without inventing retest metrics", async () => {
+    const response = findingWorkbenchReportPayload();
+    const workbench = response.workbench as Record<string, unknown>;
+    const findings = workbench.findings as Array<Record<string, unknown>>;
+    const retests = workbench.retest_plans as Array<Record<string, unknown>>;
+    findings[0].metric_ids = [];
+    retests[0].metric_ids = [];
+    const synthesis = response.synthesis as Record<string, unknown>;
+    const output = synthesis.output as Record<string, unknown>;
+    output.key_metric_ids = [];
+    output.retest_plan = [];
+    const conclusions = output.conclusions as Array<Record<string, unknown>>;
+    conclusions[0].claim_refs = (
+      conclusions[0].claim_refs as Array<Record<string, unknown>>
+    ).filter((claim) => claim.metric_id === null);
+    const client = createPerfPilotClient({
+      fetcher: vi.fn<typeof fetch>().mockResolvedValue(Response.json(response)),
+    });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      schema_version: "1.3",
+      workbench: {
+        primary_finding_ids: ["85000000-0000-4000-8000-000000000001"],
+        retest_plans: [{ metric_ids: [] }],
+      },
+    });
+  });
+
+  it("accepts SmartPerfetto source order for equally scored findings", async () => {
+    const response = findingWorkbenchReportPayload();
+    const workbench = response.workbench as Record<string, unknown>;
+    const findings = workbench.findings as Array<Record<string, unknown>>;
+    const secondFinding = structuredClone(findings[0]);
+    secondFinding.finding_id = "85000000-0000-4000-8000-000000000000";
+    secondFinding.retest_plan_id = "89000000-0000-4000-8000-000000000000";
+    findings.push(secondFinding);
+    workbench.primary_finding_ids = [findings[0].finding_id, secondFinding.finding_id];
+
+    const retests = workbench.retest_plans as Array<Record<string, unknown>>;
+    const secondRetest = structuredClone(retests[0]);
+    secondRetest.retest_plan_id = secondFinding.retest_plan_id;
+    secondRetest.finding_id = secondFinding.finding_id;
+    retests.push(secondRetest);
+
+    const synthesis = response.synthesis as Record<string, unknown>;
+    const output = synthesis.output as Record<string, unknown>;
+    const conclusions = output.conclusions as Array<Record<string, unknown>>;
+    const secondConclusion = structuredClone(conclusions[0]);
+    secondConclusion.finding_id = secondFinding.finding_id;
+    conclusions.push(secondConclusion);
+    const topFindings = output.top_findings as Array<Record<string, unknown>>;
+    const secondTopFinding = structuredClone(topFindings[0]);
+    secondTopFinding.finding_id = secondFinding.finding_id;
+    topFindings.push(secondTopFinding);
+
+    const client = createPerfPilotClient({
+      fetcher: vi.fn<typeof fetch>().mockResolvedValue(Response.json(response)),
+    });
+
+    await expect(client.report(TEAM_ID, ANALYSIS_ID)).resolves.toMatchObject({
+      workbench: {
+        primary_finding_ids: [
+          "85000000-0000-4000-8000-000000000001",
+          "85000000-0000-4000-8000-000000000000",
+        ],
+      },
+    });
+  });
+
   it.each(["private_path", "repo_url", "remote", "argv"])(
     "rejects private top-level field %s in AnalysisReport 1.3",
     async (field) => {

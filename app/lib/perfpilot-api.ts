@@ -1988,7 +1988,7 @@ function validFindingWorkbench(value: unknown, sourceCapability: ReportCapabilit
     WORKBENCH_SCENARIOS.includes(plan.scenario_type as typeof WORKBENCH_SCENARIOS[number]) &&
     typeof plan.package_name === "string" && Number.isSafeInteger(plan.duration_seconds) &&
     Number(plan.duration_seconds) >= 1 && Number(plan.duration_seconds) <= 3600 &&
-    /^sha256:[a-f0-9]{64}$/.test(String(plan.environment_fingerprint)) && uuidArray(plan.metric_ids, 20, 1) &&
+    /^sha256:[a-f0-9]{64}$/.test(String(plan.environment_fingerprint)) && uuidArray(plan.metric_ids, 20) &&
     stringArray(plan.pass_criteria, 20, 1) && new Set(plan.pass_criteria).size === plan.pass_criteria.length &&
     typeof plan.notes === "string"
   );
@@ -2011,8 +2011,8 @@ function validFindingWorkbench(value: unknown, sourceCapability: ReportCapabilit
   if (workbench.metrics.some((item) => item.evidence_ids.some((id) => !evidenceIds.has(id))) ||
       workbench.evidence.some((item) => item.metric_ids.some((id) => !metricIds.has(id))) ||
       workbench.critical_path.some((item) => item.evidence_ids.some((id) => !evidenceIds.has(id)))) return false;
-  const sorted = [...workbench.findings].sort((left, right) => right.priority_score - left.priority_score || left.finding_id.localeCompare(right.finding_id));
-  if (sorted.some((item, index) => item.finding_id !== workbench.findings[index]?.finding_id)) return false;
+  if (workbench.findings.some((item, index) =>
+    index > 0 && workbench.findings[index - 1]!.priority_score < item.priority_score)) return false;
   const eligiblePrimary = workbench.findings
     .filter((item) => item.status === "confirmed" && ["p0", "p1"].includes(item.priority))
     .slice(0, 3)

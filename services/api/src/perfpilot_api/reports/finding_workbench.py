@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from collections.abc import Mapping
 from uuid import UUID, uuid5
 
@@ -21,20 +22,47 @@ _SOURCE_STATES = {
     "none": "mismatch",
 }
 _MAX_LINKED_IDS = 20
-_MAX_FALLBACK_METRICS = 3
-_PRIMARY_METRIC_TERMS = {
-    "startup": (
-        "get_startups.dur_ms",
-        "time_to_initial_display",
-        "ttid",
-        "time_to_full_display",
-        "ttfd",
-        "startup_duration",
-    ),
-    "scroll": ("jank", "frame", "fps", "scroll"),
-    "memory_cycle": ("pss", "rss", "heap", "memory"),
-    "other": (),
-}
+_EXTERNAL_SYSTEM_PROCESS_MARKERS = (
+    "system_server",
+    "surfaceflinger",
+    "/vendor/bin/",
+)
+_EXTERNAL_SYSTEM_OWNERSHIP_MARKERS = (
+    "系统层",
+    "系统侧",
+    "框架侧",
+    "非应用可控",
+    "应用不可直接",
+    "应用不可直接控制",
+)
+_EXTERNAL_SYSTEM_MECHANISM_MARKERS = (
+    "内部 monitor",
+    "内部锁",
+    "锁竞争",
+    "内部 gc",
+    "gc 暂停",
+    "系统线程阻塞",
+)
+_APPLICATION_OWNERSHIP_MARKERS = (
+    "根因在应用侧",
+    "应用侧根因",
+    "应用重复",
+    "应用主线程重复",
+    "应用循环",
+    "应用同步调用",
+    "应用发起",
+    "应用主动触发",
+    "根因是调用时机",
+    "应用主线程同步调用",
+    "应用内部",
+    "应用代码内部",
+    "业务线程内部",
+    "主线程内部",
+    "工作线程内部",
+    "渲染线程内部",
+    "应用进程内部",
+    "发生在应用进程",
+)
 
 
 def _invalid() -> ValueError:
@@ -192,7 +220,10 @@ def build_finding_workbench(
 
     strong_fragments = _strong_fragments(source_context)
     findings = _merge_findings(scenarios, strong_fragments)
-    findings.sort(key=lambda item: (-int(item["priority_score"]), str(item["finding_id"])))
+    # Keep SmartPerfetto's source order when two findings have the same score.  The
+    # finding UUID is an identity, not a severity signal, so using it as a tie-break
+    # can promote a later secondary cause above an earlier primary problem.
+    findings.sort(key=lambda item: -int(item["priority_score"]))
     primary = [
         str(item["finding_id"])
         for item in findings
@@ -310,11 +341,11 @@ def _merge_findings(
                 "finding_id": finding_id,
                 "scenario_type": scenario_type,
                 "title": str(raw.get("title")),
-                "problem": str(raw.get("summary")),
+                "problem": str(raw.get("title")),
                 "impact": _impact_sentence(severity),
                 "mechanism": str(rule_id),
                 "root_cause": (
-                    str(raw.get("title"))
+                    str(raw.get("summary"))
                     if kind == "root_cause"
                     else "当前只能确认性能症状，尚未确认源码根因。"
                 ),
@@ -381,14 +412,8 @@ def _merge_findings(
             if isinstance(item, Mapping) and isinstance(item.get("evidence_id"), str)
         }
         evidence_ids = _string_ids(finding["evidence_ids"])
-        direct_metrics = _metric_ids_for_evidence(
-            scenario, evidence_ids, fallback=False
-        )
-        finding["metric_ids"] = (
-            direct_metrics
-            if direct_metrics
-            else _primary_metric_ids(scenario, metrics)
-        )
+        direct_metrics = _metric_ids_for_evidence(scenario, evidence_ids)
+        finding["metric_ids"] = direct_metrics
         original_ids = original_ids_by_finding[finding_id]
         finding["source_ref_ids"] = sorted(
             {
@@ -413,6 +438,8 @@ def _merge_findings(
             critical_path_points=round(contribution * 20),
             reproducibility_points=4,
         )
+        if _is_external_system_finding(finding):
+            score = min(score, 59)
         finding["critical_path_contribution"] = contribution
         finding["priority_score"] = score
         finding["priority"] = _priority(score)
@@ -422,6 +449,120 @@ def _merge_findings(
         confidence["evidence_grade"] = grade
         confidence["attribution"] = attribution
     return list(merged.values())
+
+
+def _is_external_system_finding(finding: Mapping[str, object]) -> bool:
+    text = "\n".join(
+        str(finding.get(field, ""))
+        for field in ("title", "problem", "root_cause")
+    ).casefold()
+    clauses = re.split(r"[，。；！？\n]", text)
+    system_subject = r"(?:system_server|surfaceflinger|系统层|系统侧|框架侧)"
+
+    def negates_application_ownership(clause: str) -> bool:
+        for marker in _APPLICATION_OWNERSHIP_MARKERS:
+            escaped = re.escape(marker)
+            if re.search(
+                rf"(?:已排除|排除|不是|并非|未发现|未观察到|"
+                rf"没有(?:证据表明)?|无法确认).{{0,8}}{escaped}",
+                clause,
+            ) or re.search(
+                rf"{escaped}.{{0,8}}(?:已排除|排除|并不是根因|不是根因|"
+                rf"并非根因|未发现|未观察到|尚未确认|无法确认|"
+                rf"没有证据(?:表明|支持)?)",
+                clause,
+            ):
+                return True
+        return False
+
+    if any(
+        any(marker in clause for marker in _APPLICATION_OWNERSHIP_MARKERS)
+        and not negates_application_ownership(clause)
+        for clause in clauses
+    ):
+        return False
+
+    def negates_system_ownership(clause: str) -> bool:
+        if re.search(
+            rf"{system_subject}.{{0,16}}(?:返回正常|无异常|已正常返回|调用正常|返回完成)",
+            clause,
+        ):
+            return True
+        if re.search(
+            r"(?:未发现|未观察到|没有证据表明|无证据表明|无法确认)"
+            r".{0,20}(?:system_server|surfaceflinger|系统层|系统侧|框架侧)",
+            clause,
+        ):
+            return True
+        system_match = re.search(
+            r"(?:system_server|surfaceflinger|系统层|系统侧|框架侧)",
+            clause,
+        )
+        if system_match is not None and re.search(
+            r"(?:未发现|未观察到|尚未确认|无法确认|"
+            r"没有证据(?:表明|支持)?)",
+            clause[system_match.start() :],
+        ):
+            return True
+        if any(marker in clause for marker in ("已排除", "排除")) and (
+            any(marker in clause for marker in _EXTERNAL_SYSTEM_PROCESS_MARKERS)
+            or any(marker in clause for marker in _EXTERNAL_SYSTEM_OWNERSHIP_MARKERS)
+        ):
+            return True
+        if re.search(
+            rf"(?:不是|并非|不属于|并不属于)\s*{system_subject}", clause
+        ):
+            return True
+        return (
+            re.search(
+                rf"{system_subject}.{{0,12}}(?:不是|并非|不属于|并不属于)"
+                r".{0,12}(?:问题|原因|根因|瓶颈|归因)",
+                clause,
+            )
+            is not None
+        )
+
+    grounded_clauses = [
+        clause
+        for clause in clauses
+        if not negates_system_ownership(clause)
+    ]
+    for clause in grounded_clauses:
+        process_owned = any(
+            marker in clause for marker in _EXTERNAL_SYSTEM_PROCESS_MARKERS
+        )
+        ownership_grounded = any(
+            marker in clause for marker in _EXTERNAL_SYSTEM_OWNERSHIP_MARKERS
+        ) or any(marker in clause for marker in _EXTERNAL_SYSTEM_MECHANISM_MARKERS)
+        explicit_system_ownership = (
+            any(marker in clause for marker in ("系统层", "系统侧", "框架侧"))
+            and any(
+                marker in clause
+                for marker in (
+                    "根因",
+                    "瓶颈",
+                    "阻塞",
+                    "锁竞争",
+                    "gc 暂停",
+                    "应用不可直接",
+                    "非应用可控",
+                )
+            )
+        )
+        if (process_owned and ownership_grounded) or explicit_system_ownership:
+            return True
+    has_system_subject = any(
+        any(marker in clause for marker in _EXTERNAL_SYSTEM_PROCESS_MARKERS)
+        for clause in grounded_clauses
+    )
+    has_system_mechanism = any(
+        any(marker in clause for marker in _EXTERNAL_SYSTEM_MECHANISM_MARKERS)
+        and not any(marker in clause for marker in _APPLICATION_OWNERSHIP_MARKERS)
+        for clause in grounded_clauses
+    )
+    if has_system_subject and has_system_mechanism:
+        return True
+    return False
 
 
 def _evidence_grade(
@@ -718,20 +859,27 @@ def _retest_plans(
     duration_seconds: int,
     environment_fingerprint: str,
 ) -> list[dict[str, object]]:
-    return [
-        {
+    result: list[dict[str, object]] = []
+    for finding in findings:
+        metric_ids = finding["metric_ids"]
+        result.append(
+            {
             "retest_plan_id": finding["retest_plan_id"],
             "finding_id": finding["finding_id"],
             "scenario_type": finding["scenario_type"],
             "package_name": package_name,
             "duration_seconds": duration_seconds,
             "environment_fingerprint": environment_fingerprint,
-            "metric_ids": finding["metric_ids"],
-            "pass_criteria": ["使用相同环境复测，并确认关联指标优于当前基线。"],
+            "metric_ids": metric_ids,
+            "pass_criteria": [
+                "使用相同环境复测，并确认关联指标优于当前基线。"
+                if metric_ids
+                else "在相同场景中确认该机制不再出现在关键路径，或补采到可直接量化的指标证据。"
+            ],
             "notes": "使用相同设备、构建、场景和采集时长复测。",
-        }
-        for finding in findings
-    ]
+            }
+        )
+    return result
 
 
 def _string_ids(value: object) -> list[str]:
@@ -785,54 +933,15 @@ def _bounded_metric_evidence_links(
 def _metric_ids_for_evidence(
     scenario: Mapping[str, object],
     evidence_ids: list[str],
-    *,
-    fallback: bool = True,
 ) -> list[str]:
-    metrics = scenario.get("metrics")
-    if not isinstance(metrics, list):
-        raise _invalid()
     _, metrics_by_evidence = _bounded_metric_evidence_links(scenario)
-    direct = sorted(
+    return sorted(
         {
             metric_id
             for evidence_id in evidence_ids
             for metric_id in metrics_by_evidence.get(evidence_id, [])
         }
-    )
-    if direct or not fallback:
-        return direct[:_MAX_LINKED_IDS]
-    return _primary_metric_ids(scenario, metrics)
-
-
-def _primary_metric_ids(
-    scenario: Mapping[str, object],
-    metrics: list[object],
-) -> list[str]:
-    scenario_type = scenario.get("scenario_type")
-    if not isinstance(scenario_type, str) or scenario_type not in _PRIMARY_METRIC_TERMS:
-        raise _invalid()
-    terms = _PRIMARY_METRIC_TERMS[scenario_type]
-    available: list[tuple[int, int, str, str]] = []
-    for metric in metrics:
-        if (
-            not isinstance(metric, Mapping)
-            or not isinstance(metric.get("metric_id"), str)
-            or not isinstance(metric.get("name"), str)
-            or metric.get("status") != "available"
-        ):
-            continue
-        name = str(metric["name"])
-        normalized_name = name.casefold()
-        term_rank = next(
-            (index for index, term in enumerate(terms) if term in normalized_name),
-            len(terms),
-        )
-        threshold_rank = 0 if metric.get("threshold") is not None else 1
-        available.append(
-            (term_rank, threshold_rank, normalized_name, str(metric["metric_id"]))
-        )
-    available.sort()
-    return [item[3] for item in available[:_MAX_FALLBACK_METRICS]]
+    )[:_MAX_LINKED_IDS]
 
 
 def _priority(score: int) -> str:

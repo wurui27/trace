@@ -21,6 +21,7 @@ from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Annotated, Literal, Protocol, cast
 from urllib.parse import urlsplit
@@ -105,6 +106,7 @@ from perfpilot_api.local_analysis_recovery import (
     RecoveryAction,
     RecoverySnapshot,
     plan_recovery,
+    schedule_recovery_operation,
 )
 from perfpilot_api.local_cancellation import CancellationTarget, cancel_targets
 from perfpilot_api.local_task_supervisor import (
@@ -791,7 +793,6 @@ class _LocalUpload:
     bytes_ready: bool = False
 
 
-
 def _restore_source_binding(value: object) -> SourceBinding:
     try:
         descriptor = _SourceBindingDescriptor.model_validate(value)
@@ -925,8 +926,6 @@ def _record_progress(
     )
 
 
-
-
 def _parse_utc_datetime(value: object) -> datetime | None:
     if not isinstance(value, str) or not value:
         return None
@@ -1044,10 +1043,6 @@ def _team_device(connected: LocalDevice) -> dict[str, object]:
         "state": "ready",
         "last_seen_at": datetime.now(UTC).isoformat(),
     }
-
-
-
-
 
 
 class _LocalRuntime:
@@ -2412,34 +2407,15 @@ class _LocalRuntime:
                 and analysis.task is None
             )
             if resume_from_prepared or resume_smartperfetto:
-                resume_gate = asyncio.Event()
-                generation = analysis.generation
-
-                async def resume_persisted_work(
-                    current: _LocalAnalysis = analysis,
-                    current_generation: int = generation,
-                    gate: asyncio.Event = resume_gate,
-                    resume_run: LocalEngineRun | None = (
-                        analysis.source_run if resume_smartperfetto else None
-                    ),
-                ) -> None:
-                    await gate.wait()
-                    if resume_run is not None:
-                        await self._execute_run(
-                            current,
-                            resume_run,
-                            generation=current_generation,
-                        )
-                    else:
-                        await self._execute_persisted_synthesis(
-                            current,
-                            generation=current_generation,
-                        )
-
-                task = asyncio.create_task(resume_persisted_work())
-                analysis.task = task
-                self.tasks.add(task)
-                task.add_done_callback(self.tasks.discard)
+                resume_gate, generation = asyncio.Event(), analysis.generation
+                operation = (
+                    partial(self._execute_run, analysis, analysis.source_run, generation=generation)
+                    if resume_smartperfetto
+                    else partial(self._execute_persisted_synthesis, analysis, generation=generation)
+                )
+                analysis.task = schedule_recovery_operation(
+                    gate=resume_gate, operation=operation, tasks=self.tasks
+                )
                 if resume_from_prepared:
                     analysis.stages["perfpilot_ai"] = "running"
                     analysis.version += 1

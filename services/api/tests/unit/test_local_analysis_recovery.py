@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from perfpilot_api.local_analysis_recovery import (
     RecoveryAction,
     RecoverySnapshot,
     plan_recovery,
+    schedule_recovery_operation,
 )
 
 
@@ -107,3 +110,29 @@ def test_cancel_precedes_report_or_remote_recovery() -> None:
     )
 
     assert actions == (RecoveryAction.CLOSE_CANCELED,)
+
+
+@pytest.mark.asyncio
+async def test_scheduled_recovery_waits_for_gate_and_unregisters() -> None:
+    gate = asyncio.Event()
+    tasks: set[asyncio.Task[None]] = set()
+    calls: list[str] = []
+
+    async def operation() -> None:
+        calls.append("resumed")
+
+    task = schedule_recovery_operation(
+        gate=gate,
+        operation=operation,
+        tasks=tasks,
+    )
+    await asyncio.sleep(0)
+    assert calls == []
+    assert task in tasks
+
+    gate.set()
+    await task
+    await asyncio.sleep(0)
+
+    assert calls == ["resumed"]
+    assert task not in tasks

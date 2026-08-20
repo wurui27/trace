@@ -115,13 +115,125 @@ def test_v21_rejects_claims_outside_the_finding_workbench(
         _validate(candidate, projection)
 
 
-@pytest.mark.parametrize("invented_number", ["耗时为一百毫秒。", "耗时为１秒。", "耗时为1秒。"])
+@pytest.mark.parametrize(
+    "invented_number",
+    [
+        "耗时为一百毫秒。",
+        "耗时为１秒。",
+        "耗时为1秒。",
+        "耗时为12ms。",
+        "耗时为1e3 ms。",
+        "发现四十二条长耗时。",
+        "出现二十七次 JIT。",
+        "发现三个热点。",
+        "首帧有一百帧。",
+        "CPU 占用百分之十。",
+        "吞吐提升两倍。",
+        "出现三项问题。",
+        "执行五轮。",
+        "每十帧发生卡顿。",
+        "每百次出现异常。",
+        "另两项问题。",
+        "内存增长一百 MB。",
+        "频率升至三百 MHz。",
+        "吞吐为五十 MB/s。",
+        "帧率为六十 FPS。",
+        "分配两百字节。",
+        "性能提升一百。",
+        "耗时降低四十二。",
+        "问题数量为二十七。",
+        "排名下降三。",
+        "收益提升两成。",
+        "性能提升2x。",
+        "耗时降低10milliseconds。",
+        "占比减少20percent。",
+        "排名提升Top10。",
+        "启动速度提升一百。",
+        "响应速度提升四十二。",
+        "CPU 使用率降低二十七。",
+        "卡顿率下降三。",
+        "错误数减少一百。",
+        "阻塞次数减少四十二。",
+        "冷启动改善一百。",
+        "整体提升一百。",
+        "收益翻倍。",
+        "耗时减半。",
+        "占比降低10pct。",
+        "吞吐提升10MBps。",
+        "减少10frames。",
+        "发生10calls。",
+        "性能提升x2。",
+        "性能提升10fold。",
+        "延迟降到10millis。",
+        "耗时10msecs。",
+        "第一个问题最重要。",
+        "第一项建议需要执行。",
+        "第一轮复测通过。",
+        "第一次采集失败。",
+        "耗时 ten milliseconds。",
+        "占比 twenty percent。",
+        "排名 top ten。",
+        "性能 double。",
+        "耗时壹佰毫秒。",
+        "占比贰拾％。",
+        "性能提升双倍。",
+        "耗时半秒。",
+        "耗时 latency_500ms。",
+        "占比 ratio_20percent。",
+        "延迟 duration.999ms。",
+        "吞吐 metric_2x。",
+        "吞吐 metric_2 x。",
+        "吞吐 metric_2倍。",
+        "吞吐 metric_2成。",
+        "吞吐 metric_2times。",
+        "排名 rank.Top10。",
+        "API999ms 耗时。",
+    ],
+)
 def test_v21_rejects_free_written_measurements(invented_number: str) -> None:
     candidate = _candidate_v21()
     candidate["executive_summary"] = invented_number
 
     with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
         _validate(candidate, _projection_v21())
+
+
+@pytest.mark.parametrize(
+    "lexical_text",
+    [
+        "Media3 与 H264 解码位于主线程。",
+        "一般情况下应逐一复核一部分指标，并统一采样口径。",
+        "另一方面需要核对外部 SDK 回调。",
+        "第一帧需要逐一核对每一项证据。",
+        "建议从三方面优化启动流程，避免一次性加载全部资源。",
+        "另一个问题需要处理，另一项建议需要复核。",
+        "统一 Binder 调用并复测。",
+        "逐一 Binder 调用核对。",
+        "逐一 SDK 回调核对。",
+        "统一 FPS 口径。",
+        "上一帧与当前帧对比，下一帧继续复测。",
+        "前一帧、后一帧、这一帧、某一帧和任一帧都要核对。",
+        "新一轮、上一轮和这一轮使用相同环境。",
+        "某一项和任一项都不能省略。",
+        "下一次复测与上一次采集使用相同口径。",
+        "Android14 上的 Media3、H264、HTTP2 与 TLS1.3 保持不变。",
+        "两者与二者都要核对，一系列证据一经确认就应保持一致。",
+        "该现象一度出现，但不应一时、一再、一贯或一向过度归因。",
+        "建议从两方面复核。",
+        "Android 14、HTTP/2、TLS 1.3、Wi-Fi 6 的配置需要核对。",
+        "API 34、JDK 17、Kotlin 2.0、AGP 9 与 NDK r27 保持不变。",
+        "二进制解析采用零拷贝，十六进制标识保持一致，千万不要伪造结论。",
+    ],
+)
+def test_v21_allows_digits_and_number_characters_inside_non_measurement_words(
+    lexical_text: str,
+) -> None:
+    candidate = _candidate_v21()
+    candidate["executive_summary"] = lexical_text
+
+    validated = _validate(candidate, _projection_v21())
+
+    assert validated.document["executive_summary"] == lexical_text  # type: ignore[attr-defined]
 
 
 def test_v21_low_confidence_cannot_be_narrated_as_confirmed_root_cause() -> None:

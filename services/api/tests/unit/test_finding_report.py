@@ -130,3 +130,41 @@ def test_composer_preserves_non_primary_finding_conclusions() -> None:
     assert result["workbench"]["primary_finding_ids"] == [
         "85000000-0000-4000-8000-000000000001"
     ]
+
+
+def test_composer_accepts_metricless_finding_retest_without_inventing_metrics() -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+    from perfpilot_api.reports.finding_report import compose_finding_report
+    from perfpilot_api.reports.normalizer import NormalizedTraceReport
+    from perfpilot_api.reports.projection import build_ai_projection
+
+    core_document = _load("normalized-trace-report.valid.json")
+    projection = build_ai_projection(
+        NormalizedTraceReport(
+            canonical_bytes=json.dumps(
+                core_document, separators=(",", ":"), sort_keys=True
+            ).encode("utf-8"),
+            sha256_b64="Y2hlY2tzdW0=",
+        ),
+        analysis_profile="startup",
+        question=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+    synthesis = build_deterministic_finding_synthesis(projection)
+
+    result = compose_finding_report(
+        base_report=_base_report(),
+        projection=projection.document,
+        synthesis=synthesis.document,
+        report_version=3,
+        ai_mode="deterministic_fallback",
+    )
+
+    assert result["workbench"]["findings"][0]["metric_ids"] == []
+    assert result["workbench"]["retest_plans"][0]["metric_ids"] == []
+    assert result["synthesis"]["output"]["retest_plan"] == []

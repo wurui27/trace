@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Literal
@@ -74,4 +76,25 @@ def plan_recovery(snapshot: RecoverySnapshot) -> tuple[RecoveryAction, ...]:
     return (RecoveryAction.NOOP,)
 
 
-__all__ = ["RecoveryAction", "RecoverySnapshot", "plan_recovery"]
+def schedule_recovery_operation(
+    *,
+    gate: asyncio.Event,
+    operation: Callable[[], Awaitable[None]],
+    tasks: set[asyncio.Task[None]],
+) -> asyncio.Task[None]:
+    async def run() -> None:
+        await gate.wait()
+        await operation()
+
+    task = asyncio.create_task(run())
+    tasks.add(task)
+    task.add_done_callback(tasks.discard)
+    return task
+
+
+__all__ = [
+    "RecoveryAction",
+    "RecoverySnapshot",
+    "plan_recovery",
+    "schedule_recovery_operation",
+]

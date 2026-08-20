@@ -23,7 +23,131 @@ _SOURCE_PATH_TOKEN = re.compile(
     r"(?:[A-Za-z0-9_.-]+[/\\])+(?:[A-Za-z0-9_.-]+\.(?:kt|java|xml|gradle|kts))",
     re.IGNORECASE,
 )
-_FREE_WRITTEN_NUMBER = re.compile(r"[0-9０-９零〇一二三四五六七八九十百千万亿两]")
+_NUMERIC_LITERAL = (
+    r"[+-]?(?:[0-9０-９]+(?:[.．][0-9０-９]+)?|[.．][0-9０-９]+)"
+    r"(?:[eE][+-]?[0-9０-９]+)?"
+)
+_MEASUREMENT_UNIT = (
+    r"(?:毫秒|微秒|纳秒|分钟|小时|帧每秒|"
+    r"(?:千|兆|吉|太)?字节每秒|(?:千|兆|吉|太)?字节|"
+    r"(?:千|兆|吉)?赫兹|(?:兆|吉)赫|"
+    r"[kmgt]i?b(?:/s)?|b(?:/s)?|[kmg]?hz|fps|msec|sec|ms|us|µs|μs|ns|s|%|％|秒)"
+)
+_CHINESE_INTEGER = r"[零〇一二三四五六七八九十百千万萬亿億两壹贰貳叁參肆伍陆陸柒捌玖拾佰仟]+"
+_CHINESE_NUMERAL = rf"{_CHINESE_INTEGER}(?:点{_CHINESE_INTEGER})?"
+_CHINESE_COUNT_UNIT = r"(?:次|条|个|项|帧|轮|倍|段|处|种|份|组|类|台|核|页|行)"
+_LEXICAL_ONE_COUNT_GUARD = (
+    rf"(?!一次性)(?!(?:(?<=每)|(?<=逐)|(?<=同)|(?<=另)|"
+    rf"(?<=上)|(?<=下)|(?<=前)|(?<=后)|(?<=这)|(?<=某)|(?<=任)|(?<=新))"
+    rf"一\s*{_CHINESE_COUNT_UNIT})"
+)
+_LEXICAL_ONE_MEASUREMENT_GUARD = (
+    rf"(?!(?:(?<=统)|(?<=逐)|(?<=每)|(?<=同)|(?<=另)|"
+    rf"(?<=上)|(?<=下)|(?<=前)|(?<=后)|(?<=这)|(?<=某)|(?<=任)|(?<=新))"
+    rf"一\s*{_MEASUREMENT_UNIT})"
+)
+_STANDALONE_QUANTITY_PREFIX = (
+    r"(?:性能|耗时|时长|延迟|占比|比例|问题数量|数量|排名|收益|吞吐|"
+    r"内存|帧率|频率|CPU(?:占用)?)\s*"
+    r"(?:提升|降低|增加|减少|上升|下降|为|达到|达|是)"
+)
+_STANDALONE_CHINESE_QUANTITY = (
+    rf"{_STANDALONE_QUANTITY_PREFIX}\s*{_CHINESE_NUMERAL}(?:成)?"
+    r"(?=[\s，。；！？,.!?;:]|$)"
+)
+_ASCII_SUFFIXED_MEASUREMENT = (
+    rf"(?<![A-Za-z0-9_]){_NUMERIC_LITERAL}"
+    r"(?:x|milliseconds?|microseconds?|nanoseconds?|seconds?|percent)"
+    r"(?![A-Za-z0-9_])"
+)
+_TOP_RANK = rf"(?i:top)\s*{_NUMERIC_LITERAL}(?![A-Za-z0-9_])"
+_FREE_WRITTEN_NUMBER = re.compile(
+    rf"(?<![A-Za-z0-9_]){_NUMERIC_LITERAL}\s*{_MEASUREMENT_UNIT}(?![A-Za-z0-9_])"
+    rf"|(?<![A-Za-z0-9_]){_NUMERIC_LITERAL}(?![A-Za-z0-9_])"
+    rf"|{_LEXICAL_ONE_MEASUREMENT_GUARD}{_CHINESE_NUMERAL}\s*{_MEASUREMENT_UNIT}"
+    rf"(?![A-Za-z0-9_])"
+    rf"|百分之{_CHINESE_NUMERAL}"
+    rf"|{_LEXICAL_ONE_COUNT_GUARD}{_CHINESE_NUMERAL}\s*{_CHINESE_COUNT_UNIT}"
+    rf"|{_STANDALONE_CHINESE_QUANTITY}"
+    rf"|{_ASCII_SUFFIXED_MEASUREMENT}"
+    rf"|{_TOP_RANK}",
+    re.IGNORECASE,
+)
+_TECHNICAL_IDENTIFIER_WITH_DIGIT = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"(?:android|api|media|h|avc|hevc|vp|armv?|x86|riscv|ipv|http|tls|"
+    r"wifi|jdk|java|kotlin|agp|ndk|sdk)\d+[A-Za-z0-9_.-]*"
+    r"|(?=[A-Za-z0-9_.-]*[_.])(?=[A-Za-z0-9_.-]*\d)"
+    r"[A-Za-z][A-Za-z0-9_.-]*"
+    r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_TECHNICAL_VERSION_WITH_DIGIT = re.compile(
+    r"(?<![A-Za-z0-9_])(?:"
+    r"(?:android|api|jdk|kotlin|agp|sdk)\s+\d+(?:\.\d+)*"
+    r"|http/\d+(?:\.\d+)*"
+    r"|tls\s+\d+(?:\.\d+)*"
+    r"|wi[-‑ ]?fi\s+\d+(?:\.\d+)*"
+    r"|ndk\s+r\d+(?:\.\d+)*"
+    r")(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_LEXICAL_NUMBER_WORD = re.compile(
+    r"(?:十六进制|二进制|零拷贝|千万不要|另一方面|三方面|两方面|"
+    r"一系列|一般|一旦|一部分|一次性|统一|唯一|一致|一样|一律|"
+    r"一起|一直|一定|一并|一体|一经|一度|一时|一再|一贯|一向|"
+    r"进一步|一方面|三方|两者|二者|第一帧|第一屏|逐一|同一|"
+    rf"(?:每|另|上|下|前|后|这|某|任|新)一{_CHINESE_COUNT_UNIT})"
+)
+_IMPLICIT_NUMERIC_PROMISE = re.compile(r"(?:翻倍|成倍|双倍|减半)")
+_EMBEDDED_ASCII_QUANTITY = re.compile(
+    rf"(?:{_NUMERIC_LITERAL}\s*(?:{_MEASUREMENT_UNIT}|milliseconds?|"
+    r"microseconds?|nanoseconds?|seconds?|percent|pct|mbps|frames?|calls?|"
+    r"fold|millis|msecs|x|times?|倍|成)|(?:top|x)\s*"
+    rf"{_NUMERIC_LITERAL})(?![A-Za-z0-9_])",
+    re.IGNORECASE,
+)
+_BARE_CHINESE_QUANTITY = re.compile(
+    rf"{_CHINESE_NUMERAL}(?:成)?(?=[\s，。；！？,.!?;:]|$)"
+)
+_CONTEXTUAL_CHINESE_QUANTITY = re.compile(
+    rf"(?:提升|降低|增加|减少|上升|下降|改善|优化|节省|降到|达到|达|为|是)"
+    rf"\s*{_CHINESE_NUMERAL}(?:成)?(?=[\s，。；！？,.!?;:]|$)"
+)
+_HALF_MEASUREMENT = re.compile(rf"半\s*{_MEASUREMENT_UNIT}", re.IGNORECASE)
+_ENGLISH_NUMBER_WORD = (
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
+    r"twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|nineteen|"
+    r"twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred)"
+)
+_SPELLED_ENGLISH_QUANTITY = re.compile(
+    rf"\b(?:top\s+{_ENGLISH_NUMBER_WORD}|{_ENGLISH_NUMBER_WORD}\s+"
+    r"(?:milliseconds?|microseconds?|nanoseconds?|seconds?|percent|frames?|"
+    r"calls?|times?|fold))\b"
+    r"|(?:性能|耗时|延迟|收益|占比|比例|吞吐|速度|performance|latency|"
+    r"benefit|ratio|throughput|speed)\s*(?:double|half)\b",
+    re.IGNORECASE,
+)
+
+
+def _contains_free_written_number(text: str) -> bool:
+    """Reject prose quantities without treating ordinary numbered words as metrics."""
+
+    if (
+        _IMPLICIT_NUMERIC_PROMISE.search(text)
+        or _EMBEDDED_ASCII_QUANTITY.search(text)
+        or _HALF_MEASUREMENT.search(text)
+        or _SPELLED_ENGLISH_QUANTITY.search(text)
+    ):
+        return True
+    masked = _TECHNICAL_VERSION_WITH_DIGIT.sub("", text)
+    masked = _TECHNICAL_IDENTIFIER_WITH_DIGIT.sub("", masked)
+    masked = _LEXICAL_NUMBER_WORD.sub("", masked)
+    return bool(
+        _FREE_WRITTEN_NUMBER.search(masked)
+        or _BARE_CHINESE_QUANTITY.search(masked)
+        or _CONTEXTUAL_CHINESE_QUANTITY.search(masked)
+    )
 _CONFIRMED_CAUSAL_LANGUAGE = re.compile(r"(?:已经|已)?确认(?:根因|原因|为)|确定为|根因是|直接导致|必然")
 
 
@@ -418,7 +542,7 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
             raise SynthesisValidationError
 
     for text in _narrative_fields(document):
-        if index.schema_version == "2.1" and _FREE_WRITTEN_NUMBER.search(text):
+        if index.schema_version == "2.1" and _contains_free_written_number(text):
             raise SynthesisValidationError
         if index.schema_version != "2.1" and any(
             token.group(0) not in index.numeric_spellings
