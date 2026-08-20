@@ -314,6 +314,104 @@ def test_source_aware_examples_are_closed_and_valid(
         _validator(schema_name).validate({**document, "unexpected": True})
 
 
+@pytest.mark.parametrize(
+    ("schema_name", "example_name", "expected_version"),
+    [
+        (
+            "reports/analysis-report.schema.json",
+            "analysis-report-v1.3.valid.json",
+            "1.3",
+        ),
+        (
+            "ai/analysis-projection.schema.json",
+            "analysis-projection-v2.1.valid.json",
+            "2.1",
+        ),
+        (
+            "ai/synthesis-output.schema.json",
+            "synthesis-output-v2.1.valid.json",
+            "2.1",
+        ),
+    ],
+)
+def test_finding_workbench_examples_are_closed_and_valid(
+    schema_name: str,
+    example_name: str,
+    expected_version: str,
+) -> None:
+    document = _example(example_name)
+
+    _validate_ai_contract(schema_name, document)
+    assert document["schema_version"] == expected_version
+
+    with pytest.raises(jsonschema.ValidationError):
+        _validate_ai_contract(schema_name, {**document, "private_path": "/private/repo"})
+
+
+def test_legacy_report_and_synthesis_examples_remain_exact() -> None:
+    report = _example("analysis-report-v1.2.valid.json")
+    synthesis = _example("synthesis-output-v2.valid.json")
+
+    _validate_ai_contract("reports/analysis-report.schema.json", report)
+    _validate_ai_contract("ai/synthesis-output.schema.json", synthesis)
+
+    assert report["schema_version"] == "1.2"
+    assert synthesis["schema_version"] == "2.0"
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        "unknown_primary_finding",
+        "invalid_evidence_interval",
+        "e4_without_direct_locator",
+        "source_ref_without_match",
+        "metric_with_unknown_evidence",
+        "retest_for_unknown_finding",
+    ],
+)
+def test_v13_report_rejects_invalid_workbench_semantics(mutation: str) -> None:
+    report = _example("analysis-report-v1.3.valid.json")
+    workbench = report["workbench"]
+    if mutation == "unknown_primary_finding":
+        workbench["primary_finding_ids"] = [
+            "85000000-0000-4000-8000-000000000099"
+        ]
+    elif mutation == "invalid_evidence_interval":
+        workbench["evidence"][0]["locator"]["end_ns"] = 1
+    elif mutation == "e4_without_direct_locator":
+        workbench["evidence"][0]["locator"]["thread"] = None
+    elif mutation == "source_ref_without_match":
+        workbench["findings"][0]["source_ref_ids"] = [
+            "97000000-0000-4000-8000-000000000001"
+        ]
+    elif mutation == "metric_with_unknown_evidence":
+        workbench["metrics"][0]["evidence_ids"] = [
+            "86000000-0000-4000-8000-000000000099"
+        ]
+    else:
+        workbench["retest_plans"][0]["finding_id"] = (
+            "85000000-0000-4000-8000-000000000099"
+        )
+
+    with pytest.raises(jsonschema.ValidationError):
+        _validate_ai_contract("reports/analysis-report.schema.json", report)
+
+
+def test_v21_synthesis_rejects_unknown_claim_refs_and_ai_owned_facts() -> None:
+    synthesis = _example("synthesis-output-v2.1.valid.json")
+    synthesis["conclusions"][0]["claim_refs"][0]["metric_id"] = (
+        "84000000-0000-4000-8000-000000000099"
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        _validate_ai_contract("ai/synthesis-output.schema.json", synthesis)
+
+    synthesis = _example("synthesis-output-v2.1.valid.json")
+    synthesis["conclusions"][0]["priority_score"] = 100
+    with pytest.raises(jsonschema.ValidationError):
+        _validate_ai_contract("ai/synthesis-output.schema.json", synthesis)
+
+
 def test_projection_v2_source_context_is_untrusted_relative_and_bounded() -> None:
     validator = _validator("ai/analysis-projection.schema.json")
     projection = _example("analysis-projection-v2.valid.json")

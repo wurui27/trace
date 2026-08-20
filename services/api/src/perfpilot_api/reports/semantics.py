@@ -56,11 +56,22 @@ def validate_source_aware_semantics(
     if name == "analysis-projection" and schema_version == "2.0":
         _validate_projection(document)
         return
+    if name == "analysis-projection" and schema_version == "2.1":
+        _validate_projection(document)
+        _validate_workbench_document(document)
+        return
     if name == "synthesis-output" and schema_version == "2.0":
         _validate_synthesis(document)
         return
+    if name == "synthesis-output" and schema_version == "2.1":
+        _validate_synthesis_v21(document)
+        return
     if name == "analysis-report" and schema_version == "1.2":
         _validate_report(document)
+        return
+    if name == "analysis-report" and schema_version == "1.3":
+        _validate_workbench_document(document)
+        _validate_report_v13(document)
 
 
 def _validate_projection(document: dict[str, object]) -> None:
@@ -113,6 +124,287 @@ def _validate_synthesis(document: dict[str, object]) -> None:
         if binding in bindings:
             raise SourceAwareSemanticError
         bindings.add(binding)
+
+
+def _validate_synthesis_v21(document: dict[str, object]) -> None:
+    _validate_synthesis(document)
+    key_metric_ids = _string_set(document.get("key_metric_ids"))
+    conclusions = document.get("conclusions")
+    if not isinstance(conclusions, list):
+        raise SourceAwareSemanticError
+    finding_ids: set[str] = set()
+    for conclusion in conclusions:
+        if not isinstance(conclusion, dict):
+            raise SourceAwareSemanticError
+        finding_id = conclusion.get("finding_id")
+        evidence_ids = _string_set(conclusion.get("evidence_ids"))
+        claim_refs = conclusion.get("claim_refs")
+        if not isinstance(finding_id, str) or finding_id in finding_ids:
+            raise SourceAwareSemanticError
+        finding_ids.add(finding_id)
+        if not isinstance(claim_refs, list):
+            raise SourceAwareSemanticError
+        for claim in claim_refs:
+            if not isinstance(claim, dict):
+                raise SourceAwareSemanticError
+            metric_id = claim.get("metric_id")
+            evidence_id = claim.get("evidence_id")
+            if metric_id is not None and metric_id not in key_metric_ids:
+                raise SourceAwareSemanticError
+            if evidence_id is not None and evidence_id not in evidence_ids:
+                raise SourceAwareSemanticError
+
+
+def _validate_workbench_document(document: dict[str, object]) -> None:
+    capabilities = document.get("capabilities")
+    quality = document.get("quality")
+    workbench = document.get("workbench")
+    if not all(isinstance(value, dict) for value in (capabilities, quality, workbench)):
+        raise SourceAwareSemanticError
+    assert isinstance(capabilities, dict)
+    assert isinstance(quality, dict)
+    assert isinstance(workbench, dict)
+
+    metrics = workbench.get("metrics")
+    evidence = workbench.get("evidence")
+    findings = workbench.get("findings")
+    retests = workbench.get("retest_plans")
+    primary = workbench.get("primary_finding_ids")
+    critical_path = workbench.get("critical_path")
+    if not all(
+        isinstance(value, list)
+        for value in (metrics, evidence, findings, retests, primary, critical_path)
+    ):
+        raise SourceAwareSemanticError
+    assert isinstance(metrics, list)
+    assert isinstance(evidence, list)
+    assert isinstance(findings, list)
+    assert isinstance(retests, list)
+    assert isinstance(primary, list)
+    assert isinstance(critical_path, list)
+
+    metric_ids = _unique_ids(metrics, "metric_id")
+    evidence_ids = _unique_ids(evidence, "evidence_id")
+    finding_ids = _unique_ids(findings, "finding_id")
+    retest_ids = _unique_ids(retests, "retest_plan_id")
+    evidence_by_id = {
+        item["evidence_id"]: item for item in evidence if isinstance(item, dict)
+    }
+
+    for metric in metrics:
+        if not isinstance(metric, dict) or not _string_set(
+            metric.get("evidence_ids")
+        ).issubset(evidence_ids):
+            raise SourceAwareSemanticError
+    for item in evidence:
+        if not isinstance(item, dict):
+            raise SourceAwareSemanticError
+        locator = item.get("locator")
+        if (
+            not isinstance(locator, dict)
+            or not isinstance(locator.get("start_ns"), int)
+            or not isinstance(locator.get("end_ns"), int)
+            or locator["end_ns"] < locator["start_ns"]
+            or not _string_set(item.get("metric_ids")).issubset(metric_ids)
+        ):
+            raise SourceAwareSemanticError
+
+    expected_order = sorted(
+        findings,
+        key=lambda item: (
+            -int(item.get("priority_score", -1)) if isinstance(item, dict) else 1,
+            str(item.get("finding_id")) if isinstance(item, dict) else "",
+        ),
+    )
+    if findings != expected_order:
+        raise SourceAwareSemanticError
+    eligible_primary: list[str] = []
+    for item in findings:
+        if not isinstance(item, dict):
+            raise SourceAwareSemanticError
+        finding_evidence_ids = _string_set(item.get("evidence_ids"))
+        finding_metric_ids = _string_set(item.get("metric_ids"))
+        source_ref_ids = _string_set(item.get("source_ref_ids"))
+        if (
+            not finding_evidence_ids.issubset(evidence_ids)
+            or not finding_metric_ids.issubset(metric_ids)
+            or item.get("retest_plan_id") not in retest_ids
+            or capabilities.get("source") != "matched"
+            and source_ref_ids
+        ):
+            raise SourceAwareSemanticError
+        grade = _finding_evidence_grade(item)
+        located = [evidence_by_id.get(value) for value in finding_evidence_ids]
+        if grade == "E4" and not any(_is_direct_locator(value) for value in located):
+            raise SourceAwareSemanticError
+        if grade == "E3" and sum(_has_locator(value) for value in located) < 2:
+            raise SourceAwareSemanticError
+        if item.get("status") == "confirmed" and item.get("priority") in {"p0", "p1"}:
+            eligible_primary.append(str(item["finding_id"]))
+    if primary != eligible_primary[:3] or not _string_set(primary).issubset(finding_ids):
+        raise SourceAwareSemanticError
+
+    retest_by_id = {
+        item["retest_plan_id"]: item for item in retests if isinstance(item, dict)
+    }
+    if len(retest_by_id) != len(retests):
+        raise SourceAwareSemanticError
+    for item in retests:
+        if (
+            not isinstance(item, dict)
+            or item.get("finding_id") not in finding_ids
+            or not _string_set(item.get("metric_ids")).issubset(metric_ids)
+        ):
+            raise SourceAwareSemanticError
+    for finding in findings:
+        if not isinstance(finding, dict):
+            raise SourceAwareSemanticError
+        retest = retest_by_id.get(finding.get("retest_plan_id"))
+        if not isinstance(retest, dict) or retest.get("finding_id") != finding.get("finding_id"):
+            raise SourceAwareSemanticError
+
+    for segment in critical_path:
+        if not isinstance(segment, dict):
+            raise SourceAwareSemanticError
+        start_ns = segment.get("start_ns")
+        end_ns = segment.get("end_ns")
+        duration_ns = segment.get("duration_ns")
+        if (
+            not isinstance(start_ns, int)
+            or not isinstance(end_ns, int)
+            or not isinstance(duration_ns, int)
+            or end_ns < start_ns
+            or duration_ns != end_ns - start_ns
+            or not _string_set(segment.get("evidence_ids")).issubset(evidence_ids)
+        ):
+            raise SourceAwareSemanticError
+
+    _validate_quality_coherence(document, capabilities, quality)
+
+
+def _validate_report_v13(document: dict[str, object]) -> None:
+    synthesis = document.get("synthesis")
+    output = synthesis.get("output") if isinstance(synthesis, dict) else None
+    if isinstance(output, dict):
+        _validate_synthesis_v21(output)
+        _validate_synthesis_against_workbench(document, output)
+    state = document.get("state")
+    quality = document.get("quality")
+    if not isinstance(quality, dict):
+        raise SourceAwareSemanticError
+    if state == "completed" and quality.get("trace_core_state") != "complete":
+        raise SourceAwareSemanticError
+    if state == "partially_completed" and quality.get("trace_core_state") != "partial":
+        raise SourceAwareSemanticError
+
+
+def _validate_synthesis_against_workbench(
+    document: dict[str, object],
+    output: dict[str, object],
+) -> None:
+    workbench = document.get("workbench")
+    if not isinstance(workbench, dict):
+        raise SourceAwareSemanticError
+    metric_ids = _unique_ids(workbench.get("metrics"), "metric_id")
+    evidence_ids = _unique_ids(workbench.get("evidence"), "evidence_id")
+    primary = workbench.get("primary_finding_ids")
+    conclusions = output.get("conclusions")
+    if not isinstance(primary, list) or not isinstance(conclusions, list):
+        raise SourceAwareSemanticError
+    conclusion_ids = [
+        item.get("finding_id") for item in conclusions if isinstance(item, dict)
+    ]
+    if conclusion_ids != primary:
+        raise SourceAwareSemanticError
+    if not _string_set(output.get("key_metric_ids")).issubset(metric_ids):
+        raise SourceAwareSemanticError
+    for conclusion in conclusions:
+        if not isinstance(conclusion, dict):
+            raise SourceAwareSemanticError
+        if not _string_set(conclusion.get("evidence_ids")).issubset(evidence_ids):
+            raise SourceAwareSemanticError
+        claim_refs = conclusion.get("claim_refs")
+        if not isinstance(claim_refs, list):
+            raise SourceAwareSemanticError
+        for claim in claim_refs:
+            if not isinstance(claim, dict):
+                raise SourceAwareSemanticError
+            metric_id = claim.get("metric_id")
+            evidence_id = claim.get("evidence_id")
+            if metric_id is not None and metric_id not in metric_ids:
+                raise SourceAwareSemanticError
+            if evidence_id is not None and evidence_id not in evidence_ids:
+                raise SourceAwareSemanticError
+
+
+def _validate_quality_coherence(
+    document: dict[str, object],
+    capabilities: dict[str, object],
+    quality: dict[str, object],
+) -> None:
+    source_state = quality.get("source_correlation_state")
+    expected_source = {
+        "matched": "available_strong",
+        "mismatch": "available_weak",
+        "unavailable": "unavailable",
+        "not_requested": "not_requested",
+    }.get(capabilities.get("source"))
+    if source_state != expected_source:
+        raise SourceAwareSemanticError
+    if document.get("schema_version") == "2.1" and quality.get("synthesis_state") not in {
+        "queued",
+        "running",
+    }:
+        raise SourceAwareSemanticError
+
+
+def _unique_ids(items: object, field: str) -> set[str]:
+    if not isinstance(items, list):
+        raise SourceAwareSemanticError
+    values = [item.get(field) for item in items if isinstance(item, dict)]
+    if (
+        len(values) != len(items)
+        or not all(isinstance(value, str) for value in values)
+        or len(values) != len(set(values))
+    ):
+        raise SourceAwareSemanticError
+    return set(values)  # type: ignore[arg-type]
+
+
+def _string_set(value: object) -> set[str]:
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        raise SourceAwareSemanticError
+    return set(value)
+
+
+def _finding_evidence_grade(finding: dict[str, object]) -> object:
+    confidence = finding.get("confidence")
+    if not isinstance(confidence, dict):
+        raise SourceAwareSemanticError
+    return confidence.get("evidence_grade")
+
+
+def _has_locator(evidence: object) -> bool:
+    if not isinstance(evidence, dict):
+        return False
+    locator = evidence.get("locator")
+    return bool(
+        isinstance(locator, dict)
+        and isinstance(locator.get("start_ns"), int)
+        and isinstance(locator.get("end_ns"), int)
+        and locator["end_ns"] >= locator["start_ns"]
+    )
+
+
+def _is_direct_locator(evidence: object) -> bool:
+    if not isinstance(evidence, dict) or not _has_locator(evidence):
+        return False
+    locator = evidence.get("locator")
+    assert isinstance(locator, dict)
+    return all(
+        isinstance(locator.get(field), str) and locator[field]
+        for field in ("process", "thread", "track", "slice", "query_id")
+    )
 
 
 def _validate_report(document: dict[str, object]) -> None:

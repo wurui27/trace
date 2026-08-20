@@ -1,0 +1,385 @@
+{
+  "schema_version": "1.3",
+  "analysis_id": "82000000-0000-4000-8000-000000000001",
+  "analysis_mode": "trace_upload",
+  "state": "partially_completed",
+  "report_version": 3,
+  "generated_at": "2026-08-20T09:05:00Z",
+  "scenario_reports": [
+    {
+      "scenario_job_id": "83000000-0000-4000-8000-000000000001",
+      "scenario_type": "startup",
+      "result_state": "partially_completed",
+      "device_group_id": null,
+      "device_group_reason": "not_applicable",
+      "bundle": {
+        "schema_version": "1.0",
+        "bundle_id": "36000000-0000-4000-8000-000000000001",
+        "scenario_job_id": "83000000-0000-4000-8000-000000000001",
+        "scenario_type": "startup",
+        "bundle_state": "partial",
+        "valid_measurement": true,
+        "validity_reasons": ["required_capability_binder_unavailable"],
+        "sample_ids": ["37000000-0000-4000-8000-000000000001"],
+        "generated_at": "2026-08-20T09:00:00Z",
+        "metrics": [
+          {
+            "metric_id": "84000000-0000-4000-8000-000000000001",
+            "name": "startup.time_to_initial_display_ms",
+            "status": "available",
+            "numeric_value": 812.4,
+            "unit": "ms",
+            "definition": "Median time to initial display.",
+            "threshold": {"operator": "lte", "value": 700, "unit": "ms"},
+            "sample_ids": ["37000000-0000-4000-8000-000000000001"]
+          }
+        ],
+        "findings": [
+          {
+            "finding_id": "85000000-0000-4000-8000-000000000001",
+            "rule_id": "startup.main_thread_binder",
+            "kind": "root_cause",
+            "status": "confirmed",
+            "severity": "warning",
+            "confidence": "high",
+            "confidence_ceiling": "high",
+            "title": "Main thread waits on Binder",
+            "summary": "A repeated Binder wait overlaps startup.",
+            "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+            "exclusions": [],
+            "recommendation": "Move the lookup off the launch-critical path.",
+            "retest": "Repeat cold launches."
+          }
+        ],
+        "evidence": [
+          {
+            "evidence_id": "86000000-0000-4000-8000-000000000001",
+            "source": "perfetto.startup_binder_waits",
+            "query_id": "startup.binder_wait_chain.v1",
+            "interval_start_ns": 120000000,
+            "interval_end_ns": 310000000,
+            "artifact_id": "3b000000-0000-4000-8000-000000000001",
+            "fields": {
+              "blocked_duration_ms": 190,
+              "process": "com.rivotek.mediacenter",
+              "thread": "main",
+              "track": "Main Thread",
+              "slice": "Application.onCreate"
+            }
+          }
+        ],
+        "artifacts": [
+          {
+            "artifact_id": "3b000000-0000-4000-8000-000000000001",
+            "artifact_kind": "trace",
+            "mime": "application/octet-stream",
+            "size": 1048576,
+            "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+          }
+        ],
+        "trace_health": {
+          "parse_status": "parsed",
+          "trace_start_ns": 0,
+          "trace_end_ns": 5000000000,
+          "target_resolution": {
+            "package_name": "com.rivotek.mediacenter",
+            "process_name": "com.rivotek.mediacenter",
+            "upid": 17,
+            "pid": 4242,
+            "main_thread_id": 4242
+          },
+          "measurement_window": {
+            "start_ns": 100000000,
+            "end_ns": 900000000,
+            "coverage": "complete"
+          },
+          "data_loss": {
+            "buffer_overruns": 0,
+            "ftrace_events_lost": 0,
+            "traced_buf_patches_failed": 0,
+            "incomplete_slices": 0,
+            "boundary_truncations": 0
+          },
+          "frame_timeline_coverage": "available",
+          "target_display_coverage": "available",
+          "refresh_mode_coverage": "available"
+        },
+        "trace_capabilities": [
+          {
+            "name": "android_startups",
+            "required": true,
+            "status": "available",
+            "reason": null
+          },
+          {
+            "name": "binder",
+            "required": true,
+            "status": "unavailable",
+            "reason": "trace_data_source_missing"
+          }
+        ],
+        "provenance": {
+          "input_artifacts": [
+            {
+              "artifact_id": "3b000000-0000-4000-8000-000000000001",
+              "artifact_kind": "trace",
+              "sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+            }
+          ],
+          "capture_manifest": {
+            "status": "not_provided",
+            "identifier": null,
+            "version": null,
+            "sha256_b64": null,
+            "reason": "trace_upload"
+          },
+          "apk": {
+            "status": "not_provided",
+            "identifier": null,
+            "version": null,
+            "sha256_b64": null,
+            "reason": "not_provided"
+          },
+          "device": {
+            "status": "not_provided",
+            "identifier": null,
+            "version": null,
+            "sha256_b64": null,
+            "reason": "trace_upload"
+          },
+          "agent": {
+            "status": "not_provided",
+            "identifier": null,
+            "version": null,
+            "sha256_b64": null,
+            "reason": "trace_upload"
+          },
+          "worker_container_image_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "tracekit_version": "1.0.0",
+          "tracekit_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "trace_processor_version": "v50.1",
+          "trace_processor_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "sql_bundle_version": "2026.08.1",
+          "sql_bundle_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "analysis_bundle_schema_version": "1.0",
+          "analysis_bundle_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "rules_version": "2026.08.1",
+          "rules_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "scenario_recipe_version": 1,
+          "scenario_recipe_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+          "query_parameters": [
+            {"name": "target_package", "value": "com.rivotek.mediacenter"},
+            {"name": "startup_mode", "value": "cold"}
+          ]
+        }
+      },
+      "failure": null
+    }
+  ],
+  "synthesis": {
+    "state": "completed",
+    "output": {
+      "schema_version": "2.1",
+      "verdict": "冷启动关键路径存在主线程同步等待，建议先处理启动阶段的阻塞工作。",
+      "executive_summary": "SmartPerfetto 的直接证据支持该问题；修改仅供参考，完成后应按相同环境复测。",
+      "key_metric_ids": ["84000000-0000-4000-8000-000000000001"],
+      "conclusions": [
+        {
+          "finding_id": "85000000-0000-4000-8000-000000000001",
+          "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+          "source_ref_ids": [],
+          "claim_refs": [
+            {
+              "claim_type": "metric_over_threshold",
+              "metric_id": "84000000-0000-4000-8000-000000000001",
+              "evidence_id": null
+            },
+            {
+              "claim_type": "evidence_on_critical_path",
+              "metric_id": null,
+              "evidence_id": "86000000-0000-4000-8000-000000000001"
+            }
+          ],
+          "problem": "冷启动首帧前存在主线程同步等待。",
+          "cause": "同步初始化工作占用了启动关键路径。",
+          "source_root_cause": "本次未关联源码，当前只能确认 Trace 机制，不能确认具体代码根因。",
+          "recommendation": "优先拆分首帧前的非必要同步初始化，并保持启动主线程可继续推进。"
+        }
+      ],
+      "top_findings": [
+        {
+          "finding_id": "85000000-0000-4000-8000-000000000001",
+          "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+          "user_impact": "首屏可见时间被启动关键路径上的同步等待推迟。"
+        }
+      ],
+      "recommendations": [
+        {
+          "priority": "p0",
+          "title": "拆分启动同步工作",
+          "action": "把首帧前不必要的同步初始化延后或异步化。",
+          "expected_effect": "移除已确认的启动关键路径等待。",
+          "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+          "evidence_ids": ["86000000-0000-4000-8000-000000000001"]
+        }
+      ],
+      "source_fixes": [],
+      "retest_plan": [
+        {
+          "mode": "verify_metric",
+          "scenario_type": "startup",
+          "metric_ids": ["84000000-0000-4000-8000-000000000001"],
+          "limitation_ids": [],
+          "steps": "使用相同应用、设备、场景和采集方式重新执行冷启动。",
+          "success_condition": "improve_from_baseline",
+          "failure_condition": "threshold_missed"
+        }
+      ],
+      "limitations": []
+    },
+    "synthesis_artifact_id": "88000000-0000-4000-8000-000000000001",
+    "failure_code": null,
+    "provenance": {
+      "provider_protocol": "chat-completions-json-schema-v1",
+      "provider_name": "approved-provider",
+      "model": "approved-model",
+      "prompt_template_version": "finding-workbench-1.0.0",
+      "prompt_template_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "normalizer_version": "smartperfetto-normalizer-1",
+      "report_worker_image_digest": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "projection_artifact_id": "89000000-0000-4000-8000-000000000002",
+      "projection_sha256_b64": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+      "generated_at": "2026-08-20T09:04:00Z",
+      "prompt_tokens": 100,
+      "completion_tokens": 200,
+      "total_tokens": 300,
+      "generation": 1
+    }
+  },
+  "capabilities": {
+    "trace": "available",
+    "smartperfetto": "available",
+    "source": "not_requested",
+    "ai": "available"
+  },
+  "quality": {
+    "trace_core_state": "partial",
+    "report_validation_state": "passed",
+    "synthesis_state": "completed",
+    "source_correlation_state": "not_requested",
+    "patch_validation_state": "not_requested",
+    "reason_codes": ["required_capability_binder_unavailable"],
+    "scenarios": [
+      {
+        "scenario_type": "startup",
+        "parse_status": "parsed",
+        "measurement_window_coverage": "complete",
+        "data_loss_present": false,
+        "data_loss_categories": [],
+        "capabilities": [
+          {
+            "name": "android_startups",
+            "required": true,
+            "status": "available",
+            "reason_code": null
+          },
+          {
+            "name": "binder",
+            "required": true,
+            "status": "unavailable",
+            "reason_code": "trace_data_source_missing"
+          }
+        ]
+      }
+    ]
+  },
+  "workbench": {
+    "critical_path": [
+      {
+        "segment_id": "9a000000-0000-4000-8000-000000000001",
+        "label": "Application 初始化",
+        "start_ns": 120000000,
+        "end_ns": 310000000,
+        "duration_ns": 190000000,
+        "evidence_ids": ["86000000-0000-4000-8000-000000000001"]
+      }
+    ],
+    "metrics": [
+      {
+        "metric_id": "84000000-0000-4000-8000-000000000001",
+        "name": "startup.time_to_initial_display_ms",
+        "value": 812.4,
+        "unit": "ms",
+        "aggregation": "single_sample",
+        "scenario_type": "startup",
+        "source": "smartperfetto",
+        "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+        "quality": "available"
+      }
+    ],
+    "evidence": [
+      {
+        "evidence_id": "86000000-0000-4000-8000-000000000001",
+        "kind": "trace_interval",
+        "scenario_type": "startup",
+        "metric_ids": ["84000000-0000-4000-8000-000000000001"],
+        "summary": "Application 初始化与主线程等待区间重叠。",
+        "source": "smartperfetto",
+        "locator": {
+          "start_ns": 120000000,
+          "end_ns": 310000000,
+          "process": "com.rivotek.mediacenter",
+          "thread": "main",
+          "track": "Main Thread",
+          "slice": "Application.onCreate",
+          "query_id": "startup.binder_wait_chain.v1"
+        }
+      }
+    ],
+    "findings": [
+      {
+        "finding_id": "85000000-0000-4000-8000-000000000001",
+        "scenario_type": "startup",
+        "title": "Application 初始化阻塞主线程",
+        "problem": "冷启动首帧前存在主线程同步等待。",
+        "impact": "该问题增加场景关键路径耗时。",
+        "mechanism": "startup.main_thread_binder",
+        "root_cause": "当前只能确认同步等待机制，尚未确认具体源码根因。",
+        "critical_path_contribution": 0.24,
+        "priority": "p0",
+        "priority_score": 88,
+        "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+        "metric_ids": ["84000000-0000-4000-8000-000000000001"],
+        "source_ref_ids": [],
+        "status": "confirmed",
+        "confidence": {
+          "data_completeness": "limited",
+          "evidence_grade": "E4",
+          "attribution": "high",
+          "statistical": "single_sample"
+        },
+        "confidence_ceiling": "high",
+        "confirmed_items": ["主线程同步等待与启动关键区间重叠"],
+        "unconfirmed_items": ["Binder 数据源缺失，不能确认具体等待对象"],
+        "exclusions": [],
+        "engine_recommendation": "Move the lookup off the launch-critical path.",
+        "engine_retest": "Repeat cold launches.",
+        "retest_plan_id": "89000000-0000-4000-8000-000000000001"
+      }
+    ],
+    "primary_finding_ids": ["85000000-0000-4000-8000-000000000001"],
+    "retest_plans": [
+      {
+        "retest_plan_id": "89000000-0000-4000-8000-000000000001",
+        "finding_id": "85000000-0000-4000-8000-000000000001",
+        "scenario_type": "startup",
+        "package_name": "com.rivotek.mediacenter",
+        "duration_seconds": 15,
+        "environment_fingerprint": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "metric_ids": ["84000000-0000-4000-8000-000000000001"],
+        "pass_criteria": ["使用相同环境复测，并确认关联指标优于当前基线。"],
+        "notes": "使用相同设备、构建、场景和采集时长复测。"
+      }
+    ]
+  }
+}

@@ -1,0 +1,59 @@
+{
+  "schema_version": "2.1",
+  "verdict": "冷启动关键路径存在主线程同步等待，建议先处理启动阶段的阻塞工作。",
+  "executive_summary": "SmartPerfetto 的直接证据支持该问题；修改仅供参考，完成后应按相同环境复测。",
+  "key_metric_ids": ["84000000-0000-4000-8000-000000000001"],
+  "conclusions": [
+    {
+      "finding_id": "85000000-0000-4000-8000-000000000001",
+      "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+      "source_ref_ids": [],
+      "claim_refs": [
+        {
+          "claim_type": "metric_over_threshold",
+          "metric_id": "84000000-0000-4000-8000-000000000001",
+          "evidence_id": null
+        },
+        {
+          "claim_type": "evidence_on_critical_path",
+          "metric_id": null,
+          "evidence_id": "86000000-0000-4000-8000-000000000001"
+        }
+      ],
+      "problem": "冷启动首帧前存在主线程同步等待。",
+      "cause": "同步初始化工作占用了启动关键路径。",
+      "source_root_cause": "本次未关联源码，当前只能确认 Trace 机制，不能确认具体代码根因。",
+      "recommendation": "优先拆分首帧前的非必要同步初始化，并保持启动主线程可继续推进。"
+    }
+  ],
+  "top_findings": [
+    {
+      "finding_id": "85000000-0000-4000-8000-000000000001",
+      "evidence_ids": ["86000000-0000-4000-8000-000000000001"],
+      "user_impact": "首屏可见时间被启动关键路径上的同步等待推迟。"
+    }
+  ],
+  "recommendations": [
+    {
+      "priority": "p0",
+      "title": "拆分启动同步工作",
+      "action": "把首帧前不必要的同步初始化延后或异步化。",
+      "expected_effect": "移除已确认的启动关键路径等待。",
+      "finding_ids": ["85000000-0000-4000-8000-000000000001"],
+      "evidence_ids": ["86000000-0000-4000-8000-000000000001"]
+    }
+  ],
+  "source_fixes": [],
+  "retest_plan": [
+    {
+      "mode": "verify_metric",
+      "scenario_type": "startup",
+      "metric_ids": ["84000000-0000-4000-8000-000000000001"],
+      "limitation_ids": [],
+      "steps": "使用相同应用、设备、场景和采集方式重新执行冷启动。",
+      "success_condition": "improve_from_baseline",
+      "failure_condition": "threshold_missed"
+    }
+  ],
+  "limitations": []
+}
