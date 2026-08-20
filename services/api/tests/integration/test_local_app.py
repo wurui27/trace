@@ -3213,6 +3213,8 @@ def _create_trace_analysis(
     team_id: str,
     headers: dict[str, str],
     trace: bytes = b"background-local-trace",
+    question: str = "首帧为什么慢？",
+    package_name: str = "com.example",
 ) -> tuple[str, str]:
     checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
     response = client.post(
@@ -3222,8 +3224,8 @@ def _create_trace_analysis(
             "schema_version": "1.0",
             "analysis_mode": "trace_upload",
             "test_type": "cold_start",
-            "package_name": "com.example",
-            "question": "首帧为什么慢？",
+            "package_name": package_name,
+            "question": question,
             "inputs": [
                 {
                     "kind": "trace",
@@ -6981,19 +6983,6 @@ def test_local_app_publishes_core_report_when_ai_projection_is_privacy_blocked(
     tmp_path: Path,
 ) -> None:
     result = _live_smartperfetto_result()
-    report = result.payload["report"]
-    assert isinstance(report, dict)
-    contract = report["resultContract"]
-    assert isinstance(contract, dict)
-    diagnostics = contract["diagnostics"]
-    assert isinstance(diagnostics, list)
-    diagnostic = diagnostics[0]
-    assert isinstance(diagnostic, dict)
-    evidence = diagnostic["evidence"]
-    assert isinstance(evidence, list)
-    evidence[0] = {
-        "text": "Trace evidence is stored at /Users/example/private/trace.pb"
-    }
     app = create_local_app(
         gateway=_FakeSmartPerfettoGateway(result),
         synthesizer=_test_synthesizer(),
@@ -7009,6 +6998,8 @@ def test_local_app_publishes_core_report_when_ai_projection_is_privacy_blocked(
             client,
             team_id=team_id,
             headers=headers,
+            question="Trace evidence is stored at /Users/example/private/trace.pb",
+            package_name="com.example.app",
         )
         _upload_and_finalize_trace(
             client,
