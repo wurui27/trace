@@ -547,17 +547,15 @@ def _evidence_views(scenarios: list[object]) -> list[dict[str, object]]:
         for evidence in scenario["evidence"]:
             if not isinstance(evidence, Mapping) or not isinstance(evidence.get("evidence_id"), str):
                 raise _invalid()
-            if not _has_interval(evidence):
-                continue
             result.append(
                 {
                     "evidence_id": evidence["evidence_id"],
-                    "kind": "trace_interval",
+                    "kind": "trace_interval" if _has_interval(evidence) else "metric",
                     "scenario_type": scenario.get("scenario_type"),
                     "metric_ids": metric_ids,
                     "summary": f"Trace 证据来自 {evidence.get('source')}。",
                     "source": str(evidence.get("source")),
-                    "locator": _locator(evidence),
+                    "locator": _locator(evidence) if _has_interval(evidence) else None,
                 }
             )
     return sorted(result, key=lambda item: str(item["evidence_id"]))
@@ -567,6 +565,8 @@ def _critical_path(scenarios: list[object]) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     for evidence in _evidence_views(scenarios):
         locator = evidence["locator"]
+        if not isinstance(locator, Mapping):
+            continue
         evidence_id = str(evidence["evidence_id"])
         result.append(
             {

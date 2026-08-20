@@ -200,12 +200,13 @@ def _validate_workbench_document(document: dict[str, object]) -> None:
         if not isinstance(item, dict):
             raise SourceAwareSemanticError
         locator = item.get("locator")
-        if (
+        if not _string_set(item.get("metric_ids")).issubset(metric_ids):
+            raise SourceAwareSemanticError
+        if locator is not None and (
             not isinstance(locator, dict)
             or not isinstance(locator.get("start_ns"), int)
             or not isinstance(locator.get("end_ns"), int)
             or locator["end_ns"] < locator["start_ns"]
-            or not _string_set(item.get("metric_ids")).issubset(metric_ids)
         ):
             raise SourceAwareSemanticError
 

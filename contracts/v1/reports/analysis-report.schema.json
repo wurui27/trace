@@ -2005,7 +2005,7 @@
         "metric_ids": {"type": "array", "maxItems": 20, "uniqueItems": true, "items": {"$ref": "#/$defs/sourceUuid"}},
         "summary": {"type": "string", "minLength": 1, "maxLength": 2000},
         "source": {"type": "string", "minLength": 1, "maxLength": 128},
-        "locator": {"$ref": "#/$defs/traceLocatorV13"}
+        "locator": {"oneOf": [{"$ref": "#/$defs/traceLocatorV13"}, {"type": "null"}]}
       }
     },
     "workbenchFindingV13": {

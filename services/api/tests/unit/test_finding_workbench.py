@@ -224,3 +224,22 @@ def test_weak_source_never_publishes_paths_or_symbols() -> None:
     assert workbench["findings"][0]["source_ref_ids"] == []
     assert "private/Startup.kt" not in json.dumps(workbench)
     assert "demo.Private.start" not in json.dumps(workbench)
+
+
+def test_evidence_without_interval_is_kept_without_timeline_locator() -> None:
+    core = _core()
+    evidence = core["scenario_reports"][0]["evidence"][0]  # type: ignore[index]
+    evidence["interval_start_ns"] = None
+    evidence["interval_end_ns"] = None
+
+    workbench = build_finding_workbench(
+        core_document=core,
+        source_context=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+    )
+
+    assert workbench["evidence"][0]["evidence_id"] == evidence["evidence_id"]
+    assert workbench["evidence"][0]["locator"] is None
+    assert workbench["critical_path"] == []

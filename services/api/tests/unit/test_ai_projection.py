@@ -58,6 +58,48 @@ def test_v2_projection_is_default_even_without_source_context() -> None:
     assert projection.document["source_context"] is None
 
 
+def test_projection_v21_contains_server_owned_quality_and_workbench() -> None:
+    projection = build_ai_projection(
+        _core(),
+        analysis_profile="startup",
+        question=None,
+        source_context=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=(
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ),
+        schema_version="2.1",
+    )
+
+    document = projection.document
+    assert document["schema_version"] == "2.1"
+    assert document["capabilities"]["source"] == "not_requested"
+    assert document["quality"]["trace_core_state"] == "complete"
+    assert document["quality"]["scenarios"][0]["capabilities"][0] == {
+        "name": "android_startups",
+        "required": True,
+        "status": "available",
+        "reason_code": None,
+    }
+    assert len(document["workbench"]["primary_finding_ids"]) <= 3
+    assert document["workbench"]["evidence"][0]["locator"]["start_ns"] >= 0
+
+
+def test_projection_v20_explicit_version_remains_byte_stable() -> None:
+    default = build_ai_projection(
+        _core(), analysis_profile="startup", question=None
+    )
+    explicit = build_ai_projection(
+        _core(),
+        analysis_profile="startup",
+        question=None,
+        schema_version="2.0",
+    )
+
+    assert explicit.canonical_bytes == default.canonical_bytes
+
+
 def test_v2_projection_copies_only_server_validated_source_refs() -> None:
     content = "class Startup { fun init() = Unit }\n"
     context = validate_source_context(

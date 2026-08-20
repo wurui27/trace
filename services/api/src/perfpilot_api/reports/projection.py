@@ -10,6 +10,11 @@ from dataclasses import dataclass, field
 from typing import Literal
 
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
+from perfpilot_api.reports.finding_workbench import (
+    build_capabilities,
+    build_finding_workbench,
+    build_report_quality,
+)
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.privacy import ProjectionPrivacyError, reject_private_json
 
@@ -170,11 +175,16 @@ def build_ai_projection(
     analysis_profile: Literal["auto", "startup", "scroll"],
     question: str | None,
     source_context: Mapping[str, object] | None = None,
+    package_name: str | None = None,
+    duration_seconds: int | None = None,
+    environment_fingerprint: str | None = None,
+    schema_version: Literal["2.0", "2.1"] = "2.0",
     max_bytes: int = 256 * 1024,
 ) -> AIProjection:
     if (
         not isinstance(core, NormalizedTraceReport)
         or analysis_profile not in {"auto", "startup", "scroll"}
+        or schema_version not in {"2.0", "2.1"}
         or type(max_bytes) is not int
         or not 1 <= max_bytes <= 256 * 1024
     ):
@@ -191,11 +201,41 @@ def build_ai_projection(
         for scenario in document["scenarios"]  # type: ignore[union-attr]
         for evidence in scenario["evidence"]
     )
-    document["source_context"] = _project_source_context(
+    projected_source_context = _project_source_context(
         source_context,
         finding_ids=projected_findings,
         evidence_ids=projected_evidence,
     )
+    document["source_context"] = projected_source_context
+    if schema_version == "2.1":
+        if (
+            not isinstance(package_name, str)
+            or not package_name
+            or type(duration_seconds) is not int
+            or not 1 <= duration_seconds <= 3600
+            or not isinstance(environment_fingerprint, str)
+            or len(environment_fingerprint) != 71
+            or not environment_fingerprint.startswith("sha256:")
+        ):
+            raise ProjectionPrivacyError
+        document["schema_version"] = "2.1"
+        document["capabilities"] = build_capabilities(
+            core_document=core.document,
+            source_context=projected_source_context,
+        )
+        document["quality"] = build_report_quality(
+            core_document=core.document,
+            source_context=projected_source_context,
+            synthesis_state="queued",
+            patch_validation_state="not_requested",
+        )
+        document["workbench"] = build_finding_workbench(
+            core_document=core.document,
+            source_context=projected_source_context,
+            package_name=package_name,
+            duration_seconds=duration_seconds,
+            environment_fingerprint=environment_fingerprint,
+        )
     reject_private_json(document)
     try:
         validated = validate_contract("analysis-projection", document)
