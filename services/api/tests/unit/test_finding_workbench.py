@@ -148,6 +148,50 @@ def test_quality_uses_required_capabilities_not_optional_diagnostics() -> None:
     ]
 
 
+def test_quality_projects_trace_health_and_capability_matrix_for_ai() -> None:
+    core = _core()
+    quality = build_report_quality(
+        core_document=core,
+        source_context=None,
+        synthesis_state="not_requested",
+        patch_validation_state="not_requested",
+    )
+
+    assert quality["scenarios"] == [
+        {
+            "scenario_type": "startup",
+            "parse_status": "parsed",
+            "measurement_window_coverage": "complete",
+            "data_loss_present": False,
+            "data_loss_categories": [],
+            "capabilities": [
+                {
+                    "name": "android_startups",
+                    "required": True,
+                    "status": "available",
+                    "reason_code": None,
+                }
+            ],
+        }
+    ]
+
+
+def test_finding_keeps_ceiling_exclusions_and_engine_actions() -> None:
+    workbench = build_finding_workbench(
+        core_document=_core(),
+        source_context=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+    )
+
+    finding = workbench["findings"][0]
+    assert finding["confidence_ceiling"] == "high"
+    assert finding["exclusions"] == []
+    assert finding["engine_recommendation"] == "Move the lookup off the launch-critical path."
+    assert finding["engine_retest"] == "Repeat cold launches."
+
+
 def test_capabilities_keep_quality_dimensions_separate() -> None:
     capabilities = build_capabilities(
         core_document=_core(),

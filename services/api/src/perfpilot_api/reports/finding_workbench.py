@@ -153,6 +153,7 @@ def build_report_quality(
         "patch_validation_state": patch_validation_state,
         "reason_codes": sorted(set(required_reasons))
         + sorted(set(optional_reasons)),
+        "scenarios": [_scenario_quality(scenario) for scenario in scenarios],
     }
 
 
@@ -306,8 +307,12 @@ def _merge_findings(
                     "attribution": attribution,
                     "statistical": "single_sample",
                 },
+                "confidence_ceiling": str(raw.get("confidence_ceiling")),
                 "confirmed_items": [str(raw.get("summary"))] if confirmed else [],
                 "unconfirmed_items": ["单次样本尚未验证波动范围"],
+                "exclusions": _closed_exclusions(raw.get("exclusions")),
+                "engine_recommendation": raw.get("recommendation"),
+                "engine_retest": str(raw.get("retest")),
                 "retest_plan_id": str(uuid5(_FINDING_NAMESPACE, f"retest:{finding_id}")),
             }
             current = merged.get(finding_id)
@@ -394,6 +399,87 @@ def _scenario_completeness(scenario: Mapping[str, object]) -> str:
         if capability["required"] and capability.get("status") != "available":
             return "limited"
     return "complete"
+
+
+def _scenario_quality(scenario: object) -> dict[str, object]:
+    if not isinstance(scenario, Mapping):
+        raise _invalid()
+    health = scenario.get("trace_health")
+    capabilities = scenario.get("trace_capabilities")
+    if not isinstance(health, Mapping) or not isinstance(capabilities, list):
+        raise _invalid()
+    measurement_window = health.get("measurement_window")
+    data_loss = health.get("data_loss")
+    if not isinstance(measurement_window, Mapping) or not isinstance(data_loss, Mapping):
+        raise _invalid()
+    loss_categories = sorted(
+        key
+        for key, value in data_loss.items()
+        if isinstance(key, str) and isinstance(value, int) and value > 0
+    )
+    projected_capabilities: list[dict[str, object]] = []
+    for capability in capabilities:
+        if not isinstance(capability, Mapping):
+            raise _invalid()
+        name = capability.get("name")
+        required = capability.get("required")
+        status = capability.get("status")
+        if (
+            not isinstance(name, str)
+            or not isinstance(required, bool)
+            or not isinstance(status, str)
+        ):
+            raise _invalid()
+        projected_capabilities.append(
+            {
+                "name": name,
+                "required": required,
+                "status": status,
+                "reason_code": _reason_code(capability.get("reason"), status=status),
+            }
+        )
+    projected_capabilities.sort(key=lambda item: str(item["name"]))
+    return {
+        "scenario_type": scenario.get("scenario_type"),
+        "parse_status": health.get("parse_status"),
+        "measurement_window_coverage": measurement_window.get("coverage"),
+        "data_loss_present": bool(loss_categories),
+        "data_loss_categories": loss_categories,
+        "capabilities": projected_capabilities,
+    }
+
+
+def _reason_code(value: object, *, status: str) -> str | None:
+    if status == "available":
+        return None
+    if isinstance(value, str) and value and all(
+        character.islower() or character.isdigit() or character in {"_", "."}
+        for character in value
+    ):
+        return value
+    return "capability_data_unavailable"
+
+
+def _closed_exclusions(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        raise _invalid()
+    result: list[dict[str, object]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            raise _invalid()
+        code = item.get("code")
+        status = item.get("status")
+        evidence_ids = item.get("evidence_ids")
+        if not isinstance(code, str) or not isinstance(status, str):
+            raise _invalid()
+        result.append(
+            {
+                "code": code,
+                "status": status,
+                "evidence_ids": _string_ids(evidence_ids),
+            }
+        )
+    return sorted(result, key=lambda item: (str(item["code"]), str(item["status"])))
 
 
 def _metric_views(scenarios: list[object]) -> list[dict[str, object]]:
