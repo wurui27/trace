@@ -145,6 +145,58 @@ def test_composer_builds_v12_single_document_without_source_context() -> None:
     assert result.document["source_code"] == source_code
 
 
+def test_composer_builds_v13_from_bound_projection_and_synthesis() -> None:
+    projection = _load("analysis-projection-v2.1.valid.json")
+    synthesis = _load("synthesis-output-v2.1.valid.json")
+
+    result = compose_analysis_report(
+        replace(
+            _request(),
+            synthesis_document=synthesis,
+            projection_document=projection,
+            report_schema_version="1.3",
+            ai_mode="deterministic_fallback",
+        ),
+        report_version=4,
+    )
+
+    assert result.document["schema_version"] == "1.3"
+    assert result.document["state"] == "completed"
+    assert result.document["capabilities"]["ai"] == "deterministic_fallback"
+    assert result.document["quality"]["synthesis_state"] == "completed"
+    assert result.document["workbench"] == projection["workbench"]
+
+
+def test_v13_partial_trace_keeps_bundle_and_has_no_scenario_failure() -> None:
+    projection = _load("analysis-projection-v2.1.valid.json")
+    projection["quality"]["trace_core_state"] = "partial"
+    projection["quality"]["reason_codes"] = ["required_capability_binder_unavailable"]
+    projection["quality"]["scenarios"][0]["capabilities"].append(
+        {
+            "name": "binder",
+            "required": True,
+            "status": "unavailable",
+            "reason_code": "trace_data_source_missing",
+        }
+    )
+
+    result = compose_analysis_report(
+        replace(
+            _request(),
+            synthesis_document=_load("synthesis-output-v2.1.valid.json"),
+            projection_document=projection,
+            report_schema_version="1.3",
+        ),
+        report_version=4,
+    )
+
+    assert result.document["state"] == "partially_completed"
+    scenario = result.document["scenario_reports"][0]
+    assert scenario["result_state"] == "partially_completed"
+    assert scenario["failure"] is None
+    assert scenario["bundle"] is not None
+
+
 def test_composer_enriches_strong_source_fix_in_the_same_v12_document() -> None:
     source_report = _load("analysis-report-v1.2.valid.json")
     source_code = source_report["source_code"]

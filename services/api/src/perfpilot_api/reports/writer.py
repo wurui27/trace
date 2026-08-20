@@ -8,7 +8,7 @@ import json
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Mapping
+from typing import Literal, Mapping
 from uuid import UUID, uuid5
 
 from sqlalchemy import func, select
@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 from perfpilot_api.db.tenant.models import Analysis, ReportVersion
 from perfpilot_api.db.tenant.router import TenantRouter
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
+from perfpilot_api.reports.finding_report import FindingReportError, compose_finding_report
 
 
 _PUBLIC_REPORT_ITEM_NAMESPACE = UUID("03cff422-a02c-57ec-bb96-f5b8848d5bdb")
@@ -66,6 +67,9 @@ class AnalysisReportWriteRequest:
     total_tokens: int | None
     latency_ms: int | None
     source_code_document: Mapping[str, object] | None = None
+    projection_document: Mapping[str, object] | None = None
+    report_schema_version: Literal["legacy", "1.3"] = "legacy"
+    ai_mode: Literal["available", "deterministic_fallback"] = "available"
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,6 +332,12 @@ def compose_analysis_report(
         or report_version < 1
         or request.latency_ms is not None
         and (type(request.latency_ms) is not int or request.latency_ms < 0)
+        or request.report_schema_version not in {"legacy", "1.3"}
+        or request.ai_mode not in {"available", "deterministic_fallback"}
+        or request.report_schema_version == "1.3"
+        and request.projection_document is None
+        or request.report_schema_version == "legacy"
+        and request.projection_document is not None
     ):
         raise ReportSourceError("report source is invalid")
     generated_at = _utc(request.generated_at)
@@ -491,10 +501,24 @@ def compose_analysis_report(
     }
     if source_code is not None:
         report_document["source_code"] = source_code
-    document = validate_contract(
-        "analysis-report",
-        report_document,
-    )
+    if request.report_schema_version == "1.3":
+        if synthesis_output is None or request.projection_document is None:
+            raise ReportSourceError("report source is invalid")
+        try:
+            document = compose_finding_report(
+                base_report=report_document,
+                projection=request.projection_document,
+                synthesis=synthesis_output,
+                report_version=report_version,
+                ai_mode=request.ai_mode,
+            )
+        except FindingReportError:
+            raise ReportSourceError("report source is invalid") from None
+    else:
+        document = validate_contract(
+            "analysis-report",
+            report_document,
+        )
     payload = canonical_json_bytes(document)
     digest = base64.b64encode(hashlib.sha256(payload).digest()).decode("ascii")
     tenant_provenance: dict[str, object] = {
