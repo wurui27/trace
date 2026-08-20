@@ -74,7 +74,49 @@ def test_builder_is_stable_and_merges_same_root_cause() -> None:
     finding = first["findings"][0]
     assert finding["evidence_ids"] == sorted(finding["evidence_ids"])
     assert finding["confidence"]["evidence_grade"] == "E3"
+    assert finding["critical_path_contribution"] == 0.35
     assert first["primary_finding_ids"] == [finding["finding_id"]]
+
+
+def test_critical_path_contribution_clips_and_deduplicates_intervals() -> None:
+    core = _core()
+    scenario = core["scenario_reports"][0]  # type: ignore[index]
+    finding = scenario["findings"][0]
+    first = scenario["evidence"][0]
+    first["interval_start_ns"] = 50_000_000
+    first["interval_end_ns"] = 300_000_000
+    second = deepcopy(first)
+    second["evidence_id"] = "86000000-0000-4000-8000-000000000002"
+    second["interval_start_ns"] = 250_000_000
+    second["interval_end_ns"] = 500_000_000
+    scenario["evidence"].append(second)
+    finding["evidence_ids"].append(second["evidence_id"])
+
+    workbench = build_finding_workbench(
+        core_document=core,
+        source_context=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+    )
+
+    assert workbench["findings"][0]["critical_path_contribution"] == 0.5
+
+
+def test_critical_path_contribution_is_zero_without_a_valid_window() -> None:
+    core = _core()
+    window = core["scenario_reports"][0]["trace_health"]["measurement_window"]  # type: ignore[index]
+    window["end_ns"] = window["start_ns"]
+
+    workbench = build_finding_workbench(
+        core_document=core,
+        source_context=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+    )
+
+    assert workbench["findings"][0]["critical_path_contribution"] == 0.0
 
 
 def test_direct_trace_evidence_not_source_match_determines_evidence_grade() -> None:
@@ -186,6 +228,7 @@ def test_finding_keeps_ceiling_exclusions_and_engine_actions() -> None:
     )
 
     finding = workbench["findings"][0]
+    assert finding["critical_path_contribution"] == 0.24
     assert finding["confidence_ceiling"] == "high"
     assert finding["exclusions"] == []
     assert finding["engine_recommendation"] == "Move the lookup off the launch-critical path."

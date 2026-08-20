@@ -1093,20 +1093,6 @@ def _default_ai_rounds() -> list[_LocalAIRound]:
     return [_LocalAIRound(1, "report")]
 
 
-def _source_binding_document(binding: SourceBinding) -> dict[str, object]:
-    return {
-        "provider_kind": binding.provider_kind,
-        "agent_id": str(binding.agent_id),
-        "workspace_id": str(binding.workspace_id),
-        "snapshot_policy": binding.snapshot_policy,
-        "validation_profile_id": (
-            str(binding.validation_profile_id)
-            if binding.validation_profile_id is not None
-            else None
-        ),
-    }
-
-
 def _source_code_analysis_document(binding: SourceBinding | None) -> dict[str, object]:
     if binding is None:
         return {

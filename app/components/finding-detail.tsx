@@ -11,6 +11,11 @@ const confidenceLabels = {
   statistical: "统计可信度",
 } as const;
 
+function criticalPathPercent(value: number): string {
+  const percent = value * 100;
+  return `${Number.isInteger(percent) ? percent : percent.toFixed(1)}%`;
+}
+
 export function FindingDetail({
   capabilities,
   conclusion,
@@ -30,7 +35,10 @@ export function FindingDetail({
           <span>{finding.scenario_type}</span>
         </div>
         <h3>{finding.title}</h3>
-        <p>{finding.impact}</p>
+        <p>
+          <span>{finding.impact}</span>
+          <strong>占关键路径 {criticalPathPercent(finding.critical_path_contribution)}</strong>
+        </p>
       </header>
       <dl className="finding-diagnostic-chain">
         <div>

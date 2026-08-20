@@ -428,6 +428,7 @@ describe("AnalysisReportView", () => {
     expect(screen.getByText("Application 初始化")).toBeVisible();
     expect(screen.getByText("190 ms")).toBeVisible();
     const overview = screen.getByRole("tabpanel");
+    expect(within(overview).getByText("占关键路径 24%")).toBeVisible();
     for (const label of [
       "1. 问题点",
       "2. 为什么会有这个问题",

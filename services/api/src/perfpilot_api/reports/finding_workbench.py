@@ -261,12 +261,16 @@ def _merge_findings(
             severity = str(raw.get("severity"))
             if attribution is None or severity not in _IMPACT_POINTS:
                 raise _invalid()
-            located = any(_has_interval(evidence_by_id.get(value)) for value in evidence_ids)
+            contribution = _critical_path_contribution(
+                evidence_ids,
+                evidence_by_id=evidence_by_id,
+                scenario=scenario,
+            )
             score = priority_score(
                 impact_points=_IMPACT_POINTS[severity],
                 evidence_grade=grade,
                 attribution=attribution,
-                critical_path_points=20 if located else 0,
+                critical_path_points=round(contribution * 20),
                 reproducibility_points=4,
             )
             source_refs = sorted(
@@ -294,7 +298,7 @@ def _merge_findings(
                     if kind == "root_cause"
                     else "当前只能确认性能症状，尚未确认源码根因。"
                 ),
-                "critical_path_contribution": 1.0 if located else 0.0,
+                "critical_path_contribution": contribution,
                 "priority": _priority(score),
                 "priority_score": score,
                 "evidence_ids": evidence_ids,
@@ -327,6 +331,22 @@ def _merge_findings(
             )
             current["source_ref_ids"] = sorted(
                 set(_string_ids(current["source_ref_ids"])) | set(source_refs)
+            )
+            current["critical_path_contribution"] = _critical_path_contribution(
+                _string_ids(current["evidence_ids"]),
+                evidence_by_id=evidence_by_id,
+                scenario=scenario,
+            )
+            score = priority_score(
+                impact_points=_IMPACT_POINTS[severity],
+                evidence_grade=_merged_evidence_grade(
+                    _string_ids(current["evidence_ids"]), evidence_by_id
+                ),
+                attribution=attribution,
+                critical_path_points=round(
+                    float(current["critical_path_contribution"]) * 20
+                ),
+                reproducibility_points=4,
             )
             current["priority_score"] = max(int(current["priority_score"]), score)
             current["priority"] = _priority(int(current["priority_score"]))
@@ -373,6 +393,56 @@ def _has_interval(evidence: Mapping[str, object] | None) -> bool:
         and isinstance(evidence.get("interval_end_ns"), int)
         and int(evidence["interval_end_ns"]) >= int(evidence["interval_start_ns"])
     )
+
+
+def _critical_path_contribution(
+    evidence_ids: list[str],
+    *,
+    evidence_by_id: Mapping[str, Mapping[str, object]],
+    scenario: Mapping[str, object],
+) -> float:
+    health = scenario.get("trace_health")
+    if not isinstance(health, Mapping):
+        return 0.0
+    window = health.get("measurement_window")
+    if not isinstance(window, Mapping):
+        return 0.0
+    window_start = window.get("start_ns")
+    window_end = window.get("end_ns")
+    if (
+        type(window_start) is not int
+        or type(window_end) is not int
+        or window_end <= window_start
+    ):
+        return 0.0
+
+    intervals: list[tuple[int, int]] = []
+    for evidence_id in evidence_ids:
+        evidence = evidence_by_id.get(evidence_id)
+        if evidence is None:
+            continue
+        start = evidence.get("interval_start_ns")
+        end = evidence.get("interval_end_ns")
+        if type(start) is not int or type(end) is not int or end <= start:
+            continue
+        clipped_start = max(start, window_start)
+        clipped_end = min(end, window_end)
+        if clipped_end > clipped_start:
+            intervals.append((clipped_start, clipped_end))
+    if not intervals:
+        return 0.0
+
+    intervals.sort()
+    covered_ns = 0
+    merged_start, merged_end = intervals[0]
+    for start, end in intervals[1:]:
+        if start <= merged_end:
+            merged_end = max(merged_end, end)
+            continue
+        covered_ns += merged_end - merged_start
+        merged_start, merged_end = start, end
+    covered_ns += merged_end - merged_start
+    return round(covered_ns / (window_end - window_start), 2)
 
 
 def _has_direct_locator(evidence: Mapping[str, object] | None) -> bool:
