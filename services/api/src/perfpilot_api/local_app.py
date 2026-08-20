@@ -137,6 +137,7 @@ from perfpilot_api.local_remote_capture import (
     RemoteCaptureContext,
     RemoteCaptureCoordinator,
 )
+from perfpilot_api.local_stage_execution import execute_report_stage
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.memory_join import (
     AndroidMemoryNormalizationError,
@@ -3523,7 +3524,7 @@ class _LocalRuntime:
                     remote_completed_scenarios=frozenset(results),
                     remote_scenario_failures=failures,
                 )
-            await self._publish_prepared(
+            await self._execute_prepared_stage(
                 analysis,
                 prepared,
                 generation=generation,
@@ -4521,7 +4522,7 @@ class _LocalRuntime:
                 self._load_persisted_prepared,
                 analysis,
             )
-            await self._publish_prepared(
+            await self._execute_prepared_stage(
                 analysis,
                 prepared,
                 generation=generation,
@@ -5461,7 +5462,7 @@ class _LocalRuntime:
                 else None
             ),
         )
-        await self._publish_prepared(
+        await self._execute_prepared_stage(
             analysis,
             prepared,
             generation=generation,
@@ -5582,7 +5583,7 @@ class _LocalRuntime:
                 result,
                 source_context=source_context,
             )
-            await self._publish_prepared(
+            await self._execute_prepared_stage(
                 analysis,
                 prepared,
                 generation=generation,
@@ -5746,6 +5747,36 @@ class _LocalRuntime:
             }
             analysis.version += 1
         await self._persist(analysis)
+
+    async def _execute_prepared_stage(
+        self,
+        analysis: _LocalAnalysis,
+        prepared: _PreparedLocalReport,
+        *,
+        generation: int,
+    ) -> None:
+        def guard() -> None:
+            if (
+                analysis.generation != generation
+                or analysis.cancel_requested_at is not None
+                or analysis.state == "canceled"
+            ):
+                raise _StaleLocalGeneration
+
+        async def publish(_projection: Mapping[str, object]) -> None:
+            await self._publish_prepared(
+                analysis,
+                prepared,
+                generation=generation,
+            )
+
+        await execute_report_stage(
+            validated_projection=prepared.projection.document,
+            execute=publish,
+            guard=guard,
+            progress=lambda _summary: None,
+            propagate_errors=True,
+        )
 
     async def _publish_prepared(
         self,
