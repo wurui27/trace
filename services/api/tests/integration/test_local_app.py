@@ -6233,6 +6233,96 @@ def test_local_restart_resumes_persisted_remote_evidence_without_source(
         assert provider.calls == 1
         assert capture_enqueue_calls == 0
 
+
+@pytest.mark.asyncio
+async def test_stale_generation_cannot_overwrite_newer_report(
+    tmp_path: Path,
+) -> None:
+    team_id = UUID("10000000-0000-4000-8000-000000000001")
+    analysis_id = UUID("82000000-0000-4000-8000-000000000002")
+    descriptor = _InputDescriptor(
+        kind="trace",
+        mime="application/octet-stream",
+        size=1,
+        sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+    )
+    analysis = _LocalAnalysis(
+        team_id=team_id,
+        analysis_id=analysis_id,
+        profile="startup",
+        question=None,
+        inputs={"trace": _LocalInput(descriptor)},
+        state="analyzing",
+    )
+    analysis.stages.update(
+        {
+            "input_validation": "completed",
+            "smartperfetto": "completed",
+            "perfpilot_ai": "pending",
+            "report": "pending",
+        }
+    )
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=None,
+        data_root=tmp_path / "data",
+        state_root=tmp_path / "state",
+    )
+    runtime = app.state.local_runtime
+    runtime.analyses[(team_id, analysis_id)] = analysis
+    await runtime._persist(analysis)
+    prepared = _prepare_local_report(analysis, _smartperfetto_result())
+    original_save_document = runtime.store.save_document
+    stale_report_entered = threading.Event()
+    release_stale_report = threading.Event()
+
+    def gate_stale_report(*args, **kwargs) -> None:
+        name = args[2] if len(args) >= 3 else kwargs.get("name")
+        if name == "report.json":
+            stale_report_entered.set()
+            if not release_stale_report.wait(timeout=2):
+                raise AssertionError("stale report gate timed out")
+        original_save_document(*args, **kwargs)
+
+    runtime.store.save_document = gate_stale_report
+    stale_publish = asyncio.create_task(
+        runtime._publish_prepared(analysis, prepared, generation=1)
+    )
+    assert await asyncio.to_thread(stale_report_entered.wait, 2)
+    newer_report = {"schema_version": "1.2", "report_version": 2}
+
+    async def publish_newer_generation() -> None:
+        async with runtime._terminal_commit_lock(analysis):
+            async with runtime.lock:
+                analysis.generation = 2
+                analysis.report = newer_report
+            await asyncio.to_thread(
+                original_save_document,
+                team_id,
+                analysis_id,
+                "report.json",
+                newer_report,
+            )
+
+    newer_publish = asyncio.create_task(publish_newer_generation())
+    await asyncio.sleep(0.02)
+    newer_completed_before_stale_commit = newer_publish.done()
+    release_stale_report.set()
+    await asyncio.gather(stale_publish, return_exceptions=True)
+    await newer_publish
+    persisted_report = await asyncio.to_thread(
+        runtime.store.load_document,
+        team_id,
+        analysis_id,
+        "report.json",
+    )
+    await runtime.close()
+    app.state.agent_upload_service.close()
+    app.state.local_agent_store.close()
+
+    assert newer_completed_before_stale_commit is False
+    assert persisted_report == newer_report
+
     converged_provider = _CountingProjectionReportProvider()
     converged = create_local_app(
         gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
@@ -8379,6 +8469,7 @@ def test_local_app_rolls_back_a_failed_rerun_persistence_reservation(
         assert current.generation == persisted_before["generation"]
         assert current.state == persisted_before["state"]
         assert current.stages == persisted_before["stages"]
+        assert current.runtime_status == persisted_before["runtime_status"]
         assert current.version == persisted_before["version"]
         assert provider.calls == 1
         assert provider.rerun_calls == 0

@@ -22,7 +22,7 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Literal, Protocol, cast
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4, uuid5
 
@@ -73,6 +73,11 @@ from perfpilot_api.local_analysis_store import (
     LocalAnalysisStoreError,
     migrate_analysis_runtime_status,
     validate_analysis_runtime_status,
+)
+from perfpilot_api.local_analysis_lifecycle import (
+    AnalysisLifecycleCoordinator,
+    AnalysisState,
+    LifecycleSnapshot,
 )
 from perfpilot_api.local_agent_store import LocalAgentStore, LocalDeviceDirectoryRepository
 from perfpilot_api.local_agent_enrollment import (
@@ -2560,16 +2565,22 @@ class _LocalRuntime:
         self.agent_tasks = agent_tasks
         self.agent_artifacts = agent_artifacts
         self.apk_inspector = apk_inspector
+        self.lifecycle = AnalysisLifecycleCoordinator()
         self.analyses: dict[tuple[UUID, UUID], _LocalAnalysis] = {}
         self.uploads: dict[tuple[UUID, UUID, str], _LocalUpload] = {}
         self.upload_authorizations: dict[str, tuple[UUID, UUID, str]] = {}
         self.lock = asyncio.Lock()
         self.remote_publication_locks: dict[tuple[UUID, UUID], asyncio.Lock] = {}
+        self.terminal_commit_locks: dict[tuple[UUID, UUID], asyncio.Lock] = {}
         self.tasks: set[asyncio.Task[None]] = set()
 
     def _remote_publication_lock(self, analysis: _LocalAnalysis) -> asyncio.Lock:
         key = (analysis.team_id, analysis.analysis_id)
         return self.remote_publication_locks.setdefault(key, asyncio.Lock())
+
+    def _terminal_commit_lock(self, analysis: _LocalAnalysis) -> asyncio.Lock:
+        key = (analysis.team_id, analysis.analysis_id)
+        return self.terminal_commit_locks.setdefault(key, asyncio.Lock())
 
     @staticmethod
     def _upload_key(upload: _LocalUpload) -> tuple[UUID, UUID, str]:
@@ -2700,6 +2711,67 @@ class _LocalRuntime:
             document,
         )
 
+    async def _transition(
+        self,
+        analysis: _LocalAnalysis,
+        *,
+        target: AnalysisState,
+        now: datetime,
+        result_generation: int | None = None,
+        publish_report: bool = False,
+    ) -> None:
+        current = LifecycleSnapshot(
+            analysis_id=analysis.analysis_id,
+            state=cast(AnalysisState, analysis.state),
+            generation=analysis.generation,
+            cancel_requested_at=analysis.cancel_requested_at,
+            report_available=analysis.report is not None,
+            completed_at=analysis.completed_at,
+        )
+        updated = self.lifecycle.transition(
+            current,
+            target=target,
+            now=now,
+            result_generation=result_generation,
+            publish_report=publish_report,
+        )
+        analysis.state = updated.state
+        analysis.completed_at = updated.completed_at
+        if target in _TERMINAL_ANALYSIS_STATES:
+            stage = (
+                "report"
+                if publish_report
+                else str((analysis.runtime_status or {}).get("current_stage"))
+            )
+            if stage not in {
+                "input_validation",
+                "device_claim",
+                "device_capture",
+                "smartperfetto",
+                "source_code",
+                "perfpilot_ai",
+                "report",
+            }:
+                stage = "report"
+            _record_progress(
+                analysis,
+                stage=stage,
+                state=(
+                    "completed"
+                    if target in {"completed", "partially_completed"}
+                    else target
+                ),
+                summary={
+                    "completed": "分析完成",
+                    "partially_completed": "分析完成",
+                    "failed": "分析失败",
+                    "canceled": "分析已取消",
+                    "deleted": "分析已删除",
+                }[target],
+                waiting_for=None,
+                now=now,
+            )
+
     async def _remove_previous_team_analyses(
         self,
         analysis: _LocalAnalysis,
@@ -2725,6 +2797,7 @@ class _LocalRuntime:
                     continue
                 del self.analyses[key]
                 self.remote_publication_locks.pop(key, None)
+                self.terminal_commit_locks.pop(key, None)
                 for upload in tuple(self.uploads.values()):
                     if (
                         upload.team_id == current.team_id
@@ -2739,6 +2812,21 @@ class _LocalRuntime:
         now: datetime,
     ) -> None:
         analysis = await self.analysis(access.team_id, access.analysis_id)
+        async with self._terminal_commit_lock(analysis):
+            await self._observe_agent_completion_serialized(
+                analysis,
+                access,
+                manifest,
+                now,
+            )
+
+    async def _observe_agent_completion_serialized(
+        self,
+        analysis: _LocalAnalysis,
+        access: AgentExecutionAccess,
+        manifest: ValidatedAgentExecutionManifest,
+        now: datetime,
+    ) -> None:
         manifest_document: dict[str, object] = {
             "schema_version": "1.0",
             "execution_id": str(manifest.execution_id),
@@ -2793,8 +2881,15 @@ class _LocalRuntime:
                 )
             else:
                 analysis.started_at = analysis.started_at or manifest.started_at
-                analysis.completed_at = manifest.completed_at if not completed else None
-                analysis.state = "analyzing" if completed else "failed"
+                if completed:
+                    analysis.completed_at = None
+                    analysis.state = "analyzing"
+                else:
+                    await self._transition(
+                        analysis,
+                        target="failed",
+                        now=manifest.completed_at,
+                    )
                 analysis.failure = (
                     None
                     if completed
@@ -3070,14 +3165,26 @@ class _LocalRuntime:
         now: datetime,
     ) -> None:
         analysis = await self.analysis(access.team_id, access.analysis_id)
+        async with self._terminal_commit_lock(analysis):
+            await self._observe_agent_cancellation_serialized(
+                analysis,
+                access,
+                now,
+            )
+
+    async def _observe_agent_cancellation_serialized(
+        self,
+        analysis: _LocalAnalysis,
+        access: AgentExecutionAccess,
+        now: datetime,
+    ) -> None:
         should_persist = False
         async with self.lock:
             if analysis.state in _TERMINAL_ANALYSIS_STATES:
                 should_persist = analysis.state == "canceled"
             else:
-                analysis.state = "canceled"
+                await self._transition(analysis, target="canceled", now=now)
                 analysis.failure = None
-                analysis.completed_at = now
                 for stage_name, stage_state in analysis.stages.items():
                     if stage_state not in {"completed", "failed", "not_requested"}:
                         analysis.stages[stage_name] = "canceled"
@@ -3384,7 +3491,11 @@ class _LocalRuntime:
                 and analysis.state in _ACTIVE_ANALYSIS_STATES
             )
             if restore_canceled:
-                analysis.state = "canceled"
+                await self._transition(
+                    analysis,
+                    target="canceled",
+                    now=analysis.cancel_requested_at or datetime.now(UTC),
+                )
                 analysis.failure = None
                 for stage_name, stage_state in analysis.stages.items():
                     if stage_state not in {"completed", "failed", "not_requested"}:
@@ -3482,7 +3593,11 @@ class _LocalRuntime:
                             analysis, manifest_document
                         )
                     except (ValueError, AgentTaskError):
-                        analysis.state = "failed"
+                        await self._transition(
+                            analysis,
+                            target="failed",
+                            now=datetime.now(UTC),
+                        )
                         analysis.failure = {
                             "code": "remote_capture_manifest_invalid",
                             "message": "Remote capture manifest could not be restored",
@@ -3741,7 +3856,11 @@ class _LocalRuntime:
                 await self._persist(analysis)
             except BaseException:
                 async with self.lock:
-                    analysis.state = "failed"
+                    await self._transition(
+                        analysis,
+                        target="failed",
+                        now=datetime.now(UTC),
+                    )
                     analysis.failure = {
                         "code": "remote_capture_publication_failed",
                         "message": "Remote capture task could not be queued",
@@ -3857,46 +3976,56 @@ class _LocalRuntime:
                 generation=generation,
             )
 
-        async with self.lock:
-            if analysis.task is not None and not analysis.task.done():
-                raise HTTPException(
-                    status.HTTP_409_CONFLICT,
-                    "analysis is already running",
-                )
-            previous_generation = analysis.generation
-            previous_state = analysis.state
-            previous_failure = (
-                dict(analysis.failure) if analysis.failure is not None else None
-            )
-            previous_stages = dict(analysis.stages)
-            previous_ai_rounds = [
-                _LocalAIRound(item.number, item.role, item.state, item.attempts)
-                for item in analysis.ai_rounds
-            ]
-            previous_version = analysis.version
-            analysis.generation += 1
-            analysis.state = "analyzing"
-            analysis.failure = None
-            analysis.stages["smartperfetto"] = "completed"
-            if (
-                analysis.source_binding is not None
-                and analysis.source_code_analysis.get("context_state") != "available"
-            ):
-                analysis.source_code_analysis = (
-                    _source_code_analysis_unavailable_document(
-                        analysis.source_binding
+        async with self._terminal_commit_lock(analysis):
+            async with self.lock:
+                if analysis.task is not None and not analysis.task.done():
+                    raise HTTPException(
+                        status.HTTP_409_CONFLICT,
+                        "analysis is already running",
                     )
+                previous_generation = analysis.generation
+                previous_state = analysis.state
+                previous_failure = (
+                    dict(analysis.failure) if analysis.failure is not None else None
                 )
-            analysis.stages["perfpilot_ai"] = "running"
-            analysis.stages["report"] = "pending"
-            analysis.ai_rounds = _default_ai_rounds()
-            analysis.version += 1
-            generation = analysis.generation
-            reserved_version = analysis.version
-            task = asyncio.create_task(execute_reserved(generation))
-            analysis.task = task
-            self.tasks.add(task)
-            task.add_done_callback(self.tasks.discard)
+                previous_stages = dict(analysis.stages)
+                previous_ai_rounds = [
+                    _LocalAIRound(item.number, item.role, item.state, item.attempts)
+                    for item in analysis.ai_rounds
+                ]
+                previous_runtime_status = dict(analysis.runtime_status or {})
+                previous_version = analysis.version
+                analysis.generation += 1
+                analysis.state = "analyzing"
+                analysis.failure = None
+                analysis.stages["smartperfetto"] = "completed"
+                if (
+                    analysis.source_binding is not None
+                    and analysis.source_code_analysis.get("context_state") != "available"
+                ):
+                    analysis.source_code_analysis = (
+                        _source_code_analysis_unavailable_document(
+                            analysis.source_binding
+                        )
+                    )
+                analysis.stages["perfpilot_ai"] = "running"
+                analysis.stages["report"] = "pending"
+                analysis.ai_rounds = _default_ai_rounds()
+                _record_progress(
+                    analysis,
+                    stage="perfpilot_ai",
+                    state="running",
+                    summary="正在重新生成中文分析结论",
+                    waiting_for="ai_provider",
+                    now=datetime.now(UTC),
+                )
+                analysis.version += 1
+                generation = analysis.generation
+                reserved_version = analysis.version
+                task = asyncio.create_task(execute_reserved(generation))
+                analysis.task = task
+                self.tasks.add(task)
+                task.add_done_callback(self.tasks.discard)
         try:
             await self._persist(analysis)
         except LocalAnalysisStoreDurabilityError:
@@ -3917,6 +4046,7 @@ class _LocalRuntime:
                         analysis.failure = previous_failure
                         analysis.stages = previous_stages
                         analysis.ai_rounds = previous_ai_rounds
+                        analysis.runtime_status = previous_runtime_status
                         analysis.version = previous_version
             self.tasks.discard(task)
             raise
@@ -4081,19 +4211,38 @@ class _LocalRuntime:
         self,
         analysis: _LocalAnalysis,
     ) -> tuple[_LocalAnalysis, bool]:
+        async with self._terminal_commit_lock(analysis):
+            return await self._cancel_serialized(analysis)
+
+    async def _cancel_serialized(
+        self,
+        analysis: _LocalAnalysis,
+    ) -> tuple[_LocalAnalysis, bool]:
         async with self.lock:
             if analysis.state in _TERMINAL_ANALYSIS_STATES:
                 return analysis, False
             requested_at = analysis.cancel_requested_at or datetime.now(UTC)
-            analysis.cancel_requested_at = requested_at
+            current = LifecycleSnapshot(
+                analysis_id=analysis.analysis_id,
+                state=cast(AnalysisState, analysis.state),
+                generation=analysis.generation,
+                cancel_requested_at=analysis.cancel_requested_at,
+                report_available=analysis.report is not None,
+                completed_at=analysis.completed_at,
+            )
+            canceled = self.lifecycle.cancel(current, now=requested_at)
+            analysis.cancel_requested_at = canceled.cancel_requested_at
             task = analysis.task
             run = (
                 analysis.source_run
                 if analysis.stages.get("smartperfetto") == "running"
                 else None
             )
-            analysis.state = "canceled"
-            analysis.completed_at = requested_at
+            await self._transition(
+                analysis,
+                target="canceled",
+                now=requested_at,
+            )
             analysis.failure = None
             for stage_name, stage_state in analysis.stages.items():
                 if stage_state not in {"completed", "failed", "not_requested"}:
@@ -4404,8 +4553,11 @@ class _LocalRuntime:
                     "retryable": False,
                 }
                 analysis.stages["input_validation"] = "failed"
-                analysis.state = "failed"
-                analysis.completed_at = datetime.now(UTC)
+                await self._transition(
+                    analysis,
+                    target="failed",
+                    now=datetime.now(UTC),
+                )
                 analysis.version += 1
             await self._persist(analysis)
             raise ApiError(
@@ -5247,24 +5399,53 @@ class _LocalRuntime:
             synthesizer=self.synthesizer,
             smartperfetto_original=analysis.smartperfetto_original,
         )
-        await asyncio.to_thread(
-            self.store.save_document,
-            analysis.team_id,
-            analysis.analysis_id,
-            "report.json",
-            report,
-        )
-        async with self.lock:
-            if analysis.cancel_requested_at is not None:
-                raise asyncio.CancelledError
-            if analysis.generation != generation:
-                raise _StaleLocalGeneration
-            analysis.report = report
-            analysis.state = str(report["state"])
-            analysis.completed_at = datetime.now(UTC)
-            analysis.stages["report"] = "completed"
-            analysis.version += 1
-        await self._persist(analysis)
+        async with self._terminal_commit_lock(analysis):
+            async with self.lock:
+                if analysis.cancel_requested_at is not None:
+                    raise asyncio.CancelledError
+                if analysis.generation != generation:
+                    raise _StaleLocalGeneration
+                previous_report = analysis.report
+                previous_state = analysis.state
+                previous_completed_at = analysis.completed_at
+                previous_report_stage = analysis.stages["report"]
+                previous_runtime_status = dict(analysis.runtime_status or {})
+                previous_version = analysis.version
+            await asyncio.to_thread(
+                self.store.save_document,
+                analysis.team_id,
+                analysis.analysis_id,
+                "report.json",
+                report,
+            )
+            async with self.lock:
+                if analysis.cancel_requested_at is not None:
+                    raise asyncio.CancelledError
+                if analysis.generation != generation:
+                    raise _StaleLocalGeneration
+                analysis.report = report
+                await self._transition(
+                    analysis,
+                    target=cast(AnalysisState, str(report["state"])),
+                    now=datetime.now(UTC),
+                    result_generation=generation,
+                    publish_report=True,
+                )
+                analysis.stages["report"] = "completed"
+                analysis.version += 1
+            try:
+                await self._persist(analysis)
+            except LocalAnalysisStoreDurabilityError:
+                raise
+            except BaseException:
+                async with self.lock:
+                    analysis.report = previous_report
+                    analysis.state = previous_state
+                    analysis.completed_at = previous_completed_at
+                    analysis.stages["report"] = previous_report_stage
+                    analysis.runtime_status = previous_runtime_status
+                    analysis.version = previous_version
+                raise
         if (
             analysis.analysis_mode == "trace_upload"
             and analysis.trace_test_type is not None
@@ -5286,7 +5467,7 @@ class _LocalRuntime:
             for round_state in analysis.ai_rounds:
                 if round_state.state in {"pending", "running"}:
                     round_state.state = "failed"
-            analysis.state = (
+            target = (
                 "partially_completed" if analysis.report is not None else "failed"
             )
             analysis.failure = {
@@ -5303,7 +5484,12 @@ class _LocalRuntime:
             analysis.stages["report"] = (
                 "completed" if analysis.report is not None else "not_requested"
             )
-            analysis.completed_at = datetime.now(UTC)
+            await self._transition(
+                analysis,
+                target=target,
+                now=datetime.now(UTC),
+                result_generation=generation,
+            )
             analysis.version += 1
         await self._persist(analysis)
 
@@ -5324,13 +5510,18 @@ class _LocalRuntime:
                 return
             if analysis.cancel_requested_at is not None or analysis.state == "canceled":
                 return
-            analysis.state = "failed"
             analysis.failure = failure
             if analysis.stages["smartperfetto"] != "completed":
                 analysis.stages["smartperfetto"] = "failed"
             else:
                 analysis.stages["perfpilot_ai"] = "failed"
             analysis.stages["report"] = "not_requested"
+            await self._transition(
+                analysis,
+                target="failed",
+                now=datetime.now(UTC),
+                result_generation=generation,
+            )
             analysis.version += 1
         await self._persist(analysis)
 
