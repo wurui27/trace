@@ -884,6 +884,7 @@ def test_remote_agent_full_success_is_isolated_across_two_local_tenants(
     report = report_response.json()
     assert report["schema_version"] == "1.2"
     assert report["report_version"] == 1
+    assert report["synthesis"]["provenance"]["generation"] == 1
     assert [item["scenario_type"] for item in report["scenario_reports"]] == [
         "startup",
         "scroll",

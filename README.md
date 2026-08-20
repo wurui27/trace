@@ -50,6 +50,49 @@ The optional runtime overrides are `PERFPILOT_LOCAL_SMARTPERFETTO_ROOT`,
 `PERFPILOT_LOCAL_API_ORIGIN`, `PERFPILOT_LOCAL_ADB`,
 `PERFPILOT_LOCAL_AAPT2`, and `PERFPILOT_LOCAL_ANDROID_MEMORY_ROOT`.
 
+## Analysis reliability and health
+
+`GET /v1/health` is a lightweight liveness check: `{"status":"ok"}` means the
+API process can answer requests. `GET /v1/readiness` reports the safe aggregate
+state of storage, SmartPerfetto, AI, Agent, device, source, and supervisor
+capabilities. `GET /v1/teams/{team_id}/health` applies the same model to the
+authenticated team's Agent, device, and source availability. Health responses
+never include service URLs, local paths, credentials, or source content.
+
+SmartPerfetto processing, source reading, and the PerfPilot AI Chinese summary
+do not have a fixed total deadline while their task is still alive. After three
+minutes without new progress the analysis is marked slow; after ten minutes it
+is shown as waiting for its upstream dependency, not failed. Device acquisition,
+capture, and control operations retain bounded waits and retries because they
+hold exclusive resources.
+
+A normal service restart reloads persisted analyses and reconciles the existing
+upstream run, source task, or report generation. It must not submit a duplicate
+task. The explicit local reset command is different: it deletes analysis data
+without creating a backup, while preserving users, Agents, and registered source
+workspaces.
+
+Before a release, run the manual real-device check against an approved online
+Agent and a ready source workspace. The command prompts for the account and a
+hidden password, keeps neither, and prints only a redacted JSON summary:
+
+```bash
+PYTHONPATH=services/api/src:agents/device-agent/src .venv/bin/python \
+  scripts/verify-real-device-reliability.py \
+  --server-url https://server.example \
+  --package com.rivotek.mediacenter \
+  --activity mediacenteractivity \
+  --test-type cold_start \
+  --duration-seconds 15 \
+  --source-workspace-id 71000000-0000-4000-8000-000000000001
+```
+
+The verifier creates one schema 1.3 remote-device analysis, never probes host
+ADB, follows server-authoritative Chinese progress, and requires a completed
+generation-1 report, SmartPerfetto HTML, Chinese synthesis, and strong source
+references. It intentionally has no automatic total timeout for the three
+analysis-heavy stages; use Ctrl-C to stop the manual check.
+
 ## Local checks
 
 Start PostgreSQL and Redis, then copy the safe, AI-disabled defaults:

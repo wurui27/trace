@@ -482,6 +482,7 @@ async def test_team_artifacts_reset_without_changing_persistent_users_or_agents(
     assert not any(".reset-" in path.name for path in tmp_path.iterdir())
     assert (state_root / "control" / "control.json").read_bytes() == control_bytes
     assert (state_root / "agents" / "agents.json").read_bytes() == agent_bytes
+    assert not any(analysis_root.iterdir())
     reopened_control = LocalControlStore(state_root / "control")
     reopened_agents = LocalAgentStore(state_root / "agents")
     assert reopened_control.find_user("user01") == user_a
