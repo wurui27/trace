@@ -100,10 +100,6 @@ const inputStateLabels = {
   finalized: "已校验",
 } as const;
 
-function analysisStillChanging(analysis: AnalysisResponse): boolean {
-  return !analysisIsTerminal(analysis);
-}
-
 const scenarioCopy = {
   cold_start: { label: "冷启动采集", description: "采集应用冷启动与首帧证据。" },
   scroll: { label: "滑动采集", description: "采集页面滑动与卡顿证据。" },
@@ -196,7 +192,7 @@ export function createAnalysisLoader(
 
     await publish();
     let delay = 2_000;
-    while (analysisStillChanging(current)) {
+    while (!analysisIsTerminal(current)) {
       await sleep(delay, signal);
       try {
         current = await client.analysis(teamId, analysisId, signal);

@@ -93,6 +93,27 @@ generation-1 report, SmartPerfetto HTML, Chinese synthesis, and strong source
 references. It intentionally has no automatic total timeout for the three
 analysis-heavy stages; use Ctrl-C to stop the manual check.
 
+### Local analysis runtime boundaries
+
+The local API keeps routes and dependency composition in `local_app.py`; analysis
+state rules live in focused modules so a contract change has one clear owner:
+
+| Change | Module |
+| --- | --- |
+| persisted state, public schema 1.0–1.3, report reconstruction | `local_analysis_projection.py` |
+| legal state transitions and terminal commit rules | `local_analysis_lifecycle.py` |
+| deterministic restart decisions | `local_analysis_recovery.py` |
+| remote capture serialization, task definitions, manifest restore | `local_remote_capture.py` |
+| SmartPerfetto normalization, source-aware preparation, AI/report stages | `local_stage_execution.py` |
+| slow/waiting activity reconciliation | `local_task_supervisor.py` |
+| aggregate and team capability status | `local_analysis_health.py` |
+| browser Analysis types and closed response parsing | `app/lib/perfpilot-analysis-api.ts` |
+
+When changing an analysis flow, update its focused module and unit tests first,
+then use `local_app.py` only to wire storage, gateways, services, and routes. The
+focused modules must not import FastAPI or `local_app`, and the browser parser
+must not import the HTTP client.
+
 ## Local checks
 
 Start PostgreSQL and Redis, then copy the safe, AI-disabled defaults:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import re
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -245,3 +246,84 @@ def test_module_boundaries_do_not_emit_private_runtime_values(tmp_path: Path) ->
     assert "token" not in encoded.casefold()
     assert "source content" not in encoded.casefold()
     assert "/Users/" not in encoded
+
+
+def _module_imports(path: Path) -> set[str]:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    imports: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            imports.update(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module is not None:
+            imports.add(node.module)
+    return imports
+
+
+def test_dependency_direction_keeps_runtime_modules_http_independent() -> None:
+    root = Path(__file__).parents[4]
+    package = root / "services/api/src/perfpilot_api"
+    independent = (
+        "local_analysis_projection.py",
+        "local_analysis_recovery.py",
+        "local_analysis_lifecycle.py",
+        "local_task_supervisor.py",
+        "local_remote_capture.py",
+        "local_stage_execution.py",
+    )
+
+    for name in independent:
+        imports = _module_imports(package / name)
+        assert "perfpilot_api.local_app" not in imports
+        assert not any(module == "fastapi" or module.startswith("fastapi.") for module in imports)
+
+    app_imports = _module_imports(package / "local_app.py")
+    for name in independent:
+        module = f"perfpilot_api.{Path(name).stem}"
+        assert module in app_imports
+
+    frontend_parser = (root / "app/lib/perfpilot-analysis-api.ts").read_text(
+        encoding="utf-8"
+    )
+    assert 'from "./perfpilot-api"' not in frontend_parser
+
+
+def test_module_boundaries_remove_migrated_private_implementations() -> None:
+    root = Path(__file__).parents[4]
+    local_app = (root / "services/api/src/perfpilot_api/local_app.py").read_text(
+        encoding="utf-8"
+    )
+    analysis_progress = (root / "app/components/analysis-progress.tsx").read_text(
+        encoding="utf-8"
+    )
+
+    migrated = (
+        "_restore_remote_capture",
+        "_retry_remote_publication",
+        "_remote_device_definition",
+        "_script_device_definition",
+        "_synthesis_from_core",
+        "_normalize_local_smartperfetto_result",
+        "_prepare_local_report",
+        "_compose_local_report",
+        "_local_source_code_document",
+        "_prepared_from_persisted_documents",
+    )
+    for name in migrated:
+        assert f"def {name}(" not in local_app
+    assert "function analysisStillChanging(" not in analysis_progress
+
+
+def test_module_boundaries_keep_extracted_modules_focused() -> None:
+    root = Path(__file__).parents[4]
+    package = root / "services/api/src/perfpilot_api"
+    local_app_lines = (package / "local_app.py").read_text(encoding="utf-8").count("\n") + 1
+    assert local_app_lines <= 6_032
+
+    for name in (
+        "local_analysis_projection.py",
+        "local_analysis_recovery.py",
+        "local_remote_capture.py",
+        "local_stage_execution.py",
+    ):
+        lines = (package / name).read_text(encoding="utf-8").count("\n") + 1
+        assert lines < 1_200, name

@@ -1,11 +1,72 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Mapping
-from uuid import UUID
+from typing import Literal, Mapping, Protocol
+from uuid import UUID, uuid4
 
-from perfpilot_api.local_analysis_store import migrate_analysis_runtime_status
+from perfpilot_api.ai.local_report import LocalReportSynthesizer, LocalReportUsage
+from perfpilot_api.ai.synthesis import AISynthesisOutput
+from perfpilot_api.engines.contracts import EngineResult
+from perfpilot_api.local_analysis_store import (
+    migrate_analysis_runtime_status,
+    validate_analysis_runtime_status,
+)
+from perfpilot_api.local_stage_execution import (
+    REPORT_WORKER_IMAGE_DIGEST as _ENGINE_IMAGE_DIGEST,
+    PreparedLocalReport as _PreparedLocalReport,
+    blocked_ai_projection as _blocked_ai_projection,
+    prepare_local_report as _prepare_local_report,
+    sha256_b64 as _sha256_b64,
+    validated_checksum as _validated_checksum,
+)
+from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
+from perfpilot_api.reports.normalizer import NormalizedTraceReport
+from perfpilot_api.reports.projection import (
+    AIProjection,
+    ProjectionPrivacyError,
+    ProjectionQuestionError,
+    ProjectionSizeError,
+    build_ai_projection,
+)
+from perfpilot_api.reports.smartperfetto_original import (
+    SmartPerfettoOriginalReference,
+    restore_smartperfetto_original,
+)
+from perfpilot_api.engines.smartperfetto_contracts import validate_sanitized_report_payload
+from perfpilot_api.reports.source_context import validate_persisted_source_context
+from perfpilot_api.reports.writer import AnalysisReportWriteRequest, compose_analysis_report
+from perfpilot_api.services.source_workspaces import SourceBinding
+from perfpilot_api.workers.source_orchestrator import derive_source_authority
+
+
+class _LocalAnalysis(Protocol):
+    pass
+
+
+class PersistedLocalEvidenceError(RuntimeError):
+    def __init__(self, stable_code: str) -> None:
+        self.stable_code = stable_code
+        super().__init__(stable_code)
+
+
+_PersistedLocalEvidenceError = PersistedLocalEvidenceError
+LocalAIRole = Literal["report", "extract", "review", "finalize"]
+
+
+def _source_binding_document(binding: SourceBinding) -> dict[str, object]:
+    return {
+        "provider_kind": binding.provider_kind,
+        "agent_id": str(binding.agent_id),
+        "workspace_id": str(binding.workspace_id),
+        "snapshot_policy": binding.snapshot_policy,
+        "validation_profile_id": (
+            str(binding.validation_profile_id)
+            if binding.validation_profile_id is not None
+            else None
+        ),
+    }
 
 
 _CORE_PERSISTED_KEYS = frozenset(
@@ -317,7 +378,808 @@ def to_public_document(value: LocalAnalysisView) -> dict[str, object]:
     return document
 
 
+def _compose_local_report(
+    analysis: _LocalAnalysis,
+    prepared: _PreparedLocalReport,
+    *,
+    generation: int,
+    synthesis: AISynthesisOutput | None,
+    synthesis_failure_code: str | None,
+    rounds: tuple[LocalReportUsage, ...],
+    synthesizer: LocalReportSynthesizer | None,
+    smartperfetto_original: SmartPerfettoOriginalReference | None = None,
+) -> dict[str, object]:
+    synthesis_document = synthesis.document if synthesis is not None else None
+    synthesis_bytes = synthesis.canonical_bytes if synthesis is not None else None
+    generated_at = datetime.now(UTC)
+    synthesis_execution_id = uuid4()
+    projection_artifact_id = uuid4()
+    synthesis_artifact_id = uuid4() if synthesis is not None else None
+    prompt_version = (
+        synthesizer.prompt_version
+        if synthesizer is not None
+        else "perfpilot-report-v3"
+    )
+    prompt_checksum = synthesizer.prompt_sha256_b64 if synthesizer is not None else ""
+    try:
+        _validated_checksum(prompt_checksum)
+    except ValueError:
+        prompt_checksum = _sha256_b64(prompt_version.encode("utf-8"))
+    prompt_tokens = sum(item.prompt_tokens for item in rounds)
+    completion_tokens = sum(item.completion_tokens for item in rounds)
+    latency_ms = sum(item.latency_ms for item in rounds)
+    composed = compose_analysis_report(
+        AnalysisReportWriteRequest(
+            team_id=analysis.team_id,
+            analysis_id=analysis.analysis_id,
+            synthesis_execution_id=synthesis_execution_id,
+            tenant_resource_version=1,
+            generation=generation,
+            generated_at=generated_at,
+            core_document=prepared.core_document,
+            synthesis_document=synthesis_document,
+            synthesis_failure_code=synthesis_failure_code,
+            canonical_artifact_id=prepared.canonical_artifact_id,
+            canonical_sha256_b64=prepared.canonical_sha256_b64,
+            projection_artifact_id=projection_artifact_id,
+            projection_sha256_b64=prepared.projection.sha256_b64,
+            synthesis_artifact_id=synthesis_artifact_id,
+            synthesis_sha256_b64=(
+                _sha256_b64(synthesis_bytes) if synthesis_bytes is not None else None
+            ),
+            normalizer_version=prepared.normalizer_version,
+            prompt_template_version=prompt_version[:128],
+            prompt_template_sha256_b64=prompt_checksum,
+            report_worker_image_digest=_ENGINE_IMAGE_DIGEST,
+            provider_protocol="openai-compatible",
+            provider_name=(synthesizer.provider_name[:128] if synthesizer else "unavailable"),
+            model=(synthesizer.model[:128] if synthesizer else "unavailable"),
+            prompt_tokens=prompt_tokens if synthesis is not None else None,
+            completion_tokens=completion_tokens if synthesis is not None else None,
+            total_tokens=(prompt_tokens + completion_tokens) if synthesis is not None else None,
+            latency_ms=latency_ms if synthesis is not None else None,
+            source_code_document=_local_source_code_document(analysis),
+        ),
+        report_version=generation,
+    )
+    document = dict(composed.document)
+    if document.get("schema_version") == "1.2" and smartperfetto_original is not None:
+        document["smartperfetto_original"] = smartperfetto_original.public_document()
+        document = validate_contract("analysis-report", document)
+    return document
+
+
+def _local_source_code_document(analysis: _LocalAnalysis) -> dict[str, object]:
+    binding = analysis.source_binding
+    if binding is None:
+        return {
+            "requested": False,
+            "provider_kind": None,
+            "agent_id": None,
+            "workspace_id": None,
+            "snapshot_policy": None,
+            "validation_profile_id": None,
+            "snapshot": None,
+            "context_state": "not_requested",
+            "match_summary": "none",
+            "source_refs": [],
+            "exclusions": [],
+            "fixes": [],
+            "limitations": [],
+        }
+    context = analysis.source_context
+    available = (
+        isinstance(context, Mapping)
+        and analysis.source_code_analysis.get("context_state") == "available"
+    )
+    match_summary = (
+        str(context.get("match_summary"))
+        if available
+        else str(analysis.source_code_analysis.get("match_summary", "none"))
+    )
+    source_refs: list[dict[str, object]] = []
+    if available and match_summary == "strong":
+        fragments = context.get("fragments")
+        if isinstance(fragments, list):
+            source_refs = [
+                {
+                    **{
+                        key: value
+                        for key, value in fragment.items()
+                        if key != "content"
+                    },
+                    "snapshot_hash": context["snapshot_hash"],
+                }
+                for fragment in fragments
+                if isinstance(fragment, Mapping)
+                and fragment.get("match_grade") == "strong"
+            ]
+    snapshot = (
+        {
+            "snapshot_id": context["snapshot_id"],
+            "snapshot_hash": context["snapshot_hash"],
+            "git_head": context["git_head"],
+        }
+        if available
+        else None
+    )
+    exclusions = list(context.get("exclusions", [])) if available else []
+    return {
+        "requested": True,
+        **_source_binding_document(binding),
+        "snapshot": snapshot,
+        "context_state": analysis.source_code_analysis.get(
+            "context_state", "unavailable"
+        ),
+        "match_summary": match_summary,
+        "source_refs": source_refs,
+        "exclusions": exclusions,
+        "fixes": [],
+        "limitations": [],
+    }
+
+
+def _source_metadata(
+    report: Mapping[str, object],
+) -> tuple[int | None, Literal["passed", "failed", "unknown"]]:
+    rounds: int | None = None
+    summary = report.get("summary")
+    if isinstance(summary, Mapping):
+        raw_rounds = summary.get("rounds")
+        if type(raw_rounds) is int and raw_rounds >= 0:
+            rounds = raw_rounds
+    verification: Literal["passed", "failed", "unknown"] = "unknown"
+    raw_verification = report.get("claimVerificationResult")
+    if isinstance(raw_verification, Mapping):
+        raw_status = str(raw_verification.get("status", "")).casefold()
+        if raw_status in {"passed", "pass", "verified", "success"}:
+            verification = "passed"
+        elif raw_status in {"failed", "fail", "rejected", "error"}:
+            verification = "failed"
+    return rounds, verification
+
+
+def _validated_persisted_source_report(value: object) -> dict[str, object]:
+    try:
+        if not isinstance(value, Mapping):
+            raise ValueError
+        report_id = value.get("reportId")
+        validated = validate_sanitized_report_payload(
+            {"reportId": report_id, "report": value}
+        )
+        report = validated["report"]
+        if not isinstance(report, dict):
+            raise ValueError
+        return report
+    except (TypeError, ValueError):
+        raise _PersistedLocalEvidenceError("ai_source_evidence_invalid") from None
+
+
+def _remap_projection_artifact(
+    projection_document: Mapping[str, object],
+    *,
+    replacement: UUID,
+) -> dict[str, object]:
+    migrated = dict(projection_document)
+    source = migrated.get("source")
+    scenarios = migrated.get("scenarios")
+    if not isinstance(source, Mapping) or not isinstance(scenarios, list):
+        raise _PersistedLocalEvidenceError("ai_source_evidence_invalid")
+    original = source.get("canonical_artifact_id")
+    migrated["source"] = {**source, "canonical_artifact_id": str(replacement)}
+    migrated_scenarios: list[dict[str, object]] = []
+    for scenario in scenarios:
+        if not isinstance(scenario, Mapping) or not isinstance(
+            scenario.get("evidence"), list
+        ):
+            raise _PersistedLocalEvidenceError("ai_source_evidence_invalid")
+        migrated_evidence = [
+            {
+                **evidence,
+                "artifact_id": (
+                    str(replacement)
+                    if evidence.get("artifact_id") == original
+                    else evidence.get("artifact_id")
+                ),
+            }
+            for evidence in scenario["evidence"]
+            if isinstance(evidence, Mapping)
+        ]
+        if len(migrated_evidence) != len(scenario["evidence"]):
+            raise _PersistedLocalEvidenceError("ai_source_evidence_invalid")
+        migrated_scenarios.append({**scenario, "evidence": migrated_evidence})
+    migrated["scenarios"] = migrated_scenarios
+    return validate_contract("analysis-projection", migrated)
+
+
+def _validate_legacy_report_facts(
+    analysis: _LocalAnalysis,
+    prepared: _PreparedLocalReport,
+    report_value: object,
+) -> None:
+    try:
+        report = validate_contract("analysis-report", report_value)
+        if (
+            report["analysis_id"] != str(analysis.analysis_id)
+            or report["analysis_mode"] != analysis.analysis_mode
+        ):
+            raise ValueError
+        report_scenarios = report["scenario_reports"]
+        core_scenarios = prepared.core_document["scenario_reports"]
+        if len(report_scenarios) != len(core_scenarios):
+            raise ValueError
+        selected = {
+            (item["scenario_job_id"], item["scenario_type"]): item
+            for item in report_scenarios
+        }
+        if len(selected) != len(report_scenarios):
+            raise ValueError
+        rebuilt_artifact_id = str(prepared.canonical_artifact_id)
+        for core_scenario in core_scenarios:
+            key = (
+                core_scenario["scenario_id"],
+                core_scenario["scenario_type"],
+            )
+            report_scenario = selected[key]
+            bundle = report_scenario["bundle"]
+            input_artifacts = bundle["provenance"]["input_artifacts"]
+            if (
+                len(input_artifacts) != 1
+                or input_artifacts[0].get("artifact_kind") != "engine_result"
+            ):
+                raise ValueError
+            old_artifact_id = input_artifacts[0]["artifact_id"]
+            mapped_evidence = [
+                {
+                    **item,
+                    "artifact_id": (
+                        old_artifact_id
+                        if item.get("artifact_id") == rebuilt_artifact_id
+                        else item.get("artifact_id")
+                    ),
+                }
+                for item in core_scenario["evidence"]
+            ]
+            if (
+                report_scenario["result_state"]
+                != (
+                    "completed"
+                    if core_scenario["core_state"] == "complete"
+                    else "failed"
+                )
+                or bundle["scenario_job_id"] != core_scenario["scenario_id"]
+                or bundle["scenario_type"] != core_scenario["scenario_type"]
+                or bundle["bundle_state"] != core_scenario["core_state"]
+                or bundle["metrics"] != core_scenario["metrics"]
+                or bundle["findings"] != core_scenario["findings"]
+                or bundle["evidence"] != mapped_evidence
+                or bundle["trace_health"] != core_scenario["trace_health"]
+                or bundle["trace_capabilities"]
+                != core_scenario["trace_capabilities"]
+            ):
+                raise ValueError
+    except Exception:
+        raise _PersistedLocalEvidenceError("ai_source_evidence_invalid") from None
+
+
+def _prepared_from_persisted_documents(
+    analysis: _LocalAnalysis,
+    *,
+    source_value: object,
+    core_value: object | None,
+    projection_value: object,
+    report_value: object | None,
+) -> _PreparedLocalReport:
+    source_report = _validated_persisted_source_report(source_value)
+    try:
+        projection_document = validate_contract("analysis-projection", projection_value)
+        projection_bytes = canonical_json_bytes(projection_document)
+        projection = AIProjection(
+            canonical_bytes=projection_bytes,
+            sha256_b64=_sha256_b64(projection_bytes),
+        )
+        source_rounds, source_verification = _source_metadata(source_report)
+        if (
+            analysis.source_rounds is not None
+            and source_rounds != analysis.source_rounds
+        ) or (
+            analysis.source_verification != "unknown"
+            and source_verification != analysis.source_verification
+        ):
+            raise ValueError
+        if core_value is None:
+            if analysis.analysis_mode != "trace_upload":
+                raise _PersistedLocalEvidenceError("ai_source_evidence_unavailable")
+            for source_state in ("completed", "insufficient_data"):
+                rebuilt = _prepare_local_report(
+                    analysis,
+                    EngineResult(
+                        contract="workspace-agent-v1",
+                        state=source_state,
+                        payload={
+                            "reportId": source_report["reportId"],
+                            "report": source_report,
+                        },
+                    ),
+                )
+                migrated_projection = _remap_projection_artifact(
+                    projection_document,
+                    replacement=rebuilt.canonical_artifact_id,
+                )
+                if canonical_json_bytes(migrated_projection) == (
+                    rebuilt.projection.canonical_bytes
+                ):
+                    if report_value is None:
+                        raise _PersistedLocalEvidenceError(
+                            "ai_source_evidence_unavailable"
+                        )
+                    _validate_legacy_report_facts(
+                        analysis,
+                        rebuilt,
+                        report_value,
+                    )
+                    return rebuilt
+            raise ValueError
+        core_document = validate_contract("normalized-trace-report", core_value)
+        if (
+            core_document["analysis_id"] != str(analysis.analysis_id)
+            or core_document["analysis_mode"] != analysis.analysis_mode
+            or projection_document["analysis_id"] != str(analysis.analysis_id)
+            or projection_document["analysis_profile"] != analysis.profile
+            or projection_document["question"] != analysis.question
+        ):
+            raise ValueError
+        core_bytes = canonical_json_bytes(core_document)
+        normalized = NormalizedTraceReport(
+            canonical_bytes=core_bytes,
+            sha256_b64=_sha256_b64(core_bytes),
+        )
+        source_context: dict[str, object] | None = None
+        if analysis.source_binding is not None:
+            if analysis.source_code_analysis.get("context_state") == "available":
+                authority = derive_source_authority(core_document)
+                context = analysis.source_context
+                if not isinstance(context, Mapping):
+                    raise ValueError
+                source_context = validate_persisted_source_context(
+                    context,
+                    direct_identifiers=authority.direct_identifiers,
+                    allowed_finding_ids=authority.finding_ids,
+                    allowed_evidence_ids=authority.evidence_ids,
+                )
+                if (
+                    source_context.get("match_summary")
+                    != analysis.source_code_analysis.get("match_summary")
+                ):
+                    raise ValueError
+            elif analysis.source_code_analysis.get("context_state") != "unavailable":
+                raise ValueError
+        provenance = core_document.get("provenance")
+        if not isinstance(provenance, Mapping):
+            raise ValueError
+        canonical_artifact_id = UUID(str(provenance["canonical_artifact_id"]))
+        projection_failure_code: str | None = None
+        try:
+            expected_projection = build_ai_projection(
+                normalized,
+                analysis_profile=analysis.profile,  # type: ignore[arg-type]
+                question=analysis.question,
+                source_context=source_context,
+            )
+        except (
+            ProjectionPrivacyError,
+            ProjectionQuestionError,
+            ProjectionSizeError,
+        ) as error:
+            projection_failure_code = {
+                ProjectionPrivacyError: "ai_projection_private_data",
+                ProjectionQuestionError: "ai_projection_invalid_question",
+                ProjectionSizeError: "ai_projection_too_large",
+            }[type(error)]
+            expected_projection = _blocked_ai_projection(
+                analysis_id=analysis.analysis_id,
+                analysis_profile=analysis.profile,
+                canonical_artifact_id=canonical_artifact_id,
+            )
+        if (
+            expected_projection.canonical_bytes != projection.canonical_bytes
+            or expected_projection.sha256_b64 != projection.sha256_b64
+        ):
+            raise ValueError
+        canonical_sha256_b64 = _validated_checksum(
+            str(provenance["canonical_sha256_b64"])
+        )
+        normalizer_version = provenance.get("normalizer_version")
+        if not isinstance(normalizer_version, str) or not normalizer_version:
+            raise ValueError
+        return _PreparedLocalReport(
+            core_document=core_document,
+            projection=projection,
+            projection_failure_code=projection_failure_code,
+            canonical_artifact_id=canonical_artifact_id,
+            canonical_sha256_b64=canonical_sha256_b64,
+            normalizer_version=normalizer_version,
+            source_report=source_report,
+        )
+    except _PersistedLocalEvidenceError:
+        raise
+    except Exception:
+        raise _PersistedLocalEvidenceError("ai_source_evidence_invalid") from None
+
+compose_local_report = _compose_local_report
+local_source_code_document = _local_source_code_document
+prepared_from_persisted_documents = _prepared_from_persisted_documents
+source_metadata = _source_metadata
+
+
+_PERSISTED_STATE_KEYS = {
+    "schema_version",
+    "team_id",
+    "analysis_id",
+    "analysis_mode",
+    "device_id",
+    "device_agent_id",
+    "device_digest",
+    "application_version_id",
+    "application_metadata",
+    "capture_configuration",
+    "trace_test_type",
+    "target_package_name",
+    "custom_test_name",
+    "custom_test_description",
+    "remote_publication",
+    "profile",
+    "question",
+    "created_at",
+    "started_at",
+    "completed_at",
+    "state",
+    "version",
+    "generation",
+    "inputs",
+    "failure",
+    "cancel_requested_at",
+    "stages",
+    "source_run",
+    "source_rounds",
+    "source_verification",
+    "source_binding",
+    "source_code_analysis",
+    "ai_rounds",
+    "report_available",
+    "evidence_format_version",
+    "evidence_manifest",
+    "smartperfetto_original",
+    "response_schema_version",
+    "runtime_status",
+}
+_PERSISTED_OPTIONAL_STATE_KEYS = {
+    "created_at",
+    "source_binding",
+    "source_code_analysis",
+    "ai_rounds",
+    "evidence_format_version",
+    "evidence_manifest",
+    "smartperfetto_original",
+    "remote_publication",
+    "capture_configuration",
+    "trace_test_type",
+    "target_package_name",
+    "custom_test_name",
+    "custom_test_description",
+    "response_schema_version",
+    "runtime_status",
+}
+_PERSISTED_STAGE_KEYS = {
+    "input_validation",
+    "smartperfetto",
+    "perfpilot_ai",
+    "report",
+}
+_PERSISTED_SOURCE_CODE_KEYS = {
+    "requested",
+    "provider_kind",
+    "agent_id",
+    "workspace_id",
+    "snapshot_policy",
+    "validation_profile_id",
+    "context_state",
+    "match_summary",
+    "verification_state",
+    "failure_code",
+}
+
+
+def _has_exact_keys(value: object, keys: set[str]) -> bool:
+    return isinstance(value, Mapping) and set(value) == keys
+
+
+def _validate_persisted_state_shape(document: Mapping[str, object]) -> None:
+    if document.get("schema_version") != "1.0":
+        raise ValueError
+    keys = set(document)
+    required = _PERSISTED_STATE_KEYS - _PERSISTED_OPTIONAL_STATE_KEYS
+    if not required <= keys or not keys <= _PERSISTED_STATE_KEYS:
+        raise ValueError
+    inputs = document.get("inputs")
+    if not isinstance(inputs, list):
+        raise ValueError
+    for item in inputs:
+        if not _has_exact_keys(
+            item, {"descriptor", "upload_id", "artifact_id", "finalized"}
+        ) or not _has_exact_keys(
+            item["descriptor"], {"kind", "mime", "size", "sha256_b64"}
+        ):
+            raise ValueError
+    if not _has_exact_keys(document.get("stages"), _PERSISTED_STAGE_KEYS):
+        raise ValueError
+    response_schema_version = document.get("response_schema_version")
+    if response_schema_version is not None and response_schema_version not in {
+        "1.0",
+        "1.1",
+        "1.2",
+        "1.3",
+    }:
+        raise ValueError
+    if "runtime_status" in document:
+        validate_analysis_runtime_status(document["runtime_status"])
+    source_run = document.get("source_run")
+    if source_run is not None and not _has_exact_keys(
+        source_run, {"session_id", "run_id"}
+    ):
+        raise ValueError
+    source_binding = document.get("source_binding")
+    if source_binding is not None and not _has_exact_keys(
+        source_binding,
+        {
+            "provider_kind",
+            "agent_id",
+            "workspace_id",
+            "snapshot_policy",
+            "validation_profile_id",
+        },
+    ):
+        raise ValueError
+    if "source_code_analysis" in document and not _has_exact_keys(
+        document["source_code_analysis"], _PERSISTED_SOURCE_CODE_KEYS
+    ):
+        raise ValueError
+    if "ai_rounds" in document:
+        rounds = document["ai_rounds"]
+        if not isinstance(rounds, list) or any(
+            not _has_exact_keys(item, {"round", "role", "state", "attempts"})
+            for item in rounds
+        ):
+            raise ValueError
+    metadata = document.get("application_metadata")
+    if metadata is not None and not _has_exact_keys(
+        metadata,
+        {
+            "package_name",
+            "version_name",
+            "version_code",
+            "launch_activity",
+            "min_sdk",
+            "target_sdk",
+            "supported_abis",
+            "has_native_libraries",
+        },
+    ):
+        raise ValueError
+    capture_configuration = document.get("capture_configuration")
+    if capture_configuration is not None:
+        if not _has_exact_keys(
+            capture_configuration,
+            {
+                "test_type",
+                "launch_mode",
+                "duration_seconds",
+                "package_name",
+                "launch_activity",
+            },
+        ):
+            raise ValueError
+        if (
+            capture_configuration.get("test_type")
+            not in {"cold_start", "hot_start", "scroll"}
+            or capture_configuration.get("launch_mode")
+            not in {"automatic", "manual"}
+            or type(capture_configuration.get("duration_seconds")) is not int
+            or not 1 <= int(capture_configuration["duration_seconds"]) <= 300
+        ):
+            raise ValueError
+    trace_test_type = document.get("trace_test_type")
+    target_package_name = document.get("target_package_name")
+    custom_test_name = document.get("custom_test_name")
+    custom_test_description = document.get("custom_test_description")
+    trace_details = (
+        trace_test_type,
+        target_package_name,
+        custom_test_name,
+        custom_test_description,
+    )
+    if any(value is not None for value in trace_details):
+        if (
+            document.get("analysis_mode") != "trace_upload"
+            or trace_test_type not in {"cold_start", "hot_start", "scroll", "other"}
+            or not isinstance(target_package_name, str)
+            or re.fullmatch(
+                r"[A-Za-z][A-Za-z0-9_]*(?:\.[A-Za-z][A-Za-z0-9_]*)+",
+                target_package_name,
+            )
+            is None
+        ):
+            raise ValueError
+        if trace_test_type == "other":
+            if not isinstance(custom_test_name, str) or not isinstance(
+                custom_test_description, str
+            ):
+                raise ValueError
+        elif custom_test_name is not None or custom_test_description is not None:
+            raise ValueError
+    if document.get("remote_publication", "not_requested") not in {
+        "not_requested",
+        "publishing",
+        "published",
+    }:
+        raise ValueError
+    failure = document.get("failure")
+    if failure is not None and not _has_exact_keys(
+        failure, {"code", "message", "retryable"}
+    ):
+        raise ValueError
+    if "smartperfetto_original" in document:
+        restore_smartperfetto_original(document["smartperfetto_original"])
+
+validate_persisted_state_shape = _validate_persisted_state_shape
+
+
+@dataclass(slots=True)
+class _LocalAIRound:
+    number: int
+    role: LocalAIRole
+    state: Literal["pending", "running", "completed", "failed"] = "pending"
+    attempts: int = 0
+
+
+def _restore_evidence_manifest(value: object) -> dict[str, str]:
+    checksum_keys = {
+        "normalized_core_sha256_b64",
+        "smartperfetto_report_sha256_b64",
+        "projection_sha256_b64",
+    }
+    try:
+        if (
+            not isinstance(value, Mapping)
+            or set(value) != {"schema_version", *checksum_keys}
+            or value.get("schema_version") != "1.0"
+        ):
+            raise ValueError
+        manifest = {"schema_version": "1.0"}
+        for key in checksum_keys:
+            checksum = value[key]
+            if not isinstance(checksum, str):
+                raise ValueError
+            manifest[key] = _validated_checksum(checksum)
+        return manifest
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("invalid persisted local analysis") from None
+
+
+def _default_ai_rounds() -> list[_LocalAIRound]:
+    return [_LocalAIRound(1, "report")]
+
+
+def _source_binding_document(binding: SourceBinding) -> dict[str, object]:
+    return {
+        "provider_kind": binding.provider_kind,
+        "agent_id": str(binding.agent_id),
+        "workspace_id": str(binding.workspace_id),
+        "snapshot_policy": binding.snapshot_policy,
+        "validation_profile_id": (
+            str(binding.validation_profile_id)
+            if binding.validation_profile_id is not None
+            else None
+        ),
+    }
+
+
+def _source_code_analysis_document(binding: SourceBinding | None) -> dict[str, object]:
+    if binding is None:
+        return {
+            "requested": False,
+            "provider_kind": None,
+            "agent_id": None,
+            "workspace_id": None,
+            "snapshot_policy": None,
+            "validation_profile_id": None,
+            "context_state": "not_requested",
+            "match_summary": "none",
+            "verification_state": "not_requested",
+            "failure_code": None,
+        }
+    return {
+        "requested": True,
+        **_source_binding_document(binding),
+        "context_state": "waiting_for_agent",
+        "match_summary": "none",
+        "verification_state": "not_requested",
+        "failure_code": None,
+    }
+
+
+def _source_code_analysis_unavailable_document(
+    binding: SourceBinding,
+) -> dict[str, object]:
+    return {
+        "requested": True,
+        **_source_binding_document(binding),
+        "context_state": "unavailable",
+        "match_summary": "none",
+        "verification_state": "not_requested",
+        "failure_code": "source_agent_unavailable",
+    }
+
+
+def _restore_ai_rounds(value: object) -> list[_LocalAIRound]:
+    if not isinstance(value, list):
+        raise ValueError("invalid persisted local analysis")
+    expected_roles: tuple[LocalAIRole, ...]
+    if len(value) == 1:
+        expected_roles = ("report",)
+    elif len(value) == 3:
+        expected_roles = ("extract", "review", "finalize")
+    else:
+        raise ValueError("invalid persisted local analysis")
+    restored: list[_LocalAIRound] = []
+    for number, (raw_round, role) in enumerate(
+        zip(value, expected_roles, strict=True),
+        start=1,
+    ):
+        if not isinstance(raw_round, Mapping):
+            raise ValueError("invalid persisted local analysis")
+        raw_number = raw_round.get("round")
+        state = raw_round.get("state")
+        attempts = raw_round.get("attempts")
+        if (
+            type(raw_number) is not int
+            or raw_number != number
+            or raw_round.get("role") != role
+            or not isinstance(state, str)
+            or state not in {"pending", "running", "completed", "failed"}
+            or type(attempts) is not int
+            or attempts < 0
+        ):
+            raise ValueError("invalid persisted local analysis")
+        restored.append(
+            _LocalAIRound(number, role, state, attempts)  # type: ignore[arg-type]
+        )
+    return restored
+
+
+LocalAIRound = _LocalAIRound
+default_ai_rounds = _default_ai_rounds
+restore_ai_rounds = _restore_ai_rounds
+restore_evidence_manifest = _restore_evidence_manifest
+source_binding_document = _source_binding_document
+source_code_analysis_document = _source_code_analysis_document
+source_code_analysis_unavailable_document = _source_code_analysis_unavailable_document
+
+
 __all__ = [
+    "LocalAIRound",
+    "default_ai_rounds",
+    "restore_ai_rounds",
+    "restore_evidence_manifest",
+    "source_binding_document",
+    "source_code_analysis_document",
+    "source_code_analysis_unavailable_document",
+    "validate_persisted_state_shape",
+    "PersistedLocalEvidenceError",
+    "compose_local_report",
+    "local_source_code_document",
+    "prepared_from_persisted_documents",
+    "source_metadata",
     "LocalAnalysisProjectionError",
     "LocalAnalysisView",
     "from_persisted_document",

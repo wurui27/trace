@@ -61,6 +61,7 @@ from perfpilot_api.local_device_capture import (
     LocalDeviceCapture,
     LocalDeviceCaptureError,
 )
+from perfpilot_api.local_remote_capture import script_device_definition
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.normalizer import NormalizedTraceReport
 from perfpilot_api.reports.projection import build_ai_projection
@@ -4301,7 +4302,7 @@ async def test_script_capture_cancel_is_immediate_after_agent_lease(
     )
     runtime.analyses[(team_id, analysis_id)] = analysis
     runtime.agent_tasks._repository._capture_lease_projection = None
-    await runtime.agent_tasks.enqueue(runtime._script_device_definition(analysis))
+    await runtime.agent_tasks.enqueue(script_device_definition(analysis))
     scheduled = await runtime.agent_tasks.schedule(
         analysis_id=analysis_id,
         agent_id=agent_id,
