@@ -133,6 +133,10 @@ from perfpilot_api.local_memory_analysis import (
     LocalMemoryAnalysisGateway,
     build_local_memory_analysis_gateway,
 )
+from perfpilot_api.local_remote_capture import (
+    RemoteCaptureContext,
+    RemoteCaptureCoordinator,
+)
 from perfpilot_api.reports.contracts import canonical_json_bytes, validate_contract
 from perfpilot_api.reports.memory_join import (
     AndroidMemoryNormalizationError,
@@ -2595,7 +2599,7 @@ class _LocalRuntime:
         self.uploads: dict[tuple[UUID, UUID, str], _LocalUpload] = {}
         self.upload_authorizations: dict[str, tuple[UUID, UUID, str]] = {}
         self.lock = asyncio.Lock()
-        self.remote_publication_locks: dict[tuple[UUID, UUID], asyncio.Lock] = {}
+        self.remote_capture = RemoteCaptureCoordinator()
         self.terminal_commit_locks: dict[tuple[UUID, UUID], asyncio.Lock] = {}
         self.tasks: set[asyncio.Task[None]] = set()
         self.supervisor_tasks: dict[asyncio.AbstractEventLoop, asyncio.Task[None]] = {}
@@ -2615,9 +2619,13 @@ class _LocalRuntime:
             cancel_task=self._cancel_supervised_task,
         )
 
-    def _remote_publication_lock(self, analysis: _LocalAnalysis) -> asyncio.Lock:
-        key = (analysis.team_id, analysis.analysis_id)
-        return self.remote_publication_locks.setdefault(key, asyncio.Lock())
+    @staticmethod
+    def _remote_capture_context(analysis: _LocalAnalysis) -> RemoteCaptureContext:
+        return RemoteCaptureContext(
+            team_id=analysis.team_id,
+            analysis_id=analysis.analysis_id,
+            generation=analysis.generation,
+        )
 
     def _terminal_commit_lock(self, analysis: _LocalAnalysis) -> asyncio.Lock:
         key = (analysis.team_id, analysis.analysis_id)
@@ -2890,8 +2898,17 @@ class _LocalRuntime:
                     pending.append((analysis, upload))
         for analysis, upload in pending:
             async def publish(_idempotency_key: str) -> None:
-                async with self._remote_publication_lock(analysis):
-                    await self._publish_remote_device(analysis, upload)
+                context = self._remote_capture_context(analysis)
+                await self.remote_capture.reconcile(
+                    context,
+                    guard=lambda: (
+                        analysis.generation == context.generation
+                        and analysis.cancel_requested_at is None
+                    ),
+                    operation=lambda: self._publish_remote_device(
+                        analysis, upload
+                    ),
+                )
 
             try:
                 await run_control_operation(
@@ -3141,7 +3158,9 @@ class _LocalRuntime:
                 if self.analyses.get(key) is not current:
                     continue
                 del self.analyses[key]
-                self.remote_publication_locks.pop(key, None)
+                self.remote_capture.discard(
+                    self._remote_capture_context(current)
+                )
                 self.terminal_commit_locks.pop(key, None)
                 for upload in tuple(self.uploads.values()):
                     if (
@@ -3994,8 +4013,17 @@ class _LocalRuntime:
                         ]
         for analysis, upload in pending_remote_publications:
             try:
-                async with self._remote_publication_lock(analysis):
-                    await self._publish_remote_device(analysis, upload)
+                context = self._remote_capture_context(analysis)
+                await self.remote_capture.reconcile(
+                    context,
+                    guard=lambda: (
+                        analysis.generation == context.generation
+                        and analysis.cancel_requested_at is None
+                    ),
+                    operation=lambda: self._publish_remote_device(
+                        analysis, upload
+                    ),
+                )
             except Exception as error:
                 _LOGGER.warning(
                     "Remote capture publication recovery deferred type=%s",
@@ -4917,8 +4945,14 @@ class _LocalRuntime:
         analysis: _LocalAnalysis,
         request: _FinalizeUploadRequest,
     ) -> _LocalUpload:
-        async with self._remote_publication_lock(analysis):
-            return await self._finalize_remote_device_serialized(analysis, request)
+        context = self._remote_capture_context(analysis)
+        return await self.remote_capture.finalize(
+            context,
+            guard=lambda: analysis.generation == context.generation,
+            operation=lambda: self._finalize_remote_device_serialized(
+                analysis, request
+            ),
+        )
 
     async def _finalize_remote_device_serialized(
         self,
