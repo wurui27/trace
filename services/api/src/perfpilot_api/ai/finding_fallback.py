@@ -2,17 +2,36 @@
 
 from __future__ import annotations
 
+import re
 from typing import Mapping
 
 from perfpilot_api.ai.synthesis import AISynthesisOutput, validate_synthesis_output
 from perfpilot_api.reports.projection import AIProjection
 
 
+_CJK = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff]")
+
+
+def _safe_chinese(value: object, fallback: str) -> str:
+    if not isinstance(value, str):
+        return fallback
+    text = value.strip()
+    if not text or len(text) > 2000 or not _CJK.search(text) or any(
+        character.isdigit() for character in text
+    ):
+        return fallback
+    return text
+
+
 def _claim_refs(
-    finding: Mapping[str, object], critical_evidence_ids: frozenset[str]
+    finding: Mapping[str, object],
+    critical_evidence_ids: frozenset[str],
+    key_metric_ids: frozenset[str],
 ) -> list[dict[str, object]]:
     claims: list[dict[str, object]] = []
     for metric_id in finding["metric_ids"]:  # type: ignore[union-attr]
+        if metric_id not in key_metric_ids:
+            continue
         claims.append(
             {
                 "claim_type": "metric_observed",
@@ -40,10 +59,15 @@ def _conclusion(
     *,
     source_matched: bool,
     critical_evidence_ids: frozenset[str],
+    key_metric_ids: frozenset[str],
 ) -> dict[str, object]:
     status = finding["status"]
     ceiling = finding["confidence_ceiling"]
     confirmed = status == "confirmed" and ceiling not in {"low", "none"}
+    recommendation = _safe_chinese(
+        finding.get("engine_recommendation"),
+        "建议根据关联证据调整相关实现，并按相同环境复测。",
+    )
     return {
         "finding_id": finding["finding_id"],
         "evidence_ids": list(finding["evidence_ids"]),  # type: ignore[arg-type]
@@ -52,19 +76,27 @@ def _conclusion(
             if source_matched
             else []
         ),
-        "claim_refs": _claim_refs(finding, critical_evidence_ids),
-        "problem": "检测到与该 Finding 对应的性能问题。",
-        "cause": (
-            "SmartPerfetto 证据支持该机制与测试场景的关键路径相关。"
-            if confirmed
-            else "SmartPerfetto 证据提示该机制可能影响测试场景，当前仍需复测确认。"
+        "claim_refs": _claim_refs(finding, critical_evidence_ids, key_metric_ids),
+        "problem": _safe_chinese(
+            finding.get("problem"),
+            _safe_chinese(
+                finding.get("title"), "检测到与该 Finding 对应的性能问题。"
+            ),
+        ),
+        "cause": _safe_chinese(
+            finding.get("root_cause"),
+            (
+                "SmartPerfetto 证据支持该机制与测试场景的关键路径相关。"
+                if confirmed
+                else "SmartPerfetto 证据提示该机制可能影响测试场景，当前仍需复测确认。"
+            ),
         ),
         "source_root_cause": (
             "强匹配源码证据支持该问题与对应实现相关。"
             if source_matched and finding["source_ref_ids"]
             else "当前没有经过验证的匹配源码，只能判断 Trace 机制，不能定位代码根因。"
         ),
-        "recommendation": "建议根据关联证据调整相关实现，并按相同环境复测；修改仅供参考。",
+        "recommendation": f"{recommendation.rstrip('。')}；修改仅供参考。",
     }
 
 
@@ -101,9 +133,14 @@ def _recommendations(
         result.append(
             {
                 "priority": priority,
-                "title": "处理已识别的性能问题",
+                "title": _safe_chinese(
+                    finding.get("title"), "处理已识别的性能问题"
+                ),
                 "action": conclusion["recommendation"],
-                "expected_effect": "减少已识别机制对测试场景关键路径的影响。",
+                "expected_effect": _safe_chinese(
+                    finding.get("impact"),
+                    "减少已识别机制对测试场景关键路径的影响。",
+                ),
                 "finding_ids": [finding_id],
                 "evidence_ids": list(conclusion["evidence_ids"]),  # type: ignore[arg-type]
             }
@@ -124,6 +161,7 @@ def build_deterministic_finding_synthesis(
     findings = list(workbench["findings"])
     findings_by_id = {item["finding_id"]: item for item in findings}
     primary_ids = list(workbench["primary_finding_ids"])
+    key_metric_ids = _key_metric_ids(findings, primary_ids)
     critical_evidence_ids = frozenset(
         evidence_id
         for segment in workbench["critical_path"]
@@ -135,6 +173,7 @@ def build_deterministic_finding_synthesis(
             finding,
             source_matched=source_matched,
             critical_evidence_ids=critical_evidence_ids,
+            key_metric_ids=frozenset(key_metric_ids),
         )
         for finding in findings
     ]
@@ -146,13 +185,16 @@ def build_deterministic_finding_synthesis(
         "schema_version": "2.1",
         "verdict": "分析完成",
         "executive_summary": "SmartPerfetto 证据已经整理为可执行的问题与复测建议。",
-        "key_metric_ids": _key_metric_ids(findings, primary_ids),
+        "key_metric_ids": key_metric_ids,
         "conclusions": conclusions,
         "top_findings": [
             {
                 "finding_id": finding_id,
                 "evidence_ids": list(conclusions_by_id[finding_id]["evidence_ids"]),  # type: ignore[arg-type]
-                "user_impact": "该问题影响当前测试场景的关键性能路径。",
+                "user_impact": _safe_chinese(
+                    findings_by_id[finding_id].get("impact"),
+                    "该问题影响当前测试场景的关键性能路径。",
+                ),
             }
             for finding_id in primary_ids
         ],

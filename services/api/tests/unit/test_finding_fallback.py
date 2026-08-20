@@ -86,3 +86,78 @@ def test_fallback_does_not_free_write_measurement_values() -> None:
     narratives = canonical_json_bytes(result.document).decode("utf-8")
     assert "812.4" not in narratives
     assert "700" not in narratives
+
+
+def test_fallback_claims_only_the_three_selected_key_metrics() -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+
+    document = deepcopy(_projection().document)
+    workbench = document["workbench"]
+    metric_template = workbench["metrics"][0]
+    metric_ids = [
+        f"84000000-0000-4000-8000-{index:012d}"
+        for index in range(1, 5)
+    ]
+    workbench["metrics"] = [
+        {**deepcopy(metric_template), "metric_id": metric_id, "name": f"metric.{index}"}
+        for index, metric_id in enumerate(metric_ids, start=1)
+    ]
+    scenario_metric = document["scenarios"][0]["metrics"][0]
+    document["scenarios"][0]["metrics"] = [
+        {
+            **deepcopy(scenario_metric),
+            "metric_id": metric_id,
+            "name": f"metric.{index}",
+        }
+        for index, metric_id in enumerate(metric_ids, start=1)
+    ]
+    finding = workbench["findings"][0]
+    finding["metric_ids"] = metric_ids
+    workbench["retest_plans"][0]["metric_ids"] = metric_ids
+
+    result = build_deterministic_finding_synthesis(_projection(document))
+
+    selected = set(result.document["key_metric_ids"])
+    claimed = {
+        claim["metric_id"]
+        for conclusion in result.document["conclusions"]
+        for claim in conclusion["claim_refs"]
+        if claim["metric_id"] is not None
+    }
+    assert len(selected) == 3
+    assert claimed == selected
+
+
+def test_fallback_keeps_clear_server_owned_problem_and_action_text() -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+
+    document = deepcopy(_projection().document)
+    finding = document["workbench"]["findings"][0]
+    finding["title"] = "目标冷启动场景缺失"
+    finding["problem"] = "这份 Trace 没有覆盖目标应用的冷启动过程。"
+    finding["root_cause"] = "采集开始时目标进程已经存在，因此没有记录启动关键路径。"
+    finding["impact"] = "当前证据不能用于判断冷启动性能。"
+    finding["engine_recommendation"] = "重新采集包含完整冷启动窗口的 Trace。"
+
+    result = build_deterministic_finding_synthesis(_projection(document))
+
+    conclusion = result.document["conclusions"][0]
+    assert conclusion["problem"] == finding["problem"]
+    assert conclusion["cause"] == finding["root_cause"]
+    assert conclusion["recommendation"].startswith(
+        finding["engine_recommendation"].rstrip("。")
+    )
+    assert result.document["top_findings"][0]["user_impact"] == finding["impact"]
+
+
+def test_fallback_uses_finding_title_when_problem_contains_measurement_text() -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+
+    document = deepcopy(_projection().document)
+    finding = document["workbench"]["findings"][0]
+    finding["title"] = "目标冷启动场景缺失"
+    finding["problem"] = "目标进程在采集窗口内只有 8.5 ms 运行时间。"
+
+    result = build_deterministic_finding_synthesis(_projection(document))
+
+    assert result.document["conclusions"][0]["problem"] == finding["title"]
