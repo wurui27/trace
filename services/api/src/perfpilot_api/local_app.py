@@ -49,6 +49,7 @@ from perfpilot_api.ai.local_report import (
     LocalSynthesisError,
     build_local_report_synthesizer,
 )
+from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
 from perfpilot_api.ai.synthesis import AISynthesisOutput
 from perfpilot_api.engines.canonical_results import (
     EngineResultValidationError,
@@ -4211,6 +4212,7 @@ class _LocalRuntime:
         synthesis: AISynthesisOutput | None = None
         rounds: tuple[LocalReportUsage, ...] = ()
         synthesis_failure_code: str | None = None
+        ai_mode: Literal["available", "deterministic_fallback"] = "available"
         try:
             if prepared.projection_failure_code is not None:
                 raise LocalSynthesisError(
@@ -4260,6 +4262,7 @@ class _LocalRuntime:
             )
             synthesis = synthesis_result.output
             rounds = synthesis_result.rounds
+            ai_mode = synthesis_result.ai_mode
             async with self.lock:
                 if analysis.generation != generation:
                     raise _StaleLocalGeneration
@@ -4267,7 +4270,15 @@ class _LocalRuntime:
                 analysis.failure = None
                 analysis.version += 1
         except LocalSynthesisError as error:
-            synthesis_failure_code = error.stable_code
+            if prepared.projection.document.get("schema_version") == "2.1":
+                synthesis = build_deterministic_finding_synthesis(
+                    prepared.projection
+                )
+                ai_mode = "deterministic_fallback"
+                rounds = ()
+                synthesis_failure_code = None
+            else:
+                synthesis_failure_code = error.stable_code
             _LOGGER.warning(
                 "Local AI synthesis failed code=%s detail=%s round=%s",
                 error.stable_code,
@@ -4277,12 +4288,18 @@ class _LocalRuntime:
             async with self.lock:
                 if analysis.generation != generation:
                     raise _StaleLocalGeneration
-                analysis.stages["perfpilot_ai"] = "failed"
-                analysis.failure = {
-                    "code": error.stable_code,
-                    "message": "PerfPilot AI 最终报告生成失败，SmartPerfetto 基础报告仍可查看",
-                    "retryable": error.retryable,
-                }
+                analysis.stages["perfpilot_ai"] = (
+                    "completed" if synthesis is not None else "failed"
+                )
+                analysis.failure = (
+                    None
+                    if synthesis is not None
+                    else {
+                        "code": error.stable_code,
+                        "message": "PerfPilot AI 最终报告生成失败，SmartPerfetto 基础报告仍可查看",
+                        "retryable": error.retryable,
+                    }
+                )
                 analysis.version += 1
         async with self.lock:
             if analysis.generation != generation:
@@ -4306,6 +4323,7 @@ class _LocalRuntime:
             rounds=rounds,
             synthesizer=self.synthesizer,
             smartperfetto_original=analysis.smartperfetto_original,
+            ai_mode=ai_mode,
         )
         async with self._terminal_commit_lock(analysis):
             async with self.lock:

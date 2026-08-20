@@ -581,6 +581,54 @@ def _trace_upload_question(analysis: _LocalAnalysis) -> str | None:
     return "\n\n".join(parts)
 
 
+def _finding_projection_arguments(
+    analysis: _LocalAnalysis,
+    normalized: NormalizedTraceReport,
+    *,
+    canonical_sha256_b64: str,
+    normalizer_version: str,
+) -> dict[str, object]:
+    if getattr(analysis, "response_schema_version", None) != "1.3":
+        return {"schema_version": "2.0"}
+    package_name = getattr(analysis, "target_package_name", None)
+    configuration = getattr(analysis, "capture_configuration", None)
+    if not isinstance(package_name, str) and isinstance(configuration, Mapping):
+        configured_package = configuration.get("package_name")
+        if isinstance(configured_package, str):
+            package_name = configured_package
+    if not isinstance(package_name, str):
+        for scenario in normalized.document["scenario_reports"]:
+            observed = scenario["trace_health"]["target_resolution"]["package_name"]
+            if isinstance(observed, str):
+                package_name = observed
+                break
+    duration_seconds = (
+        configuration.get("duration_seconds")
+        if isinstance(configuration, Mapping)
+        else None
+    )
+    if type(duration_seconds) is not int:
+        duration_seconds = 15
+    if not isinstance(package_name, str):
+        raise ProjectionQuestionError("finding projection package is unavailable")
+    fingerprint_source = canonical_json_bytes(
+        {
+            "analysis_profile": analysis.profile,
+            "canonical_sha256_b64": canonical_sha256_b64,
+            "duration_seconds": duration_seconds,
+            "normalizer_version": normalizer_version,
+            "package_name": package_name,
+        }
+    )
+    return {
+        "schema_version": "2.1",
+        "package_name": package_name,
+        "duration_seconds": duration_seconds,
+        "environment_fingerprint": "sha256:"
+        + hashlib.sha256(fingerprint_source).hexdigest(),
+    }
+
+
 def _missing_scroll_scenario(
     team_id: UUID, analysis_id: UUID
 ) -> tuple[dict[str, object], dict[str, object]]:
@@ -985,6 +1033,12 @@ def _prepare_local_report(
             analysis_profile=analysis.profile,  # type: ignore[arg-type]
             question=analysis.question,
             source_context=source_context,
+            **_finding_projection_arguments(
+                analysis,
+                normalized,
+                canonical_sha256_b64=primary.canonical_sha256_b64,
+                normalizer_version=normalizer_version,
+            ),
         )
     except ProjectionPrivacyError:
         projection_failure_code = "ai_projection_private_data"
@@ -1022,6 +1076,7 @@ PreparedLocalReport = _PreparedLocalReport
 NormalizedLocalResult = _NormalizedLocalResult
 blocked_ai_projection = _blocked_ai_projection
 prepare_local_report = _prepare_local_report
+finding_projection_arguments = _finding_projection_arguments
 normalize_local_smartperfetto_result = _normalize_local_smartperfetto_result
 remote_capture_question = _remote_capture_question
 sha256_b64 = _sha256_b64
@@ -1038,6 +1093,7 @@ __all__ = [
     "blocked_ai_projection",
     "normalize_local_smartperfetto_result",
     "prepare_local_report",
+    "finding_projection_arguments",
     "remote_capture_question",
     "sha256_b64",
     "synthesis_from_core",

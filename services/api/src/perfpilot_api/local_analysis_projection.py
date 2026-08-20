@@ -17,6 +17,7 @@ from perfpilot_api.local_stage_execution import (
     REPORT_WORKER_IMAGE_DIGEST as _ENGINE_IMAGE_DIGEST,
     PreparedLocalReport as _PreparedLocalReport,
     blocked_ai_projection as _blocked_ai_projection,
+    finding_projection_arguments as _finding_projection_arguments,
     prepare_local_report as _prepare_local_report,
     sha256_b64 as _sha256_b64,
     validated_checksum as _validated_checksum,
@@ -388,6 +389,7 @@ def _compose_local_report(
     rounds: tuple[LocalReportUsage, ...],
     synthesizer: LocalReportSynthesizer | None,
     smartperfetto_original: SmartPerfettoOriginalReference | None = None,
+    ai_mode: Literal["available", "deterministic_fallback"] = "available",
 ) -> dict[str, object]:
     synthesis_document = synthesis.document if synthesis is not None else None
     synthesis_bytes = synthesis.canonical_bytes if synthesis is not None else None
@@ -398,7 +400,7 @@ def _compose_local_report(
     prompt_version = (
         synthesizer.prompt_version
         if synthesizer is not None
-        else "perfpilot-report-v3"
+        else "perfpilot-finding-report-v4"
     )
     prompt_checksum = synthesizer.prompt_sha256_b64 if synthesizer is not None else ""
     try:
@@ -439,11 +441,26 @@ def _compose_local_report(
             total_tokens=(prompt_tokens + completion_tokens) if synthesis is not None else None,
             latency_ms=latency_ms if synthesis is not None else None,
             source_code_document=_local_source_code_document(analysis),
+            projection_document=(
+                prepared.projection.document
+                if prepared.projection.document.get("schema_version") == "2.1"
+                and synthesis_document is not None
+                and synthesis_document.get("schema_version") == "2.1"
+                else None
+            ),
+            report_schema_version=(
+                "1.3"
+                if prepared.projection.document.get("schema_version") == "2.1"
+                and synthesis_document is not None
+                and synthesis_document.get("schema_version") == "2.1"
+                else "legacy"
+            ),
+            ai_mode=ai_mode,
         ),
         report_version=generation,
     )
     document = dict(composed.document)
-    if document.get("schema_version") == "1.2" and smartperfetto_original is not None:
+    if document.get("schema_version") in {"1.2", "1.3"} and smartperfetto_original is not None:
         document["smartperfetto_original"] = smartperfetto_original.public_document()
         document = validate_contract("analysis-report", document)
     return document
@@ -765,6 +782,12 @@ def _prepared_from_persisted_documents(
                 analysis_profile=analysis.profile,  # type: ignore[arg-type]
                 question=analysis.question,
                 source_context=source_context,
+                **_finding_projection_arguments(
+                    analysis,
+                    normalized,
+                    canonical_sha256_b64=str(provenance["canonical_sha256_b64"]),
+                    normalizer_version=str(provenance["normalizer_version"]),
+                ),
             )
         except (
             ProjectionPrivacyError,

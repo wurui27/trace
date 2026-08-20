@@ -3111,6 +3111,31 @@ def _smartperfetto_result() -> EngineResult:
     )
 
 
+def test_local_v13_preparation_builds_finding_projection_with_retest_context() -> None:
+    trace = _InputDescriptor(
+        kind="trace",
+        mime="application/octet-stream",
+        size=1,
+        sha256_b64=base64.b64encode(hashlib.sha256(b"x").digest()).decode(),
+    )
+    analysis = _LocalAnalysis(
+        team_id=UUID("10000000-0000-4000-8000-000000000001"),
+        analysis_id=UUID("82000000-0000-4000-8000-000000000001"),
+        profile="startup",
+        question=None,
+        inputs={"trace": _LocalInput(trace)},
+        response_schema_version="1.3",
+    )
+
+    prepared = _prepare_local_report(analysis, _smartperfetto_result())
+
+    assert prepared.projection.document["schema_version"] == "2.1"
+    retest = prepared.projection.document["workbench"]["retest_plans"][0]
+    assert retest["package_name"]
+    assert retest["duration_seconds"] == 15
+    assert retest["environment_fingerprint"].startswith("sha256:")
+
+
 def _smartperfetto_scenario_result(scenario_type: str) -> EngineResult:
     result = _smartperfetto_result()
     report = result.payload["report"]
@@ -3287,13 +3312,14 @@ def _create_trace_analysis(
     trace: bytes = b"background-local-trace",
     question: str = "首帧为什么慢？",
     package_name: str = "com.example",
+    schema_version: str = "1.0",
 ) -> tuple[str, str]:
     checksum = base64.b64encode(hashlib.sha256(trace).digest()).decode("ascii")
     response = client.post(
         f"/v1/teams/{team_id}/analyses",
         headers=headers,
         json={
-            "schema_version": "1.0",
+            "schema_version": schema_version,
             "analysis_mode": "trace_upload",
             "test_type": "cold_start",
             "package_name": package_name,
@@ -7450,6 +7476,56 @@ def test_local_app_persists_bounded_single_pass_failure(tmp_path: Path) -> None:
 
     assert restored.status_code == 200
     assert restored.json()["ai_rounds"] == expected_failed_rounds
+
+
+def test_local_v13_invalid_ai_publishes_deterministic_chinese_report(
+    tmp_path: Path,
+) -> None:
+    provider = _InvalidReportProvider()
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=LocalReportSynthesizer(provider=provider),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+            schema_version="1.3",
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+        )
+        for _ in range(200):
+            terminal = client.get(
+                f"/v1/teams/{team_id}/analyses/{analysis_id}"
+            ).json()
+            if terminal["state"] in {"completed", "partially_completed", "failed"}:
+                break
+            time.sleep(0.01)
+        published = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+
+    assert provider.calls == 2
+    assert published.status_code == 200
+    report = validate_contract("analysis-report", published.json())
+    assert report["schema_version"] == "1.3"
+    assert report["state"] == "completed"
+    assert report["capabilities"]["ai"] == "deterministic_fallback"
+    assert report["synthesis"]["state"] == "completed"
+    assert report["synthesis"]["failure_code"] is None
+    assert report["synthesis"]["output"]["conclusions"]
 
 
 def test_local_app_publishes_aggregate_token_usage_after_a_valid_retry(

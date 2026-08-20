@@ -14,6 +14,7 @@ from typing import Literal, Mapping, Protocol, cast, runtime_checkable
 import httpx
 from pydantic import SecretStr
 
+from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
 from perfpilot_api.ai.openai_compatible import (
     AIProviderError,
     SYNTHESIS_SCHEMA,
@@ -77,7 +78,7 @@ class RetryAwareLocalReportProvider(Protocol):
     ) -> SynthesisCandidate: ...
 
 
-_PROMPT_RESOURCE = "perfpilot-report-v3.txt"
+_PROMPT_RESOURCE = "perfpilot-finding-report-v4.txt"
 _MAX_PROJECTION_BYTES = 256 * 1024
 
 
@@ -157,7 +158,7 @@ def build_local_report_projection(projection: AIProjection) -> AIProjection:
 
 
 class LocalOpenAICompatibleReportProvider:
-    prompt_version = "perfpilot-report-v3"
+    prompt_version = "perfpilot-finding-report-v4"
 
     def __init__(
         self,
@@ -255,6 +256,7 @@ class LocalReportUsage:
 class LocalSynthesisResult:
     output: AISynthesisOutput
     rounds: tuple[LocalReportUsage]
+    ai_mode: Literal["available", "deterministic_fallback"] = "available"
 
 
 class LocalReportSynthesizer:
@@ -377,6 +379,24 @@ class LocalReportSynthesizer:
                     break
             except asyncio.CancelledError:
                 raise
+        if projection.document.get("schema_version") == "2.1":
+            output = build_deterministic_finding_synthesis(projection)
+            validate_simplified_chinese_narrative(output.document)
+            usage = LocalReportUsage(
+                number=1,
+                role="report",
+                attempts=attempts,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                latency_ms=latency_ms,
+            )
+            if on_report is not None:
+                await on_report(1, "report", "completed", attempts, output)
+            return LocalSynthesisResult(
+                output=output,
+                rounds=(usage,),
+                ai_mode="deterministic_fallback",
+            )
         if on_report is not None:
             await on_report(1, "report", "failed", attempts, None)
         raise LocalSynthesisError(

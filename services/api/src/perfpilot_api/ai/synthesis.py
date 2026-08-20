@@ -338,6 +338,17 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
         _validate_v21_conclusions(document, index)
         _validate_source_fixes(document, index)
 
+    allowed_finding_evidence: Mapping[str, tuple[str, ...] | frozenset[str]] = (
+        index.workbench_finding_evidence
+        if index.schema_version == "2.1"
+        else index.finding_evidence
+    )
+    allowed_evidence_ids = (
+        index.workbench_evidence_ids
+        if index.schema_version == "2.1"
+        else index.evidence_ids
+    )
+
     for finding in top_findings:
         if not isinstance(finding, dict):
             raise SynthesisValidationError
@@ -345,10 +356,10 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
         evidence_ids = finding.get("evidence_ids")
         if (
             not isinstance(finding_id, str)
-            or finding_id not in index.finding_evidence
-            or not _known_ids(evidence_ids, index.evidence_ids)
+            or finding_id not in allowed_finding_evidence
+            or not _known_ids(evidence_ids, allowed_evidence_ids)
             or not isinstance(evidence_ids, list)
-            or not set(evidence_ids).issubset(index.finding_evidence[finding_id])
+            or not set(evidence_ids).issubset(allowed_finding_evidence[finding_id])
         ):
             raise SynthesisValidationError
 
@@ -357,20 +368,27 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
             raise SynthesisValidationError
         finding_ids = recommendation.get("finding_ids")
         evidence_ids = recommendation.get("evidence_ids")
-        if not _known_ids(finding_ids, index.finding_evidence) or not _known_ids(evidence_ids, index.evidence_ids):
+        if not _known_ids(finding_ids, allowed_finding_evidence) or not _known_ids(
+            evidence_ids, allowed_evidence_ids
+        ):
             raise SynthesisValidationError
         if not finding_ids or not evidence_ids or any(
-            index.finding_status[finding_id] not in {"confirmed", "suspected"}
+            (
+                index.workbench_finding_status[finding_id]
+                if index.schema_version == "2.1"
+                else index.finding_status[finding_id]
+            )
+            not in {"confirmed", "suspected", "hypothesis"}
             for finding_id in finding_ids
         ):
             raise SynthesisValidationError
         recommendation_evidence = set(evidence_ids)
         supported_evidence = set().union(
-            *(index.finding_evidence[finding_id] for finding_id in finding_ids)
+            *(allowed_finding_evidence[finding_id] for finding_id in finding_ids)
         )
         if not recommendation_evidence.issubset(supported_evidence) or any(
             not recommendation_evidence.intersection(
-                index.finding_evidence[finding_id]
+                allowed_finding_evidence[finding_id]
             )
             for finding_id in finding_ids
         ):

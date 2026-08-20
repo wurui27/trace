@@ -78,6 +78,16 @@ def _source_projection() -> AIProjection:
     )
 
 
+def _projection_v21() -> AIProjection:
+    document = _load("analysis-projection-v2.1.valid.json")
+    document["analysis_profile"] = "auto"
+    payload = canonical_json_bytes(document)
+    return AIProjection(
+        canonical_bytes=payload,
+        sha256_b64=base64.b64encode(hashlib.sha256(payload).digest()).decode(),
+    )
+
+
 def _strong_v2_candidate() -> dict[str, object]:
     document = _v2_candidate()
     source_fix = _load("synthesis-output-v2.valid.json")["source_fixes"][0]
@@ -432,6 +442,26 @@ async def test_report_synthesizer_stops_after_second_invalid_output() -> None:
 
 
 @pytest.mark.asyncio
+async def test_v21_report_synthesizer_falls_back_after_second_invalid_output() -> None:
+    provider = FakeReportProvider([b"{}", b"{}"])
+    observed: list[tuple[str, int]] = []
+
+    async def observe(_number, _role, state, attempts, _output) -> None:
+        observed.append((state, attempts))
+
+    result = await LocalReportSynthesizer(provider=provider).synthesize(
+        _projection_v21(),
+        on_report=observe,
+    )
+
+    assert provider.calls == 2
+    assert result.ai_mode == "deterministic_fallback"
+    assert result.output.document["schema_version"] == "2.1"
+    assert result.output.document["conclusions"]
+    assert observed[-1] == ("completed", 2)
+
+
+@pytest.mark.asyncio
 async def test_report_synthesizer_discards_only_unsafe_diffs_after_retry() -> None:
     candidate = _strong_v2_candidate()
     unsafe = dict(candidate["source_fixes"][0])  # type: ignore[index]
@@ -556,7 +586,7 @@ def test_local_provider_factory_exposes_non_secret_report_metadata() -> None:
     try:
         assert synthesizer.provider_name == "local-deepseek"
         assert synthesizer.model == "model-a"
-        assert synthesizer.prompt_version == "perfpilot-report-v3"
+        assert synthesizer.prompt_version == "perfpilot-finding-report-v4"
         assert "not-a-real-token" not in repr(synthesizer)
         assert "not-a-real-token" not in repr(synthesizer._provider)
     finally:
