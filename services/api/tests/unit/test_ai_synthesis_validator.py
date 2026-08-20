@@ -39,6 +39,106 @@ def _candidate() -> dict[str, object]:
     return document
 
 
+def _projection_v21() -> AIProjection:
+    document = _json_fixture("analysis-projection-v2.1.valid.json")
+    payload = canonical_json_bytes(document)
+    return AIProjection(canonical_bytes=payload, sha256_b64="Y2hlY2tzdW0=")
+
+
+def _candidate_v21() -> dict[str, object]:
+    return _json_fixture("synthesis-output-v2.1.valid.json")
+
+
+def test_v21_accepts_only_the_deterministic_finding_order() -> None:
+    validated = _validate(_candidate_v21(), _projection_v21())
+    assert validated.document["schema_version"] == "2.1"  # type: ignore[attr-defined]
+
+    duplicate = deepcopy(_projection_v21().document["workbench"]["findings"][0])
+    duplicate.update(
+        finding_id="85000000-0000-4000-8000-000000000002",
+        title="第二项问题",
+        priority="p1",
+        priority_score=70,
+        retest_plan_id="89000000-0000-4000-8000-000000000002",
+    )
+    projection_document = deepcopy(_projection_v21().document)
+    projection_document["workbench"]["findings"].append(duplicate)
+    projection_document["workbench"]["retest_plans"].append(
+        {
+            **deepcopy(projection_document["workbench"]["retest_plans"][0]),
+            "retest_plan_id": duplicate["retest_plan_id"],
+            "finding_id": duplicate["finding_id"],
+        }
+    )
+    payload = canonical_json_bytes(projection_document)
+    projection = AIProjection(canonical_bytes=payload, sha256_b64="Y2hlY2tzdW0=")
+    candidate = _candidate_v21()
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
+
+
+@pytest.mark.parametrize(
+    ("claim_type", "metric_id", "evidence_id"),
+    [
+        ("metric_observed", UNKNOWN_ID, None),
+        ("evidence_supports_mechanism", None, UNKNOWN_ID),
+        (
+            "evidence_on_critical_path",
+            None,
+            "86000000-0000-4000-8000-000000000002",
+        ),
+    ],
+)
+def test_v21_rejects_claims_outside_the_finding_workbench(
+    claim_type: str,
+    metric_id: str | None,
+    evidence_id: str | None,
+) -> None:
+    projection_document = deepcopy(_projection_v21().document)
+    if evidence_id and evidence_id != UNKNOWN_ID:
+        extra = deepcopy(projection_document["workbench"]["evidence"][0])
+        extra["evidence_id"] = evidence_id
+        projection_document["workbench"]["evidence"].append(extra)
+    payload = canonical_json_bytes(projection_document)
+    projection = AIProjection(canonical_bytes=payload, sha256_b64="Y2hlY2tzdW0=")
+    candidate = _candidate_v21()
+    candidate["conclusions"][0]["claim_refs"] = [
+        {
+            "claim_type": claim_type,
+            "metric_id": metric_id,
+            "evidence_id": evidence_id,
+        }
+    ]
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
+
+
+@pytest.mark.parametrize("invented_number", ["耗时为一百毫秒。", "耗时为１秒。", "耗时为1秒。"])
+def test_v21_rejects_free_written_measurements(invented_number: str) -> None:
+    candidate = _candidate_v21()
+    candidate["executive_summary"] = invented_number
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, _projection_v21())
+
+
+def test_v21_low_confidence_cannot_be_narrated_as_confirmed_root_cause() -> None:
+    projection_document = deepcopy(_projection_v21().document)
+    finding = projection_document["workbench"]["findings"][0]
+    finding["status"] = "hypothesis"
+    finding["confidence_ceiling"] = "low"
+    finding["confidence"]["attribution"] = "low"
+    payload = canonical_json_bytes(projection_document)
+    projection = AIProjection(canonical_bytes=payload, sha256_b64="Y2hlY2tzdW0=")
+    candidate = _candidate_v21()
+    candidate["conclusions"][0]["cause"] = "已经确认根因是主线程同步初始化。"
+
+    with pytest.raises(ValueError, match="^AI synthesis output is invalid$"):
+        _validate(candidate, projection)
+
+
 def test_v2_requires_a_four_part_conclusion_for_every_supported_problem() -> None:
     candidate = _candidate()
     candidate["conclusions"] = [

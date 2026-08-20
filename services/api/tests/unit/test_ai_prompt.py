@@ -9,7 +9,7 @@ def test_synthesis_prompt_is_versioned_hashed_and_constrains_untrusted_input() -
 
     prompt = load_synthesis_prompt()
 
-    assert prompt.version == "perfpilot-report-v3"
+    assert prompt.version == "perfpilot-finding-report-v4"
     assert prompt.sha256_b64 == base64.b64encode(
         hashlib.sha256(prompt.raw_bytes).digest()
     ).decode("ascii")
@@ -30,3 +30,12 @@ def test_synthesis_prompt_is_versioned_hashed_and_constrains_untrusted_input() -
     assert "strong" in instruction
     assert "diff" in instruction
     assert "concrete recommendation" in instruction
+    assert "schema version 2.1" in instruction
+    assert "claim_refs" in instruction
+    assert "问题点" in prompt.system_instruction
+    assert "为什么会有这个问题" in prompt.system_instruction
+    assert "结合源码判断的根因" in prompt.system_instruction
+    assert "修改建议" in prompt.system_instruction
+    assert "修改仅供参考" in prompt.system_instruction
+    assert "must not write measurement numbers" in instruction
+    assert "confidence_ceiling" in instruction

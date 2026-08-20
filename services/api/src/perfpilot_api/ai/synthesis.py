@@ -23,6 +23,8 @@ _SOURCE_PATH_TOKEN = re.compile(
     r"(?:[A-Za-z0-9_.-]+[/\\])+(?:[A-Za-z0-9_.-]+\.(?:kt|java|xml|gradle|kts))",
     re.IGNORECASE,
 )
+_FREE_WRITTEN_NUMBER = re.compile(r"[0-9０-９零〇一二三四五六七八九十百千万亿两]")
+_CONFIRMED_CAUSAL_LANGUAGE = re.compile(r"(?:已经|已)?确认(?:根因|原因|为)|确定为|根因是|直接导致|必然")
 
 
 class SynthesisValidationError(ValueError):
@@ -55,6 +57,15 @@ class _ProjectionIndex:
     numeric_spellings: frozenset[str]
     source_match: str
     source_refs: Mapping[str, Mapping[str, object]]
+    workbench_finding_order: tuple[str, ...]
+    workbench_finding_evidence: Mapping[str, tuple[str, ...]]
+    workbench_finding_metrics: Mapping[str, tuple[str, ...]]
+    workbench_finding_sources: Mapping[str, tuple[str, ...]]
+    workbench_finding_status: Mapping[str, str]
+    workbench_finding_ceiling: Mapping[str, str]
+    workbench_evidence_ids: frozenset[str]
+    workbench_metric_ids: frozenset[str]
+    critical_path_evidence_ids: frozenset[str]
 
 
 def _reject_duplicate_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -203,6 +214,67 @@ def _projection_index(projection: AIProjection) -> _ProjectionIndex:
                 if not isinstance(source_ref_id, str) or source_ref_id in source_refs:
                     raise SynthesisValidationError
                 source_refs[source_ref_id] = MappingProxyType(dict(fragment))
+
+        workbench_finding_order: tuple[str, ...] = ()
+        workbench_finding_evidence: dict[str, tuple[str, ...]] = {}
+        workbench_finding_metrics: dict[str, tuple[str, ...]] = {}
+        workbench_finding_sources: dict[str, tuple[str, ...]] = {}
+        workbench_finding_status: dict[str, str] = {}
+        workbench_finding_ceiling: dict[str, str] = {}
+        workbench_evidence_ids: set[str] = set()
+        workbench_metric_ids: set[str] = set()
+        critical_path_evidence_ids: set[str] = set()
+        if document.get("schema_version") == "2.1":
+            workbench = document.get("workbench")
+            if not isinstance(workbench, dict):
+                raise SynthesisValidationError
+            findings = workbench.get("findings")
+            metrics = workbench.get("metrics")
+            evidence = workbench.get("evidence")
+            critical_path = workbench.get("critical_path")
+            if not all(isinstance(value, list) for value in (findings, metrics, evidence, critical_path)):
+                raise SynthesisValidationError
+            order: list[str] = []
+            for finding in findings:
+                if not isinstance(finding, dict):
+                    raise SynthesisValidationError
+                finding_id = finding.get("finding_id")
+                evidence_refs = finding.get("evidence_ids")
+                metric_refs = finding.get("metric_ids")
+                source_refs_for_finding = finding.get("source_ref_ids")
+                if (
+                    not isinstance(finding_id, str)
+                    or finding_id in workbench_finding_evidence
+                    or not all(
+                        isinstance(value, list)
+                        and all(isinstance(item, str) for item in value)
+                        for value in (evidence_refs, metric_refs, source_refs_for_finding)
+                    )
+                    or not isinstance(finding.get("status"), str)
+                    or not isinstance(finding.get("confidence_ceiling"), str)
+                ):
+                    raise SynthesisValidationError
+                order.append(finding_id)
+                workbench_finding_evidence[finding_id] = tuple(evidence_refs)
+                workbench_finding_metrics[finding_id] = tuple(metric_refs)
+                workbench_finding_sources[finding_id] = tuple(source_refs_for_finding)
+                workbench_finding_status[finding_id] = str(finding["status"])
+                workbench_finding_ceiling[finding_id] = str(finding["confidence_ceiling"])
+            workbench_finding_order = tuple(order)
+            for metric in metrics:
+                if not isinstance(metric, dict) or not isinstance(metric.get("metric_id"), str):
+                    raise SynthesisValidationError
+                workbench_metric_ids.add(metric["metric_id"])
+            for item in evidence:
+                if not isinstance(item, dict) or not isinstance(item.get("evidence_id"), str):
+                    raise SynthesisValidationError
+                workbench_evidence_ids.add(item["evidence_id"])
+            for segment in critical_path:
+                if not isinstance(segment, dict) or not isinstance(segment.get("evidence_ids"), list):
+                    raise SynthesisValidationError
+                if not all(isinstance(item, str) for item in segment["evidence_ids"]):
+                    raise SynthesisValidationError
+                critical_path_evidence_ids.update(segment["evidence_ids"])
     except SynthesisValidationError:
         raise
     except Exception:
@@ -221,6 +293,15 @@ def _projection_index(projection: AIProjection) -> _ProjectionIndex:
         numeric_spellings=frozenset(numeric_spellings),
         source_match=source_match,
         source_refs=MappingProxyType(source_refs),
+        workbench_finding_order=workbench_finding_order,
+        workbench_finding_evidence=MappingProxyType(workbench_finding_evidence),
+        workbench_finding_metrics=MappingProxyType(workbench_finding_metrics),
+        workbench_finding_sources=MappingProxyType(workbench_finding_sources),
+        workbench_finding_status=MappingProxyType(workbench_finding_status),
+        workbench_finding_ceiling=MappingProxyType(workbench_finding_ceiling),
+        workbench_evidence_ids=frozenset(workbench_evidence_ids),
+        workbench_metric_ids=frozenset(workbench_metric_ids),
+        critical_path_evidence_ids=frozenset(critical_path_evidence_ids),
     )
 
 
@@ -248,6 +329,13 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
         ):
             raise SynthesisValidationError
         _validate_conclusions(document, index)
+        _validate_source_fixes(document, index)
+    elif index.schema_version == "2.1":
+        if document.get("schema_version") != "2.1" or not _known_ids(
+            document.get("key_metric_ids"), index.workbench_metric_ids
+        ):
+            raise SynthesisValidationError
+        _validate_v21_conclusions(document, index)
         _validate_source_fixes(document, index)
 
     for finding in top_findings:
@@ -312,7 +400,12 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
             raise SynthesisValidationError
 
     for text in _narrative_fields(document):
-        if any(token.group(0) not in index.numeric_spellings for token in _NUMERIC_TOKEN.finditer(text)):
+        if index.schema_version == "2.1" and _FREE_WRITTEN_NUMBER.search(text):
+            raise SynthesisValidationError
+        if index.schema_version != "2.1" and any(
+            token.group(0) not in index.numeric_spellings
+            for token in _NUMERIC_TOKEN.finditer(text)
+        ):
             raise SynthesisValidationError
         if index.source_match != "strong":
             folded = text.casefold()
@@ -320,6 +413,70 @@ def _validate_semantics(document: dict[str, object], index: _ProjectionIndex) ->
                 term and term in folded for term in _unverified_source_terms(index)
             ):
                 raise SynthesisValidationError
+
+
+def _validate_v21_conclusions(
+    document: dict[str, object], index: _ProjectionIndex
+) -> None:
+    conclusions = document.get("conclusions")
+    if not isinstance(conclusions, list):
+        raise SynthesisValidationError
+    conclusion_ids = tuple(
+        item.get("finding_id") if isinstance(item, dict) else None
+        for item in conclusions
+    )
+    if conclusion_ids != index.workbench_finding_order:
+        raise SynthesisValidationError
+    for conclusion in conclusions:
+        if not isinstance(conclusion, dict):
+            raise SynthesisValidationError
+        finding_id = conclusion["finding_id"]
+        evidence_ids = conclusion.get("evidence_ids")
+        source_ref_ids = conclusion.get("source_ref_ids")
+        claim_refs = conclusion.get("claim_refs")
+        if (
+            not isinstance(finding_id, str)
+            or not isinstance(evidence_ids, list)
+            or tuple(evidence_ids) != index.workbench_finding_evidence[finding_id]
+            or not isinstance(source_ref_ids, list)
+            or tuple(source_ref_ids) != index.workbench_finding_sources[finding_id]
+            or not isinstance(claim_refs, list)
+            or not claim_refs
+        ):
+            raise SynthesisValidationError
+        for claim in claim_refs:
+            if not isinstance(claim, dict):
+                raise SynthesisValidationError
+            claim_type = claim.get("claim_type")
+            metric_id = claim.get("metric_id")
+            evidence_id = claim.get("evidence_id")
+            if metric_id is not None:
+                if (
+                    claim_type not in {"metric_over_threshold", "metric_observed"}
+                    or metric_id not in index.workbench_metric_ids
+                    or metric_id not in index.workbench_finding_metrics[finding_id]
+                    or evidence_id is not None
+                ):
+                    raise SynthesisValidationError
+            elif (
+                claim_type not in {"evidence_on_critical_path", "evidence_supports_mechanism"}
+                or evidence_id not in index.workbench_evidence_ids
+                or evidence_id not in index.workbench_finding_evidence[finding_id]
+            ):
+                raise SynthesisValidationError
+            if (
+                claim_type == "evidence_on_critical_path"
+                and evidence_id not in index.critical_path_evidence_ids
+            ):
+                raise SynthesisValidationError
+        if (
+            index.workbench_finding_status[finding_id] != "confirmed"
+            or index.workbench_finding_ceiling[finding_id] in {"low", "none"}
+        ) and any(
+            _CONFIRMED_CAUSAL_LANGUAGE.search(str(conclusion[field]))
+            for field in ("problem", "cause", "source_root_cause", "recommendation")
+        ):
+            raise SynthesisValidationError
 
 
 def _validate_conclusions(
@@ -463,7 +620,7 @@ def _validate_source_fixes(
 
 def _narrative_fields(document: dict[str, object]) -> tuple[str, ...]:
     fields = [document["executive_summary"]]
-    if document.get("schema_version") == "2.0":
+    if document.get("schema_version") in {"2.0", "2.1"}:
         fields.append(document["verdict"])
         for conclusion in document["conclusions"]:
             fields.extend(
