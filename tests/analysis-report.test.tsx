@@ -439,6 +439,27 @@ describe("AnalysisReportView", () => {
     }
   });
 
+  it("does not render a zero critical-path percentage when intervals are unavailable", () => {
+    const withoutCriticalPath = structuredClone(analysisReportV13Example);
+    withoutCriticalPath.workbench.critical_path = [];
+    for (const finding of withoutCriticalPath.workbench.findings) {
+      finding.critical_path_contribution = 0;
+    }
+
+    render(
+      <AnalysisReportView
+        report={withoutCriticalPath as unknown as Extract<
+          AnalysisReport,
+          { readonly schema_version: "1.3" }
+        >}
+        onRetrySynthesis={vi.fn()}
+        retrying={false}
+      />,
+    );
+
+    expect(screen.queryByText(/占关键路径/)).not.toBeInTheDocument();
+  });
+
   it("opens only a validated Trace evidence identifier", async () => {
     const user = userEvent.setup();
     const openEvidence = vi.fn();

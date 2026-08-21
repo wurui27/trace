@@ -19,10 +19,12 @@ function criticalPathPercent(value: number): string {
 export function FindingDetail({
   capabilities,
   conclusion,
+  criticalPathAvailable,
   finding,
 }: {
   readonly capabilities: ReportCapabilities;
   readonly conclusion: FindingSynthesisOutput["conclusions"][number];
+  readonly criticalPathAvailable: boolean;
   readonly finding: FindingWorkbenchFinding;
 }) {
   return (
@@ -37,7 +39,9 @@ export function FindingDetail({
         <h3>{finding.title}</h3>
         <p>
           <span>{finding.impact}</span>
-          <strong>占关键路径 {criticalPathPercent(finding.critical_path_contribution)}</strong>
+          {criticalPathAvailable ? (
+            <strong>占关键路径 {criticalPathPercent(finding.critical_path_contribution)}</strong>
+          ) : null}
         </p>
       </header>
       <dl className="finding-diagnostic-chain">

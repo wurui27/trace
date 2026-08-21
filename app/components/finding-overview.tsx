@@ -106,7 +106,12 @@ export function FindingOverview({ report }: { readonly report: FindingWorkbenchR
         </div>
         {primary.map(({ finding, conclusion }) => (
           <div data-testid="primary-finding" key={finding.finding_id}>
-            <FindingDetail capabilities={report.capabilities} conclusion={conclusion} finding={finding} />
+            <FindingDetail
+              capabilities={report.capabilities}
+              conclusion={conclusion}
+              criticalPathAvailable={report.workbench.critical_path.length > 0}
+              finding={finding}
+            />
           </div>
         ))}
         {additional.length > 0 ? (
@@ -114,7 +119,12 @@ export function FindingOverview({ report }: { readonly report: FindingWorkbenchR
             <summary>展开其余 {additional.length} 项</summary>
             {additional.map(({ finding, conclusion }) => (
               <div data-testid="additional-finding" key={finding.finding_id}>
-                <FindingDetail capabilities={report.capabilities} conclusion={conclusion} finding={finding} />
+                <FindingDetail
+                  capabilities={report.capabilities}
+                  conclusion={conclusion}
+                  criticalPathAvailable={report.workbench.critical_path.length > 0}
+                  finding={finding}
+                />
               </div>
             ))}
           </details>

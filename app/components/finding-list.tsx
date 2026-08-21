@@ -82,7 +82,12 @@ export function FindingList({
           ))}
         </ol>
         {selected && conclusion ? (
-          <FindingDetail capabilities={report.capabilities} conclusion={conclusion} finding={selected} />
+          <FindingDetail
+            capabilities={report.capabilities}
+            conclusion={conclusion}
+            criticalPathAvailable={report.workbench.critical_path.length > 0}
+            finding={selected}
+          />
         ) : (
           <p className="finding-empty">当前筛选条件下没有问题。</p>
         )}
