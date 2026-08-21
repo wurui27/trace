@@ -4777,6 +4777,162 @@ fieldset.new-analysis-field {
   }
 }
 
+/* Successful analysis history */
+
+.analysis-history-page {
+  display: grid;
+  gap: 18px;
+}
+
+.analysis-history-header h1 {
+  margin: 0;
+  color: var(--text);
+  font-size: 24px;
+  font-weight: 730;
+  letter-spacing: -0.04em;
+  line-height: 1.25;
+}
+
+.analysis-history-header > p:last-child {
+  margin: 6px 0 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.analysis-history-notice,
+.analysis-history-state,
+.analysis-history-item {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--surface);
+  box-shadow: var(--shadow-soft);
+}
+
+.analysis-history-notice {
+  margin: 0;
+  padding: 14px 16px;
+  border-color: rgb(45 109 246 / 22%);
+  background: rgb(45 109 246 / 6%);
+  color: var(--primary-dark);
+  font-size: 13px;
+}
+
+.analysis-history-list {
+  display: grid;
+  gap: 12px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.analysis-history-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 18px;
+  padding: 18px 20px;
+}
+
+.analysis-history-copy {
+  min-width: 0;
+}
+
+.analysis-history-heading,
+.analysis-history-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 14px;
+}
+
+.analysis-history-heading h2 {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+}
+
+.analysis-history-package {
+  display: block;
+  margin: 8px 0;
+  color: var(--primary-dark);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.analysis-history-meta {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.analysis-history-status {
+  color: var(--success);
+  font-size: 12px;
+  font-weight: 750;
+}
+
+.analysis-history-link {
+  min-height: 40px;
+  display: inline-flex;
+  align-items: center;
+  align-self: center;
+  gap: 5px;
+  color: var(--primary-dark);
+  font-size: 13px;
+  font-weight: 750;
+  text-decoration: none;
+}
+
+.analysis-history-link svg {
+  width: 15px;
+  height: 15px;
+}
+
+.analysis-history-state {
+  min-height: 220px;
+  display: grid;
+  place-content: center;
+  justify-items: center;
+  gap: 6px;
+  padding: 32px;
+  text-align: center;
+}
+
+.analysis-history-state > svg {
+  width: 28px;
+  height: 28px;
+  color: var(--primary);
+}
+
+.analysis-history-state strong {
+  color: var(--text);
+}
+
+.analysis-history-state p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.analysis-history-state a {
+  margin-top: 8px;
+  color: var(--primary-dark);
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.analysis-history-state.is-error > svg {
+  color: var(--danger);
+}
+
+@media (max-width: 680px) {
+  .analysis-history-item {
+    grid-template-columns: 1fr;
+  }
+
+  .analysis-history-link {
+    justify-self: start;
+  }
+}
+
 /* Honest route placeholders */
 
 .placeholder-page {

@@ -1,10 +1,10 @@
 import { AppShell } from "../components/app-shell";
-import { PlaceholderPage } from "../components/placeholder-page";
+import { AnalysisHistory } from "../components/analysis-history";
 
 export default function TestsPage() {
   return (
     <AppShell activeItem="tests">
-      <PlaceholderPage title="测试" />
+      <AnalysisHistory />
     </AppShell>
   );
 }

@@ -32,7 +32,7 @@ test("keeps absolute metadata assets on HTTP for private-network deployments", a
   assert.doesNotMatch(html, /https:\/\/10\.166\.0\.125:3000\/favicon\.svg/);
 });
 
-test("server-renders a clean PerfPilot dashboard without demo analysis data", async () => {
+test("server-renders the dashboard behind the local session gate", async () => {
   const response = await render();
   assert.equal(response.status, 200);
   assert.match(response.headers.get("content-type") ?? "", /^text\/html\b/i);
@@ -52,30 +52,8 @@ test("server-renders a clean PerfPilot dashboard without demo analysis data", as
     /<link[^>]+rel="icon"[^>]+href="(?:http:\/\/localhost)?\/favicon\.svg"/,
   );
   assert.match(html, /PerfPilot/);
-  assert.match(html, /最新分析报告/);
-  assert.match(html, /正在读取最新报告/);
-  assert.match(html, /新建分析/);
-  assert.match(html, /尚未选择应用/);
-  assert.match(html, /ray_wu/);
+  assert.match(html, /正在验证本地会话/);
   assert.doesNotMatch(html, /林墨/);
-  for (const placeholder of [
-    "本次结论",
-    "等待首次分析",
-    "核心表现",
-    "启动体验",
-    "页面流畅度",
-    "主线程响应",
-    "内存稳定性",
-    "CPU 与调度",
-    "本次重点",
-    "暂无重点问题",
-    "数据可信度",
-  ]) {
-    assert.ok(
-      html.includes(placeholder),
-      `expected empty dashboard to retain "${placeholder}"`,
-    );
-  }
   assert.doesNotMatch(html, /928295d3-a73a-5c53-93e5-e24debb21b6c/);
   assert.doesNotMatch(html, /Acme Gallery/);
   assert.doesNotMatch(html, /Pixel 8/);
@@ -100,31 +78,29 @@ test("keeps unfinished navigation pages free of demo application data", async ()
     const response = await render(path);
     assert.equal(response.status, 200);
     const html = await response.text();
-    assert.match(html, /尚未选择应用/);
+    assert.match(html, /正在验证本地会话/);
     assert.doesNotMatch(html, /Acme Gallery/);
     assert.doesNotMatch(html, /Pixel 8/);
   }
 });
 
-test("server-renders the live analysis route without demo findings", async () => {
+test("server-renders the live analysis route behind the local session gate", async () => {
   const response = await render("/analyses/analysis-live-1");
   assert.equal(response.status, 200);
 
   const html = await response.text();
-  assert.match(html, /分析进度/);
-  assert.match(html, /正在读取分析状态/);
+  assert.match(html, /正在验证本地会话/);
   assert.doesNotMatch(html, /首页启动慢/);
   assert.doesNotMatch(html, /Acme Gallery/);
   assert.doesNotMatch(html, /执行摘要/);
 });
 
-test("server-renders the dedicated final report route without demo content", async () => {
+test("server-renders the final report route behind the local session gate", async () => {
   const response = await render("/analyses/analysis-live-1/report");
   assert.equal(response.status, 200);
 
   const html = await response.text();
-  assert.match(html, /正在读取最终报告/);
-  assert.match(html, /返回分析进度/);
+  assert.match(html, /正在验证本地会话/);
   assert.doesNotMatch(html, /首页启动慢/);
   assert.doesNotMatch(html, /Acme Gallery/);
 });
