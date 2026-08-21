@@ -77,7 +77,6 @@ export function AnalysisHistory({
   useEffect(() => {
     if (teamId === null) return;
     const controller = new AbortController();
-    setView({ state: "loading" });
     client
       .analyses(teamId, HISTORY_LIMIT, controller.signal)
       .then(({ analyses }) => {

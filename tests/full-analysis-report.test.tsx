@@ -125,9 +125,10 @@ describe("FullAnalysisReport", () => {
       smartPerfettoOriginalDownloadUrl: vi.fn(() => "/original.html?download=true"),
     } as unknown as PerfPilotClient;
     const printer = vi.fn(() => {
-      for (const layer of ["overview", "findings", "evidence", "source", "original", "retest"]) {
+      for (const layer of ["overview", "findings", "source", "original", "retest"]) {
         expect(document.querySelector(`[data-report-layer="${layer}"]`)).not.toBeNull();
       }
+      expect(document.querySelector('[data-report-layer="evidence"]')).toBeNull();
       expect(screen.getByTitle("SmartPerfetto 原始 HTML 报告")).toBeInTheDocument();
       return true;
     });
