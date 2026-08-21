@@ -24,7 +24,7 @@
 - 修改 `app/tests/page.tsx`：用真实历史组件替换占位页。
 - 修改 `app/globals.css`：增加蓝白风格的历史列表、状态和空态样式。
 - 新建 `tests/analysis-history.test.tsx`：覆盖加载、成功列表、字段降级、空态与错误态。
-- 修改 `tests/rendered-html.test.mjs`：确认 `/tests` 服务端骨架包含真实历史页文案，场景页继续保持占位。
+- 修改 `tests/rendered-html.test.mjs`：让匿名 SSR 合同与登录门禁一致；历史正文由组件测试和登录后的 API 验收覆盖。
 
 ### Task 1: 建立成功报告判定并停止低于上限时误删
 
@@ -818,20 +818,31 @@ export default function TestsPage() {
 }
 ```
 
-- [ ] **Step 7: 更新服务端渲染合同**
+- [ ] **Step 7: 更新匿名服务端渲染合同**
 
-把 `tests/rendered-html.test.mjs` 中未完成页面循环改为只包含 `"/scenarios"`、`"/problems"`、`"/comparisons"`。新增：
+当前 `LocalLogin` 在客户端完成会话校验前会阻止受保护正文输出，因此匿名 SSR 不能断言“测试历史”正文。把 `tests/rendered-html.test.mjs` 中受保护页面断言统一为真实登录门禁：
 
 ```js
-test("server-renders the real successful analysis history shell", async () => {
-  const response = await render("/tests");
-  assert.equal(response.status, 200);
-  const html = await response.text();
-  assert.match(html, /测试历史/);
-  assert.match(html, /历史数据仅保留最近 10 份/);
-  assert.doesNotMatch(html, /Acme Gallery|Pixel 8/);
+test("server-renders protected routes behind the local session gate", async () => {
+  for (const path of [
+    "/",
+    "/tests",
+    "/scenarios",
+    "/problems",
+    "/comparisons",
+    "/analyses/analysis-live-1",
+    "/analyses/analysis-live-1/report",
+  ]) {
+    const response = await render(path);
+    assert.equal(response.status, 200);
+    const html = await response.text();
+    assert.match(html, /正在验证本地会话/);
+    assert.doesNotMatch(html, /Acme Gallery|Pixel 8|首页启动慢/);
+  }
 });
 ```
+
+保留元数据、404 路由和无演示数据断言。删除匿名 SSR 对“最新分析报告”“分析进度”“正在读取最终报告”等受保护正文的过期断言。
 
 - [ ] **Step 8: 运行组件、导航和 SSR 测试**
 
@@ -884,7 +895,7 @@ Expected: ESLint 无错误；构建成功；SSR 测试全部 PASS。
 Run:
 
 ```bash
-.venv/bin/python -m pytest \
+PYTHONPATH=services/api/src:services/agent/src .venv/bin/python -m pytest \
   services/api/tests/unit/test_local_analysis_store.py \
   services/api/tests/unit/test_local_analysis_lifecycle.py \
   services/api/tests/unit/test_local_analysis_recovery.py \
@@ -912,10 +923,10 @@ Expected: 第一条只允许出现在明确断言“不存在”的测试中；�
 ```bash
 npm run dev:restart
 curl -fsS http://127.0.0.1:3000/tests > /tmp/perfpilot-tests.html
-rg -n '测试历史|历史数据仅保留最近 10 份' /tmp/perfpilot-tests.html
+rg -n '正在验证本地会话' /tmp/perfpilot-tests.html
 ```
 
-Expected: 服务健康，`/tests` 返回真实历史页骨架和固定提示。
+Expected: 服务健康，`/tests` 匿名响应遵守登录门禁。测试历史正文和固定提示已经由 `analysis-history.test.tsx` 验证，真实列表由下一步登录后的 API 请求验证。
 
 - [ ] **Step 6: 使用 `ray_wu` 的现有认证在后台完成一份真实 Trace 分析**
 
