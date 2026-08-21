@@ -304,11 +304,10 @@ def _validate_synthesis_against_workbench(
         raise SourceAwareSemanticError
     metric_ids = _unique_ids(workbench.get("metrics"), "metric_id")
     evidence_ids = _unique_ids(workbench.get("evidence"), "evidence_id")
-    primary = workbench.get("primary_finding_ids")
     findings = workbench.get("findings")
     conclusions = output.get("conclusions")
     top_findings = output.get("top_findings")
-    if not all(isinstance(value, list) for value in (primary, findings, conclusions, top_findings)):
+    if not all(isinstance(value, list) for value in (findings, conclusions, top_findings)):
         raise SourceAwareSemanticError
     assert isinstance(findings, list)
     assert isinstance(top_findings, list)
@@ -321,8 +320,27 @@ def _validate_synthesis_against_workbench(
     top_finding_ids = [
         item.get("finding_id") for item in top_findings if isinstance(item, dict)
     ]
-    if conclusion_ids != expected_finding_ids or top_finding_ids != primary:
+    finding_evidence_by_id = {
+        item["finding_id"]: _string_set(item.get("evidence_ids"))
+        for item in findings
+        if isinstance(item, dict) and isinstance(item.get("finding_id"), str)
+    }
+    if (
+        conclusion_ids != expected_finding_ids
+        or len(top_finding_ids) != len(top_findings)
+        or len(top_finding_ids) != len(set(top_finding_ids))
+    ):
         raise SourceAwareSemanticError
+    for top_finding in top_findings:
+        if not isinstance(top_finding, dict):
+            raise SourceAwareSemanticError
+        finding_id = top_finding.get("finding_id")
+        top_evidence_ids = _string_set(top_finding.get("evidence_ids"))
+        allowed_evidence_ids = finding_evidence_by_id.get(finding_id)
+        if allowed_evidence_ids is None or not top_evidence_ids.issubset(
+            allowed_evidence_ids
+        ):
+            raise SourceAwareSemanticError
     if not _string_set(output.get("key_metric_ids")).issubset(metric_ids):
         raise SourceAwareSemanticError
     for conclusion in conclusions:

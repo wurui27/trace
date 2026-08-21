@@ -132,6 +132,57 @@ def test_composer_preserves_non_primary_finding_conclusions() -> None:
     ]
 
 
+def test_composer_accepts_three_grounded_top_findings_with_two_primary() -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+    from perfpilot_api.ai.synthesis import AISynthesisOutput
+    from perfpilot_api.reports.contracts import canonical_json_bytes
+    from perfpilot_api.reports.finding_report import compose_finding_report
+    from perfpilot_api.reports.projection import AIProjection
+
+    projection = _load("analysis-projection-v2.1.valid.json")
+    workbench = projection["workbench"]
+    for index in (2, 3):
+        finding = deepcopy(workbench["findings"][0])
+        finding["finding_id"] = f"85000000-0000-4000-8000-{index:012d}"
+        finding["title"] = f"证据支持的补充问题 {index}"
+        finding["status"] = "hypothesis"
+        finding["priority_score"] = 60 - index
+        finding["retest_plan_id"] = f"89000000-0000-4000-8000-{index:012d}"
+        workbench["findings"].append(finding)
+        retest = deepcopy(workbench["retest_plans"][0])
+        retest["retest_plan_id"] = finding["retest_plan_id"]
+        retest["finding_id"] = finding["finding_id"]
+        workbench["retest_plans"].append(retest)
+    payload = canonical_json_bytes(projection)
+    synthesis = build_deterministic_finding_synthesis(
+        AIProjection(canonical_bytes=payload, sha256_b64="Y2hlY2tzdW0=")
+    ).document
+    synthesis["top_findings"] = [
+        {
+            "finding_id": finding["finding_id"],
+            "evidence_ids": list(finding["evidence_ids"]),
+            "user_impact": "该问题会拖慢当前测试场景的关键性能路径。",
+        }
+        for finding in workbench["findings"][:3]
+    ]
+    synthesis_payload = canonical_json_bytes(synthesis)
+
+    result = compose_finding_report(
+        base_report=_base_report(),
+        projection=projection,
+        synthesis=AISynthesisOutput(
+            canonical_bytes=synthesis_payload,
+            sha256_b64="Y2hlY2tzdW0=",
+        ).document,
+        report_version=3,
+    )
+
+    assert [
+        item["finding_id"] for item in result["synthesis"]["output"]["top_findings"]
+    ] == [item["finding_id"] for item in workbench["findings"][:3]]
+    assert len(result["workbench"]["primary_finding_ids"]) == 1
+
+
 def test_composer_accepts_metricless_finding_retest_without_inventing_metrics() -> None:
     from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
     from perfpilot_api.reports.finding_report import compose_finding_report
