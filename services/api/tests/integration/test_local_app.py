@@ -3979,6 +3979,21 @@ def test_report_history_excludes_active_rerun_with_a_previous_report(
         assert history.status_code == 200
         assert history.json()["analyses"] == []
 
+        async def mark_partial_report_complete() -> None:
+            analysis = runtime.analyses[(UUID(team_id), UUID(analysis_id))]
+            async with runtime.lock:
+                analysis.state = "partially_completed"
+                analysis.version += 1
+            await runtime._persist(analysis)
+
+        client.portal.call(mark_partial_report_complete)
+        history = client.get(
+            f"/v1/teams/{team_id}/analyses?report_available=true&limit=10"
+        )
+        assert [item["analysis_id"] for item in history.json()["analyses"]] == [
+            analysis_id
+        ]
+
 
 def test_local_runtime_prunes_excess_successful_history_on_restart(
     tmp_path: Path,
