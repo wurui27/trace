@@ -3,7 +3,6 @@
 import { useState } from "react";
 
 import type { FindingWorkbenchReport, PerfPilotClient } from "../lib/perfpilot-api";
-import { EvidenceMetricsPanel, type TraceEvidenceTarget } from "./evidence-metrics-panel";
 import { FindingList } from "./finding-list";
 import { FindingOverview } from "./finding-overview";
 import { FindingSourcePanel } from "./finding-source-panel";
@@ -13,7 +12,6 @@ import { SmartPerfettoOriginalReport } from "./smartperfetto-original-report";
 const regions = [
   ["overview", "概览"],
   ["findings", "问题清单"],
-  ["evidence", "证据与指标"],
   ["source", "源码与优化"],
   ["original", "SmartPerfetto 原始报告"],
   ["retest", "复测计划"],
@@ -21,14 +19,8 @@ const regions = [
 
 type Region = typeof regions[number][0];
 
-function defaultOpenEvidence(target: TraceEvidenceTarget): void {
-  const query = new URLSearchParams({ evidence: target.evidenceId });
-  window.location.assign(`/analyses/${target.analysisId}/trace?${query.toString()}`);
-}
-
 export function FindingWorkbench({
   client,
-  openEvidence = defaultOpenEvidence,
   onOriginalReady,
   preloadOriginal = false,
   originalPrintFallback = false,
@@ -36,7 +28,6 @@ export function FindingWorkbench({
   teamId,
 }: {
   readonly client: PerfPilotClient;
-  readonly openEvidence?: (target: TraceEvidenceTarget) => void;
   readonly onOriginalReady?: (ready: boolean) => void;
   readonly preloadOriginal?: boolean;
   readonly originalPrintFallback?: boolean;
@@ -76,9 +67,6 @@ export function FindingWorkbench({
         <div data-report-layer="findings" hidden={region !== "findings"} id="finding-region-findings" role="tabpanel">
           <FindingList report={report} selectedFindingId={selectedFindingId} setSelectedFindingId={setSelectedFindingId} />
         </div>
-        <div data-report-layer="evidence" hidden={region !== "evidence"} id="finding-region-evidence" role="tabpanel">
-          <EvidenceMetricsPanel openEvidence={openEvidence} report={report} selectedFindingId={selectedFindingId} />
-        </div>
         <div data-report-layer="source" hidden={region !== "source"} id="finding-region-source" role="tabpanel">
           <FindingSourcePanel report={report} />
         </div>
@@ -101,5 +89,3 @@ export function FindingWorkbench({
     </article>
   );
 }
-
-export type { TraceEvidenceTarget };

@@ -392,7 +392,7 @@ function findingWorkbenchReportWithSixFindings(): Extract<AnalysisReport, { read
 }
 
 describe("AnalysisReportView", () => {
-  it("dispatches AnalysisReport 1.3 to the six-region Finding workbench", () => {
+  it("dispatches AnalysisReport 1.3 to the five-region Finding workbench", () => {
     render(
       <AnalysisReportView
         report={findingWorkbenchReport()}
@@ -405,15 +405,16 @@ describe("AnalysisReportView", () => {
     for (const label of [
       "概览",
       "问题清单",
-      "证据与指标",
       "源码与优化",
       "SmartPerfetto 原始报告",
       "复测计划",
     ]) {
       expect(screen.getByRole("tab", { name: label })).toBeVisible();
     }
+    expect(screen.queryByRole("tab", { name: "证据与指标" })).not.toBeInTheDocument();
     expect(screen.getByText("分析完成")).toHaveClass("is-completed");
     expect(screen.queryByRole("tab", { name: "技术附录" })).not.toBeInTheDocument();
+    expect(findingWorkbenchReport().workbench.evidence).not.toHaveLength(0);
   });
 
   it("renders the server-owned critical path and four-part Finding diagnosis", () => {
@@ -460,24 +461,19 @@ describe("AnalysisReportView", () => {
     expect(screen.queryByText(/占关键路径/)).not.toBeInTheDocument();
   });
 
-  it("opens only a validated Trace evidence identifier", async () => {
-    const user = userEvent.setup();
-    const openEvidence = vi.fn();
+  it("does not expose the evidence locator action", () => {
     render(
       <AnalysisReportView
         report={findingWorkbenchReport()}
         onRetrySynthesis={vi.fn()}
         retrying={false}
-        openEvidence={openEvidence}
       />,
     );
 
-    await user.click(screen.getByRole("tab", { name: "证据与指标" }));
-    await user.click(screen.getByRole("button", { name: "在 Trace 中打开证据" }));
-    expect(openEvidence).toHaveBeenCalledWith({
-      analysisId: ANALYSIS_ID,
-      evidenceId: "86000000-0000-4000-8000-000000000001",
-    });
+    expect(screen.queryByRole("tab", { name: "证据与指标" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "在 Trace 中打开证据" }),
+    ).not.toBeInTheDocument();
   });
 
   it("keeps AnalysisReport 1.2 on the existing report tabs", () => {

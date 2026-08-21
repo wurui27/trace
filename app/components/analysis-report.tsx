@@ -12,7 +12,7 @@ import {
   type ReportMetric,
 } from "../lib/perfpilot-api";
 import { ConciseReportSummary } from "./concise-report-summary";
-import { FindingWorkbench, type TraceEvidenceTarget } from "./finding-workbench";
+import { FindingWorkbench } from "./finding-workbench";
 import { SourceFixesPanel } from "./source-fixes-panel";
 import { SmartPerfettoOriginalReport } from "./smartperfetto-original-report";
 
@@ -24,7 +24,6 @@ interface AnalysisReportViewProps {
   readonly retrying: boolean;
   readonly teamId?: string;
   readonly client?: PerfPilotClient;
-  readonly openEvidence?: (target: TraceEvidenceTarget) => void;
   readonly onOriginalReady?: (ready: boolean) => void;
   readonly preloadOriginal?: boolean;
   readonly originalPrintFallback?: boolean;
@@ -168,7 +167,6 @@ export function AnalysisReportView(props: AnalysisReportViewProps) {
     return (
       <FindingWorkbench
         client={props.client ?? defaultClient}
-        openEvidence={props.openEvidence}
         onOriginalReady={props.onOriginalReady}
         preloadOriginal={props.preloadOriginal}
         originalPrintFallback={props.originalPrintFallback}
