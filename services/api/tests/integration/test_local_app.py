@@ -3383,6 +3383,23 @@ def _upload_and_finalize_trace(
     )
 
 
+def _wait_for_report(
+    client: TestClient,
+    *,
+    team_id: str,
+    analysis_id: str,
+) -> dict[str, object]:
+    response = client.get(f"/v1/teams/{team_id}/analyses/{analysis_id}/report")
+    for _ in range(200):
+        if response.status_code == 200:
+            return response.json()
+        time.sleep(0.01)
+        response = client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        )
+    pytest.fail(f"analysis report did not become available: {analysis_id}")
+
+
 def test_local_analysis_v13_persists_authoritative_runtime_status(
     tmp_path: Path,
 ) -> None:
@@ -3786,6 +3803,349 @@ def test_successful_trace_submission_preserves_previous_report_below_retention_l
         "state": "completed",
     }
     reopened.close()
+
+
+def test_successful_analysis_retention_keeps_latest_ten_without_deleting_non_successes(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    other_team_id = UUID("82000000-0000-4000-8000-000000000098")
+    other_analysis_id = UUID("91000000-0000-4000-8000-000000000098")
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+
+        canceled_id, _ = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+            trace=b"canceled-trace",
+        )
+        canceled = client.post(
+            f"/v1/teams/{team_id}/analyses/{canceled_id}/cancel",
+            headers=headers,
+        )
+        assert canceled.status_code == 202
+        assert canceled.json()["state"] == "canceled"
+
+        failed_id, _ = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+            trace=b"failed-trace",
+        )
+        runtime = app.state.local_runtime
+
+        async def fail_analysis() -> None:
+            analysis = runtime.analyses[(UUID(team_id), UUID(failed_id))]
+            await runtime._fail_analysis(
+                analysis,
+                generation=analysis.generation,
+                failure_code="test_analysis_failed",
+            )
+
+        assert client.portal is not None
+        client.portal.call(fail_analysis)
+        assert client.get(
+            f"/v1/teams/{team_id}/analyses/{failed_id}"
+        ).json()["state"] == "failed"
+
+        extra_store = LocalAnalysisStore(tmp_path)
+        extra_store.save_state(
+            other_team_id,
+            other_analysis_id,
+            {
+                "team_id": str(other_team_id),
+                "analysis_id": str(other_analysis_id),
+                "state": "completed",
+            },
+        )
+        extra_store.close()
+
+        successful_ids: list[str] = []
+        for index in range(11):
+            trace = f"retained-trace-{index:02d}".encode()
+            analysis_id, checksum = _create_trace_analysis(
+                client,
+                team_id=team_id,
+                headers=headers,
+                trace=trace,
+                package_name="com.rivotek.mediacenter",
+                schema_version="1.3",
+            )
+            _upload_and_finalize_trace(
+                client,
+                team_id=team_id,
+                analysis_id=analysis_id,
+                headers=headers,
+                checksum=checksum,
+                trace=trace,
+            )
+            _wait_for_report(client, team_id=team_id, analysis_id=analysis_id)
+            successful_ids.append(analysis_id)
+
+        history = client.get(
+            f"/v1/teams/{team_id}/analyses?report_available=true&limit=20"
+        )
+        assert history.status_code == 200
+        assert [item["analysis_id"] for item in history.json()["analyses"]] == list(
+            reversed(successful_ids[1:])
+        )
+        assert client.get(
+            f"/v1/teams/{team_id}/analyses/{successful_ids[0]}"
+        ).status_code == 404
+        active_id, _ = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+            trace=b"active-trace",
+        )
+        assert client.portal is not None
+        client.portal.call(runtime._prune_successful_team_analyses, UUID(team_id))
+        for preserved_id in (active_id, canceled_id, failed_id):
+            assert client.get(
+                f"/v1/teams/{team_id}/analyses/{preserved_id}"
+            ).status_code == 200
+
+    team_root = tmp_path / "teams" / team_id / "analyses"
+    assert not (team_root / successful_ids[0]).exists()
+    for preserved_id in (active_id, canceled_id, failed_id):
+        assert (team_root / preserved_id).is_dir()
+    reopened = LocalAnalysisStore(tmp_path)
+    assert reopened.load_document(
+        other_team_id,
+        other_analysis_id,
+        "state.json",
+    ) == {
+        "team_id": str(other_team_id),
+        "analysis_id": str(other_analysis_id),
+        "state": "completed",
+    }
+    reopened.close()
+
+
+def test_report_history_excludes_active_rerun_with_a_previous_report(
+    tmp_path: Path,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    trace = b"active-rerun-trace"
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+            trace=trace,
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+            trace=trace,
+        )
+        _wait_for_report(client, team_id=team_id, analysis_id=analysis_id)
+        runtime = app.state.local_runtime
+
+        async def mark_rerun_active() -> None:
+            analysis = runtime.analyses[(UUID(team_id), UUID(analysis_id))]
+            async with runtime.lock:
+                analysis.state = "analyzing"
+                analysis.version += 1
+            await runtime._persist(analysis)
+
+        assert client.portal is not None
+        client.portal.call(mark_rerun_active)
+        assert client.get(
+            f"/v1/teams/{team_id}/analyses/{analysis_id}/report"
+        ).status_code == 200
+        history = client.get(
+            f"/v1/teams/{team_id}/analyses?report_available=true&limit=10"
+        )
+        assert history.status_code == 200
+        assert history.json()["analyses"] == []
+
+
+def test_local_runtime_prunes_excess_successful_history_on_restart(
+    tmp_path: Path,
+) -> None:
+    first_app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    trace = b"restart-retention-trace"
+    with TestClient(first_app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        analysis_id, checksum = _create_trace_analysis(
+            client,
+            team_id=team_id,
+            headers=headers,
+            trace=trace,
+        )
+        _upload_and_finalize_trace(
+            client,
+            team_id=team_id,
+            analysis_id=analysis_id,
+            headers=headers,
+            checksum=checksum,
+            trace=trace,
+        )
+        _wait_for_report(client, team_id=team_id, analysis_id=analysis_id)
+
+    parsed_team_id = UUID(team_id)
+    parsed_analysis_id = UUID(analysis_id)
+    store = LocalAnalysisStore(tmp_path)
+    base_state = store.load_states()[(parsed_team_id, parsed_analysis_id)]
+    base_report = store.load_document(
+        parsed_team_id,
+        parsed_analysis_id,
+        "report.json",
+    )
+    assert base_report is not None
+    cloned_ids: list[UUID] = []
+    for index in range(10):
+        cloned_id = UUID(f"93000000-0000-4000-8000-{index + 1:012d}")
+        cloned_state = copy.deepcopy(base_state)
+        cloned_state["analysis_id"] = str(cloned_id)
+        cloned_state["created_at"] = f"20{index + 1:02d}-01-01T00:00:00+00:00"
+        cloned_state["completed_at"] = f"20{index + 1:02d}-01-01T00:01:00+00:00"
+        cloned_state.pop("smartperfetto_original", None)
+        cloned_report = copy.deepcopy(base_report)
+        cloned_report["analysis_id"] = str(cloned_id)
+        store.save_state(parsed_team_id, cloned_id, cloned_state)
+        store.save_document(
+            parsed_team_id,
+            cloned_id,
+            "report.json",
+            cloned_report,
+        )
+        cloned_ids.append(cloned_id)
+    store.close()
+
+    oldest_id = cloned_ids[0]
+    second_app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(second_app) as client:
+        history = client.get(
+            f"/v1/teams/{team_id}/analyses?report_available=true&limit=20"
+        )
+        assert history.status_code == 200
+        assert len(history.json()["analyses"]) == 10
+        assert client.get(
+            f"/v1/teams/{team_id}/analyses/{oldest_id}"
+        ).status_code == 404
+
+    assert not (
+        tmp_path
+        / "teams"
+        / team_id
+        / "analyses"
+        / str(oldest_id)
+    ).exists()
+
+
+def test_successful_analysis_cleanup_failure_keeps_new_report_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = create_local_app(
+        gateway=_FakeSmartPerfettoGateway(_smartperfetto_result()),
+        synthesizer=_test_synthesizer(),
+        data_root=tmp_path,
+        public_origin="http://localhost:8000",
+        poll_interval_seconds=0.001,
+    )
+    with TestClient(app) as client:
+        headers = {"x-csrf-token": client.get("/v1/auth/csrf").json()["csrf_token"]}
+        team_id = client.get("/v1/me").json()["memberships"][0]["team"]["id"]
+        parsed_team_id = UUID(team_id)
+        runtime = app.state.local_runtime
+        original_prune = runtime._prune_successful_team_analyses
+
+        async def defer_cleanup(_team_id: UUID) -> None:
+            return None
+
+        monkeypatch.setattr(
+            runtime,
+            "_prune_successful_team_analyses",
+            defer_cleanup,
+        )
+        successful_ids: list[str] = []
+        for index in range(11):
+            trace = f"cleanup-failure-trace-{index:02d}".encode()
+            analysis_id, checksum = _create_trace_analysis(
+                client,
+                team_id=team_id,
+                headers=headers,
+                trace=trace,
+            )
+            _upload_and_finalize_trace(
+                client,
+                team_id=team_id,
+                analysis_id=analysis_id,
+                headers=headers,
+                checksum=checksum,
+                trace=trace,
+            )
+            _wait_for_report(client, team_id=team_id, analysis_id=analysis_id)
+            successful_ids.append(analysis_id)
+
+        monkeypatch.setattr(
+            runtime,
+            "_prune_successful_team_analyses",
+            original_prune,
+        )
+        original_remove = runtime.store.remove_analysis
+
+        def fail_cleanup(_team_id: UUID, _analysis_id: UUID) -> None:
+            raise LocalAnalysisStoreError("retention cleanup unavailable")
+
+        monkeypatch.setattr(runtime.store, "remove_analysis", fail_cleanup)
+        assert client.portal is not None
+        client.portal.call(original_prune, parsed_team_id)
+
+        newest = client.get(
+            f"/v1/teams/{team_id}/analyses/{successful_ids[-1]}"
+        )
+        assert newest.status_code == 200
+        assert newest.json()["state"] in {"completed", "partially_completed"}
+        assert newest.json()["report_available"] is True
+        assert len(
+            client.get(
+                f"/v1/teams/{team_id}/analyses?report_available=true&limit=20"
+            ).json()["analyses"]
+        ) == 11
+
+        monkeypatch.setattr(runtime.store, "remove_analysis", original_remove)
+        client.portal.call(original_prune, parsed_team_id)
+        assert len(
+            client.get(
+                f"/v1/teams/{team_id}/analyses?report_available=true&limit=20"
+            ).json()["analyses"]
+        ) == 10
 
 
 def _persist_created_trace_analysis(

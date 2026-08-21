@@ -1046,6 +1046,8 @@ def _team_device(connected: LocalDevice) -> dict[str, object]:
 
 
 class _LocalRuntime:
+    SUCCESSFUL_ANALYSIS_RETENTION_LIMIT = 10
+
     def __init__(
         self,
         *,
@@ -1125,6 +1127,13 @@ class _LocalRuntime:
     def _terminal_commit_lock(self, analysis: _LocalAnalysis) -> asyncio.Lock:
         key = (analysis.team_id, analysis.analysis_id)
         return self.terminal_commit_locks.setdefault(key, asyncio.Lock())
+
+    @staticmethod
+    def _is_successful_analysis(analysis: _LocalAnalysis) -> bool:
+        return (
+            analysis.report is not None
+            and analysis.state in {"completed", "partially_completed"}
+        )
 
     @staticmethod
     def _recovery_snapshot(
@@ -1632,6 +1641,55 @@ class _LocalRuntime:
                 waiting_for=None,
                 now=now,
             )
+
+    async def _prune_successful_team_analyses(self, team_id: UUID) -> None:
+        async with self.lock:
+            successful = tuple(
+                current
+                for (current_team_id, _), current in self.analyses.items()
+                if current_team_id == team_id
+                and self._is_successful_analysis(current)
+            )
+            expired = tuple(
+                sorted(
+                    successful,
+                    key=lambda current: (
+                        current.created_at,
+                        str(current.analysis_id),
+                    ),
+                    reverse=True,
+                )[self.SUCCESSFUL_ANALYSIS_RETENTION_LIMIT :]
+            )
+
+        for current in expired:
+            key = (current.team_id, current.analysis_id)
+            try:
+                await asyncio.to_thread(
+                    self.store.remove_analysis,
+                    current.team_id,
+                    current.analysis_id,
+                )
+            except LocalAnalysisStoreError as error:
+                _LOGGER.warning(
+                    "Successful analysis retention cleanup deferred "
+                    "team_id=%s analysis_id=%s type=%s",
+                    current.team_id,
+                    current.analysis_id,
+                    type(error).__name__,
+                )
+                continue
+            async with self.lock:
+                if self.analyses.get(key) is not current:
+                    continue
+                del self.analyses[key]
+                self.remote_capture.discard(self._remote_capture_context(current))
+                self.terminal_commit_locks.pop(key, None)
+                for upload in tuple(self.uploads.values()):
+                    if (
+                        upload.team_id == current.team_id
+                        and upload.analysis_id == current.analysis_id
+                    ):
+                        self._unregister_upload(upload)
 
     async def observe_agent_completion(
         self,
@@ -2257,12 +2315,14 @@ class _LocalRuntime:
 
     async def start(self) -> None:
         persisted = await asyncio.to_thread(self.store.load_states)
+        restored_team_ids: set[UUID] = set()
         pending_remote_publications: list[tuple[_LocalAnalysis, _LocalUpload]] = []
         pending_script_publications: list[_LocalAnalysis] = []
         pending_remote_analyses: list[
             tuple[_LocalAnalysis, AgentExecutionAccess, ValidatedAgentExecutionManifest]
         ] = []
         for (team_id, analysis_id), document in persisted.items():
+            restored_team_ids.add(team_id)
             analysis = self._restore_analysis(document)
             migrate_created_at = document.get("created_at") is None
             migrate_runtime_contract = (
@@ -2483,6 +2543,8 @@ class _LocalRuntime:
                             for item in pending_remote_publications
                             if item[0] is not analysis
                         ]
+        for restored_team_id in sorted(restored_team_ids, key=str):
+            await self._prune_successful_team_analyses(restored_team_id)
         for analysis, upload in pending_remote_publications:
             try:
                 context = self._remote_capture_context(analysis)
@@ -2993,7 +3055,8 @@ class _LocalRuntime:
             available = tuple(
                 analysis
                 for (current_team_id, _), analysis in self.analyses.items()
-                if current_team_id == team_id and analysis.report is not None
+                if current_team_id == team_id
+                and self._is_successful_analysis(analysis)
             )
         return tuple(
             sorted(
@@ -4333,6 +4396,8 @@ class _LocalRuntime:
                     analysis.runtime_status = previous_runtime_status
                     analysis.version = previous_version
                 raise
+        await self._prune_successful_team_analyses(analysis.team_id)
+
     async def _fail_synthesis_rerun(
         self,
         analysis: _LocalAnalysis,
