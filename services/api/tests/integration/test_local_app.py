@@ -3655,7 +3655,7 @@ def test_local_supervisor_marks_idle_upstream_without_failing_analysis(
         assert active["runtime_status"]["waiting_for"] is None
 
 
-def test_successful_trace_submission_removes_only_current_team_previous_analysis(
+def test_successful_trace_submission_preserves_previous_report_below_retention_limit(
     tmp_path: Path,
 ) -> None:
     app = create_local_app(
@@ -3765,11 +3765,19 @@ def test_successful_trace_submission_removes_only_current_team_previous_analysis
             f"/v1/teams/{team_id}/analyses/{second_id}/report"
         ).status_code == 200
         assert client.get(
-            f"/v1/teams/{team_id}/analyses/{first_id}"
-        ).status_code == 404
+            f"/v1/teams/{team_id}/analyses/{first_id}/report"
+        ).status_code == 200
+        history = client.get(
+            f"/v1/teams/{team_id}/analyses?report_available=true&limit=10"
+        )
+        assert history.status_code == 200
+        assert [item["analysis_id"] for item in history.json()["analyses"]] == [
+            second_id,
+            first_id,
+        ]
 
     reopened = LocalAnalysisStore(tmp_path)
-    assert (UUID(team_id), UUID(first_id)) not in reopened.load_states()
+    assert (UUID(team_id), UUID(first_id)) in reopened.load_states()
     assert reopened.load_document(
         other_team_id, other_analysis_id, "state.json"
     ) == {
