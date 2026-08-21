@@ -28,7 +28,8 @@ usage() {
     "一键重启 PerfPilot 本地服务" \
     "" \
     "用法：npm run dev:restart" \
-    "说明：每次重启都会删除本地历史分析数据" \
+    "说明：默认保留本地分析历史" \
+    "清空：bash scripts/restart-local.sh --reset-only" \
     "网页：$WEB_URL" \
     "API：$API_URL" \
     "SmartPerfetto：$SMARTPERFETTO_URL"
@@ -273,7 +274,6 @@ stop_managed_listener \
 assert_port_free "$WEB_PORT" "网页服务"
 assert_port_free "$API_PORT" "API 服务"
 assert_port_free "$SMARTPERFETTO_PORT" "SmartPerfetto 服务"
-clear_analysis_history
 
 printf '正在启动新服务……\n'
 (

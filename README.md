@@ -18,12 +18,14 @@ cp .dev.vars.example .dev.vars
 npm run dev:restart
 ```
 
-`npm run dev:restart` clears all local analysis history and starts
+`npm run dev:restart` preserves local analysis history and starts
 SmartPerfetto on `127.0.0.1:3001`, the PerfPilot API on `127.0.0.1:8000`, and
 the web workspace on `http://localhost:3000`. It expects the SmartPerfetto
 backend at `~/SmartPerfetto/backend`; when the checkout lives elsewhere, set
 `PERFPILOT_LOCAL_SMARTPERFETTO_ROOT` to its `backend` directory before running
 the command. Logs and managed process IDs are stored in `.perfpilot/run`.
+To intentionally delete all local analysis data without starting services, run
+`bash scripts/restart-local.sh --reset-only`.
 
 Open `http://localhost:3000`. Completed analyses expose an **打开完整报告**
 link. The report page shows SmartPerfetto provenance, one PerfPilot AI report

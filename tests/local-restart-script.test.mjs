@@ -34,6 +34,12 @@ test("npm exposes a documented one-command local restart", async () => {
   assert.match(stdout, /npm run dev:restart/);
   assert.match(stdout, /http:\/\/localhost:3000/);
   assert.match(stdout, /http:\/\/127\.0\.0\.1:8000\/v1\/health/);
+  assert.match(stdout, /默认保留本地分析历史/);
+  assert.match(stdout, /--reset-only/);
+
+  const script = await readFile(restartScript, "utf8");
+  const clearCalls = script.match(/^\s*clear_analysis_history\s*$/gm) ?? [];
+  assert.equal(clearCalls.length, 1);
 });
 
 test("restart reset removes all local analysis history", async (t) => {
