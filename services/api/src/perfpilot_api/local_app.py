@@ -1098,6 +1098,7 @@ class _LocalRuntime:
         self.lock = asyncio.Lock()
         self.remote_capture = RemoteCaptureCoordinator()
         self.terminal_commit_locks: dict[tuple[UUID, UUID], asyncio.Lock] = {}
+        self.report_publications_in_progress: set[tuple[UUID, UUID]] = set()
         self.tasks: set[asyncio.Task[None]] = set()
         self.supervisor_tasks: dict[asyncio.AbstractEventLoop, asyncio.Task[None]] = {}
         self.supervisor_last_tick_at: datetime | None = None
@@ -1133,6 +1134,13 @@ class _LocalRuntime:
         return (
             analysis.report is not None
             and analysis.state in {"completed", "partially_completed"}
+        )
+
+    def _report_available(self, analysis: _LocalAnalysis) -> bool:
+        return (
+            analysis.report is not None
+            and (analysis.team_id, analysis.analysis_id)
+            not in self.report_publications_in_progress
         )
 
     @staticmethod
@@ -1477,6 +1485,7 @@ class _LocalRuntime:
         analysis: _LocalAnalysis,
         *,
         public_document: Mapping[str, object] | None = None,
+        report_available: bool | None = None,
     ) -> LocalAnalysisView:
         if analysis.response_schema_version is None:
             raise RuntimeError("local analysis response schema is unavailable")
@@ -1564,7 +1573,11 @@ class _LocalRuntime:
             started_at=analysis.started_at,
             completed_at=analysis.completed_at,
             cancel_requested_at=analysis.cancel_requested_at,
-            report_available=analysis.report is not None,
+            report_available=(
+                analysis.report is not None
+                if report_available is None
+                else report_available
+            ),
             runtime_status=dict(analysis.runtime_status or {}),
             payload=payload,
         )
@@ -3057,6 +3070,7 @@ class _LocalRuntime:
                 for (current_team_id, _), analysis in self.analyses.items()
                 if current_team_id == team_id
                 and self._is_successful_analysis(analysis)
+                and self._report_available(analysis)
             )
         return tuple(
             sorted(
@@ -4373,19 +4387,27 @@ class _LocalRuntime:
                     raise asyncio.CancelledError
                 if analysis.generation != generation:
                     raise _StaleLocalGeneration
-                analysis.report = report
-                await self._transition(
-                    analysis,
-                    target=cast(AnalysisState, str(report["state"])),
-                    now=datetime.now(UTC),
-                    result_generation=generation,
-                    publish_report=True,
-                )
-                analysis.stages["report"] = "completed"
-                analysis.version += 1
+                publication_key = (analysis.team_id, analysis.analysis_id)
+                self.report_publications_in_progress.add(publication_key)
+                try:
+                    analysis.report = report
+                    await self._transition(
+                        analysis,
+                        target=cast(AnalysisState, str(report["state"])),
+                        now=datetime.now(UTC),
+                        result_generation=generation,
+                        publish_report=True,
+                    )
+                    analysis.stages["report"] = "completed"
+                    analysis.version += 1
+                except BaseException:
+                    self.report_publications_in_progress.discard(publication_key)
+                    raise
             try:
                 await self._persist(analysis)
             except LocalAnalysisStoreDurabilityError:
+                async with self.lock:
+                    self.report_publications_in_progress.discard(publication_key)
                 raise
             except BaseException:
                 async with self.lock:
@@ -4395,8 +4417,13 @@ class _LocalRuntime:
                     analysis.stages["report"] = previous_report_stage
                     analysis.runtime_status = previous_runtime_status
                     analysis.version = previous_version
+                    self.report_publications_in_progress.discard(publication_key)
                 raise
-        await self._prune_successful_team_analyses(analysis.team_id)
+            try:
+                await self._prune_successful_team_analyses(analysis.team_id)
+            finally:
+                async with self.lock:
+                    self.report_publications_in_progress.discard(publication_key)
 
     async def _fail_synthesis_rerun(
         self,
@@ -4474,7 +4501,11 @@ class _LocalRuntime:
     def response(self, analysis: _LocalAnalysis) -> dict[str, object]:
         document = self._response_document(analysis)
         return to_public_document(
-            self._analysis_view(analysis, public_document=document)
+            self._analysis_view(
+                analysis,
+                public_document=document,
+                report_available=self._report_available(analysis),
+            )
         )
 
     def _response_document(self, analysis: _LocalAnalysis) -> dict[str, object]:
@@ -4592,7 +4623,7 @@ class _LocalRuntime:
                     ],
                     "sample_verdict_counts": verdicts,
                     "active_lease": None,
-                    "report_available": analysis.report is not None,
+                    "report_available": self._report_available(analysis),
                     "created_at": analysis.created_at.isoformat(),
                     "started_at": (
                         analysis.started_at.isoformat()
@@ -4732,7 +4763,7 @@ class _LocalRuntime:
                 ],
                 "sample_verdict_counts": verdicts,
                 "active_lease": None,
-                "report_available": analysis.report is not None,
+                "report_available": self._report_available(analysis),
                 "created_at": analysis.created_at.isoformat(),
                 "started_at": (
                     analysis.started_at.isoformat()
@@ -4808,7 +4839,7 @@ class _LocalRuntime:
                 if analysis.cancel_requested_at is not None
                 else None
             ),
-            "report_available": analysis.report is not None,
+            "report_available": self._report_available(analysis),
             "stages": stages,
             "input_uploads": input_uploads,
             "failure": analysis.failure,
@@ -5945,8 +5976,9 @@ def create_local_app(
     async def read_report(request: Request, team_id: UUID, analysis_id: UUID) -> dict[str, object]:
         authorize_team(request, team_id)
         analysis = await runtime.analysis(team_id, analysis_id)
-        if analysis.report is None:
+        if not runtime._report_available(analysis):
             raise HTTPException(status.HTTP_404_NOT_FOUND, "report not ready")
+        assert analysis.report is not None
         return analysis.report
 
     @app.get(
