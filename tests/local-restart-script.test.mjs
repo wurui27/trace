@@ -15,6 +15,21 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const projectRoot = path.resolve(import.meta.dirname, "..");
 const restartScript = path.join(projectRoot, "scripts", "restart-local.sh");
+const localApiScript = path.join(projectRoot, "scripts", "run-local-api.sh");
+
+test("local API startup loads the private persistent AI environment", async () => {
+  const packageJson = JSON.parse(
+    await readFile(path.join(projectRoot, "package.json"), "utf8"),
+  );
+
+  assert.equal(packageJson.scripts["dev:api"], "bash scripts/run-local-api.sh");
+  await access(localApiScript);
+
+  const script = await readFile(localApiScript, "utf8");
+  assert.match(script, /\.perfpilot\/local-control\/perfpilot-ai\.env/);
+  assert.match(script, /source "\$AI_ENV_FILE"/);
+  assert.match(script, /exec env PYTHONPATH=/);
+});
 
 test("npm exposes a documented one-command local restart", async () => {
   const packageJson = JSON.parse(

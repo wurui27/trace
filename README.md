@@ -18,6 +18,11 @@ cp .dev.vars.example .dev.vars
 npm run dev:restart
 ```
 
+For persistent local use, store the same five values in
+`.perfpilot/local-control/perfpilot-ai.env` and set the file mode to `600`.
+`npm run dev:api` and `npm run dev:restart` load this ignored private file
+automatically; credentials are never committed to Git.
+
 `npm run dev:restart` preserves local analysis history and starts
 SmartPerfetto on `127.0.0.1:3001`, the PerfPilot API on `127.0.0.1:8000`, and
 the web workspace on `http://localhost:3000`. It expects the SmartPerfetto

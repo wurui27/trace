@@ -7,7 +7,7 @@
   },
   "scripts": {
     "dev": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext dev",
-    "dev:api": "PYTHONPATH=services/api/src .venv/bin/python -c \"from perfpilot_api.local_app import run; run()\"",
+    "dev:api": "bash scripts/run-local-api.sh",
     "dev:restart": "bash scripts/restart-local.sh",
     "build": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext build",
     "start": "WRANGLER_LOG_PATH=.wrangler/wrangler.log vinext start",
