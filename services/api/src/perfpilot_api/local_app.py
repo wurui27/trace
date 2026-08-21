@@ -5971,7 +5971,7 @@ def create_local_app(
             "content-security-policy": (
                 "sandbox allow-scripts; default-src 'none'; "
                 "img-src data: blob:; style-src 'unsafe-inline'; "
-                "script-src 'unsafe-inline'"
+                "script-src 'unsafe-inline' https://cdn.jsdelivr.net"
             ),
             "x-content-type-options": "nosniff",
         }

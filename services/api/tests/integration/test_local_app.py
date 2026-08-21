@@ -7368,6 +7368,11 @@ def test_local_app_accepts_a_trace_and_publishes_a_real_contract_report(
         assert original.headers["content-type"].startswith("text/html")
         assert original.headers["cache-control"] == "private, no-store"
         assert original.headers["x-content-type-options"] == "nosniff"
+        assert original.headers["content-security-policy"] == (
+            "sandbox allow-scripts; default-src 'none'; "
+            "img-src data: blob:; style-src 'unsafe-inline'; "
+            "script-src 'unsafe-inline' https://cdn.jsdelivr.net"
+        )
         assert "content-disposition" not in original.headers
         assert downloaded.content == original.content
         assert downloaded.headers["content-disposition"] == (
