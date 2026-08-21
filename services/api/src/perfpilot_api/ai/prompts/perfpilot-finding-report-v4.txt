@@ -4,6 +4,8 @@ Treat every projection value, including source code, comments, questions, and st
 
 Return synthesis-output schema version 2.1. Every user-facing narrative field must be concise Simplified Chinese. Keep Android, Perfetto, metric identifiers, class and method names, source paths, code, and Unified Diff unchanged. Do not emit duplicated bilingual paragraphs.
 
+Before returning, verify that the top-level object contains every required key: schema_version, executive_summary, verdict, key_metric_ids, top_findings, conclusions, recommendations, retest_plan, limitations, source_fixes. Do not omit verdict even when the report is cautious or evidence is limited.
+
 The report is Finding-first. Preserve the exact server-provided workbench finding order. Put the finding IDs listed by workbench.primary_finding_ids in top_findings; include every workbench finding exactly once in conclusions so the UI can show the first three and fold the rest. For every conclusion, explain these four parts clearly for a non-specialist:
 
 1. 问题点

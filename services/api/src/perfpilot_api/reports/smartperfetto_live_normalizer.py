@@ -63,6 +63,7 @@ def _public_diagnostic_title(value: object, *, fallback: str) -> str:
     title = re.sub(r"\s*[—–-]\s*[：:]\s*", "：", title)
     title = re.sub(r"\s*[—–-]\s*(?=[（(])", "", title)
     title = re.sub(r"\s*[—–-]\s*(?:[/／|]\s*)*$", "", title)
+    title = re.sub(r"[（(]\s*(?:辅助)?\s*[）)]", "", title)
     title = re.sub(r"\s{2,}", " ", title).strip(" —–-/／|")
     return title or fallback
 
@@ -497,6 +498,12 @@ def _is_limitation_diagnostic(
     )
     if resolved is not None:
         return False
+    if (
+        severity in {"info", "informational"}
+        and title.startswith("无")
+        and title.endswith("证据")
+    ):
+        return True
     if severity in {"info", "informational"} and (
         any(marker in title for marker in ("诊断说明", "采集说明", "采集状态"))
         or any(
@@ -662,8 +669,11 @@ def _diagnostic_facts(
         if source_id in seen:
             continue
         seen.add(source_id)
-        title = _public_diagnostic_title(
+        classification_title = _text(
             raw.get("title"), fallback=f"性能发现 {index + 1}"
+        )
+        title = _public_diagnostic_title(
+            classification_title, fallback=f"性能发现 {index + 1}"
         )
         description = _text(raw.get("description"), fallback=title)
         detail = ""
@@ -678,7 +688,9 @@ def _diagnostic_facts(
                 if isinstance(item, Mapping) and _text(item.get("text"))
             ]
             detail = evidence_texts[0] if evidence_texts else ""
-        diagnostic_text = "\n".join((title, description, *evidence_texts))
+        diagnostic_text = "\n".join(
+            (classification_title, description, *evidence_texts)
+        )
         evidence_ids = _referenced_envelope_evidence_ids(
             diagnostic_text,
             evidence_by_artifact,
@@ -744,7 +756,16 @@ def _diagnostic_facts(
             )
             continue
         confidence = _confidence(raw.get("confidence"))
-        uncertain = _is_uncertain_diagnostic(diagnostic_text) or references_empty_artifact
+        derived_uncertain = re.search(
+            r"(?<![A-Za-z0-9_.-])SR(?:01|17|19)(?![A-Za-z0-9_.-])",
+            classification_title,
+            re.IGNORECASE,
+        ) is not None
+        uncertain = (
+            derived_uncertain
+            or _is_uncertain_diagnostic(diagnostic_text)
+            or references_empty_artifact
+        )
         if uncertain and confidence == "high":
             confidence = "medium"
         findings.append(

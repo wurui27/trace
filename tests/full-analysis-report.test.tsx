@@ -307,6 +307,29 @@ describe("FullAnalysisReport", () => {
     );
   });
 
+  it("states when the final report uses the deterministic Chinese fallback", async () => {
+    const fallbackReport = structuredClone(analysisReportV13Example) as Record<string, unknown>;
+    (fallbackReport.capabilities as Record<string, unknown>).ai = "deterministic_fallback";
+    const loader = vi.fn(async (_id, _signal, onSnapshot) => {
+      onSnapshot({
+        teamId: "team-1",
+        analysis,
+        report: fallbackReport as unknown as AnalysisReport,
+        reportLoadFailed: false,
+      });
+    });
+
+    render(<FullAnalysisReport analysisId="analysis-live-1" loader={loader} />);
+
+    expect(await screen.findByText("稳定中文结论已生成")).toBeVisible();
+    expect(screen.getByText("结论生成")).toBeVisible();
+    expect(screen.queryByText("AI 复核")).not.toBeInTheDocument();
+    expect(
+      screen.getByText("当前采用确定性结论，未将 AI 候选作为最终报告"),
+    ).toBeVisible();
+    expect(screen.queryByText("单轮 PerfPilot AI 深度分析已完成")).not.toBeInTheDocument();
+  });
+
   it("preserves the completed legacy three-round process copy", async () => {
     const legacyAnalysis: AnalysisResponse = {
       ...analysis,

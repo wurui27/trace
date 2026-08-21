@@ -245,6 +245,53 @@ def test_live_normalizer_keeps_informational_performance_diagnostics_as_findings
     )
 
 
+def test_live_normalizer_treats_sr17_schedule_attribution_as_uncertain() -> None:
+    def mutate(contract: dict[str, object]) -> None:
+        diagnostic = contract["diagnostics"][0]  # type: ignore[index]
+        diagnostic.update(
+            {
+                "severity": "medium",
+                "title": "主线程 Runnable 12.7%（SR17）",
+                "description": (
+                    "主线程存在调度等待，说明主要受系统调度竞争影响；"
+                    "启动窗口内同时有其他进程 fork。"
+                ),
+            }
+        )
+
+    core = normalize_live_smartperfetto_result(
+        _mutated_live_source(mutate)
+    ).document
+    finding = core["scenario_reports"][0]["findings"][0]  # type: ignore[index]
+
+    assert finding["status"] == "suspected"
+    assert finding["kind"] == "symptom"
+    assert finding["title"] == "主线程 Runnable 12.7%"
+
+
+def test_live_normalizer_moves_negative_environment_observation_to_limitations() -> None:
+    def mutate(contract: dict[str, object]) -> None:
+        diagnostic = contract["diagnostics"][0]  # type: ignore[index]
+        diagnostic.update(
+            {
+                "severity": "info",
+                "title": "无频率/热/容量受限证据",
+                "description": "未发现热降频或 GPU 活跃证据。",
+            }
+        )
+
+    core = normalize_live_smartperfetto_result(
+        _mutated_live_source(mutate)
+    ).document
+    scenario = core["scenario_reports"][0]  # type: ignore[index]
+
+    assert scenario["findings"] == []
+    assert any(
+        limitation["summary"] == "未发现热降频或 GPU 活跃证据。"
+        for limitation in core["limitations"]  # type: ignore[index]
+    )
+
+
 def test_live_normalizer_does_not_turn_finding_into_limitation_for_caveat_reference() -> None:
     def mutate(contract: dict[str, object]) -> None:
         diagnostic = contract["diagnostics"][0]  # type: ignore[index]

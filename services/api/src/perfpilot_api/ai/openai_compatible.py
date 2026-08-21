@@ -378,7 +378,11 @@ class OpenAICompatibleSynthesisProvider:
                             "new JSON object from the authoritative projection. Strictly "
                             "check the schema and every referenced identifier. Narrative "
                             "fields must contain no ASCII digits; measurements belong only "
-                            "in report metric sections."
+                            "in report metric sections. Before returning, verify that the "
+                            "top-level object contains every required key: schema_version, "
+                            "executive_summary, verdict, key_metric_ids, top_findings, "
+                            "conclusions, recommendations, retest_plan, limitations, "
+                            "source_fixes."
                         )
                     ),
                 }

@@ -149,6 +149,8 @@ describe("AnalysisProgress", () => {
     render(<AnalysisProgressView analysis={analysis("partially_completed")} />);
 
     expect(screen.getByRole("heading", { name: "分析完成" })).toHaveClass("is-success");
+    expect(screen.getAllByText("分析完成")).toHaveLength(2);
+    expect(screen.queryByText("partially_completed")).not.toBeInTheDocument();
     expect(screen.queryByText(/部分证据不足|证据仍缺失/)).not.toBeInTheDocument();
   });
 

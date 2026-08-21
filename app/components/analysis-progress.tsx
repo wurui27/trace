@@ -371,6 +371,9 @@ export function AnalysisProgressView({
   const description = runtimeStatus && !terminal
     ? "当前进度由服务端任务状态实时确认。"
     : copy.description;
+  const badgeLabel = ["completed", "partially_completed"].includes(analysis.state)
+    ? "分析完成"
+    : analysis.state;
 
   return (
     <div className="analysis-detail-stack">
@@ -381,7 +384,7 @@ export function AnalysisProgressView({
           <h1 className={`analysis-state-title is-${copy.tone}`}>{title}</h1>
           <p>{description}</p>
         </div>
-        <span className={`analysis-state-badge is-${copy.tone}`}>{analysis.state}</span>
+        <span className={`analysis-state-badge is-${copy.tone}`}>{badgeLabel}</span>
       </header>
 
       <dl className="analysis-identity">

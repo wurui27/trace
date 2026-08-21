@@ -147,6 +147,8 @@ export function FullAnalysisReport({
   const hasMemoryScenario = memoryScenario !== undefined;
   const memoryComplete = memoryScenario?.result_state === "completed";
   const findingWorkbenchComplete = report.schema_version === "1.3";
+  const deterministicFallback =
+    report.schema_version === "1.3" && report.capabilities.ai === "deterministic_fallback";
   const smartPerfettoSummary =
     sourceRounds === null || sourceRounds === undefined
       ? "SmartPerfetto 已完成"
@@ -290,17 +292,21 @@ export function FullAnalysisReport({
               </span>
             </div>
             <div>
-              <dt>AI 复核</dt>
+              <dt>{deterministicFallback ? "结论生成" : "AI 复核"}</dt>
               <dd>
                 {report.synthesis.state === "completed"
-                  ? aiProcess.title
+                  ? deterministicFallback
+                    ? "稳定中文结论已生成"
+                    : aiProcess.title
                   : report.synthesis.state === "not_requested"
                     ? "当前报告未包含 AI"
                     : "PerfPilot AI 未完成"}
               </dd>
               <span>
                 {report.synthesis.state === "completed"
-                  ? aiProcess.detail
+                  ? deterministicFallback
+                    ? "当前采用确定性结论，未将 AI 候选作为最终报告"
+                    : aiProcess.detail
                   : report.synthesis.state === "not_requested"
                     ? hasMemoryScenario
                       ? "双内核基础报告"

@@ -32,6 +32,8 @@ def test_synthesis_prompt_is_versioned_hashed_and_constrains_untrusted_input() -
     assert "concrete recommendation" in instruction
     assert "schema version 2.1" in instruction
     assert "claim_refs" in instruction
+    assert "executive_summary, verdict, key_metric_ids" in instruction
+    assert "conclusions, recommendations, retest_plan, limitations, source_fixes" in instruction
     assert "问题点" in prompt.system_instruction
     assert "为什么会有这个问题" in prompt.system_instruction
     assert "结合源码判断的根因" in prompt.system_instruction

@@ -456,6 +456,30 @@ def test_system_ownership_downgrade_keeps_actionable_application_callers(
     ]
 
 
+def test_system_ownership_keeps_main_thread_binder_target_actionable() -> None:
+    core = _core()
+    finding = core["scenario_reports"][0]["findings"][0]  # type: ignore[index]
+    finding["title"] = "主线程同步 Binder 到 system_server 累计过高"
+    finding["summary"] = (
+        "启动期间主线程同步 Binder 到 system_server；部分请求在 system_server 侧 "
+        "Sleeping。报告同时记录主线程锁竞争，根因包含应用和 vendor 服务同步调用。"
+    )
+    finding["severity"] = "critical"
+
+    workbench = build_finding_workbench(
+        core_document=core,
+        source_context=None,
+        package_name="com.rivotek.mediacenter",
+        duration_seconds=15,
+        environment_fingerprint=ENVIRONMENT_FINGERPRINT,
+    )
+
+    assert workbench["findings"][0]["priority"] in {"p0", "p1"}
+    assert workbench["primary_finding_ids"] == [
+        workbench["findings"][0]["finding_id"]
+    ]
+
+
 @pytest.mark.parametrize(
     "summary",
     [

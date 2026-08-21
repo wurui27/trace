@@ -467,6 +467,7 @@ def _hypothesis_cause(finding: Mapping[str, object]) -> str | None:
 def _specific_cause(finding: Mapping[str, object]) -> str | None:
     text = _finding_text(finding)
     category = _primary_category(finding)
+    scenario = str(finding.get("scenario_type", "other"))
     category_resolution = _finding_category_resolution(finding)
     if category_resolution == "excluded":
         return "关联 Trace 证据已排除该候选机制，应继续核对当前场景中的其他证据。"
@@ -506,9 +507,13 @@ def _specific_cause(finding: Mapping[str, object]) -> str | None:
             )
         return "Trace 显示外部 SDK 初始化占用冷启动主线程；具体生命周期入口仍需结合源码确认。"
     needs_summary = _specific_problem(finding) is not None
-    if needs_summary and category == "binder":
+    if not low_confidence and scenario == "scroll" and category == "binder":
+        return "滑动回调在主线程发起同步 Binder 调用并等待返回，直接占用关键帧。"
+    if not low_confidence and scenario == "scroll" and category == "frame":
+        return "滑动过程中出现 Compose 重组与 View 测量，主线程关键帧工作量过重。"
+    if not low_confidence and scenario == "startup" and category == "binder":
         return "冷启动主线程发起同步 Binder 调用并等待 system_server 返回，直接占用关键路径。"
-    if needs_summary and category == "frame":
+    if not low_confidence and scenario == "startup" and category == "frame":
         return "首帧 doFrame 内同时出现 Compose 重组与 View 测量，主线程呈 CPU 密集工作。"
     if needs_summary and category == "lock":
         return "Trace 显示冷启动主线程存在 ClassLinker 与应用锁竞争；具体调用点仍需源码定位。"
@@ -565,10 +570,21 @@ def _specific_recommendation(finding: Mapping[str, object]) -> str:
     recommendation = _safe_chinese(finding.get("engine_recommendation"), "")
     if re.search(r"(?<![a-z])(?:self|wall|running|sleeping)(?![a-z])", recommendation, re.IGNORECASE):
         recommendation = ""
+    recommendation_category = _primary_category({"title": recommendation})
     if (
         not low_confidence
         and recommendation
         and not recommendation.startswith("排查并优化")
+        and recommendation_category == primary_category
+        and primary_category not in {
+            "binder",
+            "sdk",
+            "frame",
+            "native",
+            "jit",
+            "fork",
+            "schedule",
+        }
     ):
         return recommendation
     if (
@@ -596,7 +612,8 @@ def _specific_recommendation(finding: Mapping[str, object]) -> str:
         and _category_state(text, ("binder", "同步 ipc")) == "present"
     ):
         return (
-            "梳理冷启动主线程上的同步 Binder 调用；将非首屏必需调用延后，"
+            "梳理冷启动主线程上的同步 Binder 调用；将主线程 Binder 查询移出"
+            "冷启动关键路径，非首屏必需调用延后，"
             "必须同步的结果采用合并或缓存，并复测等待是否下降。"
         )
     if scenario == "startup" and primary_category == "sdk":

@@ -774,6 +774,64 @@ def test_fallback_publishes_readable_cautious_conclusions_for_real_trace_finding
     assert conclusion["problem"] == expected_problem
     assert expected_cause in conclusion["cause"]
     assert expected_recommendation in conclusion["recommendation"]
+
+
+@pytest.mark.parametrize(
+    (
+        "title",
+        "root_cause",
+        "engine_recommendation",
+        "expected_cause",
+        "expected_recommendation",
+    ),
+    [
+        (
+            "首帧渲染过重（doFrame 349.2ms）",
+            (
+                "首帧 Choreographer#doFrame 214733 = 349.2ms，traversal 348.9ms；"
+                "其中 measure 110.9ms，Compose:recompose self 83.62ms。"
+            ),
+            "优化首帧布局并减少 Compose 重组。",
+            "Compose 重组与 View 测量",
+            "首帧 Compose",
+        ),
+        (
+            "主线程同步 Binder 到 system_server 累计过高（辅助）",
+            (
+                "启动期间主线程同步 Binder 到 system_server 共 111 次、298.34ms；"
+                "全量 Binder 到 system_server 233 次、752.86ms。"
+            ),
+            "关注启动窗口 ±5s 内进程 fork，评估 boot storm 治理。",
+            "同步 Binder 调用并等待 system_server 返回",
+            "同步 Binder",
+        ),
+    ],
+)
+def test_fallback_replaces_measurement_heavy_real_causes_with_readable_mechanisms(
+    title: str,
+    root_cause: str,
+    engine_recommendation: str,
+    expected_cause: str,
+    expected_recommendation: str,
+) -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+
+    document = deepcopy(_projection().document)
+    finding = document["workbench"]["findings"][0]
+    finding["title"] = title
+    finding["problem"] = title
+    finding["root_cause"] = root_cause
+    finding["engine_recommendation"] = engine_recommendation
+    finding["scenario_type"] = "startup"
+
+    result = build_deterministic_finding_synthesis(_projection(document))
+    conclusion = result.document["conclusions"][0]
+
+    assert expected_cause in conclusion["cause"]
+    assert expected_recommendation in conclusion["recommendation"]
+    assert "共、" not in conclusion["cause"]
+    assert "=，" not in conclusion["cause"]
+    assert "± 内" not in conclusion["recommendation"]
     assert all(
         fragment not in conclusion[field]
         for field in ("problem", "cause", "recommendation")
@@ -885,6 +943,34 @@ def test_fallback_category_actions_respect_scenario_and_negation(
     assert expected in recommendation
     if title.startswith("已排除 JIT"):
         assert "存在 JIT 编译活动" not in result.document["conclusions"][0]["cause"]
+
+
+@pytest.mark.parametrize(
+    ("title", "forbidden"),
+    [
+        ("Binder 回调阻塞滑动帧", "冷启动"),
+        ("Compose 测量阻塞滑动帧", "首帧"),
+    ],
+)
+def test_fallback_scroll_causes_do_not_use_startup_templates(
+    title: str,
+    forbidden: str,
+) -> None:
+    from perfpilot_api.ai.finding_fallback import build_deterministic_finding_synthesis
+
+    document = deepcopy(_projection().document)
+    _set_scenario(document, "scroll")
+    finding = document["workbench"]["findings"][0]
+    finding["title"] = title
+    finding["problem"] = title
+    finding["root_cause"] = title
+    finding["engine_recommendation"] = f"排查并优化：{title}。"
+
+    result = build_deterministic_finding_synthesis(_projection(document))
+
+    cause = result.document["conclusions"][0]["cause"]
+    assert forbidden not in cause
+    assert "滑动" in cause
 
 
 @pytest.mark.parametrize(
