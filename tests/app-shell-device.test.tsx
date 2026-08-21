@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import "@testing-library/jest-dom/vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { cleanup, render, screen, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 
 import { AppShell } from "../app/components/app-shell";
@@ -53,4 +53,13 @@ it("shows real remote devices without rendering a demo Pixel or raw serial", asy
   expect(screen.queryByText("Pixel 8")).not.toBeInTheDocument();
   expect(screen.queryByText("R3CN30SECRET7K2A")).not.toBeInTheDocument();
   expect(screen.getByText("尚未选择应用")).toBeInTheDocument();
+  const navigation = screen.getByRole("navigation", { name: "主导航" });
+  expect(within(navigation).getByRole("link", { name: "测试" })).toBeVisible();
+  expect(within(navigation).getByRole("link", { name: "场景" })).toBeVisible();
+  expect(
+    within(navigation).queryByRole("link", { name: "问题" }),
+  ).not.toBeInTheDocument();
+  expect(
+    within(navigation).queryByRole("link", { name: "对比" }),
+  ).not.toBeInTheDocument();
 });

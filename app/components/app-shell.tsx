@@ -1,9 +1,7 @@
 import type { ReactNode } from "react";
 import Link from "next/link";
 import {
-  CircleAlert,
   FlaskConical,
-  GitCompare,
   Layers3,
   LayoutDashboard,
   PackageOpen,
@@ -48,18 +46,6 @@ const navigationItems = [
     label: "场景",
     href: "/scenarios",
     icon: Layers3,
-  },
-  {
-    id: "problems",
-    label: "问题",
-    href: "/problems",
-    icon: CircleAlert,
-  },
-  {
-    id: "comparisons",
-    label: "对比",
-    href: "/comparisons",
-    icon: GitCompare,
   },
   {
     id: "agents",
